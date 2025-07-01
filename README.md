@@ -1,1 +1,1 @@
-# fastify-json-rpc-2
+# Fastify Adapter for the Model Context Protocol
