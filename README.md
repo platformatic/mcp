@@ -30,7 +30,7 @@ await app.register(mcpPlugin, {
   instructions: 'This server provides custom tools and resources'
 })
 
-// Add tools, resources, and prompts
+// Add tools, resources, and prompts with handlers
 app.mcpAddTool({
   name: 'calculator',
   description: 'Performs basic arithmetic operations',
@@ -43,6 +43,19 @@ app.mcpAddTool({
     },
     required: ['operation', 'a', 'b']
   }
+}, async (params) => {
+  const { operation, a, b } = params
+  let result
+  switch (operation) {
+    case 'add': result = a + b; break
+    case 'subtract': result = a - b; break
+    case 'multiply': result = a * b; break
+    case 'divide': result = a / b; break
+    default: throw new Error('Invalid operation')
+  }
+  return {
+    content: [{ type: 'text', text: `Result: ${result}` }]
+  }
 })
 
 app.mcpAddResource({
@@ -50,6 +63,16 @@ app.mcpAddResource({
   name: 'Application Config',
   description: 'Server configuration file',
   mimeType: 'application/json'
+}, async (uri) => {
+  // Read and return the configuration file
+  const config = { setting1: 'value1', setting2: 'value2' }
+  return {
+    contents: [{
+      uri,
+      text: JSON.stringify(config, null, 2),
+      mimeType: 'application/json'
+    }]
+  }
 })
 
 app.mcpAddPrompt({
@@ -60,6 +83,17 @@ app.mcpAddPrompt({
     description: 'Programming language',
     required: true
   }]
+}, async (name, args) => {
+  const language = args?.language || 'javascript'
+  return {
+    messages: [{
+      role: 'user',
+      content: {
+        type: 'text',
+        text: `Please review this ${language} code for best practices, potential bugs, and improvements.`
+      }
+    }]
+  }
 })
 
 await app.listen({ port: 3000 })
@@ -77,9 +111,14 @@ await app.listen({ port: 3000 })
 
 The plugin adds three decorators to your Fastify instance:
 
-- `app.mcpAddTool(tool)`: Register a tool
-- `app.mcpAddResource(resource)`: Register a resource  
-- `app.mcpAddPrompt(prompt)`: Register a prompt
+- `app.mcpAddTool(definition, handler?)`: Register a tool with optional handler function
+- `app.mcpAddResource(definition, handler?)`: Register a resource with optional handler function
+- `app.mcpAddPrompt(definition, handler?)`: Register a prompt with optional handler function
+
+Handler functions are called when the corresponding MCP methods are invoked:
+- Tool handlers receive the tool arguments and return `CallToolResult`
+- Resource handlers receive the URI and return `ReadResourceResult`  
+- Prompt handlers receive the prompt name and arguments, return `GetPromptResult`
 
 ### MCP Endpoint
 
@@ -90,11 +129,11 @@ The plugin exposes a POST endpoint at `/mcp` that handles JSON-RPC 2.0 messages 
 - `initialize`: Server initialization
 - `ping`: Health check
 - `tools/list`: List available tools
-- `tools/call`: Execute a tool (returns not implemented by default)
+- `tools/call`: Execute a tool (calls registered handler or returns error)
 - `resources/list`: List available resources
-- `resources/read`: Read a resource (returns not found by default)
+- `resources/read`: Read a resource (calls registered handler or returns error)
 - `prompts/list`: List available prompts
-- `prompts/get`: Get a prompt (returns not found by default)
+- `prompts/get`: Get a prompt (calls registered handler or returns error)
 
 ## Testing
 

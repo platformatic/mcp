@@ -11,7 +11,7 @@
     "lint:fix": "eslint --cache --fix",
     "typecheck": "tsc -p . --noEmit",
     "test": "node --experimental-strip-types --no-warnings --test test/*.test.ts",
-    "ci": "npm run build && npm run lint && npm run test:ci"
+    "ci": "npm run build && npm run lint && npm run test"
   },
   "repository": {
     "type": "git",
@@ -31,6 +31,7 @@
   },
   "homepage": "https://github.com/mcollina/fastify-mcp#readme",
   "devDependencies": {
+    "@types/node": "^24.0.10",
     "eslint": "^9.30.0",
     "fastify": "^5.4.0",
     "neostandard": "^0.12.1",

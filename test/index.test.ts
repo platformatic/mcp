@@ -9,10 +9,7 @@ import type {
   InitializeResult,
   ListToolsResult,
   ListResourcesResult,
-  ListPromptsResult,
-  CallToolResult,
-  ReadResourceResult,
-  GetPromptResult
+  ListPromptsResult
 } from '../src/schema.ts'
 import {
   JSONRPC_VERSION,
@@ -25,24 +22,24 @@ describe('MCP Fastify Plugin', () => {
   test('should register plugin successfully', async (t) => {
     const app = Fastify()
     t.after(() => app.close())
-    
+
     await app.register(mcpPlugin)
     await app.ready()
-    
+
     t.assert.ok(app.hasPlugin('fastify-mcp'))
   })
 
   test('should register plugin with custom options', async (t) => {
     const app = Fastify()
     t.after(() => app.close())
-    
+
     await app.register(mcpPlugin, {
       serverInfo: { name: 'test-server', version: '2.0.0' },
       capabilities: { tools: { listChanged: true } },
       instructions: 'Test instructions'
     })
     await app.ready()
-    
+
     t.assert.ok(app.hasPlugin('fastify-mcp'))
   })
 
@@ -50,7 +47,7 @@ describe('MCP Fastify Plugin', () => {
     test('should handle initialize request', async (t) => {
       const app = Fastify()
       t.after(() => app.close())
-      
+
       await app.register(mcpPlugin, {
         serverInfo: { name: 'test-server', version: '1.0.0' },
         instructions: 'Test server for MCP'
@@ -90,7 +87,7 @@ describe('MCP Fastify Plugin', () => {
     test('should handle ping request', async (t) => {
       const app = Fastify()
       t.after(() => app.close())
-      
+
       await app.register(mcpPlugin)
       await app.ready()
 
@@ -116,7 +113,7 @@ describe('MCP Fastify Plugin', () => {
     test('should handle tools/list request', async (t) => {
       const app = Fastify()
       t.after(() => app.close())
-      
+
       await app.register(mcpPlugin)
       await app.ready()
 
@@ -142,7 +139,7 @@ describe('MCP Fastify Plugin', () => {
     test('should handle resources/list request', async (t) => {
       const app = Fastify()
       t.after(() => app.close())
-      
+
       await app.register(mcpPlugin)
       await app.ready()
 
@@ -168,7 +165,7 @@ describe('MCP Fastify Plugin', () => {
     test('should handle prompts/list request', async (t) => {
       const app = Fastify()
       t.after(() => app.close())
-      
+
       await app.register(mcpPlugin)
       await app.ready()
 
@@ -191,10 +188,10 @@ describe('MCP Fastify Plugin', () => {
       t.assert.strictEqual(result.prompts.length, 0)
     })
 
-    test('should handle tools/call request', async (t) => {
+    test('should handle tools/call request for non-existent tool', async (t) => {
       const app = Fastify()
       t.after(() => app.close())
-      
+
       await app.register(mcpPlugin)
       await app.ready()
 
@@ -212,18 +209,17 @@ describe('MCP Fastify Plugin', () => {
       })
 
       t.assert.strictEqual(response.statusCode, 200)
-      const body = response.json() as JSONRPCResponse
-      const result = body.result as CallToolResult
-      t.assert.ok(Array.isArray(result.content))
-      t.assert.strictEqual(result.content[0].type, 'text')
-      t.assert.ok(result.content[0].text.includes('test-tool'))
-      t.assert.strictEqual(result.isError, true)
+      const body = response.json() as JSONRPCError
+      t.assert.strictEqual(body.jsonrpc, JSONRPC_VERSION)
+      t.assert.strictEqual(body.id, 6)
+      t.assert.strictEqual(body.error.code, METHOD_NOT_FOUND)
+      t.assert.ok(body.error.message.includes('test-tool'))
     })
 
-    test('should handle resources/read request', async (t) => {
+    test('should handle resources/read request for non-existent resource', async (t) => {
       const app = Fastify()
       t.after(() => app.close())
-      
+
       await app.register(mcpPlugin)
       await app.ready()
 
@@ -241,17 +237,17 @@ describe('MCP Fastify Plugin', () => {
       })
 
       t.assert.strictEqual(response.statusCode, 200)
-      const body = response.json() as JSONRPCResponse
-      const result = body.result as ReadResourceResult
-      t.assert.ok(Array.isArray(result.contents))
-      t.assert.strictEqual(result.contents[0].uri, 'file://test.txt')
-      t.assert.strictEqual(result.contents[0].mimeType, 'text/plain')
+      const body = response.json() as JSONRPCError
+      t.assert.strictEqual(body.jsonrpc, JSONRPC_VERSION)
+      t.assert.strictEqual(body.id, 7)
+      t.assert.strictEqual(body.error.code, METHOD_NOT_FOUND)
+      t.assert.ok(body.error.message.includes('file://test.txt'))
     })
 
-    test('should handle prompts/get request', async (t) => {
+    test('should handle prompts/get request for non-existent prompt', async (t) => {
       const app = Fastify()
       t.after(() => app.close())
-      
+
       await app.register(mcpPlugin)
       await app.ready()
 
@@ -269,17 +265,17 @@ describe('MCP Fastify Plugin', () => {
       })
 
       t.assert.strictEqual(response.statusCode, 200)
-      const body = response.json() as JSONRPCResponse
-      const result = body.result as GetPromptResult
-      t.assert.ok(Array.isArray(result.messages))
-      t.assert.strictEqual(result.messages[0].role, 'user')
-      t.assert.strictEqual(result.messages[0].content.type, 'text')
+      const body = response.json() as JSONRPCError
+      t.assert.strictEqual(body.jsonrpc, JSONRPC_VERSION)
+      t.assert.strictEqual(body.id, 8)
+      t.assert.strictEqual(body.error.code, METHOD_NOT_FOUND)
+      t.assert.ok(body.error.message.includes('test-prompt'))
     })
 
     test('should return method not found for unknown method', async (t) => {
       const app = Fastify()
       t.after(() => app.close())
-      
+
       await app.register(mcpPlugin)
       await app.ready()
 
@@ -306,7 +302,7 @@ describe('MCP Fastify Plugin', () => {
     test('should handle notifications without response', async (t) => {
       const app = Fastify()
       t.after(() => app.close())
-      
+
       await app.register(mcpPlugin)
       await app.ready()
 
@@ -327,7 +323,7 @@ describe('MCP Fastify Plugin', () => {
     test('should handle cancelled notification', async (t) => {
       const app = Fastify()
       t.after(() => app.close())
-      
+
       await app.register(mcpPlugin)
       await app.ready()
 
@@ -349,7 +345,7 @@ describe('MCP Fastify Plugin', () => {
     test('should handle invalid JSON-RPC message', async (t) => {
       const app = Fastify()
       t.after(() => app.close())
-      
+
       await app.register(mcpPlugin)
       await app.ready()
 
@@ -372,7 +368,7 @@ describe('MCP Fastify Plugin', () => {
     test('should provide mcpAddTool decorator', async (t) => {
       const app = Fastify()
       t.after(() => app.close())
-      
+
       await app.register(mcpPlugin)
       await app.ready()
 
@@ -407,7 +403,7 @@ describe('MCP Fastify Plugin', () => {
     test('should provide mcpAddResource decorator', async (t) => {
       const app = Fastify()
       t.after(() => app.close())
-      
+
       await app.register(mcpPlugin)
       await app.ready()
 
@@ -442,7 +438,7 @@ describe('MCP Fastify Plugin', () => {
     test('should provide mcpAddPrompt decorator', async (t) => {
       const app = Fastify()
       t.after(() => app.close())
-      
+
       await app.register(mcpPlugin)
       await app.ready()
 
