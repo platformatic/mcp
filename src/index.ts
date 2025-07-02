@@ -19,14 +19,14 @@ import type {
   GetPromptResult,
   ServerCapabilities,
   Implementation
-} from './schema.js'
+} from './schema.ts'
 
 import {
   JSONRPC_VERSION,
   LATEST_PROTOCOL_VERSION,
   METHOD_NOT_FOUND,
   INTERNAL_ERROR
-} from './schema.js'
+} from './schema.ts'
 
 interface MCPPluginOptions {
   serverInfo?: Implementation
