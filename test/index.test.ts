@@ -364,6 +364,107 @@ describe('MCP Fastify Plugin', () => {
     })
   })
 
+  describe('SSE Support', () => {
+    test('should handle POST request with SSE support', async (t) => {
+      const app = Fastify()
+      t.after(() => app.close())
+
+      await app.register(mcpPlugin, { enableSSE: true })
+      await app.ready()
+
+      const request: JSONRPCRequest = {
+        jsonrpc: JSONRPC_VERSION,
+        id: 1,
+        method: 'ping'
+      }
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/mcp',
+        payload: request,
+        headers: {
+          accept: 'application/json, text/event-stream'
+        }
+      })
+
+      t.assert.strictEqual(response.statusCode, 200)
+      t.assert.strictEqual(response.headers['content-type'], 'text/event-stream')
+      t.assert.ok(response.headers['mcp-session-id'])
+      t.assert.ok(response.payload.includes('id: 1'))
+      t.assert.ok(response.payload.includes('data: '))
+    })
+
+    test.skip('should handle GET request for SSE stream', async (t) => {
+      // Skipped because GET SSE streams are long-lived and don't work well with inject()
+      // This would require a real HTTP client to test properly
+    })
+
+    test('should return 405 for GET request when SSE is disabled', async (t) => {
+      const app = Fastify()
+      t.after(() => app.close())
+
+      await app.register(mcpPlugin, { enableSSE: false })
+      await app.ready()
+
+      const response = await app.inject({
+        method: 'GET',
+        url: '/mcp',
+        headers: {
+          accept: 'text/event-stream'
+        }
+      })
+
+      t.assert.strictEqual(response.statusCode, 405)
+    })
+
+    test('should return 405 for GET request without SSE support', async (t) => {
+      const app = Fastify()
+      t.after(() => app.close())
+
+      await app.register(mcpPlugin, { enableSSE: true })
+      await app.ready()
+
+      const response = await app.inject({
+        method: 'GET',
+        url: '/mcp',
+        headers: {
+          accept: 'application/json'
+        }
+      })
+
+      t.assert.strictEqual(response.statusCode, 405)
+    })
+
+    test('should handle regular JSON response when SSE not requested', async (t) => {
+      const app = Fastify()
+      t.after(() => app.close())
+
+      await app.register(mcpPlugin, { enableSSE: true })
+      await app.ready()
+
+      const request: JSONRPCRequest = {
+        jsonrpc: JSONRPC_VERSION,
+        id: 1,
+        method: 'ping'
+      }
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/mcp',
+        payload: request,
+        headers: {
+          accept: 'application/json'
+        }
+      })
+
+      t.assert.strictEqual(response.statusCode, 200)
+      t.assert.strictEqual(response.headers['content-type'], 'application/json; charset=utf-8')
+      const body = response.json() as JSONRPCResponse
+      t.assert.strictEqual(body.jsonrpc, JSONRPC_VERSION)
+      t.assert.strictEqual(body.id, 1)
+    })
+  })
+
   describe('Plugin Decorators', () => {
     test('should provide mcpAddTool decorator', async (t) => {
       const app = Fastify()

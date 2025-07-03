@@ -16,7 +16,7 @@ describe('MCP Integration Tests', () => {
   test('should handle full MCP workflow with SDK client', async (t) => {
     // Create Fastify server with MCP plugin
     const app = Fastify({ logger: false })
-    
+
     // Register MCP plugin with tools, resources, and prompts
     await app.register(mcpPlugin, {
       serverInfo: { name: 'test-server', version: '1.0.0' },
@@ -98,9 +98,9 @@ describe('MCP Integration Tests', () => {
     await app.ready()
 
     // Start the server
-    const address = await app.listen({ port: 0, host: '127.0.0.1' })
+    await app.listen({ port: 0, host: '127.0.0.1' })
     const port = (app.server.address() as any)?.port
-    
+
     t.after(async () => {
       await app.close()
     })
@@ -215,7 +215,6 @@ describe('MCP Integration Tests', () => {
       t.assert.strictEqual(promptResult.messages.length, 1)
       t.assert.strictEqual(promptResult.messages[0].role, 'user')
       t.assert.ok(promptResult.messages[0].content.text.includes('typescript'))
-
     } catch (error) {
       t.assert.fail(`MCP SDK integration test failed: ${error}`)
     }
@@ -223,13 +222,13 @@ describe('MCP Integration Tests', () => {
 
   test('should handle errors properly with SDK client', async (t) => {
     const app = Fastify({ logger: false })
-    
+
     await app.register(mcpPlugin)
     await app.ready()
 
-    const address = await app.listen({ port: 0, host: '127.0.0.1' })
+    await app.listen({ port: 0, host: '127.0.0.1' })
     const port = (app.server.address() as any)?.port
-    
+
     t.after(async () => {
       await app.close()
     })
@@ -288,9 +287,9 @@ describe('MCP Integration Tests', () => {
 
   test('should handle tools without handlers using SDK client', async (t) => {
     const app = Fastify({ logger: false })
-    
+
     await app.register(mcpPlugin)
-    
+
     // Add tool without handler
     app.mcpAddTool({
       name: 'no-handler-tool',
@@ -300,9 +299,9 @@ describe('MCP Integration Tests', () => {
 
     await app.ready()
 
-    const address = await app.listen({ port: 0, host: '127.0.0.1' })
+    await app.listen({ port: 0, host: '127.0.0.1' })
     const port = (app.server.address() as any)?.port
-    
+
     t.after(async () => {
       await app.close()
     })
