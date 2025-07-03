@@ -463,6 +463,17 @@ describe('MCP Fastify Plugin', () => {
       t.assert.strictEqual(body.jsonrpc, JSONRPC_VERSION)
       t.assert.strictEqual(body.id, 1)
     })
+
+    test('should provide mcpSessions decorator', async (t) => {
+      const app = Fastify()
+      t.after(() => app.close())
+
+      await app.register(mcpPlugin, { enableSSE: true })
+      await app.ready()
+
+      t.assert.ok(app.mcpSessions instanceof Map)
+      t.assert.strictEqual(app.mcpSessions.size, 0)
+    })
   })
 
   describe('Plugin Decorators', () => {

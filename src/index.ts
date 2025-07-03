@@ -34,6 +34,7 @@ declare module 'fastify' {
     mcpAddTool: (definition: any, handler?: ToolHandler) => void
     mcpAddResource: (definition: any, handler?: ResourceHandler) => void
     mcpAddPrompt: (definition: any, handler?: PromptHandler) => void
+    mcpSessions: Map<string, SSESession>
   }
 }
 
@@ -83,7 +84,6 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
   }
 
   const enableSSE = opts.enableSSE ?? true
-  const sessions = new Map<string, SSESession>()
   const tools = new Map<string, MCPTool>()
   const resources = new Map<string, MCPResource>()
   const prompts = new Map<string, MCPPrompt>()
@@ -307,7 +307,7 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
       streams: new Set(),
       lastEventId: undefined
     }
-    sessions.set(sessionId, session)
+    app.mcpSessions.set(sessionId, session)
     return session
   }
 
@@ -331,8 +331,8 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
         reply.header('Access-Control-Allow-Headers', 'Cache-Control')
 
         let session: SSESession
-        if (sessionId && sessions.has(sessionId)) {
-          session = sessions.get(sessionId)!
+        if (sessionId && app.mcpSessions.has(sessionId)) {
+          session = app.mcpSessions.get(sessionId)!
         } else {
           session = createSSESession()
           reply.header('Mcp-Session-Id', session.id)
@@ -410,8 +410,8 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
       reply.header('Access-Control-Allow-Headers', 'Cache-Control')
 
       let session: SSESession
-      if (sessionId && sessions.has(sessionId)) {
-        session = sessions.get(sessionId)!
+      if (sessionId && app.mcpSessions.has(sessionId)) {
+        session = app.mcpSessions.get(sessionId)!
       } else {
         session = createSSESession()
         reply.header('Mcp-Session-Id', session.id)
@@ -429,7 +429,7 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
       reply.raw.on('close', () => {
         session.streams.delete(reply)
         if (session.streams.size === 0) {
-          sessions.delete(session.id)
+          app.mcpSessions.delete(session.id)
         }
       })
 
@@ -454,6 +454,8 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
       reply.type('application/json').code(500).send({ error: 'Internal server error' })
     }
   })
+
+  app.decorate('mcpSessions', new Map<string, SSESession>())
 
   app.decorate('mcpAddTool', (definition: any, handler?: ToolHandler) => {
     const name = definition.name

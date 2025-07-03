@@ -237,11 +237,12 @@ app.addHook('preHandler', async (request, reply) => {
 
 ### Decorators
 
-The plugin adds three decorators to your Fastify instance:
+The plugin adds the following decorators to your Fastify instance:
 
 - `app.mcpAddTool(definition, handler?)`: Register a tool with optional handler function
 - `app.mcpAddResource(definition, handler?)`: Register a resource with optional handler function
 - `app.mcpAddPrompt(definition, handler?)`: Register a prompt with optional handler function
+- `app.mcpSessions`: Map<string, SSESession> - Session management for SSE connections
 
 Handler functions are called when the corresponding MCP methods are invoked:
 - Tool handlers receive the tool arguments and return `CallToolResult`
