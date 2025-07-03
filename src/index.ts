@@ -311,23 +311,12 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
     return session
   }
 
-  function validateOrigin (_request: FastifyRequest): boolean {
-    // For security, validate origin to prevent DNS rebinding attacks
-    // In production, you should implement proper origin validation
-    return true // Simplified for this implementation
-  }
-
   function supportsSSE (request: FastifyRequest): boolean {
     const accept = request.headers.accept
     return accept ? accept.includes('text/event-stream') : false
   }
 
   app.post('/mcp', async (request: FastifyRequest, reply: FastifyReply) => {
-    if (!validateOrigin(request)) {
-      reply.type('application/json').code(403).send({ error: 'Forbidden: Invalid origin' })
-      return
-    }
-
     try {
       const message = request.body as JSONRPCMessage
       const sessionId = request.headers['mcp-session-id'] as string
@@ -402,11 +391,6 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
   app.get('/mcp', async (request: FastifyRequest, reply: FastifyReply) => {
     if (!enableSSE) {
       reply.type('application/json').code(405).send({ error: 'Method Not Allowed: SSE not enabled' })
-      return
-    }
-
-    if (!validateOrigin(request)) {
-      reply.type('application/json').code(403).send({ error: 'Forbidden: Invalid origin' })
       return
     }
 
