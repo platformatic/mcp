@@ -474,6 +474,31 @@ describe('MCP Fastify Plugin', () => {
       t.assert.ok(app.mcpSessions instanceof Map)
       t.assert.strictEqual(app.mcpSessions.size, 0)
     })
+
+    test('should provide notification broadcasting decorators', async (t) => {
+      const app = Fastify()
+      t.after(() => app.close())
+
+      await app.register(mcpPlugin, { enableSSE: true })
+      await app.ready()
+
+      t.assert.ok(typeof app.mcpBroadcastNotification === 'function')
+      t.assert.ok(typeof app.mcpSendToSession === 'function')
+
+      // Test that they don't throw when called with no sessions
+      app.mcpBroadcastNotification({
+        jsonrpc: JSONRPC_VERSION,
+        method: 'notifications/message',
+        params: { text: 'test' }
+      })
+
+      const result = app.mcpSendToSession('nonexistent', {
+        jsonrpc: JSONRPC_VERSION,
+        method: 'notifications/message',
+        params: { text: 'test' }
+      })
+      t.assert.strictEqual(result, false)
+    })
   })
 
   describe('Plugin Decorators', () => {

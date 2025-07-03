@@ -35,6 +35,8 @@ declare module 'fastify' {
     mcpAddResource: (definition: any, handler?: ResourceHandler) => void
     mcpAddPrompt: (definition: any, handler?: PromptHandler) => void
     mcpSessions: Map<string, SSESession>
+    mcpBroadcastNotification: (notification: JSONRPCNotification) => void
+    mcpSendToSession: (sessionId: string, message: JSONRPCMessage) => boolean
   }
 }
 
@@ -316,6 +318,33 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
     return accept ? accept.includes('text/event-stream') : false
   }
 
+  function sendSSEMessage (session: SSESession, message: JSONRPCMessage): void {
+    const eventId = (++session.eventId).toString()
+    const sseEvent = `id: ${eventId}\ndata: ${JSON.stringify(message)}\n\n`
+    session.lastEventId = eventId
+
+    // Send to all connected streams in this session
+    const deadStreams = new Set<FastifyReply>()
+    for (const stream of session.streams) {
+      try {
+        stream.raw.write(sseEvent)
+      } catch (error) {
+        app.log.error('Failed to write SSE event:', error)
+        deadStreams.add(stream)
+      }
+    }
+
+    // Clean up dead streams
+    for (const deadStream of deadStreams) {
+      session.streams.delete(deadStream)
+    }
+
+    // Clean up session if no streams left
+    if (session.streams.size === 0) {
+      app.mcpSessions.delete(session.id)
+    }
+  }
+
   app.post('/mcp', async (request: FastifyRequest, reply: FastifyReply) => {
     try {
       const message = request.body as JSONRPCMessage
@@ -456,6 +485,34 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
   })
 
   app.decorate('mcpSessions', new Map<string, SSESession>())
+
+  app.decorate('mcpBroadcastNotification', (notification: JSONRPCNotification) => {
+    if (!enableSSE) {
+      app.log.warn('Cannot broadcast notification: SSE is disabled')
+      return
+    }
+
+    for (const session of app.mcpSessions.values()) {
+      if (session.streams.size > 0) {
+        sendSSEMessage(session, notification)
+      }
+    }
+  })
+
+  app.decorate('mcpSendToSession', (sessionId: string, message: JSONRPCMessage): boolean => {
+    if (!enableSSE) {
+      app.log.warn('Cannot send to session: SSE is disabled')
+      return false
+    }
+
+    const session = app.mcpSessions.get(sessionId)
+    if (!session || session.streams.size === 0) {
+      return false
+    }
+
+    sendSSEMessage(session, message)
+    return true
+  })
 
   app.decorate('mcpAddTool', (definition: any, handler?: ToolHandler) => {
     const name = definition.name
