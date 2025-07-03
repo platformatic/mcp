@@ -107,7 +107,7 @@ This plugin supports the MCP Streamable HTTP transport specification, enabling b
 
 ```typescript
 await app.register(mcpPlugin, {
-  enableSSE: true, // Enable SSE support (default: true)
+  enableSSE: true, // Enable SSE support (default: false)
   // ... other options
 })
 ```
@@ -233,7 +233,7 @@ app.addHook('preHandler', async (request, reply) => {
 - `serverInfo`: Server identification (name, version)
 - `capabilities`: MCP capabilities configuration
 - `instructions`: Optional server instructions
-- `enableSSE`: Enable Server-Sent Events support (default: true)
+- `enableSSE`: Enable Server-Sent Events support (default: false)
 
 ### Decorators
 

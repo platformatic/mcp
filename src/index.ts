@@ -83,7 +83,7 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
     prompts: {}
   }
 
-  const enableSSE = opts.enableSSE ?? true
+  const enableSSE = opts.enableSSE ?? false
   const tools = new Map<string, MCPTool>()
   const resources = new Map<string, MCPResource>()
   const prompts = new Map<string, MCPPrompt>()
