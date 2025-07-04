@@ -17,7 +17,7 @@ test('Last-Event-ID Support', async (t) => {
       url: '/mcp',
       headers: {
         'Content-Type': 'application/json',
-        'Accept': 'text/event-stream'
+        Accept: 'text/event-stream'
       },
       payload: {
         jsonrpc: '2.0',
@@ -33,7 +33,7 @@ test('Last-Event-ID Support', async (t) => {
 
     // Extract session ID from response
     const sessionId = initResponse.headers['mcp-session-id'] as string
-    
+
     // Send a notification to create some history
     await app.inject({
       method: 'POST',
@@ -61,7 +61,7 @@ test('Last-Event-ID Support', async (t) => {
       method: 'GET',
       url: '/mcp',
       headers: {
-        'Accept': 'text/event-stream',
+        Accept: 'text/event-stream',
         'mcp-session-id': sessionId,
         'Last-Event-ID': '1'
       }
@@ -82,7 +82,7 @@ test('Last-Event-ID Support', async (t) => {
       method: 'GET',
       url: '/mcp',
       headers: {
-        'Accept': 'text/event-stream',
+        Accept: 'text/event-stream',
         'Last-Event-ID': 'invalid-id'
       }
     })
