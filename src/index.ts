@@ -71,6 +71,7 @@ interface SSESession {
   eventId: number
   streams: Set<FastifyReply>
   lastEventId?: string
+  messageHistory: Array<{ eventId: string, message: JSONRPCMessage }>
 }
 
 export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) {
@@ -307,7 +308,8 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
       id: sessionId,
       eventId: 0,
       streams: new Set(),
-      lastEventId: undefined
+      lastEventId: undefined,
+      messageHistory: []
     }
     app.mcpSessions.set(sessionId, session)
     return session
@@ -318,10 +320,43 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
     return accept ? accept.includes('text/event-stream') : false
   }
 
+  function replayMessagesFromEventId (session: SSESession, lastEventId: string, stream: FastifyReply): void {
+    // Find the index of the last received event
+    const lastIndex = session.messageHistory.findIndex(entry => entry.eventId === lastEventId)
+
+    if (lastIndex !== -1) {
+      // Replay messages after the last received event
+      const messagesToReplay = session.messageHistory.slice(lastIndex + 1)
+
+      for (const entry of messagesToReplay) {
+        const sseEvent = `id: ${entry.eventId}\ndata: ${JSON.stringify(entry.message)}\n\n`
+        try {
+          stream.raw.write(sseEvent)
+        } catch (error) {
+          app.log.error('Failed to replay SSE event:', error)
+          break
+        }
+      }
+
+      if (messagesToReplay.length > 0) {
+        app.log.info(`Replayed ${messagesToReplay.length} messages from event ID: ${lastEventId}`)
+      }
+    } else {
+      app.log.warn(`Event ID ${lastEventId} not found in message history`)
+    }
+  }
+
   function sendSSEMessage (session: SSESession, message: JSONRPCMessage): void {
     const eventId = (++session.eventId).toString()
     const sseEvent = `id: ${eventId}\ndata: ${JSON.stringify(message)}\n\n`
     session.lastEventId = eventId
+
+    // Store message in history for resumability
+    session.messageHistory.push({ eventId, message })
+    // Keep only last 100 messages to prevent memory leaks
+    if (session.messageHistory.length > 100) {
+      session.messageHistory.shift()
+    }
 
     // Send to all connected streams in this session
     const deadStreams = new Set<FastifyReply>()
@@ -446,13 +481,14 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
         reply.header('Mcp-Session-Id', session.id)
       }
 
+      session.streams.add(reply)
+
       // Handle resumability with Last-Event-ID
       const lastEventId = request.headers['last-event-id'] as string
-      if (lastEventId && session.lastEventId) {
+      if (lastEventId && session.messageHistory.length > 0) {
         app.log.info(`Resuming SSE stream from event ID: ${lastEventId}`)
+        replayMessagesFromEventId(session, lastEventId, reply)
       }
-
-      session.streams.add(reply)
 
       // Handle connection close
       reply.raw.on('close', () => {
