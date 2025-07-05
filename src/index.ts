@@ -464,7 +464,7 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
     }
 
     try {
-      const sessionId = (request.headers['mcp-session-id'] as string) || 
+      const sessionId = (request.headers['mcp-session-id'] as string) ||
                        (request.query as any)['mcp-session-id']
 
       // Set up SSE stream
