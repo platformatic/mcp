@@ -467,20 +467,24 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
       const sessionId = (request.headers['mcp-session-id'] as string) ||
                        (request.query as any)['mcp-session-id']
 
+      // We are opting out of Fastify proper
+      reply.hijack()
+
+      const raw = reply.raw
+
       // Set up SSE stream
-      reply.type('text/event-stream')
-      reply.header('Cache-Control', 'no-cache')
-      reply.header('Connection', 'keep-alive')
-      reply.header('Access-Control-Allow-Origin', '*')
-      reply.header('Access-Control-Allow-Headers', 'Cache-Control')
+      raw.setHeader('Content-type', 'text/event-stream')
+      raw.setHeader('Cache-Control', 'no-cache')
 
       let session: SSESession
       if (sessionId && app.mcpSessions.has(sessionId)) {
         session = app.mcpSessions.get(sessionId)!
       } else {
         session = createSSESession()
-        reply.header('Mcp-Session-Id', session.id)
+        raw.setHeader('Mcp-Session-Id', session.id)
       }
+
+      reply.writeHead(200)
 
       session.streams.add(reply)
 
@@ -511,6 +515,7 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
           session.streams.delete(reply)
         }
       }, 30000) // 30 second heartbeat
+      heartbeatInterval.unref()
 
       reply.raw.on('close', () => {
         clearInterval(heartbeatInterval)
