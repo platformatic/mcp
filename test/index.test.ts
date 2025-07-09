@@ -1,4 +1,5 @@
 import { test, describe } from 'node:test'
+import type { TestContext } from 'node:test'
 import Fastify from 'fastify'
 import mcpPlugin from '../src/index.ts'
 import type {
@@ -19,7 +20,7 @@ import {
 } from '../src/schema.ts'
 
 describe('MCP Fastify Plugin', () => {
-  test('should register plugin successfully', async (t) => {
+  test('should register plugin successfully', async (t: TestContext) => {
     const app = Fastify()
     t.after(() => app.close())
 
@@ -29,7 +30,7 @@ describe('MCP Fastify Plugin', () => {
     t.assert.ok(app.hasPlugin('fastify-mcp'))
   })
 
-  test('should register plugin with custom options', async (t) => {
+  test('should register plugin with custom options', async (t: TestContext) => {
     const app = Fastify()
     t.after(() => app.close())
 
@@ -44,7 +45,7 @@ describe('MCP Fastify Plugin', () => {
   })
 
   describe('MCP Protocol Handlers', () => {
-    test('should handle initialize request', async (t) => {
+    test('should handle initialize request', async (t: TestContext) => {
       const app = Fastify()
       t.after(() => app.close())
 
@@ -84,7 +85,7 @@ describe('MCP Fastify Plugin', () => {
       t.assert.ok(result.capabilities)
     })
 
-    test('should handle ping request', async (t) => {
+    test('should handle ping request', async (t: TestContext) => {
       const app = Fastify()
       t.after(() => app.close())
 
@@ -110,7 +111,7 @@ describe('MCP Fastify Plugin', () => {
       t.assert.deepStrictEqual(body.result, {})
     })
 
-    test('should handle tools/list request', async (t) => {
+    test('should handle tools/list request', async (t: TestContext) => {
       const app = Fastify()
       t.after(() => app.close())
 
@@ -136,7 +137,7 @@ describe('MCP Fastify Plugin', () => {
       t.assert.strictEqual(result.tools.length, 0)
     })
 
-    test('should handle resources/list request', async (t) => {
+    test('should handle resources/list request', async (t: TestContext) => {
       const app = Fastify()
       t.after(() => app.close())
 
@@ -162,7 +163,7 @@ describe('MCP Fastify Plugin', () => {
       t.assert.strictEqual(result.resources.length, 0)
     })
 
-    test('should handle prompts/list request', async (t) => {
+    test('should handle prompts/list request', async (t: TestContext) => {
       const app = Fastify()
       t.after(() => app.close())
 
@@ -188,7 +189,7 @@ describe('MCP Fastify Plugin', () => {
       t.assert.strictEqual(result.prompts.length, 0)
     })
 
-    test('should handle tools/call request for non-existent tool', async (t) => {
+    test('should handle tools/call request for non-existent tool', async (t: TestContext) => {
       const app = Fastify()
       t.after(() => app.close())
 
@@ -216,7 +217,7 @@ describe('MCP Fastify Plugin', () => {
       t.assert.ok(body.error.message.includes('test-tool'))
     })
 
-    test('should handle resources/read request for non-existent resource', async (t) => {
+    test('should handle resources/read request for non-existent resource', async (t: TestContext) => {
       const app = Fastify()
       t.after(() => app.close())
 
@@ -244,7 +245,7 @@ describe('MCP Fastify Plugin', () => {
       t.assert.ok(body.error.message.includes('file://test.txt'))
     })
 
-    test('should handle prompts/get request for non-existent prompt', async (t) => {
+    test('should handle prompts/get request for non-existent prompt', async (t: TestContext) => {
       const app = Fastify()
       t.after(() => app.close())
 
@@ -272,7 +273,7 @@ describe('MCP Fastify Plugin', () => {
       t.assert.ok(body.error.message.includes('test-prompt'))
     })
 
-    test('should return method not found for unknown method', async (t) => {
+    test('should return method not found for unknown method', async (t: TestContext) => {
       const app = Fastify()
       t.after(() => app.close())
 
@@ -299,7 +300,7 @@ describe('MCP Fastify Plugin', () => {
       t.assert.ok(body.error.message.includes('unknown/method'))
     })
 
-    test('should handle notifications without response', async (t) => {
+    test('should handle notifications without response', async (t: TestContext) => {
       const app = Fastify()
       t.after(() => app.close())
 
@@ -320,7 +321,7 @@ describe('MCP Fastify Plugin', () => {
       t.assert.strictEqual(response.statusCode, 204)
     })
 
-    test('should handle cancelled notification', async (t) => {
+    test('should handle cancelled notification', async (t: TestContext) => {
       const app = Fastify()
       t.after(() => app.close())
 
@@ -342,7 +343,7 @@ describe('MCP Fastify Plugin', () => {
       t.assert.strictEqual(response.statusCode, 204)
     })
 
-    test('should handle invalid JSON-RPC message', async (t) => {
+    test('should handle invalid JSON-RPC message', async (t: TestContext) => {
       const app = Fastify()
       t.after(() => app.close())
 
@@ -365,7 +366,7 @@ describe('MCP Fastify Plugin', () => {
   })
 
   describe('SSE Support', () => {
-    test('should handle POST request with SSE support', async (t) => {
+    test('should handle POST request with SSE support', async (t: TestContext) => {
       const app = Fastify()
       t.after(() => app.close())
 
@@ -394,12 +395,12 @@ describe('MCP Fastify Plugin', () => {
       t.assert.ok(response.payload.includes('data: '))
     })
 
-    test.skip('should handle GET request for SSE stream', async (t) => {
+    test.skip('should handle GET request for SSE stream', async () => {
       // Skipped because GET SSE streams are long-lived and don't work well with inject()
       // This would require a real HTTP client to test properly
     })
 
-    test('should return 405 for GET request when SSE is disabled', async (t) => {
+    test('should return 405 for GET request when SSE is disabled', async (t: TestContext) => {
       const app = Fastify()
       t.after(() => app.close())
 
@@ -417,7 +418,7 @@ describe('MCP Fastify Plugin', () => {
       t.assert.strictEqual(response.statusCode, 405)
     })
 
-    test('should return 405 for GET request without SSE support', async (t) => {
+    test('should return 405 for GET request without SSE support', async (t: TestContext) => {
       const app = Fastify()
       t.after(() => app.close())
 
@@ -435,7 +436,7 @@ describe('MCP Fastify Plugin', () => {
       t.assert.strictEqual(response.statusCode, 405)
     })
 
-    test('should handle regular JSON response when SSE not requested', async (t) => {
+    test('should handle regular JSON response when SSE not requested', async (t: TestContext) => {
       const app = Fastify()
       t.after(() => app.close())
 
@@ -464,7 +465,7 @@ describe('MCP Fastify Plugin', () => {
       t.assert.strictEqual(body.id, 1)
     })
 
-    test('should provide mcpSessions decorator', async (t) => {
+    test('should provide mcpSessions decorator', async (t: TestContext) => {
       const app = Fastify()
       t.after(() => app.close())
 
@@ -475,7 +476,7 @@ describe('MCP Fastify Plugin', () => {
       t.assert.strictEqual(app.mcpSessions.size, 0)
     })
 
-    test('should provide notification broadcasting decorators', async (t) => {
+    test('should provide notification broadcasting decorators', async (t: TestContext) => {
       const app = Fastify()
       t.after(() => app.close())
 
@@ -502,7 +503,7 @@ describe('MCP Fastify Plugin', () => {
   })
 
   describe('Plugin Decorators', () => {
-    test('should provide mcpAddTool decorator', async (t) => {
+    test('should provide mcpAddTool decorator', async (t: TestContext) => {
       const app = Fastify()
       t.after(() => app.close())
 
@@ -537,7 +538,7 @@ describe('MCP Fastify Plugin', () => {
       t.assert.strictEqual(result.tools[0].name, 'test-tool')
     })
 
-    test('should provide mcpAddResource decorator', async (t) => {
+    test('should provide mcpAddResource decorator', async (t: TestContext) => {
       const app = Fastify()
       t.after(() => app.close())
 
@@ -572,7 +573,7 @@ describe('MCP Fastify Plugin', () => {
       t.assert.strictEqual(result.resources[0].name, 'Test Resource')
     })
 
-    test('should provide mcpAddPrompt decorator', async (t) => {
+    test('should provide mcpAddPrompt decorator', async (t: TestContext) => {
       const app = Fastify()
       t.after(() => app.close())
 

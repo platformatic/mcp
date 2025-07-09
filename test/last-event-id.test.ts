@@ -1,9 +1,10 @@
 import { test, describe } from 'node:test'
+import type { TestContext } from 'node:test'
 import Fastify from 'fastify'
 import { EventSource, request } from 'undici'
 import mcpPlugin from '../src/index.ts'
 
-async function setupServer (t) {
+async function setupServer (t: TestContext) {
   const app = Fastify({ logger: { level: 'error' } })
   await app.register(mcpPlugin, {
     serverInfo: { name: 'test', version: '1.0.0' },
@@ -11,7 +12,7 @@ async function setupServer (t) {
   })
 
   await app.listen({ port: 0, host: '127.0.0.1' })
-  const port = app.server.address()?.port
+  const port = (app.server.address() as any)?.port
   const baseUrl = `http://127.0.0.1:${port}`
 
   t.after(async () => {
@@ -21,9 +22,9 @@ async function setupServer (t) {
   return { app, baseUrl } 
 }
 
-describe('Last-Event-ID Support', async (t) => {
-  test('should add message history to SSE sessions', async (t) => {
-    const { app, baseUrl } = await setupServer(t)
+describe('Last-Event-ID Support', () => {
+  test('should add message history to SSE sessions', async (t: TestContext) => {
+    const { app } = await setupServer(t)
     // Create a session by sending a POST request with SSE
     const initResponse = await app.inject({
       method: 'POST',
@@ -97,7 +98,7 @@ describe('Last-Event-ID Support', async (t) => {
     })
   })
 
-  test('should replay messages after Last-Event-ID with EventSource', async (t) => {
+  test('should replay messages after Last-Event-ID with EventSource', async (t: TestContext) => {
     const { app, baseUrl } = await setupServer(t)
     // Create a session and populate it with message history
     const initResponse = await app.inject({
@@ -120,13 +121,13 @@ describe('Last-Event-ID Support', async (t) => {
     })
 
     const sessionId = initResponse.headers['mcp-session-id'] as string
-    t.assert.ok(sessionId, 'Session ID should be present in headers')
+    ;(t.assert.ok as any)(sessionId, 'Session ID should be present in headers')
 
     const session = app.mcpSessions.get(sessionId)
-    t.assert.ok(session, 'Session should exist in sessions map')
+    ;(t.assert.ok as any)(session, 'Session should exist in sessions map')
 
     // Manually add messages to session history to simulate prior activity
-    session.messageHistory.push({
+    session!.messageHistory.push({
       eventId: '1',
       message: {
         jsonrpc: '2.0',
@@ -135,7 +136,7 @@ describe('Last-Event-ID Support', async (t) => {
       }
     })
 
-    session.messageHistory.push({
+    session!.messageHistory.push({
       eventId: '2',
       message: {
         jsonrpc: '2.0',
@@ -144,7 +145,7 @@ describe('Last-Event-ID Support', async (t) => {
       }
     })
 
-    session.messageHistory.push({
+    session!.messageHistory.push({
       eventId: '3',
       message: {
         jsonrpc: '2.0',
@@ -153,7 +154,7 @@ describe('Last-Event-ID Support', async (t) => {
       }
     })
 
-    session.eventId = 3
+    session!.eventId = 3
 
     // First verify GET endpoint works with inject
     const injectGetResponse = await app.inject({
@@ -192,7 +193,6 @@ describe('Last-Event-ID Support', async (t) => {
 
     // Read the initial chunk from the stream to check for replayed messages
     await new Promise<void>((resolve, reject) => {
-      let resolved = false
 
       body.on('data', (chunk: Buffer) => {
         const text = chunk.toString()
