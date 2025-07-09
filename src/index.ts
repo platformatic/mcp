@@ -388,18 +388,14 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
 
       if (useSSE) {
         // Set up SSE stream
-        reply.type('text/event-stream')
-        reply.header('Cache-Control', 'no-cache')
-        reply.header('Connection', 'keep-alive')
-        reply.header('Access-Control-Allow-Origin', '*')
-        reply.header('Access-Control-Allow-Headers', 'Cache-Control')
+        reply.raw.setHeader('content-type', 'text/event-stream')
 
         let session: SSESession
         if (sessionId && app.mcpSessions.has(sessionId)) {
           session = app.mcpSessions.get(sessionId)!
         } else {
           session = createSSESession()
-          reply.header('Mcp-Session-Id', session.id)
+          reply.raw.setHeader('Mcp-Session-Id', session.id)
         }
 
         // Process message and send via SSE
@@ -484,7 +480,7 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
         raw.setHeader('Mcp-Session-Id', session.id)
       }
 
-      reply.writeHead(200)
+      raw.writeHead(200)
 
       session.streams.add(reply)
 

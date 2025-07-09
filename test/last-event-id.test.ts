@@ -1,10 +1,10 @@
-import { test } from 'node:test'
+import { test, describe } from 'node:test'
 import Fastify from 'fastify'
 import { EventSource, request } from 'undici'
 import mcpPlugin from '../src/index.ts'
 
-test('Last-Event-ID Support', async (t) => {
-  const app = Fastify()
+async function setupServer (t) {
+  const app = Fastify({ logger: { level: 'error' } })
   await app.register(mcpPlugin, {
     serverInfo: { name: 'test', version: '1.0.0' },
     enableSSE: true
@@ -18,7 +18,12 @@ test('Last-Event-ID Support', async (t) => {
     await app.close()
   })
 
-  await t.test('should add message history to SSE sessions', { skip: true }, async () => {
+  return { app, baseUrl } 
+}
+
+describe('Last-Event-ID Support', async (t) => {
+  test('should add message history to SSE sessions', async (t) => {
+    const { app, baseUrl } = await setupServer(t)
     // Create a session by sending a POST request with SSE
     const initResponse = await app.inject({
       method: 'POST',
@@ -65,16 +70,11 @@ test('Last-Event-ID Support', async (t) => {
     }
   })
 
-  await t.test('should handle GET request with Last-Event-ID using EventSource', async () => {
+  test('should handle GET request with Last-Event-ID using EventSource', async (t) => {
+    const { app, baseUrl } = await setupServer(t)
     const eventSource = new EventSource(`${baseUrl}/mcp`)
 
-    eventSource.onopen = () => {
-      console.log('onopen')
-    }
-
     eventSource.addEventListener('open', () => {
-      console.log('opened')
-
       // For this simplified test, we just need to verify EventSource works
       // Broadcast a notification to create some server activity
       app.mcpBroadcastNotification({
@@ -84,22 +84,21 @@ test('Last-Event-ID Support', async (t) => {
       })
     })
 
-    eventSource.onerror = (event) => {
-      console.log(event)
+    eventSource.onerror = () => {
       eventSource.close()
       t.assert.fail('Error happened')
     }
 
-    await new Promise((resolve) => {
-      eventSource.onmessage = (...args) => {
-        console.log(args)
+    await new Promise<void>((resolve) => {
+      eventSource.onmessage = () => {
         eventSource.close()
         resolve()
       }
     })
   })
 
-  await t.test('should replay messages after Last-Event-ID with EventSource', { skip: true }, async () => {
+  test('should replay messages after Last-Event-ID with EventSource', async (t) => {
+    const { app, baseUrl } = await setupServer(t)
     // Create a session and populate it with message history
     const initResponse = await app.inject({
       method: 'POST',
@@ -121,15 +120,10 @@ test('Last-Event-ID Support', async (t) => {
     })
 
     const sessionId = initResponse.headers['mcp-session-id'] as string
-    if (!sessionId) {
-      throw new Error('Expected session ID from initialization')
-    }
+    t.assert.ok(sessionId, 'Session ID should be present in headers')
 
-    // Get the session and populate it with message history
     const session = app.mcpSessions.get(sessionId)
-    if (!session) {
-      throw new Error('Session should exist')
-    }
+    t.assert.ok(session, 'Session should exist in sessions map')
 
     // Manually add messages to session history to simulate prior activity
     session.messageHistory.push({
@@ -165,6 +159,7 @@ test('Last-Event-ID Support', async (t) => {
     const injectGetResponse = await app.inject({
       method: 'GET',
       url: '/mcp',
+      payloadAsStream: true,
       headers: {
         'Accept': 'text/event-stream',
         'mcp-session-id': sessionId,
@@ -172,9 +167,8 @@ test('Last-Event-ID Support', async (t) => {
       }
     })
 
-    if (injectGetResponse.statusCode !== 200) {
-      throw new Error(`Inject GET failed: ${injectGetResponse.statusCode} - ${injectGetResponse.body}`)
-    }
+    t.assert.equal(injectGetResponse.statusCode, 200, 'GET request should return 200 status')
+    injectGetResponse.stream().destroy()
 
     // Test Last-Event-ID replay using undici.request()
     const { statusCode, headers, body } = await request(`${baseUrl}/mcp`, {
@@ -197,63 +191,23 @@ test('Last-Event-ID Support', async (t) => {
     }
 
     // Read the initial chunk from the stream to check for replayed messages
-    return new Promise<void>((resolve, reject) => {
+    await new Promise<void>((resolve, reject) => {
       let resolved = false
-      
-      const cleanup = () => {
-        if (!resolved) {
-          resolved = true
-          try {
-            body.destroy()
-          } catch {
-            // Ignore cleanup errors
-          }
-        }
-      }
-
-      const timeout = setTimeout(() => {
-        cleanup()
-        resolve() // Timeout is acceptable - server processed Last-Event-ID without errors
-      }, 500) // Shorter timeout to prevent hanging
 
       body.on('data', (chunk: Buffer) => {
         const text = chunk.toString()
         
         // Check if we received replayed messages or any SSE data
         if (text.includes('Message 2') || text.includes('Message 3') || text.includes('heartbeat')) {
-          clearTimeout(timeout)
-          cleanup()
           resolve() // Successfully received data from server
-          return
         }
-        
-        // Any data means the connection worked
-        clearTimeout(timeout)
-        cleanup()
-        resolve()
       })
 
       body.on('error', (error) => {
-        clearTimeout(timeout)
-        cleanup()
-        // Even errors are acceptable - server attempted to process the request
-        resolve()
+        reject(error)
       })
-
-      body.on('end', () => {
-        clearTimeout(timeout)
-        cleanup()
-        resolve() // Stream ended normally
-      })
-
-      // Force close after a very short time to prevent hanging
-      setTimeout(() => {
-        if (!resolved) {
-          clearTimeout(timeout)
-          cleanup()
-          resolve()
-        }
-      }, 200)
     })
+
+    body.destroy()
   })
 })
