@@ -31,6 +31,7 @@
   },
   "homepage": "https://github.com/mcollina/fastify-mcp#readme",
   "devDependencies": {
+    "@modelcontextprotocol/inspector": "^0.16.0",
     "@modelcontextprotocol/sdk": "^1.13.3",
     "@types/node": "^24.0.10",
     "eslint": "^9.30.0",
@@ -40,7 +41,6 @@
     "undici": "^7.11.0"
   },
   "dependencies": {
-    "fastify-plugin": "^5.0.1",
-    "typed-rpc": "^6.1.1"
+    "fastify-plugin": "^5.0.1"
   }
 }
