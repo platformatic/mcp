@@ -108,6 +108,12 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
   }
 
   async function handleRequest (request: JSONRPCRequest, sessionId?: string): Promise<JSONRPCResponse | JSONRPCError> {
+    app.log.info({
+      method: request.method,
+      id: request.id,
+      sessionId
+    }, `JSON-RPC method invoked: ${request.method}`)
+    
     try {
       switch (request.method) {
         case 'initialize': {
@@ -415,6 +421,11 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
 
         // Add this connection to the session's streams
         session.streams.add(reply)
+        app.log.info({
+          sessionId: session.id,
+          totalStreams: session.streams.size,
+          method: 'POST'
+        }, 'Added new stream to session')
 
         // Handle connection close
         reply.raw.on('close', () => {
@@ -510,6 +521,11 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
       raw.writeHead(200)
 
       session.streams.add(reply)
+      app.log.info({
+        sessionId: session.id,
+        totalStreams: session.streams.size,
+        method: 'GET'
+      }, 'Added new stream to session')
 
       // Handle resumability with Last-Event-ID
       const lastEventId = request.headers['last-event-id'] as string

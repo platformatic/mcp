@@ -11,7 +11,8 @@
     "lint:fix": "eslint --cache --fix",
     "typecheck": "tsc -p . --noEmit",
     "test": "node --experimental-strip-types --no-warnings --test test/*.test.ts",
-    "ci": "npm run build && npm run lint && npm run test"
+    "ci": "npm run build && npm run lint && npm run test",
+    "start-demo": "node --watch examples/file-listing-server.ts | pino-pretty --colorize --translateTime 'SYS:standard' --ignore pid,hostname"
   },
   "repository": {
     "type": "git",
@@ -37,6 +38,7 @@
     "eslint": "^9.30.0",
     "fastify": "^5.4.0",
     "neostandard": "^0.12.1",
+    "pino-pretty": "^13.0.0",
     "typescript": "^5.8.3",
     "undici": "^7.11.0"
   },
