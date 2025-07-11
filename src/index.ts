@@ -40,7 +40,7 @@ declare module 'fastify' {
   }
 }
 
-type ToolHandler = (params: any) => Promise<CallToolResult> | CallToolResult
+type ToolHandler = (params: any, context?: { sessionId?: string }) => Promise<CallToolResult> | CallToolResult
 type ResourceHandler = (uri: string) => Promise<ReadResourceResult> | ReadResourceResult
 type PromptHandler = (name: string, args?: any) => Promise<GetPromptResult> | GetPromptResult
 
@@ -107,7 +107,7 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
     }
   }
 
-  async function handleRequest (request: JSONRPCRequest): Promise<JSONRPCResponse | JSONRPCError> {
+  async function handleRequest (request: JSONRPCRequest, sessionId?: string): Promise<JSONRPCResponse | JSONRPCError> {
     try {
       switch (request.method) {
         case 'initialize': {
@@ -174,7 +174,7 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
           }
 
           try {
-            const result = await tool.handler(params.arguments || {})
+            const result = await tool.handler(params.arguments || {}, { sessionId })
             return createResponse(request.id, result)
           } catch (error: any) {
             const result: CallToolResult = {
@@ -291,9 +291,9 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
     }
   }
 
-  async function processMessage (message: JSONRPCMessage): Promise<JSONRPCResponse | JSONRPCError | null> {
+  async function processMessage (message: JSONRPCMessage, sessionId?: string): Promise<JSONRPCResponse | JSONRPCError | null> {
     if ('id' in message && 'method' in message) {
-      return await handleRequest(message as JSONRPCRequest)
+      return await handleRequest(message as JSONRPCRequest, sessionId)
     } else if ('method' in message) {
       handleNotification(message as JSONRPCNotification)
       return null
@@ -376,6 +376,9 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
 
     // Clean up session if no streams left
     if (session.streams.size === 0) {
+      app.log.info({
+        sessionId: session.id
+      }, 'Session has no active streams, cleaning up')
       app.mcpSessions.delete(session.id)
     }
   }
@@ -387,6 +390,9 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
       const useSSE = enableSSE && supportsSSE(request)
 
       if (useSSE) {
+        reply.hijack()
+        request.log.info({ sessionId }, 'Handling SSE request')
+
         // Set up SSE stream
         reply.raw.setHeader('content-type', 'text/event-stream')
 
@@ -398,36 +404,55 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
           reply.raw.setHeader('Mcp-Session-Id', session.id)
         }
 
+        // Set up persistent SSE connection
+        reply.raw.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          Connection: 'keep-alive',
+          'Access-Control-Allow-Origin': '*',
+          'Mcp-Session-Id': session.id
+        })
+
+        // Add this connection to the session's streams
+        session.streams.add(reply)
+
+        // Handle connection close
+        reply.raw.on('close', () => {
+          app.log.info({
+            sessionId: session.id,
+            remainingStreams: session.streams.size - 1
+          }, 'POST SSE connection closed')
+
+          session.streams.delete(reply)
+          if (session.streams.size === 0) {
+            app.log.info({
+              sessionId: session.id
+            }, 'Last POST SSE stream closed, cleaning up session')
+            app.mcpSessions.delete(session.id)
+          }
+        })
+
         // Process message and send via SSE
-        const response = await processMessage(message)
+        const response = await processMessage(message, sessionId)
         if (response) {
-          // Send the SSE event and end the stream
+          // Send the SSE event but keep the stream open
           const eventId = (++session.eventId).toString()
           const sseEvent = `id: ${eventId}\ndata: ${JSON.stringify(response)}\n\n`
-          reply.raw.writeHead(200, {
-            'Content-Type': 'text/event-stream',
-            'Cache-Control': 'no-cache',
-            Connection: 'keep-alive',
-            'Access-Control-Allow-Origin': '*',
-            'Mcp-Session-Id': session.id
-          })
           reply.raw.write(sseEvent)
-          reply.raw.end()
+
+          // Store message in history for resumability
+          session.messageHistory.push({ eventId, message: response })
+          // Keep only last 100 messages to prevent memory leaks
+          if (session.messageHistory.length > 100) {
+            session.messageHistory.shift()
+          }
         } else {
-          reply.raw.writeHead(200, {
-            'Content-Type': 'text/event-stream',
-            'Cache-Control': 'no-cache',
-            Connection: 'keep-alive',
-            'Access-Control-Allow-Origin': '*',
-            'Mcp-Session-Id': session.id
-          })
           reply.raw.write(': heartbeat\n\n')
-          reply.raw.end()
         }
       } else {
         // Regular JSON response
         reply.type('application/json')
-        const response = await processMessage(message)
+        const response = await processMessage(message, sessionId)
         if (response) {
           reply.send(response)
         } else {
@@ -463,6 +488,8 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
       const sessionId = (request.headers['mcp-session-id'] as string) ||
                        (request.query as any)['mcp-session-id']
 
+      request.log.info({ sessionId }, 'Handling SSE request')
+
       // We are opting out of Fastify proper
       reply.hijack()
 
@@ -493,8 +520,16 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
 
       // Handle connection close
       reply.raw.on('close', () => {
+        app.log.info({
+          sessionId: session.id,
+          remainingStreams: session.streams.size - 1
+        }, 'SSE connection closed')
+
         session.streams.delete(reply)
         if (session.streams.size === 0) {
+          app.log.info({
+            sessionId: session.id
+          }, 'Last SSE stream closed, cleaning up session')
           app.mcpSessions.delete(session.id)
         }
       })
@@ -514,6 +549,9 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
       heartbeatInterval.unref()
 
       reply.raw.on('close', () => {
+        app.log.info({
+          sessionId: session.id
+        }, 'SSE heartbeat connection closed')
         clearInterval(heartbeatInterval)
       })
     } catch (error) {

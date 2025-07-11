@@ -19,7 +19,7 @@ async function setupServer (t: TestContext) {
     await app.close()
   })
 
-  return { app, baseUrl } 
+  return { app, baseUrl }
 }
 
 describe('Last-Event-ID Support', () => {
@@ -33,6 +33,7 @@ describe('Last-Event-ID Support', () => {
         'Content-Type': 'application/json',
         Accept: 'text/event-stream'
       },
+      payloadAsStream: true,
       payload: {
         jsonrpc: '2.0',
         method: 'initialize',
@@ -69,6 +70,8 @@ describe('Last-Event-ID Support', () => {
     if (!Array.isArray(session.messageHistory)) {
       throw new Error('Session should have messageHistory array')
     }
+
+    initResponse.stream().destroy()
   })
 
   test('should handle GET request with Last-Event-ID using EventSource', async (t) => {
@@ -104,6 +107,7 @@ describe('Last-Event-ID Support', () => {
     const initResponse = await app.inject({
       method: 'POST',
       url: '/mcp',
+      payloadAsStream: true,
       headers: {
         'Content-Type': 'application/json',
         Accept: 'text/event-stream'
@@ -162,7 +166,7 @@ describe('Last-Event-ID Support', () => {
       url: '/mcp',
       payloadAsStream: true,
       headers: {
-        'Accept': 'text/event-stream',
+        Accept: 'text/event-stream',
         'mcp-session-id': sessionId,
         'Last-Event-ID': '1'
       }
@@ -175,7 +179,7 @@ describe('Last-Event-ID Support', () => {
     const { statusCode, headers, body } = await request(`${baseUrl}/mcp`, {
       method: 'GET',
       headers: {
-        'Accept': 'text/event-stream',
+        Accept: 'text/event-stream',
         'mcp-session-id': sessionId,
         'Last-Event-ID': '1' // Should replay messages 2 and 3
       }
@@ -193,10 +197,9 @@ describe('Last-Event-ID Support', () => {
 
     // Read the initial chunk from the stream to check for replayed messages
     await new Promise<void>((resolve, reject) => {
-
       body.on('data', (chunk: Buffer) => {
         const text = chunk.toString()
-        
+
         // Check if we received replayed messages or any SSE data
         if (text.includes('Message 2') || text.includes('Message 3') || text.includes('heartbeat')) {
           resolve() // Successfully received data from server

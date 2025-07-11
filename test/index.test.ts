@@ -13,6 +13,9 @@ import type {
   ListPromptsResult
 } from '../src/schema.ts'
 import {
+  once
+} from 'node:events'
+import {
   JSONRPC_VERSION,
   LATEST_PROTOCOL_VERSION,
   METHOD_NOT_FOUND,
@@ -382,22 +385,23 @@ describe('MCP Fastify Plugin', () => {
       const response = await app.inject({
         method: 'POST',
         url: '/mcp',
+        payloadAsStream: true,
         payload: request,
         headers: {
           accept: 'application/json, text/event-stream'
         }
       })
 
+      const stream = response.stream()
+      stream.setEncoding('utf8')
+
+      const [payload] = await once(stream, 'data')
+
       t.assert.strictEqual(response.statusCode, 200)
       t.assert.strictEqual(response.headers['content-type'], 'text/event-stream')
       t.assert.ok(response.headers['mcp-session-id'])
-      t.assert.ok(response.payload.includes('id: 1'))
-      t.assert.ok(response.payload.includes('data: '))
-    })
-
-    test.skip('should handle GET request for SSE stream', async () => {
-      // Skipped because GET SSE streams are long-lived and don't work well with inject()
-      // This would require a real HTTP client to test properly
+      t.assert.ok(payload.includes('id: 1'))
+      t.assert.ok(payload.includes('data: '))
     })
 
     test('should return 405 for GET request when SSE is disabled', async (t: TestContext) => {
