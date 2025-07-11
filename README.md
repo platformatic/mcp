@@ -297,26 +297,6 @@ await app.register(import('@fastify/bearer-auth'), {
 })
 ```
 
-### Alternative Authentication Methods
-
-You can also use other Fastify authentication plugins:
-- `@fastify/jwt` for JWT-based authentication
-- `@fastify/basic-auth` for basic authentication
-- Custom authentication hooks
-
-```typescript
-// Custom authentication hook example
-app.addHook('preHandler', async (request, reply) => {
-  if (request.url.startsWith('/mcp')) {
-    const token = request.headers.authorization?.replace('Bearer ', '')
-    if (!token || !isValidToken(token)) {
-      reply.code(401).send({ error: 'Unauthorized' })
-      return
-    }
-  }
-})
-```
-
 ## API Reference
 
 ### Plugin Options
