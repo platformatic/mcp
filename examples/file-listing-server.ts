@@ -295,8 +295,8 @@ fastify.mcpAddTool({
             watchId,
             event_type: eventType,
             filename,
-            full_path: join(fullPath, filename),
-            relative_path: relative(process.cwd(), join(fullPath, filename)),
+            full_path: join(fullPath, filename.toString()),
+            relative_path: relative(process.cwd(), join(fullPath, filename.toString())),
             timestamp: new Date().toISOString()
           }
         }
@@ -434,7 +434,7 @@ fastify.mcpAddTool({
     type: 'object',
     properties: {}
   }
-}, async (params) => {
+}, async (_params) => {
   const watcherEntries = Array.from(activeWatchers.entries())
 
   return {
