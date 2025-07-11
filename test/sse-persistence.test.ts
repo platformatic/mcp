@@ -1,9 +1,14 @@
 import { test } from 'node:test'
 import { strict as assert } from 'node:assert'
 import Fastify from 'fastify'
-import { request } from 'undici'
+import { request, Agent, setGlobalDispatcher } from 'undici'
 import { Readable } from 'node:stream'
 import mcpPlugin from '../src/index.ts'
+
+setGlobalDispatcher(new Agent({
+  keepAliveTimeout: 10,
+  keepAliveMaxTimeout: 10
+}))
 
 test('POST SSE connections should persist and receive notifications', async (t) => {
   const app = Fastify({ logger: false })
@@ -123,6 +128,7 @@ test('POST SSE connections should persist and receive notifications', async (t) 
       if (data.includes('notifications/test')) {
         clearTimeout(timeout)
         resolve(receivedData)
+        stream.destroy()
       }
     })
 
@@ -154,10 +160,23 @@ test('POST SSE connections should persist and receive notifications', async (t) 
   })
 
   assert.strictEqual(toolResponse.statusCode, 200)
-  assert.strictEqual(toolResponse.headers['content-type'], 'text/event-stream')
+  assert.strictEqual(toolResponse.headers['content-type'], 'application/json; charset=utf-8')
 
-  // Check that session now has 2 active streams
-  assert.strictEqual(session.streams.size, 2, 'Session should have 2 active streams after second request')
+  // Check that session still has only 1 active stream (the original one)
+  assert.strictEqual(session.streams.size, 1, 'Session should still have 1 active stream after second request')
+
+  const actual = await toolResponse.body.json()
+
+  assert.deepStrictEqual(actual, {
+    jsonrpc: '2.0',
+    id: 2,
+    result: {
+      content: [{
+        type: 'text',
+        text: 'Will send notification: Hello from test!'
+      }]
+    }
+  })
 
   // Wait for notification
   const notificationData = await notificationPromise
@@ -166,17 +185,8 @@ test('POST SSE connections should persist and receive notifications', async (t) 
   assert.ok(notificationData.includes('notifications/test'), 'Should receive test notification')
   assert.ok(notificationData.includes('Hello from test!'), 'Should contain test message')
 
-  // Test 4: Close one stream and verify session persists
-  toolResponse.body.destroy()
-
-  // Wait a bit for cleanup
-  await new Promise(resolve => setTimeout(resolve, 100))
-
-  // Session should still exist with 1 stream
-  assert.ok(app.mcpSessions.has(sessionId), 'Session should still exist')
-  assert.strictEqual(session.streams.size, 1, 'Session should have 1 active stream after closing one')
-
-  // Close the other stream
+  // Test 4: Close the SSE stream and verify session cleanup
+  // Since there's only one SSE stream (the toolResponse was JSON), we just close the original
   initResponse.body.destroy()
 
   // Wait a bit for cleanup

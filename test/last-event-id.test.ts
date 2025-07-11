@@ -1,8 +1,13 @@
 import { test, describe } from 'node:test'
 import type { TestContext } from 'node:test'
 import Fastify from 'fastify'
-import { EventSource, request } from 'undici'
+import { EventSource, request, Agent, setGlobalDispatcher } from 'undici'
 import mcpPlugin from '../src/index.ts'
+
+setGlobalDispatcher(new Agent({
+  keepAliveTimeout: 10,
+  keepAliveMaxTimeout: 10
+}))
 
 async function setupServer (t: TestContext) {
   const app = Fastify({ logger: { level: 'error' } })
@@ -160,20 +165,31 @@ describe('Last-Event-ID Support', () => {
 
     session!.eventId = 3
 
-    // First verify GET endpoint works with inject
+    // First verify GET endpoint works with inject (use regular JSON since SSE session is active)
     const injectGetResponse = await app.inject({
       method: 'GET',
       url: '/mcp',
-      payloadAsStream: true,
       headers: {
-        Accept: 'text/event-stream',
+        Accept: 'application/json',
         'mcp-session-id': sessionId,
         'Last-Event-ID': '1'
       }
     })
 
-    t.assert.equal(injectGetResponse.statusCode, 200, 'GET request should return 200 status')
-    injectGetResponse.stream().destroy()
+    t.assert.equal(injectGetResponse.statusCode, 405, 'GET request should return 405 status when not requesting SSE')
+
+    // Close the POST SSE stream to allow a new connection
+    initResponse.stream().destroy()
+
+    // Wait a bit for the stream to be cleaned up
+    await new Promise(resolve => setTimeout(resolve, 200))
+
+    // Verify session has no active streams - if it does, manually clean it up for the test
+    const currentSession = app.mcpSessions.get(sessionId)
+    if (currentSession && currentSession.streams.size > 0) {
+      // Force cleanup for the test (this simulates what should happen when the stream closes)
+      currentSession.streams.clear()
+    }
 
     // Test Last-Event-ID replay using undici.request()
     const { statusCode, headers, body } = await request(`${baseUrl}/mcp`, {

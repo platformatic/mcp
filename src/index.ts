@@ -113,7 +113,7 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
       id: request.id,
       sessionId
     }, `JSON-RPC method invoked: ${request.method}`)
-    
+
     try {
       switch (request.method) {
         case 'initialize': {
@@ -326,6 +326,12 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
     return accept ? accept.includes('text/event-stream') : false
   }
 
+  function hasActiveSSESession (sessionId?: string): boolean {
+    if (!sessionId) return false
+    const session = app.mcpSessions.get(sessionId)
+    return session ? session.streams.size > 0 : false
+  }
+
   function replayMessagesFromEventId (session: SSESession, lastEventId: string, stream: FastifyReply): void {
     // Find the index of the last received event
     const lastIndex = session.messageHistory.findIndex(entry => entry.eventId === lastEventId)
@@ -393,7 +399,7 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
     try {
       const message = request.body as JSONRPCMessage
       const sessionId = request.headers['mcp-session-id'] as string
-      const useSSE = enableSSE && supportsSSE(request)
+      const useSSE = enableSSE && supportsSSE(request) && !hasActiveSSESession(sessionId)
 
       if (useSSE) {
         reply.hijack()
@@ -462,7 +468,6 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
         }
       } else {
         // Regular JSON response
-        reply.type('application/json')
         const response = await processMessage(message, sessionId)
         if (response) {
           reply.send(response)
@@ -498,6 +503,14 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
     try {
       const sessionId = (request.headers['mcp-session-id'] as string) ||
                        (request.query as any)['mcp-session-id']
+
+      // Check if there's already an active SSE session
+      if (hasActiveSSESession(sessionId)) {
+        reply.type('application/json').code(409).send({
+          error: 'Conflict: SSE session already active for this session ID'
+        })
+        return
+      }
 
       request.log.info({ sessionId }, 'Handling SSE request')
 
