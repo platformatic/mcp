@@ -3,11 +3,11 @@ import type { JSONRPCMessage } from '../schema.ts'
 import { JSONRPC_VERSION, INTERNAL_ERROR } from '../schema.ts'
 import type { SSESession, MCPPluginOptions, MCPTool, MCPResource, MCPPrompt } from '../types.ts'
 import { processMessage } from '../handlers/mcp-handlers.ts'
-import { 
-  createSSESession, 
-  supportsSSE, 
-  hasActiveSSESession, 
-  replayMessagesFromEventId 
+import {
+  createSSESession,
+  supportsSSE,
+  hasActiveSSESession,
+  replayMessagesFromEventId
 } from '../session/sse-session.ts'
 
 export function registerMCPRoutes (
