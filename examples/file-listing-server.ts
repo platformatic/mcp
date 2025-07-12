@@ -24,8 +24,14 @@ await fastify.register(mcpPlugin, {
   enableSSE: true
 })
 
-// Store active watchers
-const activeWatchers = new Map<string, any>()
+// Store active watchers with debounce state
+interface WatcherData {
+  watcher: any
+  sessionId: string
+  debounceTimers: Map<string, NodeJS.Timeout>
+}
+
+const activeWatchers = new Map<string, WatcherData>()
 
 // Periodic cleanup for orphaned watchers
 const cleanupInterval = setInterval(() => {
@@ -77,6 +83,12 @@ fastify.addHook('onClose', async () => {
       const watcherData = activeWatchers.get(watchId)
       if (watcherData) {
         try {
+          // Clear all debounce timers before closing
+          for (const timer of watcherData.debounceTimers.values()) {
+            clearTimeout(timer)
+          }
+          watcherData.debounceTimers.clear()
+          
           watcherData.watcher.close()
         } catch (error) {
           fastify.log.error(`Error closing watcher ${watchId} during shutdown:`, error)
@@ -283,52 +295,83 @@ fastify.mcpAddTool({
 
     // Create file watcher
     const watcher = watch(fullPath, { recursive: true })
-    activeWatchers.set(watchId, { watcher, sessionId })
+    activeWatchers.set(watchId, { 
+      watcher, 
+      sessionId, 
+      debounceTimers: new Map<string, NodeJS.Timeout>()
+    })
 
-    // Handle file change events
+    // Handle file change events with debouncing
     watcher.on('change', (eventType, filename) => {
       if (filename) {
-        const notification = {
-          jsonrpc: '2.0' as const,
-          method: 'notifications/file_changed',
-          params: {
-            watchId,
-            event_type: eventType,
-            filename,
-            full_path: join(fullPath, filename.toString()),
-            relative_path: relative(process.cwd(), join(fullPath, filename.toString())),
-            timestamp: new Date().toISOString()
-          }
+        const watcherData = activeWatchers.get(watchId)
+        if (!watcherData) return
+
+        const fileKey = filename.toString()
+        const debounceKey = `${eventType}:${fileKey}`
+        
+        // Clear existing timer for this file+event combination
+        const existingTimer = watcherData.debounceTimers.get(debounceKey)
+        if (existingTimer) {
+          clearTimeout(existingTimer)
         }
 
-        // Send to specific session
-        const sent = fastify.mcpSendToSession(sessionId, notification)
-        if (sent) {
-          fastify.log.info(`File change sent to session ${sessionId}: ${eventType} ${filename}`)
-        } else {
-          // More detailed logging
-          const sessionExists = fastify.mcpSessions.has(sessionId)
-          const sessionStreams = sessionExists ? fastify.mcpSessions.get(sessionId)?.streams.size : 0
-          fastify.log.warn({
-            sessionId,
-            sessionExists,
-            sessionStreams,
-            eventType,
-            filename,
-            watchId
-          }, `Failed to send file change - session exists: ${sessionExists}, streams: ${sessionStreams}`)
-
-          // Clean up watcher if session has no active streams
-          if (sessionExists && sessionStreams === 0) {
-            fastify.log.info({
+        // Set new debounce timer (1 second)
+        const timer = setTimeout(() => {
+          const notification = {
+            jsonrpc: '2.0' as const,
+            method: 'notifications/file_changed',
+            params: {
               watchId,
-              sessionId
-            }, 'Cleaning up watcher for session with no active streams')
-
-            watcher.close()
-            activeWatchers.delete(watchId)
+              event_type: eventType,
+              filename: fileKey,
+              full_path: join(fullPath, fileKey),
+              relative_path: relative(process.cwd(), join(fullPath, fileKey)),
+              timestamp: new Date().toISOString()
+            }
           }
-        }
+
+          // Send to specific session
+          const sent = fastify.mcpSendToSession(sessionId, notification)
+          if (sent) {
+            fastify.log.info(`File change sent to session ${sessionId}: ${eventType} ${fileKey}`)
+          } else {
+            // More detailed logging
+            const sessionExists = fastify.mcpSessions.has(sessionId)
+            const sessionStreams = sessionExists ? fastify.mcpSessions.get(sessionId)?.streams.size : 0
+            fastify.log.warn({
+              sessionId,
+              sessionExists,
+              sessionStreams,
+              eventType,
+              filename: fileKey,
+              watchId
+            }, `Failed to send file change - session exists: ${sessionExists}, streams: ${sessionStreams}`)
+
+            // Clean up watcher if session has no active streams
+            if (sessionExists && sessionStreams === 0) {
+              fastify.log.info({
+                watchId,
+                sessionId
+              }, 'Cleaning up watcher for session with no active streams')
+
+              // Clear all debounce timers
+              for (const timer of watcherData.debounceTimers.values()) {
+                clearTimeout(timer)
+              }
+              watcherData.debounceTimers.clear()
+              
+              watcher.close()
+              activeWatchers.delete(watchId)
+            }
+          }
+          
+          // Clean up the timer from the map
+          watcherData.debounceTimers.delete(debounceKey)
+        }, 1000) // 1 second debounce
+
+        // Store the timer
+        watcherData.debounceTimers.set(debounceKey, timer)
       }
     })
 
@@ -345,7 +388,15 @@ fastify.mcpAddTool({
       fastify.mcpSendToSession(sessionId, notification)
       fastify.log.error(`Watch error for ${watchId}:`, error)
 
-      // Clean up failed watcher
+      // Clean up failed watcher and its timers
+      const watcherData = activeWatchers.get(watchId)
+      if (watcherData) {
+        // Clear all debounce timers
+        for (const timer of watcherData.debounceTimers.values()) {
+          clearTimeout(timer)
+        }
+        watcherData.debounceTimers.clear()
+      }
       activeWatchers.delete(watchId)
     })
 
@@ -406,6 +457,12 @@ fastify.mcpAddTool({
   }
 
   try {
+    // Clear all debounce timers before closing
+    for (const timer of watcherData.debounceTimers.values()) {
+      clearTimeout(timer)
+    }
+    watcherData.debounceTimers.clear()
+    
     watcherData.watcher.close()
     activeWatchers.delete(watchId)
 
