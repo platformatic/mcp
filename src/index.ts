@@ -21,6 +21,10 @@ import type {
   ServerCapabilities,
   Implementation
 } from './schema.ts'
+import type { SessionStore, SessionMetadata } from './stores/session-store.ts'
+import type { MessageBroker } from './brokers/message-broker.ts'
+import { MemorySessionStore } from './stores/memory-session-store.ts'
+import { MemoryMessageBroker } from './brokers/memory-message-broker.ts'
 
 import {
   JSONRPC_VERSION,
@@ -34,9 +38,8 @@ declare module 'fastify' {
     mcpAddTool: (definition: any, handler?: ToolHandler) => void
     mcpAddResource: (definition: any, handler?: ResourceHandler) => void
     mcpAddPrompt: (definition: any, handler?: PromptHandler) => void
-    mcpSessions: Map<string, SSESession>
-    mcpBroadcastNotification: (notification: JSONRPCNotification) => void
-    mcpSendToSession: (sessionId: string, message: JSONRPCMessage) => boolean
+    mcpBroadcastNotification: (notification: JSONRPCNotification) => Promise<void>
+    mcpSendToSession: (sessionId: string, message: JSONRPCMessage) => Promise<boolean>
   }
 }
 
@@ -64,14 +67,14 @@ interface MCPPluginOptions {
   capabilities?: ServerCapabilities
   instructions?: string
   enableSSE?: boolean
-}
-
-interface SSESession {
-  id: string
-  eventId: number
-  streams: Set<FastifyReply>
-  lastEventId?: string
-  messageHistory: Array<{ eventId: string, message: JSONRPCMessage }>
+  sessionStore?: 'memory' | 'redis'
+  messageBroker?: 'memory' | 'redis'
+  redis?: {
+    host: string
+    port: number
+    password?: string
+    db?: number
+  }
 }
 
 export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) {
@@ -90,6 +93,13 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
   const tools = new Map<string, MCPTool>()
   const resources = new Map<string, MCPResource>()
   const prompts = new Map<string, MCPPrompt>()
+
+  // Initialize stores and brokers
+  const sessionStore: SessionStore = new MemorySessionStore()
+  const messageBroker: MessageBroker = new MemoryMessageBroker()
+  
+  // Local stream management per server instance
+  const localStreams = new Map<string, Set<FastifyReply>>()
 
   function createResponse (id: string | number, result: any): JSONRPCResponse {
     return {
@@ -308,16 +318,27 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
     }
   }
 
-  function createSSESession (): SSESession {
+  async function createSSESession (): Promise<SessionMetadata> {
     const sessionId = randomUUID()
-    const session: SSESession = {
+    const session: SessionMetadata = {
       id: sessionId,
       eventId: 0,
-      streams: new Set(),
       lastEventId: undefined,
-      messageHistory: []
+      createdAt: new Date(),
+      lastActivity: new Date()
     }
-    app.mcpSessions.set(sessionId, session)
+    
+    await sessionStore.create(session)
+    localStreams.set(sessionId, new Set())
+    
+    // Subscribe to messages for this session
+    await messageBroker.subscribe(`mcp/session/${sessionId}/message`, (message) => {
+      const streams = localStreams.get(sessionId)
+      if (streams && streams.size > 0) {
+        sendSSEToStreams(sessionId, message, streams)
+      }
+    })
+    
     return session
   }
 
@@ -328,17 +349,53 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
 
   function hasActiveSSESession (sessionId?: string): boolean {
     if (!sessionId) return false
-    const session = app.mcpSessions.get(sessionId)
-    return session ? session.streams.size > 0 : false
+    const streams = localStreams.get(sessionId)
+    return streams ? streams.size > 0 : false
   }
 
-  function replayMessagesFromEventId (session: SSESession, lastEventId: string, stream: FastifyReply): void {
-    // Find the index of the last received event
-    const lastIndex = session.messageHistory.findIndex(entry => entry.eventId === lastEventId)
+  async function sendSSEToStreams (sessionId: string, message: JSONRPCMessage, streams: Set<FastifyReply>): Promise<void> {
+    const session = await sessionStore.get(sessionId)
+    if (!session) return
 
-    if (lastIndex !== -1) {
-      // Replay messages after the last received event
-      const messagesToReplay = session.messageHistory.slice(lastIndex + 1)
+    const eventId = (++session.eventId).toString()
+    const sseEvent = `id: ${eventId}\ndata: ${JSON.stringify(message)}\n\n`
+    session.lastEventId = eventId
+    session.lastActivity = new Date()
+
+    // Store message in history
+    await sessionStore.addMessage(sessionId, eventId, message)
+    await sessionStore.trimMessageHistory(sessionId, 100)
+    await sessionStore.update(sessionId, session)
+
+    // Send to all connected streams in this session
+    const deadStreams = new Set<FastifyReply>()
+    for (const stream of streams) {
+      try {
+        stream.raw.write(sseEvent)
+      } catch (error) {
+        app.log.error('Failed to write SSE event:', error)
+        deadStreams.add(stream)
+      }
+    }
+
+    // Clean up dead streams
+    for (const deadStream of deadStreams) {
+      streams.delete(deadStream)
+    }
+
+    // Clean up session if no streams left
+    if (streams.size === 0) {
+      app.log.info({
+        sessionId
+      }, 'Session has no active streams, cleaning up')
+      localStreams.delete(sessionId)
+      await messageBroker.unsubscribe(`mcp/session/${sessionId}/message`)
+    }
+  }
+
+  async function replayMessagesFromEventId (sessionId: string, lastEventId: string, stream: FastifyReply): Promise<void> {
+    try {
+      const messagesToReplay = await sessionStore.getMessagesFrom(sessionId, lastEventId)
 
       for (const entry of messagesToReplay) {
         const sseEvent = `id: ${entry.eventId}\ndata: ${JSON.stringify(entry.message)}\n\n`
@@ -353,47 +410,11 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
       if (messagesToReplay.length > 0) {
         app.log.info(`Replayed ${messagesToReplay.length} messages from event ID: ${lastEventId}`)
       }
-    } else {
-      app.log.warn(`Event ID ${lastEventId} not found in message history`)
+    } catch (error) {
+      app.log.warn(`Failed to replay messages from event ID ${lastEventId}:`, error)
     }
   }
 
-  function sendSSEMessage (session: SSESession, message: JSONRPCMessage): void {
-    const eventId = (++session.eventId).toString()
-    const sseEvent = `id: ${eventId}\ndata: ${JSON.stringify(message)}\n\n`
-    session.lastEventId = eventId
-
-    // Store message in history for resumability
-    session.messageHistory.push({ eventId, message })
-    // Keep only last 100 messages to prevent memory leaks
-    if (session.messageHistory.length > 100) {
-      session.messageHistory.shift()
-    }
-
-    // Send to all connected streams in this session
-    const deadStreams = new Set<FastifyReply>()
-    for (const stream of session.streams) {
-      try {
-        stream.raw.write(sseEvent)
-      } catch (error) {
-        app.log.error('Failed to write SSE event:', error)
-        deadStreams.add(stream)
-      }
-    }
-
-    // Clean up dead streams
-    for (const deadStream of deadStreams) {
-      session.streams.delete(deadStream)
-    }
-
-    // Clean up session if no streams left
-    if (session.streams.size === 0) {
-      app.log.info({
-        sessionId: session.id
-      }, 'Session has no active streams, cleaning up')
-      app.mcpSessions.delete(session.id)
-    }
-  }
 
   app.post('/mcp', async (request: FastifyRequest, reply: FastifyReply) => {
     try {
@@ -408,11 +429,17 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
         // Set up SSE stream
         reply.raw.setHeader('content-type', 'text/event-stream')
 
-        let session: SSESession
-        if (sessionId && app.mcpSessions.has(sessionId)) {
-          session = app.mcpSessions.get(sessionId)!
+        let session: SessionMetadata
+        if (sessionId) {
+          const existingSession = await sessionStore.get(sessionId)
+          if (existingSession) {
+            session = existingSession
+          } else {
+            session = await createSSESession()
+            reply.raw.setHeader('Mcp-Session-Id', session.id)
+          }
         } else {
-          session = createSSESession()
+          session = await createSSESession()
           reply.raw.setHeader('Mcp-Session-Id', session.id)
         }
 
@@ -425,27 +452,37 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
           'Mcp-Session-Id': session.id
         })
 
-        // Add this connection to the session's streams
-        session.streams.add(reply)
+        // Add this connection to the local streams
+        let streams = localStreams.get(session.id)
+        if (!streams) {
+          streams = new Set()
+          localStreams.set(session.id, streams)
+        }
+        streams.add(reply)
+        
         app.log.info({
           sessionId: session.id,
-          totalStreams: session.streams.size,
+          totalStreams: streams.size,
           method: 'POST'
         }, 'Added new stream to session')
 
         // Handle connection close
         reply.raw.on('close', () => {
-          app.log.info({
-            sessionId: session.id,
-            remainingStreams: session.streams.size - 1
-          }, 'POST SSE connection closed')
-
-          session.streams.delete(reply)
-          if (session.streams.size === 0) {
+          const streams = localStreams.get(session.id)
+          if (streams) {
+            streams.delete(reply)
             app.log.info({
-              sessionId: session.id
-            }, 'Last POST SSE stream closed, cleaning up session')
-            app.mcpSessions.delete(session.id)
+              sessionId: session.id,
+              remainingStreams: streams.size
+            }, 'POST SSE connection closed')
+
+            if (streams.size === 0) {
+              app.log.info({
+                sessionId: session.id
+              }, 'Last POST SSE stream closed, cleaning up session')
+              localStreams.delete(session.id)
+              messageBroker.unsubscribe(`mcp/session/${session.id}/message`)
+            }
           }
         })
 
@@ -453,15 +490,18 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
         const response = await processMessage(message, sessionId)
         if (response) {
           // Send the SSE event but keep the stream open
-          const eventId = (++session.eventId).toString()
-          const sseEvent = `id: ${eventId}\ndata: ${JSON.stringify(response)}\n\n`
-          reply.raw.write(sseEvent)
+          const updatedSession = await sessionStore.get(session.id)
+          if (updatedSession) {
+            const eventId = (++updatedSession.eventId).toString()
+            const sseEvent = `id: ${eventId}\ndata: ${JSON.stringify(response)}\n\n`
+            reply.raw.write(sseEvent)
 
-          // Store message in history for resumability
-          session.messageHistory.push({ eventId, message: response })
-          // Keep only last 100 messages to prevent memory leaks
-          if (session.messageHistory.length > 100) {
-            session.messageHistory.shift()
+            // Store message in history and update session
+            updatedSession.lastEventId = eventId
+            updatedSession.lastActivity = new Date()
+            await sessionStore.addMessage(session.id, eventId, response)
+            await sessionStore.trimMessageHistory(session.id, 100)
+            await sessionStore.update(session.id, updatedSession)
           }
         } else {
           reply.raw.write(': heartbeat\n\n')
@@ -523,43 +563,59 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
       raw.setHeader('Content-type', 'text/event-stream')
       raw.setHeader('Cache-Control', 'no-cache')
 
-      let session: SSESession
-      if (sessionId && app.mcpSessions.has(sessionId)) {
-        session = app.mcpSessions.get(sessionId)!
+      let session: SessionMetadata
+      if (sessionId) {
+        const existingSession = await sessionStore.get(sessionId)
+        if (existingSession) {
+          session = existingSession
+        } else {
+          session = await createSSESession()
+          raw.setHeader('Mcp-Session-Id', session.id)
+        }
       } else {
-        session = createSSESession()
+        session = await createSSESession()
         raw.setHeader('Mcp-Session-Id', session.id)
       }
 
       raw.writeHead(200)
 
-      session.streams.add(reply)
+      let streams = localStreams.get(session.id)
+      if (!streams) {
+        streams = new Set()
+        localStreams.set(session.id, streams)
+      }
+      streams.add(reply)
+      
       app.log.info({
         sessionId: session.id,
-        totalStreams: session.streams.size,
+        totalStreams: streams.size,
         method: 'GET'
       }, 'Added new stream to session')
 
       // Handle resumability with Last-Event-ID
       const lastEventId = request.headers['last-event-id'] as string
-      if (lastEventId && session.messageHistory.length > 0) {
+      if (lastEventId) {
         app.log.info(`Resuming SSE stream from event ID: ${lastEventId}`)
-        replayMessagesFromEventId(session, lastEventId, reply)
+        await replayMessagesFromEventId(session.id, lastEventId, reply)
       }
 
       // Handle connection close
       reply.raw.on('close', () => {
-        app.log.info({
-          sessionId: session.id,
-          remainingStreams: session.streams.size - 1
-        }, 'SSE connection closed')
-
-        session.streams.delete(reply)
-        if (session.streams.size === 0) {
+        const streams = localStreams.get(session.id)
+        if (streams) {
+          streams.delete(reply)
           app.log.info({
-            sessionId: session.id
-          }, 'Last SSE stream closed, cleaning up session')
-          app.mcpSessions.delete(session.id)
+            sessionId: session.id,
+            remainingStreams: streams.size
+          }, 'SSE connection closed')
+
+          if (streams.size === 0) {
+            app.log.info({
+              sessionId: session.id
+            }, 'Last SSE stream closed, cleaning up session')
+            localStreams.delete(session.id)
+            messageBroker.unsubscribe(`mcp/session/${session.id}/message`)
+          }
         }
       })
 
@@ -572,7 +628,10 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
           reply.raw.write(': heartbeat\n\n')
         } catch (error) {
           clearInterval(heartbeatInterval)
-          session.streams.delete(reply)
+          const streams = localStreams.get(session.id)
+          if (streams) {
+            streams.delete(reply)
+          }
         }
       }, 30000) // 30 second heartbeat
       heartbeatInterval.unref()
@@ -589,35 +648,45 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
     }
   })
 
-  app.decorate('mcpSessions', new Map<string, SSESession>())
-
-  app.decorate('mcpBroadcastNotification', (notification: JSONRPCNotification) => {
+  app.decorate('mcpBroadcastNotification', async (notification: JSONRPCNotification) => {
     if (!enableSSE) {
       app.log.warn('Cannot broadcast notification: SSE is disabled')
       return
     }
 
-    for (const session of app.mcpSessions.values()) {
-      if (session.streams.size > 0) {
-        sendSSEMessage(session, notification)
-      }
+    try {
+      await messageBroker.publish('mcp/broadcast/notification', notification)
+    } catch (error) {
+      app.log.error('Failed to broadcast notification:', error)
     }
   })
 
-  app.decorate('mcpSendToSession', (sessionId: string, message: JSONRPCMessage): boolean => {
+  app.decorate('mcpSendToSession', async (sessionId: string, message: JSONRPCMessage): Promise<boolean> => {
     if (!enableSSE) {
       app.log.warn('Cannot send to session: SSE is disabled')
       return false
     }
 
-    const session = app.mcpSessions.get(sessionId)
-    if (!session || session.streams.size === 0) {
+    try {
+      await messageBroker.publish(`mcp/session/${sessionId}/message`, message)
+      return true
+    } catch (error) {
+      app.log.error('Failed to send message to session:', error)
       return false
     }
-
-    sendSSEMessage(session, message)
-    return true
   })
+
+  // Subscribe to broadcast notifications
+  if (enableSSE) {
+    messageBroker.subscribe('mcp/broadcast/notification', (notification) => {
+      // Send to all local streams
+      for (const [sessionId, streams] of localStreams.entries()) {
+        if (streams.size > 0) {
+          sendSSEToStreams(sessionId, notification, streams)
+        }
+      }
+    })
+  }
 
   app.decorate('mcpAddTool', (definition: any, handler?: ToolHandler) => {
     const name = definition.name
