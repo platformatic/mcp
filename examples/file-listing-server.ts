@@ -88,7 +88,7 @@ fastify.addHook('onClose', async () => {
             clearTimeout(timer)
           }
           watcherData.debounceTimers.clear()
-          
+
           watcherData.watcher.close()
         } catch (error) {
           fastify.log.error(`Error closing watcher ${watchId} during shutdown:`, error)
@@ -295,9 +295,9 @@ fastify.mcpAddTool({
 
     // Create file watcher
     const watcher = watch(fullPath, { recursive: true })
-    activeWatchers.set(watchId, { 
-      watcher, 
-      sessionId, 
+    activeWatchers.set(watchId, {
+      watcher,
+      sessionId,
       debounceTimers: new Map<string, NodeJS.Timeout>()
     })
 
@@ -309,7 +309,7 @@ fastify.mcpAddTool({
 
         const fileKey = filename.toString()
         const debounceKey = `${eventType}:${fileKey}`
-        
+
         // Clear existing timer for this file+event combination
         const existingTimer = watcherData.debounceTimers.get(debounceKey)
         if (existingTimer) {
@@ -360,12 +360,12 @@ fastify.mcpAddTool({
                 clearTimeout(timer)
               }
               watcherData.debounceTimers.clear()
-              
+
               watcher.close()
               activeWatchers.delete(watchId)
             }
           }
-          
+
           // Clean up the timer from the map
           watcherData.debounceTimers.delete(debounceKey)
         }, 1000) // 1 second debounce
@@ -462,7 +462,7 @@ fastify.mcpAddTool({
       clearTimeout(timer)
     }
     watcherData.debounceTimers.clear()
-    
+
     watcherData.watcher.close()
     activeWatchers.delete(watchId)
 
