@@ -1,18 +1,18 @@
-import type { FastifyInstance } from 'fastify'
+import type { FastifyPluginAsync } from 'fastify'
+import fp from 'fastify-plugin'
 import type { JSONRPCMessage, JSONRPCNotification } from '../schema.ts'
 import type { SSESession, ToolHandler, ResourceHandler, PromptHandler, MCPTool, MCPResource, MCPPrompt } from '../types.ts'
 import { sendSSEMessage } from '../session/sse-session.ts'
 
-export function registerMCPDecorators (
-  app: FastifyInstance,
-  dependencies: {
-    enableSSE: boolean
-    tools: Map<string, MCPTool>
-    resources: Map<string, MCPResource>
-    prompts: Map<string, MCPPrompt>
-  }
-): void {
-  const { enableSSE, tools, resources, prompts } = dependencies
+interface MCPDecoratorsOptions {
+  enableSSE: boolean
+  tools: Map<string, MCPTool>
+  resources: Map<string, MCPResource>
+  prompts: Map<string, MCPPrompt>
+}
+
+const mcpDecoratorsPlugin: FastifyPluginAsync<MCPDecoratorsOptions> = async (app, options) => {
+  const { enableSSE, tools, resources, prompts } = options
 
   app.decorate('mcpSessions', new Map<string, SSESession>())
 
@@ -68,3 +68,7 @@ export function registerMCPDecorators (
     prompts.set(name, { definition, handler })
   })
 }
+
+export default fp(mcpDecoratorsPlugin, {
+  name: 'mcp-decorators'
+})

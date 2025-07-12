@@ -1,4 +1,5 @@
-import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify'
+import type { FastifyRequest, FastifyReply, FastifyPluginAsync } from 'fastify'
+import fp from 'fastify-plugin'
 import type { JSONRPCMessage } from '../schema.ts'
 import { JSONRPC_VERSION, INTERNAL_ERROR } from '../schema.ts'
 import type { SSESession, MCPPluginOptions, MCPTool, MCPResource, MCPPrompt } from '../types.ts'
@@ -10,19 +11,18 @@ import {
   replayMessagesFromEventId
 } from '../session/sse-session.ts'
 
-export function registerMCPRoutes (
-  app: FastifyInstance,
-  dependencies: {
-    enableSSE: boolean
-    opts: MCPPluginOptions
-    capabilities: any
-    serverInfo: any
-    tools: Map<string, MCPTool>
-    resources: Map<string, MCPResource>
-    prompts: Map<string, MCPPrompt>
-  }
-): void {
-  const { enableSSE, opts, capabilities, serverInfo, tools, resources, prompts } = dependencies
+interface MCPRoutesOptions {
+  enableSSE: boolean
+  opts: MCPPluginOptions
+  capabilities: any
+  serverInfo: any
+  tools: Map<string, MCPTool>
+  resources: Map<string, MCPResource>
+  prompts: Map<string, MCPPrompt>
+}
+
+const mcpRoutesPlugin: FastifyPluginAsync<MCPRoutesOptions> = async (app, options) => {
+  const { enableSSE, opts, capabilities, serverInfo, tools, resources, prompts } = options
 
   app.post('/mcp', async (request: FastifyRequest, reply: FastifyReply) => {
     try {
@@ -234,3 +234,7 @@ export function registerMCPRoutes (
     }
   })
 }
+
+export default fp(mcpRoutesPlugin, {
+  name: 'mcp-routes'
+})

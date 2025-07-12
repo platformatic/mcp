@@ -5,8 +5,8 @@ import type {
   Implementation
 } from './schema.ts'
 import type { MCPPluginOptions, MCPTool, MCPResource, MCPPrompt } from './types.ts'
-import { registerMCPRoutes } from './routes/mcp-routes.ts'
-import { registerMCPDecorators } from './decorators/mcp-decorators.ts'
+import mcpRoutesPlugin from './routes/mcp-routes.ts'
+import mcpDecoratorsPlugin from './decorators/mcp-decorators.ts'
 
 export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) {
   const serverInfo: Implementation = opts.serverInfo ?? {
@@ -26,7 +26,7 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
   const prompts = new Map<string, MCPPrompt>()
 
   // Register decorators first
-  registerMCPDecorators(app, {
+  await app.register(mcpDecoratorsPlugin, {
     enableSSE,
     tools,
     resources,
@@ -34,7 +34,7 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
   })
 
   // Register routes
-  registerMCPRoutes(app, {
+  await app.register(mcpRoutesPlugin, {
     enableSSE,
     opts,
     capabilities,
