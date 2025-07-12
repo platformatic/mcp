@@ -36,7 +36,7 @@ export function replayMessagesFromEventId (session: SSESession, lastEventId: str
     const messagesToReplay = session.messageHistory.slice(lastIndex + 1)
 
     for (const entry of messagesToReplay) {
-      const sseEvent = `id: ${entry.eventId}\\ndata: ${JSON.stringify(entry.message)}\\n\\n`
+      const sseEvent = `id: ${entry.eventId}\ndata: ${JSON.stringify(entry.message)}\n\n`
       try {
         stream.raw.write(sseEvent)
       } catch (error) {
@@ -55,7 +55,7 @@ export function replayMessagesFromEventId (session: SSESession, lastEventId: str
 
 export function sendSSEMessage (session: SSESession, message: JSONRPCMessage, sessions: Map<string, SSESession>, app: FastifyInstance): void {
   const eventId = (++session.eventId).toString()
-  const sseEvent = `id: ${eventId}\\ndata: ${JSON.stringify(message)}\\n\\n`
+  const sseEvent = `id: ${eventId}\ndata: ${JSON.stringify(message)}\n\n`
   session.lastEventId = eventId
 
   // Store message in history for resumability

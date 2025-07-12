@@ -94,7 +94,7 @@ export function registerMCPRoutes (
         if (response) {
           // Send the SSE event but keep the stream open
           const eventId = (++session.eventId).toString()
-          const sseEvent = `id: ${eventId}\\ndata: ${JSON.stringify(response)}\\n\\n`
+          const sseEvent = `id: ${eventId}\ndata: ${JSON.stringify(response)}\n\n`
           reply.raw.write(sseEvent)
 
           // Store message in history for resumability
@@ -104,7 +104,7 @@ export function registerMCPRoutes (
             session.messageHistory.shift()
           }
         } else {
-          reply.raw.write(': heartbeat\\n\\n')
+          reply.raw.write(': heartbeat\n\n')
         }
       } else {
         // Regular JSON response
@@ -196,12 +196,12 @@ export function registerMCPRoutes (
       }
 
       // Send initial heartbeat
-      reply.raw.write(': heartbeat\\n\\n')
+      reply.raw.write(': heartbeat\n\n')
 
       // Keep connection alive with periodic heartbeats
       const heartbeatInterval = setInterval(() => {
         try {
-          reply.raw.write(': heartbeat\\n\\n')
+          reply.raw.write(': heartbeat\n\n')
         } catch (error) {
           clearInterval(heartbeatInterval)
           session.streams.delete(reply)
