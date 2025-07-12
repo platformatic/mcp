@@ -13,6 +13,7 @@ This is a Fastify adapter for the Model Context Protocol (MCP). The project impl
 - **Lint Fix**: `npm run lint:fix` - Run ESLint with auto-fix
 - **Type Check**: `npm run typecheck` - Run TypeScript compiler without emitting files
 - **Test**: `npm run test` - Run Node.js test runner on test files
+- **Test Individual**: `node --experimental-strip-types --no-warnings --test test/filename.test.ts` - Run a specific test file
 - **CI**: `npm run ci` - Full CI pipeline (build + lint + test)
 
 ## Architecture

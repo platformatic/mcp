@@ -1,4 +1,5 @@
 import { test, describe } from 'node:test'
+import type { TestContext } from 'node:test'
 import Fastify from 'fastify'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
@@ -13,10 +14,10 @@ import {
 import mcpPlugin from '../src/index.ts'
 
 describe('MCP Integration Tests', () => {
-  test('should handle full MCP workflow with SDK client', async (t) => {
+  test('should handle full MCP workflow with SDK client', async (t: TestContext) => {
     // Create Fastify server with MCP plugin
     const app = Fastify({ logger: false })
-    
+
     // Register MCP plugin with tools, resources, and prompts
     await app.register(mcpPlugin, {
       serverInfo: { name: 'test-server', version: '1.0.0' },
@@ -82,7 +83,7 @@ describe('MCP Integration Tests', () => {
         description: 'Programming language',
         required: true
       }]
-    }, async (name, args) => {
+    }, async (_, args) => {
       const language = args?.language || 'javascript'
       return {
         messages: [{
@@ -98,9 +99,9 @@ describe('MCP Integration Tests', () => {
     await app.ready()
 
     // Start the server
-    const address = await app.listen({ port: 0, host: '127.0.0.1' })
+    await app.listen({ port: 0, host: '127.0.0.1' })
     const port = (app.server.address() as any)?.port
-    
+
     t.after(async () => {
       await app.close()
     })
@@ -171,7 +172,7 @@ describe('MCP Integration Tests', () => {
       }, CallToolResultSchema)
 
       t.assert.strictEqual(errorResult.isError, true)
-      t.assert.ok(errorResult.content[0].text.includes('Invalid operation'))
+      t.assert.ok((errorResult.content[0].text as string).includes('Invalid operation'))
 
       // Test resources listing
       const resourcesResult = await client.request({
@@ -190,7 +191,7 @@ describe('MCP Integration Tests', () => {
 
       t.assert.strictEqual(configResult.contents[0].uri, 'config://settings.json')
       t.assert.strictEqual(configResult.contents[0].mimeType, 'application/json')
-      const config = JSON.parse(configResult.contents[0].text)
+      const config = JSON.parse(configResult.contents[0].text as string)
       t.assert.strictEqual(config.mode, 'test')
       t.assert.strictEqual(config.debug, true)
 
@@ -214,22 +215,21 @@ describe('MCP Integration Tests', () => {
 
       t.assert.strictEqual(promptResult.messages.length, 1)
       t.assert.strictEqual(promptResult.messages[0].role, 'user')
-      t.assert.ok(promptResult.messages[0].content.text.includes('typescript'))
-
+      t.assert.ok((promptResult.messages[0].content.text as string).includes('typescript'))
     } catch (error) {
       t.assert.fail(`MCP SDK integration test failed: ${error}`)
     }
   })
 
-  test('should handle errors properly with SDK client', async (t) => {
+  test('should handle errors properly with SDK client', async (t: TestContext) => {
     const app = Fastify({ logger: false })
-    
+
     await app.register(mcpPlugin)
     await app.ready()
 
-    const address = await app.listen({ port: 0, host: '127.0.0.1' })
+    await app.listen({ port: 0, host: '127.0.0.1' })
     const port = (app.server.address() as any)?.port
-    
+
     t.after(async () => {
       await app.close()
     })
@@ -286,11 +286,11 @@ describe('MCP Integration Tests', () => {
     }
   })
 
-  test('should handle tools without handlers using SDK client', async (t) => {
+  test('should handle tools without handlers using SDK client', async (t: TestContext) => {
     const app = Fastify({ logger: false })
-    
+
     await app.register(mcpPlugin)
-    
+
     // Add tool without handler
     app.mcpAddTool({
       name: 'no-handler-tool',
@@ -300,9 +300,9 @@ describe('MCP Integration Tests', () => {
 
     await app.ready()
 
-    const address = await app.listen({ port: 0, host: '127.0.0.1' })
+    await app.listen({ port: 0, host: '127.0.0.1' })
     const port = (app.server.address() as any)?.port
-    
+
     t.after(async () => {
       await app.close()
     })
@@ -341,6 +341,6 @@ describe('MCP Integration Tests', () => {
     }, CallToolResultSchema)
 
     t.assert.strictEqual(callResult.isError, true)
-    t.assert.ok(callResult.content[0].text.includes('no handler implementation'))
+    t.assert.ok((callResult.content[0].text as string).includes('no handler implementation'))
   })
 })
