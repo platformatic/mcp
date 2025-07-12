@@ -1,8 +1,6 @@
-import type { MQEmitter } from 'mqemitter'
+import mqemitter, { type MQEmitter } from 'mqemitter'
 import type { JSONRPCMessage } from '../schema.ts'
 import type { MessageBroker } from './message-broker.ts'
-
-const mqemitter = require('mqemitter')
 
 export class MemoryMessageBroker implements MessageBroker {
   private emitter: MQEmitter

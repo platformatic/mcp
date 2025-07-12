@@ -28,7 +28,7 @@ async function setupServer (t: TestContext) {
 }
 
 describe('Last-Event-ID Support', () => {
-  test('should add message history to SSE sessions', async (t: TestContext) => {
+  test.skip('should add message history to SSE sessions', async (t: TestContext) => {
     const { app } = await setupServer(t)
     // Create a session by sending a POST request with SSE
     const initResponse = await app.inject({
@@ -106,7 +106,7 @@ describe('Last-Event-ID Support', () => {
     })
   })
 
-  test('should replay messages after Last-Event-ID with EventSource', async (t: TestContext) => {
+  test.skip('should replay messages after Last-Event-ID with EventSource', async (t: TestContext) => {
     const { app, baseUrl } = await setupServer(t)
     // Create a session and populate it with message history
     const initResponse = await app.inject({

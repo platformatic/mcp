@@ -667,6 +667,12 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
       return false
     }
 
+    // Check if there are local streams for this session
+    const streams = localStreams.get(sessionId)
+    if (!streams || streams.size === 0) {
+      return false
+    }
+
     try {
       await messageBroker.publish(`mcp/session/${sessionId}/message`, message)
       return true

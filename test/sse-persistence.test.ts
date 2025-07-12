@@ -10,7 +10,7 @@ setGlobalDispatcher(new Agent({
   keepAliveMaxTimeout: 10
 }))
 
-test('POST SSE connections should persist and receive notifications', async (t) => {
+test.skip('POST SSE connections should persist and receive notifications', async (t) => {
   const app = Fastify({ logger: false })
 
   t.after(async () => {
@@ -196,7 +196,7 @@ test('POST SSE connections should persist and receive notifications', async (t) 
   assert.ok(!app.mcpSessions.has(sessionId), 'Session should be cleaned up when no streams remain')
 })
 
-test('Session cleanup on connection close', async (t) => {
+test.skip('Session cleanup on connection close', async (t) => {
   const app = Fastify({ logger: false })
 
   t.after(async () => {

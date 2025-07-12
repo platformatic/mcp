@@ -469,15 +469,16 @@ describe('MCP Fastify Plugin', () => {
       t.assert.strictEqual(body.id, 1)
     })
 
-    test('should provide mcpSessions decorator', async (t: TestContext) => {
+    test('should provide session management through interfaces', async (t: TestContext) => {
       const app = Fastify()
       t.after(() => app.close())
 
       await app.register(mcpPlugin, { enableSSE: true })
       await app.ready()
 
-      t.assert.ok(app.mcpSessions instanceof Map)
-      t.assert.strictEqual(app.mcpSessions.size, 0)
+      // Session management is now internal, verify SSE endpoints exist
+      t.assert.ok(typeof app.mcpBroadcastNotification === 'function')
+      t.assert.ok(typeof app.mcpSendToSession === 'function')
     })
 
     test('should provide notification broadcasting decorators', async (t: TestContext) => {
@@ -491,13 +492,13 @@ describe('MCP Fastify Plugin', () => {
       t.assert.ok(typeof app.mcpSendToSession === 'function')
 
       // Test that they don't throw when called with no sessions
-      app.mcpBroadcastNotification({
+      await app.mcpBroadcastNotification({
         jsonrpc: JSONRPC_VERSION,
         method: 'notifications/message',
         params: { text: 'test' }
       })
 
-      const result = app.mcpSendToSession('nonexistent', {
+      const result = await app.mcpSendToSession('nonexistent', {
         jsonrpc: JSONRPC_VERSION,
         method: 'notifications/message',
         params: { text: 'test' }
