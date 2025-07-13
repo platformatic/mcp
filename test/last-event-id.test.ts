@@ -87,13 +87,16 @@ describe('Last-Event-ID Support', () => {
     const eventSource = new EventSource(`${baseUrl}/mcp`)
 
     eventSource.addEventListener('open', () => {
-      // For this simplified test, we just need to verify EventSource works
-      // Broadcast a notification to create some server activity
-      app.mcpBroadcastNotification({
-        jsonrpc: '2.0',
-        method: 'notifications/message',
-        params: { level: 'info', message: 'Test message for replay' }
-      })
+      // Add a small delay to ensure the stream is fully set up in localStreams
+      setTimeout(() => {
+        // For this simplified test, we just need to verify EventSource works
+        // Broadcast a notification to create some server activity
+        app.mcpBroadcastNotification({
+          jsonrpc: '2.0',
+          method: 'notifications/message',
+          params: { level: 'info', message: 'Test message for replay' }
+        })
+      }, 50)
     })
 
     eventSource.onerror = () => {

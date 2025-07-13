@@ -2,7 +2,6 @@ import { test } from 'node:test'
 import { strict as assert } from 'node:assert'
 import Fastify from 'fastify'
 import { request, Agent, setGlobalDispatcher } from 'undici'
-import { Readable } from 'node:stream'
 import mcpPlugin from '../src/index.ts'
 
 setGlobalDispatcher(new Agent({
