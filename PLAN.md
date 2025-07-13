@@ -219,24 +219,24 @@ Add required packages:
 ## Step-by-Step Implementation Checklist
 
 ### Phase 1: Core Interfaces
-- [ ] Create `src/stores/session-store.ts` with SessionStore interface
-- [ ] Create `src/brokers/message-broker.ts` with MessageBroker interface
-- [ ] Define SessionMetadata type without stream references
-- [ ] Add message history operations to SessionStore interface
+- [x] Create `src/stores/session-store.ts` with SessionStore interface
+- [x] Create `src/brokers/message-broker.ts` with MessageBroker interface
+- [x] Define SessionMetadata type without stream references
+- [x] Add message history operations to SessionStore interface
 
 ### Phase 2: Memory Implementations
-- [ ] Implement `src/stores/memory-session-store.ts`
-- [ ] Implement `src/brokers/memory-message-broker.ts` using local MQEmitter
+- [x] Implement `src/stores/memory-session-store.ts`
+- [x] Implement `src/brokers/memory-message-broker.ts` using local MQEmitter
 - [ ] Add unit tests for memory implementations
-- [ ] Ensure 100% backward compatibility with existing behavior
+- [x] Ensure 100% backward compatibility with existing behavior
 
 ### Phase 3: Plugin Integration
-- [ ] Replace `app.mcpSessions` Map with SessionStore in `src/index.ts`
-- [ ] Add local `Map<string, Set<FastifyReply>>` for stream management per server
-- [ ] Replace `sendSSEMessage` with MessageBroker.publish calls
-- [ ] Replace `mcpBroadcastNotification` with pub/sub pattern
-- [ ] Update SSE connection handlers to use new interfaces
-- [ ] Add proper subscription/unsubscription on stream connect/disconnect
+- [x] Replace `app.mcpSessions` Map with SessionStore in `src/index.ts`
+- [x] Add local `Map<string, Set<FastifyReply>>` for stream management per server
+- [x] Replace `sendSSEMessage` with MessageBroker.publish calls
+- [x] Replace `mcpBroadcastNotification` with pub/sub pattern
+- [x] Update SSE connection handlers to use new interfaces
+- [x] Add proper subscription/unsubscription on stream connect/disconnect
 
 ### Phase 4: Configuration
 - [ ] Add plugin options for sessionStore and messageBroker selection

@@ -10,7 +10,7 @@ setGlobalDispatcher(new Agent({
   keepAliveMaxTimeout: 10
 }))
 
-test.skip('POST SSE connections should persist and receive notifications', async (t) => {
+test('POST SSE connections should persist and receive notifications', async (t) => {
   const app = Fastify({ logger: false })
 
   t.after(async () => {
@@ -101,13 +101,15 @@ test.skip('POST SSE connections should persist and receive notifications', async
   const sessionId = initResponse.headers['mcp-session-id'] as string
   assert.ok(sessionId, 'Session ID should be provided')
 
-  // Test 2: Check that session has active streams
-  const sessionExists = app.mcpSessions.has(sessionId)
-  assert.ok(sessionExists, 'Session should exist')
-
-  const session = app.mcpSessions.get(sessionId)
-  assert.ok(session, 'Session should be retrievable')
-  assert.strictEqual(session.streams.size, 1, 'Session should have 1 active stream')
+  // Test 2: Verify session is working by testing message sending
+  // With the new architecture, session management is internal
+  // We verify functionality by testing that messages can be sent to the session
+  const canSendMessage = await app.mcpSendToSession(sessionId, {
+    jsonrpc: '2.0',
+    method: 'notifications/test',
+    params: { message: 'test connectivity' }
+  })
+  assert.ok(canSendMessage, 'Should be able to send messages to active session')
 
   // Test 3: Set up stream reading for notifications
   const notificationPromise = new Promise<string>((resolve, reject) => {
@@ -192,11 +194,16 @@ test.skip('POST SSE connections should persist and receive notifications', async
   // Wait a bit for cleanup
   await new Promise(resolve => setTimeout(resolve, 100))
 
-  // Session should be cleaned up
-  assert.ok(!app.mcpSessions.has(sessionId), 'Session should be cleaned up when no streams remain')
+  // Verify session is cleaned up by testing that messages can no longer be sent
+  const canSendAfterClose = await app.mcpSendToSession(sessionId, {
+    jsonrpc: '2.0',
+    method: 'notifications/test',
+    params: { message: 'should fail' }
+  })
+  assert.ok(!canSendAfterClose, 'Should not be able to send messages to cleaned up session')
 })
 
-test.skip('Session cleanup on connection close', async (t) => {
+test('Session cleanup on connection close', async (t) => {
   const app = Fastify({ logger: false })
 
   t.after(async () => {
@@ -241,9 +248,13 @@ test.skip('Session cleanup on connection close', async (t) => {
   const sessionId = response.headers['mcp-session-id'] as string
   assert.ok(sessionId, 'Session ID should be provided')
 
-  // Verify session exists
-  assert.ok(app.mcpSessions.has(sessionId), 'Session should exist')
-  assert.strictEqual(app.mcpSessions.get(sessionId)?.streams.size, 1, 'Should have 1 active stream')
+  // Verify session exists by testing message sending capability
+  const canSend = await app.mcpSendToSession(sessionId, {
+    jsonrpc: '2.0',
+    method: 'notifications/test',
+    params: { message: 'test' }
+  })
+  assert.ok(canSend, 'Should be able to send messages to active session')
 
   // Close the connection
   response.body.destroy()
@@ -251,6 +262,11 @@ test.skip('Session cleanup on connection close', async (t) => {
   // Wait for cleanup
   await new Promise(resolve => setTimeout(resolve, 200))
 
-  // Session should be cleaned up
-  assert.ok(!app.mcpSessions.has(sessionId), 'Session should be cleaned up after connection close')
+  // Verify session is cleaned up
+  const canSendAfterClose = await app.mcpSendToSession(sessionId, {
+    jsonrpc: '2.0',
+    method: 'notifications/test',
+    params: { message: 'should fail' }
+  })
+  assert.ok(!canSendAfterClose, 'Should not be able to send messages after connection close')
 })
