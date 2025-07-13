@@ -239,9 +239,9 @@ Add required packages:
 - [x] Add proper subscription/unsubscription on stream connect/disconnect
 
 ### Phase 4: Configuration
-- [ ] Add plugin options for sessionStore and messageBroker selection
-- [ ] Add Redis configuration options (host, port, password, db)
-- [ ] Set memory implementations as defaults for backward compatibility
+- [x] Add plugin options for sessionStore and messageBroker selection
+- [x] Add Redis configuration options (host, port, password, db)
+- [x] Set memory implementations as defaults for backward compatibility
 - [ ] Add configuration validation
 
 ### Phase 5: Redis Implementations
