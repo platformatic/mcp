@@ -25,12 +25,6 @@ export class MemorySessionStore implements SessionStore {
     return session ? { ...session } : null
   }
 
-  async update (sessionId: string, metadata: SessionMetadata): Promise<void> {
-    if (this.sessions.has(sessionId)) {
-      this.sessions.set(sessionId, { ...metadata })
-    }
-  }
-
   async delete (sessionId: string): Promise<void> {
     this.sessions.delete(sessionId)
     this.messageHistory.delete(sessionId)
@@ -81,12 +75,5 @@ export class MemorySessionStore implements SessionStore {
       eventId: entry.eventId,
       message: entry.message
     }))
-  }
-
-  async trimMessageHistory (sessionId: string, maxMessages: number): Promise<void> {
-    const history = this.messageHistory.get(sessionId)
-    if (history && history.length > maxMessages) {
-      history.splice(0, history.length - maxMessages)
-    }
   }
 }
