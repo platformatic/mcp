@@ -16,7 +16,7 @@ interface MCPPubSubDecoratorsOptions {
 }
 
 const mcpPubSubDecoratorsPlugin: FastifyPluginAsync<MCPPubSubDecoratorsOptions> = async (app, options) => {
-  const { enableSSE, tools, resources, prompts, sessionStore, messageBroker, localStreams } = options
+  const { enableSSE, tools, resources, prompts, messageBroker, localStreams } = options
 
   app.decorate('mcpBroadcastNotification', async (notification: JSONRPCNotification) => {
     if (!enableSSE) {

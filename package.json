@@ -45,6 +45,6 @@
   },
   "dependencies": {
     "fastify-plugin": "^5.0.1",
-    "mqemitter": "^7.0.0"
+    "mqemitter": "^7.1.0"
   }
 }
