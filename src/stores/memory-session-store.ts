@@ -10,28 +10,28 @@ export class MemorySessionStore implements SessionStore {
   private sessions = new Map<string, SessionMetadata>()
   private messageHistory = new Map<string, MessageHistoryEntry[]>()
 
-  async create(metadata: SessionMetadata): Promise<void> {
+  async create (metadata: SessionMetadata): Promise<void> {
     this.sessions.set(metadata.id, { ...metadata })
     this.messageHistory.set(metadata.id, [])
   }
 
-  async get(sessionId: string): Promise<SessionMetadata | null> {
+  async get (sessionId: string): Promise<SessionMetadata | null> {
     const session = this.sessions.get(sessionId)
     return session ? { ...session } : null
   }
 
-  async update(sessionId: string, metadata: SessionMetadata): Promise<void> {
+  async update (sessionId: string, metadata: SessionMetadata): Promise<void> {
     if (this.sessions.has(sessionId)) {
       this.sessions.set(sessionId, { ...metadata })
     }
   }
 
-  async delete(sessionId: string): Promise<void> {
+  async delete (sessionId: string): Promise<void> {
     this.sessions.delete(sessionId)
     this.messageHistory.delete(sessionId)
   }
 
-  async cleanup(): Promise<void> {
+  async cleanup (): Promise<void> {
     const now = new Date()
     const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000)
 
@@ -42,7 +42,7 @@ export class MemorySessionStore implements SessionStore {
     }
   }
 
-  async addMessage(sessionId: string, eventId: string, message: JSONRPCMessage): Promise<void> {
+  async addMessage (sessionId: string, eventId: string, message: JSONRPCMessage): Promise<void> {
     let history = this.messageHistory.get(sessionId)
     if (!history) {
       history = []
@@ -52,10 +52,10 @@ export class MemorySessionStore implements SessionStore {
     history.push({ eventId, message })
   }
 
-  async getMessagesFrom(sessionId: string, fromEventId: string): Promise<Array<{ eventId: string, message: JSONRPCMessage }>> {
+  async getMessagesFrom (sessionId: string, fromEventId: string): Promise<Array<{ eventId: string, message: JSONRPCMessage }>> {
     const history = this.messageHistory.get(sessionId) || []
     const fromIndex = history.findIndex(entry => entry.eventId === fromEventId)
-    
+
     if (fromIndex === -1) {
       return []
     }
@@ -66,7 +66,7 @@ export class MemorySessionStore implements SessionStore {
     }))
   }
 
-  async trimMessageHistory(sessionId: string, maxMessages: number): Promise<void> {
+  async trimMessageHistory (sessionId: string, maxMessages: number): Promise<void> {
     const history = this.messageHistory.get(sessionId)
     if (history && history.length > maxMessages) {
       history.splice(0, history.length - maxMessages)

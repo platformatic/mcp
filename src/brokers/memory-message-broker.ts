@@ -6,11 +6,11 @@ export class MemoryMessageBroker implements MessageBroker {
   private emitter: MQEmitter
   private subscriptions = new Map<string, { handler: (message: JSONRPCMessage) => void, listener: (message: any, done: () => void) => void }>()
 
-  constructor() {
+  constructor () {
     this.emitter = mqemitter()
   }
 
-  async publish(topic: string, message: JSONRPCMessage): Promise<void> {
+  async publish (topic: string, message: JSONRPCMessage): Promise<void> {
     return new Promise((resolve, reject) => {
       this.emitter.emit({ topic, message }, (err) => {
         if (err) {
@@ -22,7 +22,7 @@ export class MemoryMessageBroker implements MessageBroker {
     })
   }
 
-  async subscribe(topic: string, handler: (message: JSONRPCMessage) => void): Promise<void> {
+  async subscribe (topic: string, handler: (message: JSONRPCMessage) => void): Promise<void> {
     return new Promise((resolve, reject) => {
       const listener = (data: any, cb: () => void) => {
         try {
@@ -46,7 +46,7 @@ export class MemoryMessageBroker implements MessageBroker {
     })
   }
 
-  async unsubscribe(topic: string): Promise<void> {
+  async unsubscribe (topic: string): Promise<void> {
     return new Promise((resolve, reject) => {
       const subscription = this.subscriptions.get(topic)
       if (!subscription) {
@@ -65,7 +65,7 @@ export class MemoryMessageBroker implements MessageBroker {
     })
   }
 
-  async close(): Promise<void> {
+  async close (): Promise<void> {
     return new Promise((resolve, reject) => {
       this.emitter.close((err?: any) => {
         if (err) {

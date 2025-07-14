@@ -67,18 +67,18 @@ describe('Last-Event-ID Support', () => {
 
     // With the new architecture, session management is internal
     // We verify functionality by testing message history via subsequent requests
-    
+
     // With the new architecture, verify the session functionality works
     // by testing that we can send a message to the session
     const canSendMessage = await app.mcpSendToSession(sessionId, {
       jsonrpc: '2.0',
-      method: 'notifications/test', 
+      method: 'notifications/test',
       params: { message: 'test message history functionality' }
     })
-    
+
     t.assert.ok(canSendMessage, 'Should be able to send messages to active session')
     t.assert.ok(sessionId, 'Session ID should be present for message history tracking')
-    
+
     initResponse.stream().destroy()
   })
 
@@ -165,7 +165,7 @@ describe('Last-Event-ID Support', () => {
 
     await app.mcpSendToSession(sessionId, {
       jsonrpc: '2.0',
-      method: 'notifications/message', 
+      method: 'notifications/message',
       params: { level: 'info', message: 'Message 2' }
     })
 

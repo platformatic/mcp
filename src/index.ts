@@ -32,7 +32,7 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
   // Initialize stores and brokers
   const sessionStore: SessionStore = new MemorySessionStore()
   const messageBroker: MessageBroker = new MemoryMessageBroker()
-  
+
   // Local stream management per server instance
   const localStreams = new Map<string, Set<any>>()
 

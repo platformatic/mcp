@@ -115,12 +115,12 @@ test('POST SSE connections should persist and receive notifications', async (t) 
   const testNotificationSent = await app.mcpSendToSession(sessionId, {
     jsonrpc: '2.0',
     method: 'notifications/test',
-    params: { 
+    params: {
       message: 'test persistence',
       timestamp: new Date().toISOString()
     }
   })
-  
+
   assert.ok(testNotificationSent, 'Should be able to send notification to active session')
 
   // Trigger the notification

@@ -33,10 +33,10 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
       createdAt: new Date(),
       lastActivity: new Date()
     }
-    
+
     await sessionStore.create(session)
     localStreams.set(sessionId, new Set())
-    
+
     // Subscribe to messages for this session
     await messageBroker.subscribe(`mcp/session/${sessionId}/message`, (message) => {
       const streams = localStreams.get(sessionId)
@@ -44,7 +44,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         sendSSEToStreams(sessionId, message, streams)
       }
     })
-    
+
     return session
   }
 
@@ -164,7 +164,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
           localStreams.set(session.id, streams)
         }
         streams.add(reply)
-        
+
         app.log.info({
           sessionId: session.id,
           totalStreams: streams.size,
@@ -306,7 +306,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         localStreams.set(session.id, streams)
       }
       streams.add(reply)
-      
+
       app.log.info({
         sessionId: session.id,
         totalStreams: streams.size,

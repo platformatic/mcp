@@ -14,7 +14,7 @@ export interface SessionStore {
   update(sessionId: string, metadata: SessionMetadata): Promise<void>
   delete(sessionId: string): Promise<void>
   cleanup(): Promise<void>
-  
+
   // Message history operations
   addMessage(sessionId: string, eventId: string, message: JSONRPCMessage): Promise<void>
   getMessagesFrom(sessionId: string, fromEventId: string): Promise<Array<{ eventId: string, message: JSONRPCMessage }>>
