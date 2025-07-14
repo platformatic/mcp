@@ -83,45 +83,26 @@ describe('Last-Event-ID Support', () => {
   })
 
   test('should handle GET request with Last-Event-ID using EventSource', async (t) => {
-    const { app, baseUrl } = await setupServer(t)
+    const { baseUrl } = await setupServer(t)
     const eventSource = new EventSource(`${baseUrl}/mcp`)
 
-    let connected = false
-    eventSource.addEventListener('open', () => {
-      connected = true
-      // Add a small delay to ensure the stream is fully set up in localStreams
-      setTimeout(() => {
-        // For this simplified test, we just need to verify EventSource works
-        // Broadcast a notification to create some server activity
-        app.mcpBroadcastNotification({
-          jsonrpc: '2.0',
-          method: 'notifications/message',
-          params: { level: 'info', message: 'Test message for replay' }
-        })
-      }, 100)
-    })
-
-    eventSource.onerror = () => {
-      eventSource.close()
-      t.assert.fail('EventSource error occurred')
-    }
-
     await new Promise<void>((resolve, reject) => {
-      // Set a timeout to prevent hanging
       const timeout = setTimeout(() => {
         eventSource.close()
-        if (connected) {
-          // If we connected successfully, that's good enough for this test
-          resolve()
-        } else {
-          reject(new Error('EventSource failed to connect within timeout'))
-        }
+        reject(new Error('EventSource test timeout'))
       }, 2000)
 
-      eventSource.onmessage = () => {
+      eventSource.addEventListener('open', () => {
+        // EventSource connected successfully
         clearTimeout(timeout)
         eventSource.close()
         resolve()
+      })
+
+      eventSource.onerror = () => {
+        clearTimeout(timeout)
+        eventSource.close()
+        reject(new Error('EventSource error occurred'))
       }
     })
   })

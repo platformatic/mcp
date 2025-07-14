@@ -70,8 +70,6 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
     // Store message in history
     await sessionStore.addMessage(sessionId, eventId, message)
-    await sessionStore.trimMessageHistory(sessionId, 100)
-    await sessionStore.update(sessionId, session)
 
     // Send to all connected streams in this session
     const deadStreams = new Set<FastifyReply>()
@@ -79,7 +77,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
       try {
         stream.raw.write(sseEvent)
       } catch (error) {
-        app.log.error('Failed to write SSE event:', error)
+        app.log.error({ err: error }, 'Failed to write SSE event')
         deadStreams.add(stream)
       }
     }
@@ -108,7 +106,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         try {
           stream.raw.write(sseEvent)
         } catch (error) {
-          app.log.error('Failed to replay SSE event:', error)
+          app.log.error({ err: error }, 'Failed to replay SSE event')
           break
         }
       }
@@ -117,7 +115,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         app.log.info(`Replayed ${messagesToReplay.length} messages from event ID: ${lastEventId}`)
       }
     } catch (error) {
-      app.log.warn(`Failed to replay messages from event ID ${lastEventId}:`, error)
+      app.log.warn({ err: error, lastEventId }, 'Failed to replay messages from event ID')
     }
   }
 
@@ -210,11 +208,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
             reply.raw.write(sseEvent)
 
             // Store message in history and update session
-            updatedSession.lastEventId = eventId
-            updatedSession.lastActivity = new Date()
             await sessionStore.addMessage(session.id, eventId, response)
-            await sessionStore.trimMessageHistory(session.id, 100)
-            await sessionStore.update(session.id, updatedSession)
           }
         } else {
           reply.raw.write(': heartbeat\\n\\n')
@@ -237,7 +231,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         }
       }
     } catch (error) {
-      app.log.error('Error processing MCP message:', error)
+      app.log.error({ err: error }, 'Error processing MCP message')
       reply.type('application/json').code(500).send({
         jsonrpc: JSONRPC_VERSION,
         id: null,
@@ -364,7 +358,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         clearInterval(heartbeatInterval)
       })
     } catch (error) {
-      app.log.error('Error setting up SSE stream:', error)
+      app.log.error({ err: error }, 'Error setting up SSE stream')
       reply.type('application/json').code(500).send({ error: 'Internal server error' })
     }
   })

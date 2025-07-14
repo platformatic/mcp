@@ -17,7 +17,7 @@ interface MCPPubSubDecoratorsOptions {
 }
 
 const mcpPubSubDecoratorsPlugin: FastifyPluginAsync<MCPPubSubDecoratorsOptions> = async (app, options) => {
-  const { enableSSE, tools, resources, prompts, messageBroker, localStreams } = options
+  const { enableSSE, tools, resources, prompts, messageBroker, sessionStore, localStreams } = options
 
   // Register the base MCP decorators
   await app.register(mcpDecoratorsPlugin, { tools, resources, prompts })
@@ -31,7 +31,7 @@ const mcpPubSubDecoratorsPlugin: FastifyPluginAsync<MCPPubSubDecoratorsOptions> 
     try {
       await messageBroker.publish('mcp/broadcast/notification', notification)
     } catch (error) {
-      app.log.error('Failed to broadcast notification:', error)
+      app.log.error({ err: error }, 'Failed to broadcast notification')
     }
   })
 
@@ -41,7 +41,13 @@ const mcpPubSubDecoratorsPlugin: FastifyPluginAsync<MCPPubSubDecoratorsOptions> 
       return false
     }
 
-    // Check if there are local streams for this session
+    // Check if session exists in store
+    const session = await sessionStore.get(sessionId)
+    if (!session) {
+      return false
+    }
+
+    // Check if there are active streams for this session
     const streams = localStreams.get(sessionId)
     if (!streams || streams.size === 0) {
       return false
@@ -51,11 +57,10 @@ const mcpPubSubDecoratorsPlugin: FastifyPluginAsync<MCPPubSubDecoratorsOptions> 
       await messageBroker.publish(`mcp/session/${sessionId}/message`, message)
       return true
     } catch (error) {
-      app.log.error('Failed to send message to session:', error)
+      app.log.error({ err: error }, 'Failed to send message to session')
       return false
     }
   })
-
 }
 
 export default fp(mcpPubSubDecoratorsPlugin, {

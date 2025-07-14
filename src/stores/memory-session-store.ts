@@ -9,6 +9,11 @@ interface MessageHistoryEntry {
 export class MemorySessionStore implements SessionStore {
   private sessions = new Map<string, SessionMetadata>()
   private messageHistory = new Map<string, MessageHistoryEntry[]>()
+  private maxMessages: number
+
+  constructor (maxMessages: number = 100) {
+    this.maxMessages = maxMessages
+  }
 
   async create (metadata: SessionMetadata): Promise<void> {
     this.sessions.set(metadata.id, { ...metadata })
@@ -50,6 +55,18 @@ export class MemorySessionStore implements SessionStore {
     }
 
     history.push({ eventId, message })
+
+    // Auto-trim using constructor maxMessages
+    if (history.length > this.maxMessages) {
+      history.splice(0, history.length - this.maxMessages)
+    }
+
+    // Update session metadata
+    const session = this.sessions.get(sessionId)
+    if (session) {
+      session.lastEventId = eventId
+      session.lastActivity = new Date()
+    }
   }
 
   async getMessagesFrom (sessionId: string, fromEventId: string): Promise<Array<{ eventId: string, message: JSONRPCMessage }>> {
