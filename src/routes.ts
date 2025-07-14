@@ -1,12 +1,12 @@
 import { randomUUID } from 'crypto'
 import type { FastifyRequest, FastifyReply, FastifyPluginAsync } from 'fastify'
 import fp from 'fastify-plugin'
-import type { JSONRPCMessage } from '../schema.ts'
-import { JSONRPC_VERSION, INTERNAL_ERROR } from '../schema.ts'
-import type { MCPPluginOptions, MCPTool, MCPResource, MCPPrompt } from '../types.ts'
-import type { SessionStore, SessionMetadata } from '../stores/session-store.ts'
-import type { MessageBroker } from '../brokers/message-broker.ts'
-import { processMessage } from '../handlers/mcp-handlers.ts'
+import type { JSONRPCMessage } from './schema.ts'
+import { JSONRPC_VERSION, INTERNAL_ERROR } from './schema.ts'
+import type { MCPPluginOptions, MCPTool, MCPResource, MCPPrompt } from './types.ts'
+import type { SessionStore, SessionMetadata } from './stores/session-store.ts'
+import type { MessageBroker } from './brokers/message-broker.ts'
+import { processMessage } from './handlers.ts'
 
 interface MCPPubSubRoutesOptions {
   enableSSE: boolean

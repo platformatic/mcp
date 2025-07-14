@@ -4,7 +4,7 @@ import type { JSONRPCMessage, JSONRPCNotification } from '../schema.ts'
 import type { MCPTool, MCPResource, MCPPrompt } from '../types.ts'
 import type { SessionStore } from '../stores/session-store.ts'
 import type { MessageBroker } from '../brokers/message-broker.ts'
-import mcpDecoratorsPlugin from './mcp-decorators.ts'
+import mcpDecoratorsPlugin from './decorators.ts'
 
 interface MCPPubSubDecoratorsOptions {
   enableSSE: boolean

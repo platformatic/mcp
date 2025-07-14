@@ -9,8 +9,8 @@ import type { MessageBroker } from './brokers/message-broker.ts'
 import { MemorySessionStore } from './stores/memory-session-store.ts'
 import { MemoryMessageBroker } from './brokers/memory-message-broker.ts'
 import type { MCPPluginOptions, MCPTool, MCPResource, MCPPrompt } from './types.ts'
-import mcpPubSubDecoratorsPlugin from './decorators/mcp-pubsub-decorators.ts'
-import mcpPubSubRoutesPlugin from './routes/mcp-pubsub-routes.ts'
+import mcpPubSubDecoratorsPlugin from './decorators/pubsub-decorators.ts'
+import mcpPubSubRoutesPlugin from './routes.ts'
 
 export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) {
   const serverInfo: Implementation = opts.serverInfo ?? {
