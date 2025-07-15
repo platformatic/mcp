@@ -50,19 +50,19 @@ export class RedisSessionStore implements SessionStore {
   async cleanup (): Promise<void> {
     // Redis TTL handles cleanup automatically for sessions
     // But we can also clean up old message histories
-    let cursor = '0';
+    let cursor = '0'
     do {
-      const [nextCursor, keys] = await this.redis.scan(cursor, 'MATCH', 'session:*:history', 'COUNT', 100);
-      cursor = nextCursor;
+      const [nextCursor, keys] = await this.redis.scan(cursor, 'MATCH', 'session:*:history', 'COUNT', 100)
+      cursor = nextCursor
       for (const key of keys) {
-        const sessionId = key.split(':')[1];
-        const sessionKey = `session:${sessionId}`;
-        const exists = await this.redis.exists(sessionKey);
+        const sessionId = key.split(':')[1]
+        const sessionKey = `session:${sessionId}`
+        const exists = await this.redis.exists(sessionKey)
         if (!exists) {
-          await this.redis.del(key);
+          await this.redis.del(key)
         }
       }
-    } while (cursor !== '0');
+    } while (cursor !== '0')
   }
 
   async addMessage (sessionId: string, eventId: string, message: JSONRPCMessage): Promise<void> {
