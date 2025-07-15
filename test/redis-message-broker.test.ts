@@ -5,8 +5,9 @@ import { testWithRedis } from './redis-test-utils.ts'
 import type { JSONRPCMessage } from '../src/schema.ts'
 
 describe('RedisMessageBroker', () => {
-  testWithRedis('should publish and receive messages', async (redis) => {
+  testWithRedis('should publish and receive messages', async (redis, t) => {
     const broker = new RedisMessageBroker(redis)
+    t.after(() => broker.close())
 
     const testMessage: JSONRPCMessage = {
       jsonrpc: '2.0',
@@ -30,8 +31,6 @@ describe('RedisMessageBroker', () => {
 
     assert.ok(receivedMessage)
     assert.deepStrictEqual(receivedMessage, testMessage)
-
-    await broker.close()
   })
 
   testWithRedis('should handle multiple subscribers to same topic', async (redis, t) => {
@@ -40,6 +39,8 @@ describe('RedisMessageBroker', () => {
 
     const broker1 = new RedisMessageBroker(redis)
     const broker2 = new RedisMessageBroker(redis2)
+    t.after(() => broker1.close())
+    t.after(() => broker2.close())
 
     const testMessage: JSONRPCMessage = {
       jsonrpc: '2.0',
@@ -67,14 +68,11 @@ describe('RedisMessageBroker', () => {
     await messagePromise
 
     assert.strictEqual(receivedCount, 2)
-
-    await broker1.close()
-    await broker2.close()
-    await redis2.disconnect()
   })
 
-  testWithRedis('should handle session-specific topics', async (redis) => {
+  testWithRedis('should handle session-specific topics', async (redis, t) => {
     const broker = new RedisMessageBroker(redis)
+    t.after(() => broker.close())
 
     const sessionId = 'test-session-123'
     const testMessage: JSONRPCMessage = {
@@ -99,12 +97,11 @@ describe('RedisMessageBroker', () => {
 
     assert.ok(receivedMessage)
     assert.deepStrictEqual(receivedMessage, testMessage)
-
-    await broker.close()
   })
 
-  testWithRedis('should handle broadcast notifications', async (redis) => {
+  testWithRedis('should handle broadcast notifications', async (redis, t) => {
     const broker = new RedisMessageBroker(redis)
+    t.after(() => broker.close())
 
     const notification: JSONRPCMessage = {
       jsonrpc: '2.0',
@@ -128,12 +125,11 @@ describe('RedisMessageBroker', () => {
 
     assert.ok(receivedNotification)
     assert.deepStrictEqual(receivedNotification, notification)
-
-    await broker.close()
   })
 
-  testWithRedis('should handle unsubscribe', async (redis) => {
+  testWithRedis('should handle unsubscribe', async (redis, t) => {
     const broker = new RedisMessageBroker(redis)
+    t.after(() => broker.close())
 
     const testMessage: JSONRPCMessage = {
       jsonrpc: '2.0',
@@ -160,12 +156,11 @@ describe('RedisMessageBroker', () => {
     await new Promise(resolve => setTimeout(resolve, 200))
 
     assert.strictEqual(messageReceived, false)
-
-    await broker.close()
   })
 
-  testWithRedis('should handle multiple topics on same broker', async (redis) => {
+  testWithRedis('should handle multiple topics on same broker', async (redis, t) => {
     const broker = new RedisMessageBroker(redis)
+    t.after(() => broker.close())
 
     const message1: JSONRPCMessage = {
       jsonrpc: '2.0',
@@ -204,12 +199,11 @@ describe('RedisMessageBroker', () => {
     assert.strictEqual(receivedMessages.length, 2)
     assert.ok(receivedMessages.some(msg => 'method' in msg && msg.method === 'test1'))
     assert.ok(receivedMessages.some(msg => 'method' in msg && msg.method === 'test2'))
-
-    await broker.close()
   })
 
-  testWithRedis('should handle complex JSON-RPC messages', async (redis) => {
+  testWithRedis('should handle complex JSON-RPC messages', async (redis, t) => {
     const broker = new RedisMessageBroker(redis)
+    t.after(() => broker.close())
 
     const complexMessage: JSONRPCMessage = {
       jsonrpc: '2.0',
@@ -242,12 +236,11 @@ describe('RedisMessageBroker', () => {
 
     assert.ok(receivedMessage)
     assert.deepStrictEqual(receivedMessage, complexMessage)
-
-    await broker.close()
   })
 
-  testWithRedis('should handle broker close gracefully', async (redis) => {
+  testWithRedis('should handle broker close gracefully', async (redis, t) => {
     const broker = new RedisMessageBroker(redis)
+    t.after(() => broker.close())
 
     const testMessage: JSONRPCMessage = {
       jsonrpc: '2.0',
@@ -262,7 +255,6 @@ describe('RedisMessageBroker', () => {
 
     await broker.publish('close-topic', testMessage)
 
-    // Close should not throw
-    await broker.close()
+    // Close should not throw - will be handled by t.after()
   })
 })
