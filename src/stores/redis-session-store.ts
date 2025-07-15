@@ -71,8 +71,8 @@ export class RedisSessionStore implements SessionStore {
     // Add message to Redis stream
     pipeline.xadd(historyKey, `${eventId}-0`, 'message', JSON.stringify(message))
 
-    // Trim to max messages
-    pipeline.xtrim(historyKey, 'MAXLEN', '~', this.maxMessages)
+    // Trim to max messages (exact trimming)
+    pipeline.xtrim(historyKey, 'MAXLEN', this.maxMessages)
 
     // Update session metadata
     pipeline.hset(sessionKey, {
