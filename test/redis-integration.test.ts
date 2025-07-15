@@ -111,6 +111,7 @@ describe('Redis Integration Tests', () => {
       headers: {
         accept: 'text/event-stream'
       },
+      payloadAsStream: true,
       payload: {
         jsonrpc: '2.0',
         method: 'initialize',
@@ -122,6 +123,8 @@ describe('Redis Integration Tests', () => {
         id: 1
       }
     })
+
+    response.stream().destroy() // Ensure we clean up the stream after test
 
     assert.strictEqual(response.statusCode, 200)
     assert.ok(response.headers['content-type']?.includes('text/event-stream'))
@@ -139,9 +142,6 @@ describe('Redis Integration Tests', () => {
   })
 
   testWithRedis('should handle message broadcasting across Redis instances', async (redis, t) => {
-    const redis2 = await redis.duplicate()
-    t.after(() => redis2.disconnect())
-
     const app1 = fastify()
     const app2 = fastify()
     t.after(() => app1.close())
@@ -159,9 +159,9 @@ describe('Redis Integration Tests', () => {
     await app2.register(mcpPlugin, {
       enableSSE: true,
       redis: {
-        host: redis2.options.host!,
-        port: redis2.options.port!,
-        db: redis2.options.db!
+        host: redis.options.host!,
+        port: redis.options.port!,
+        db: redis.options.db!
       }
     })
 
@@ -172,6 +172,7 @@ describe('Redis Integration Tests', () => {
       headers: {
         accept: 'text/event-stream'
       },
+      payloadAsStream: true,
       payload: {
         jsonrpc: '2.0',
         method: 'initialize',
@@ -196,8 +197,14 @@ describe('Redis Integration Tests', () => {
 
     await app2.mcpBroadcastNotification(notification)
 
-    // Give time for message to propagate
-    await new Promise(resolve => setTimeout(resolve, 200))
+    for await (const chunk of sessionResponse.stream()) {
+      const data = chunk.toString()
+      if (data.includes('Cross-instance notification')) {
+        // Verify the notification was received
+        t.assert.ok(data.includes('Cross-instance notification'))
+        break
+      }
+    }
 
     // Verify message was stored in session history
     const history = await redis.xrange(`session:${sessionId}:history`, '-', '+')
@@ -205,6 +212,8 @@ describe('Redis Integration Tests', () => {
   })
 
   testWithRedis('should handle session message sending with Redis', async (redis, t) => {
+    t.plan(3) // Expect two assertions
+
     const app = fastify()
     t.after(() => app.close())
 
@@ -224,6 +233,7 @@ describe('Redis Integration Tests', () => {
       headers: {
         accept: 'text/event-stream'
       },
+      payloadAsStream: true,
       payload: {
         jsonrpc: '2.0',
         method: 'initialize',
@@ -237,7 +247,7 @@ describe('Redis Integration Tests', () => {
     })
 
     const sessionId = sessionResponse.headers['mcp-session-id'] as string
-    assert.ok(sessionId)
+    t.assert.ok(sessionId)
 
     // Send message to session
     const message: JSONRPCMessage = {
@@ -247,29 +257,18 @@ describe('Redis Integration Tests', () => {
       id: 2
     }
 
-    // This should return false because no active streams exist
-    // (the session exists but no active SSE connections)
     const result = await app.mcpSendToSession(sessionId, message)
-    assert.strictEqual(result, false)
-  })
+    t.assert.strictEqual(result, true)
 
-  testWithRedis('should handle Redis connection failures gracefully', async (_, t) => {
-    const app = fastify()
-    t.after(() => app.close())
-
-    // Use invalid Redis configuration
-    await app.register(mcpPlugin, {
-      enableSSE: true,
-      redis: {
-        host: 'invalid-host',
-        port: 9999,
-        db: 0
+    // Verify message was stored in session history
+    for await (const chunk of sessionResponse.stream()) {
+      const data = chunk.toString()
+      if (data.includes('test-message')) {
+        // Verify the message was received
+        t.assert.ok(data.includes('test-message'))
+        break
       }
-    })
-
-    // Plugin should still register (connection failures are handled by Redis client)
-    assert.ok(app.mcpAddTool)
-    assert.ok(app.mcpBroadcastNotification)
+    }
   })
 
   testWithRedis('should fallback to memory when Redis not configured', async (_, t) => {

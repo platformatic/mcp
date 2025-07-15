@@ -1,5 +1,6 @@
 import { Redis } from 'ioredis'
 import { test } from 'node:test'
+import type { TestOptions } from 'node:test'
 
 export interface RedisTestConfig {
   host: string
@@ -25,6 +26,7 @@ export async function createTestRedis (config: RedisTestConfig = defaultRedisCon
 
   try {
     await redis.ping()
+    await redis.flushdb() // Clear the database before starting tests
     return redis
   } catch (error) {
     await redis.disconnect()
@@ -41,8 +43,15 @@ export async function cleanupRedis (redis: Redis): Promise<void> {
   }
 }
 
-export function testWithRedis (testName: string, testFn: (redis: Redis, t: any) => Promise<void>) {
-  test(testName, async (t) => {
+type testFn = (redis: Redis, t: any) => Promise<void>
+
+export function testWithRedis (testName: string, opts: TestOptions, testFn: testFn) {
+  if (typeof opts === 'function') {
+    testFn = opts
+    opts = {}
+  }
+
+  test(testName, opts, async (t) => {
     let redis: Redis
     try {
       redis = await createTestRedis()
