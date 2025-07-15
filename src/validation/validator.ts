@@ -9,7 +9,7 @@ const compiledValidators = new Map<string, ReturnType<typeof TypeCompiler.Compil
 /**
  * Get a compiled validator for a schema, with caching
  */
-function getValidator<T extends TSchema>(schema: T): ReturnType<typeof TypeCompiler.Compile> {
+function getValidator<T extends TSchema> (schema: T): ReturnType<typeof TypeCompiler.Compile> {
   const key = JSON.stringify(schema)
   if (!compiledValidators.has(key)) {
     compiledValidators.set(key, TypeCompiler.Compile(schema))
@@ -31,12 +31,12 @@ export type ValidationResult<T> = {
 /**
  * Validate data against a TypeBox schema
  */
-export function validate<T extends TSchema>(
+export function validate<T extends TSchema> (
   schema: T,
   data: unknown
 ): ValidationResult<Static<T>> {
   const validator = getValidator(schema)
-  
+
   if (validator.Check(data)) {
     return {
       success: true,
@@ -67,7 +67,7 @@ export function validate<T extends TSchema>(
 /**
  * Validate data against a TypeBox schema (throws on error)
  */
-export function validateOrThrow<T extends TSchema>(
+export function validateOrThrow<T extends TSchema> (
   schema: T,
   data: unknown
 ): Static<T> {
@@ -81,7 +81,7 @@ export function validateOrThrow<T extends TSchema>(
 /**
  * Check if data matches a schema without detailed error information
  */
-export function check<T extends TSchema>(
+export function check<T extends TSchema> (
   schema: T,
   data: unknown
 ): data is Static<T> {
@@ -92,13 +92,13 @@ export function check<T extends TSchema>(
 /**
  * Transform data to match a schema (with defaults, etc.)
  */
-export function transform<T extends TSchema>(
+export function transform<T extends TSchema> (
   schema: T,
   data: unknown
 ): Static<T> {
   // Apply defaults and transformations
   const transformed = Value.Default(schema, data)
-  
+
   // Validate the transformed data
   return validateOrThrow(schema, transformed)
 }
@@ -106,7 +106,7 @@ export function transform<T extends TSchema>(
 /**
  * Create a validation error response
  */
-export function createValidationError(
+export function createValidationError (
   message: string,
   errors: ValidationError['errors']
 ): ValidationError {
@@ -120,8 +120,8 @@ export function createValidationError(
 /**
  * Convert TypeBox validation errors to a user-friendly format
  */
-export function formatValidationErrors(errors: ValidationError['errors']): string {
-  return errors.map(error => 
+export function formatValidationErrors (errors: ValidationError['errors']): string {
+  return errors.map(error =>
     `${error.path}: ${error.message} (expected ${error.expected}, got ${typeof error.received})`
   ).join('; ')
 }
@@ -129,7 +129,7 @@ export function formatValidationErrors(errors: ValidationError['errors']): strin
 /**
  * Schema validation decorator for async functions
  */
-export function validateSchema<TParams extends TObject, TResult extends TSchema>(
+export function validateSchema<TParams extends TObject, TResult extends TSchema> (
   paramsSchema: TParams,
   resultSchema?: TResult
 ) {
@@ -139,7 +139,7 @@ export function validateSchema<TParams extends TObject, TResult extends TSchema>
     descriptor: TypedPropertyDescriptor<T>
   ) {
     const originalMethod = descriptor.value!
-    
+
     descriptor.value = async function (this: any, params: unknown, ...args: any[]) {
       // Validate input parameters
       const paramResult = validate(paramsSchema, params)
@@ -161,7 +161,7 @@ export function validateSchema<TParams extends TObject, TResult extends TSchema>
 
       return result
     } as any
-    
+
     return descriptor
   }
 }
@@ -169,6 +169,6 @@ export function validateSchema<TParams extends TObject, TResult extends TSchema>
 /**
  * Utility to get schema hash for caching
  */
-export function getSchemaHash(schema: TSchema): string {
+export function getSchemaHash (schema: TSchema): string {
   return JSON.stringify(schema)
 }

@@ -113,7 +113,7 @@ async function handleToolsCall (
   dependencies: HandlerDependencies
 ): Promise<JSONRPCResponse | JSONRPCError> {
   const { tools } = dependencies
-  
+
   // Validate the request parameters structure
   const paramsValidation = validate(CallToolRequestSchema, request.params)
   if (!paramsValidation.success) {
@@ -159,7 +159,7 @@ async function handleToolsCall (
         }
         return createResponse(request.id, result)
       }
-      
+
       // Use validated arguments
       try {
         const result = await tool.handler(argumentsValidation.data, { sessionId })

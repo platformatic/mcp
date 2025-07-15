@@ -53,26 +53,39 @@ export interface MCPPrompt<TArgsSchema extends TObject = TObject> {
 // Enhanced Fastify module declaration with generic types
 declare module 'fastify' {
   interface FastifyInstance {
-    mcpAddTool<TSchema extends TObject = TObject>(
+    // Overloaded methods to support both TypeBox schemas and legacy usage
+    mcpAddTool<TSchema extends TObject>(
       definition: Omit<Tool, 'inputSchema'> & { inputSchema: TSchema },
       handler?: ToolHandler<TSchema>
     ): void
-    
+    mcpAddTool(
+      definition: any,
+      handler?: any
+    ): void
+
     mcpAddResource<TUriSchema extends TSchema = TString>(
-      definition: Omit<Resource, 'uri'> & { 
+      definition: Omit<Resource, 'uri'> & {
         uriPattern: string,
-        uriSchema?: TUriSchema 
+        uriSchema?: TUriSchema
       },
       handler?: ResourceHandler<TUriSchema>
     ): void
-    
-    mcpAddPrompt<TArgsSchema extends TObject = TObject>(
-      definition: Omit<Prompt, 'arguments'> & { 
-        argumentSchema?: TArgsSchema 
+    mcpAddResource(
+      definition: any,
+      handler?: any
+    ): void
+
+    mcpAddPrompt<TArgsSchema extends TObject>(
+      definition: Omit<Prompt, 'arguments'> & {
+        argumentSchema?: TArgsSchema
       },
       handler?: PromptHandler<TArgsSchema>
     ): void
-    
+    mcpAddPrompt(
+      definition: any,
+      handler?: any
+    ): void
+
     mcpBroadcastNotification: (notification: JSONRPCNotification) => Promise<void>
     mcpSendToSession: (sessionId: string, message: JSONRPCMessage) => Promise<boolean>
   }

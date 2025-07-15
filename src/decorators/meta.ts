@@ -1,8 +1,8 @@
 import type { FastifyPluginAsync } from 'fastify'
 import fp from 'fastify-plugin'
-import type { 
-  MCPTool, 
-  MCPResource, 
+import type {
+  MCPTool,
+  MCPResource,
   MCPPrompt
 } from '../types.ts'
 import { schemaToArguments, validateToolSchema, typeBoxToJSONSchema } from '../validation/index.ts'
@@ -18,7 +18,7 @@ const mcpDecoratorsPlugin: FastifyPluginAsync<MCPDecoratorsOptions> = async (app
 
   // Enhanced tool decorator with TypeBox schema support
   app.decorate('mcpAddTool', (
-    definition: any, 
+    definition: any,
     handler?: any
   ) => {
     const name = definition.name
@@ -44,19 +44,19 @@ const mcpDecoratorsPlugin: FastifyPluginAsync<MCPDecoratorsOptions> = async (app
       }
     }
 
-    tools.set(name, { 
+    tools.set(name, {
       definition: {
         ...toolDefinition,
         // Store the original schema for validation (TypeBox or JSON Schema)
         inputSchema: definition.inputSchema || toolDefinition.inputSchema
-      }, 
-      handler 
+      },
+      handler
     })
   })
 
   // Enhanced resource decorator with URI schema support
   app.decorate('mcpAddResource', (
-    definition: any, 
+    definition: any,
     handler?: any
   ) => {
     const uriPattern = definition.uriPattern || definition.uri
@@ -75,7 +75,7 @@ const mcpDecoratorsPlugin: FastifyPluginAsync<MCPDecoratorsOptions> = async (app
 
   // Enhanced prompt decorator with argument schema support
   app.decorate('mcpAddPrompt', (
-    definition: any, 
+    definition: any,
     handler?: any
   ) => {
     const name = definition.name
@@ -84,18 +84,20 @@ const mcpDecoratorsPlugin: FastifyPluginAsync<MCPDecoratorsOptions> = async (app
     }
 
     // Generate arguments array from schema if provided
-    const promptDefinition = definition.argumentSchema ? {
-      ...definition,
-      arguments: schemaToArguments(definition.argumentSchema)
-    } : definition
+    const promptDefinition = definition.argumentSchema
+      ? {
+          ...definition,
+          arguments: schemaToArguments(definition.argumentSchema)
+        }
+      : definition
 
-    prompts.set(name, { 
+    prompts.set(name, {
       definition: {
         ...promptDefinition,
         // Store the original TypeBox schema for validation
         argumentSchema: definition.argumentSchema
-      }, 
-      handler 
+      },
+      handler
     })
   })
 }
