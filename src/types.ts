@@ -60,7 +60,7 @@ declare module 'fastify' {
     ): void
     mcpAddTool(
       definition: any,
-      handler?: any
+      handler?: LegacyToolHandler
     ): void
 
     mcpAddResource<TUriSchema extends TSchema = TString>(
@@ -72,7 +72,7 @@ declare module 'fastify' {
     ): void
     mcpAddResource(
       definition: any,
-      handler?: any
+      handler?: LegacyResourceHandler
     ): void
 
     mcpAddPrompt<TArgsSchema extends TObject>(
@@ -83,7 +83,7 @@ declare module 'fastify' {
     ): void
     mcpAddPrompt(
       definition: any,
-      handler?: any
+      handler?: LegacyPromptHandler
     ): void
 
     mcpBroadcastNotification: (notification: JSONRPCNotification) => Promise<void>
