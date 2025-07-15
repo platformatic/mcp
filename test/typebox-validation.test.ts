@@ -216,43 +216,43 @@ describe('TypeBox Validation', () => {
       assert.ok(complexResult.content[0].text.includes('User: Alice, Age: 30'))
     })
 
-    test('should work with legacy tools without schemas', async (t) => {
+    test('should work with unsafe tools without schemas', async (t) => {
       const app = Fastify()
       t.after(() => app.close())
 
       await app.register(mcpPlugin)
 
       app.mcpAddTool({
-        name: 'legacy',
-        description: 'Legacy tool without schema'
+        name: 'unsafe',
+        description: 'Unsafe tool without schema'
       }, async (params) => {
         return {
-          content: [{ type: 'text', text: `Legacy tool called with: ${JSON.stringify(params)}` }]
+          content: [{ type: 'text', text: `Unsafe tool called with: ${JSON.stringify(params)}` }]
         }
       })
 
       await app.ready()
 
-      const legacyRequest: JSONRPCRequest = {
+      const unsafeRequest: JSONRPCRequest = {
         jsonrpc: JSONRPC_VERSION,
         id: 1,
         method: 'tools/call',
         params: {
-          name: 'legacy',
+          name: 'unsafe',
           arguments: { anything: 'goes' }
         }
       }
 
-      const legacyResponse = await app.inject({
+      const unsafeResponse = await app.inject({
         method: 'POST',
         url: '/mcp',
-        payload: legacyRequest
+        payload: unsafeRequest
       })
 
-      assert.strictEqual(legacyResponse.statusCode, 200)
-      const legacyBody = legacyResponse.json() as JSONRPCResponse
-      const legacyResult = legacyBody.result as CallToolResult
-      assert.ok(legacyResult.content[0].text.includes('Legacy tool called'))
+      assert.strictEqual(unsafeResponse.statusCode, 200)
+      const unsafeBody = unsafeResponse.json() as JSONRPCResponse
+      const unsafeResult = unsafeBody.result as CallToolResult
+      assert.ok(unsafeResult.content[0].text.includes('Unsafe tool called'))
     })
 
     test('should convert TypeBox schemas to JSON Schema in tools/list', async (t) => {
@@ -641,22 +641,22 @@ describe('TypeBox Validation', () => {
       assert.ok(complexityArg.description.includes('Code complexity level'))
     })
 
-    test('should handle prompts without schemas (legacy)', async (t) => {
+    test('should handle prompts without schemas (unsafe)', async (t) => {
       const app = Fastify()
       t.after(() => app.close())
 
       await app.register(mcpPlugin)
 
       app.mcpAddPrompt({
-        name: 'legacy-prompt',
-        description: 'Legacy prompt without schema'
+        name: 'unsafe-prompt',
+        description: 'Unsafe prompt without schema'
       }, async (name, args) => {
         return {
           messages: [{
             role: 'user',
             content: {
               type: 'text',
-              text: `Legacy prompt called with: ${JSON.stringify(args)}`
+              text: `Unsafe prompt called with: ${JSON.stringify(args)}`
             }
           }]
         }
@@ -664,26 +664,26 @@ describe('TypeBox Validation', () => {
 
       await app.ready()
 
-      const legacyRequest: JSONRPCRequest = {
+      const unsafeRequest: JSONRPCRequest = {
         jsonrpc: JSONRPC_VERSION,
         id: 1,
         method: 'prompts/get',
         params: {
-          name: 'legacy-prompt',
+          name: 'unsafe-prompt',
           arguments: { anything: 'goes' }
         }
       }
 
-      const legacyResponse = await app.inject({
+      const unsafeResponse = await app.inject({
         method: 'POST',
         url: '/mcp',
-        payload: legacyRequest
+        payload: unsafeRequest
       })
 
-      assert.strictEqual(legacyResponse.statusCode, 200)
-      const legacyBody = legacyResponse.json() as JSONRPCResponse
-      const legacyResult = legacyBody.result as GetPromptResult
-      assert.ok(legacyResult.messages[0].content.text.includes('Legacy prompt called'))
+      assert.strictEqual(unsafeResponse.statusCode, 200)
+      const unsafeBody = unsafeResponse.json() as JSONRPCResponse
+      const unsafeResult = unsafeBody.result as GetPromptResult
+      assert.ok(unsafeResult.messages[0].content.text.includes('Unsafe prompt called'))
     })
   })
 

@@ -190,7 +190,7 @@ async function handleToolsCall (
       }
     }
   } else {
-    // Legacy tool without schema - pass arguments as-is
+    // Unsafe tool without schema - pass arguments as-is
     try {
       const result = await tool.handler(toolArguments, { sessionId })
       return createResponse(request.id, result)
@@ -365,7 +365,7 @@ async function handlePromptsGet (
       }
     }
   } else {
-    // Legacy prompt without schema - pass arguments as-is
+    // Unsafe prompt without schema - pass arguments as-is
     try {
       const result = await prompt.handler(promptName, promptArguments)
       return createResponse(request.id, result)

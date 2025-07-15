@@ -199,7 +199,7 @@ app.mcpAddPrompt({
 
 #### 2.1 Generic Tool Implementation ✅
 - **✅ Enhanced tool interface**: `MCPTool<TSchema>` with automatic type inference
-- **✅ Schema registration**: `mcpAddTool` accepts both TypeBox schemas and legacy JSON schemas
+- **✅ Schema registration**: `mcpAddTool` accepts both TypeBox schemas and unsafe JSON schemas
 - **✅ Handler type safety**: Handlers receive `Static<TSchema>` parameters for TypeBox schemas
 - **✅ Schema compilation**: Pre-compiled validators with caching for performance
 
@@ -208,7 +208,7 @@ app.mcpAddPrompt({
 - **✅ Parameter validation**: Tool arguments validated against registered schema
 - **✅ Error responses**: Structured validation errors with detailed field-level information
 - **✅ Type-safe handler execution**: Validated, typed parameters passed to handlers
-- **✅ Backward compatibility**: Legacy tools without schemas continue to work
+- **✅ Backward compatibility**: Unsafe tools without schemas continue to work
 
 ### Phase 3: Resource Validation ✅ **COMPLETED**
 
@@ -278,7 +278,7 @@ type ValidationError = Static<typeof ValidationErrorSchema>
 - **✅ Error handling tests**: Error response formatting tested
 - **✅ Performance tests**: Validation performance verified (< 1ms overhead)
 - **✅ Integration tests**: Complete validation workflow tested
-- **✅ Backward compatibility tests**: Legacy usage patterns verified
+- **✅ Backward compatibility tests**: Unsafe usage patterns verified
 
 #### 7.2 Documentation Updates ✅
 - **✅ API documentation**: New validation features documented in plan

@@ -53,14 +53,14 @@ export interface MCPPrompt<TArgsSchema extends TObject = TObject> {
 // Enhanced Fastify module declaration with generic types
 declare module 'fastify' {
   interface FastifyInstance {
-    // Overloaded methods to support both TypeBox schemas and legacy usage
+    // Overloaded methods to support both TypeBox schemas and unsafe usage
     mcpAddTool<TSchema extends TObject>(
       definition: Omit<Tool, 'inputSchema'> & { inputSchema: TSchema },
       handler?: ToolHandler<TSchema>
     ): void
     mcpAddTool(
       definition: any,
-      handler?: LegacyToolHandler
+      handler?: UnsafeToolHandler
     ): void
 
     mcpAddResource<TUriSchema extends TSchema = TString>(
@@ -72,7 +72,7 @@ declare module 'fastify' {
     ): void
     mcpAddResource(
       definition: any,
-      handler?: LegacyResourceHandler
+      handler?: UnsafeResourceHandler
     ): void
 
     mcpAddPrompt<TArgsSchema extends TObject>(
@@ -83,7 +83,7 @@ declare module 'fastify' {
     ): void
     mcpAddPrompt(
       definition: any,
-      handler?: LegacyPromptHandler
+      handler?: UnsafePromptHandler
     ): void
 
     mcpBroadcastNotification: (notification: JSONRPCNotification) => Promise<void>
@@ -91,25 +91,25 @@ declare module 'fastify' {
   }
 }
 
-// Legacy handler types for backward compatibility
-export type LegacyToolHandler = (params: any, context?: { sessionId?: string }) => Promise<CallToolResult> | CallToolResult
-export type LegacyResourceHandler = (uri: string) => Promise<ReadResourceResult> | ReadResourceResult
-export type LegacyPromptHandler = (name: string, args?: any) => Promise<GetPromptResult> | GetPromptResult
+// Unsafe handler types for backward compatibility
+export type UnsafeToolHandler = (params: any, context?: { sessionId?: string }) => Promise<CallToolResult> | CallToolResult
+export type UnsafeResourceHandler = (uri: string) => Promise<ReadResourceResult> | ReadResourceResult
+export type UnsafePromptHandler = (name: string, args?: any) => Promise<GetPromptResult> | GetPromptResult
 
-// Legacy interfaces for backward compatibility
-export interface LegacyMCPTool {
+// Unsafe interfaces for backward compatibility
+export interface UnsafeMCPTool {
   definition: any
-  handler?: LegacyToolHandler
+  handler?: UnsafeToolHandler
 }
 
-export interface LegacyMCPResource {
+export interface UnsafeMCPResource {
   definition: any
-  handler?: LegacyResourceHandler
+  handler?: UnsafeResourceHandler
 }
 
-export interface LegacyMCPPrompt {
+export interface UnsafeMCPPrompt {
   definition: any
-  handler?: LegacyPromptHandler
+  handler?: UnsafePromptHandler
 }
 
 export interface MCPPluginOptions {
