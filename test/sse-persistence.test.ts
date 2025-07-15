@@ -2,6 +2,7 @@ import { test } from 'node:test'
 import { strict as assert } from 'node:assert'
 import Fastify from 'fastify'
 import { request, Agent, setGlobalDispatcher } from 'undici'
+import { setTimeout as sleep } from 'node:timers/promises'
 import mcpPlugin from '../src/index.ts'
 
 setGlobalDispatcher(new Agent({
@@ -55,7 +56,7 @@ test('POST SSE connections should persist and receive notifications', async (t) 
       }
 
       if (sessionIdFromTool) {
-        await app.mcpSendToSession(sessionIdFromTool, notification)
+        app.mcpSendToSession(sessionIdFromTool, notification)
       }
     }, 100)
 
@@ -176,7 +177,7 @@ test('POST SSE connections should persist and receive notifications', async (t) 
   initResponse.body.destroy()
 
   // Wait a bit for cleanup
-  await new Promise(resolve => setTimeout(resolve, 100))
+  await sleep(100)
 
   // Verify session is cleaned up by testing that messages can no longer be sent
   const canSendAfterClose = await app.mcpSendToSession(sessionId, {
@@ -244,7 +245,7 @@ test('Session cleanup on connection close', async (t) => {
   response.body.destroy()
 
   // Wait for cleanup
-  await new Promise(resolve => setTimeout(resolve, 200))
+  await sleep(200)
 
   // Verify session is cleaned up
   const canSendAfterClose = await app.mcpSendToSession(sessionId, {

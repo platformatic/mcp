@@ -2,6 +2,7 @@ import { test, describe } from 'node:test'
 import type { TestContext } from 'node:test'
 import Fastify from 'fastify'
 import { EventSource, request, Agent, setGlobalDispatcher } from 'undici'
+import { setTimeout as sleep } from 'node:timers/promises'
 import mcpPlugin from '../src/index.ts'
 
 setGlobalDispatcher(new Agent({
@@ -173,7 +174,7 @@ describe('Last-Event-ID Support', () => {
     initResponse.stream().destroy()
 
     // Wait for the stream to be cleaned up
-    await new Promise(resolve => setTimeout(resolve, 500))
+    await sleep(500)
 
     // With the new architecture, streams are managed internally
     // The cleanup happens automatically when the stream is destroyed

@@ -1,5 +1,6 @@
 import { describe } from 'node:test'
 import assert from 'node:assert'
+import { setTimeout as sleep } from 'node:timers/promises'
 import { RedisMessageBroker } from '../src/brokers/redis-message-broker.ts'
 import { testWithRedis } from './redis-test-utils.ts'
 import type { JSONRPCMessage } from '../src/schema.ts'
@@ -24,7 +25,7 @@ describe('RedisMessageBroker', () => {
     })
 
     // Give subscription time to register
-    await new Promise(resolve => setTimeout(resolve, 100))
+    await sleep(100)
 
     await broker.publish('test-topic', testMessage)
     await messagePromise
@@ -62,7 +63,7 @@ describe('RedisMessageBroker', () => {
     })
 
     // Give subscriptions time to register
-    await new Promise(resolve => setTimeout(resolve, 100))
+    await sleep(100)
 
     await broker1.publish('multi-topic', testMessage)
     await messagePromise
@@ -90,7 +91,7 @@ describe('RedisMessageBroker', () => {
     })
 
     // Give subscription time to register
-    await new Promise(resolve => setTimeout(resolve, 100))
+    await sleep(100)
 
     await broker.publish(`mcp/session/${sessionId}/message`, testMessage)
     await messagePromise
@@ -118,7 +119,7 @@ describe('RedisMessageBroker', () => {
     })
 
     // Give subscription time to register
-    await new Promise(resolve => setTimeout(resolve, 100))
+    await sleep(100)
 
     await broker.publish('mcp/broadcast/notification', notification)
     await notificationPromise
@@ -143,17 +144,17 @@ describe('RedisMessageBroker', () => {
     })
 
     // Give subscription time to register
-    await new Promise(resolve => setTimeout(resolve, 100))
+    await sleep(100)
 
     await broker.unsubscribe('unsub-topic')
 
     // Give unsubscribe time to take effect
-    await new Promise(resolve => setTimeout(resolve, 100))
+    await sleep(100)
 
     await broker.publish('unsub-topic', testMessage)
 
     // Wait a bit to see if message is received (it shouldn't be)
-    await new Promise(resolve => setTimeout(resolve, 200))
+    await sleep(200)
 
     assert.strictEqual(messageReceived, false)
   })
@@ -190,7 +191,7 @@ describe('RedisMessageBroker', () => {
     })
 
     // Give subscriptions time to register
-    await new Promise(resolve => setTimeout(resolve, 100))
+    await sleep(100)
 
     await broker.publish('topic1', message1)
     await broker.publish('topic2', message2)
@@ -229,7 +230,7 @@ describe('RedisMessageBroker', () => {
     })
 
     // Give subscription time to register
-    await new Promise(resolve => setTimeout(resolve, 100))
+    await sleep(100)
 
     await broker.publish('complex-topic', complexMessage)
     await messagePromise
@@ -251,7 +252,7 @@ describe('RedisMessageBroker', () => {
     await broker.subscribe('close-topic', () => {})
 
     // Give subscription time to register
-    await new Promise(resolve => setTimeout(resolve, 100))
+    await sleep(100)
 
     await broker.publish('close-topic', testMessage)
 
