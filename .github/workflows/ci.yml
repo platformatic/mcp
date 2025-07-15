@@ -7,11 +7,22 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     
     strategy:
       matrix:
         node-version: [22.x, 24.x]
+    
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     
     steps:
     - uses: actions/checkout@v4
@@ -22,7 +33,11 @@ jobs:
         node-version: ${{ matrix.node-version }}
     
     - name: Install dependencies
-      run: npm install
+      run: npm ci 
     
     - name: Run CI pipeline
       run: npm run ci
+      env:
+        REDIS_HOST: localhost
+        REDIS_PORT: 6379
+        REDIS_DB: 1

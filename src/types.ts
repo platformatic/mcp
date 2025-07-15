@@ -14,9 +14,8 @@ declare module 'fastify' {
     mcpAddTool: (definition: any, handler?: ToolHandler) => void
     mcpAddResource: (definition: any, handler?: ResourceHandler) => void
     mcpAddPrompt: (definition: any, handler?: PromptHandler) => void
-    mcpSessions: Map<string, SSESession>
-    mcpBroadcastNotification: (notification: JSONRPCNotification) => void
-    mcpSendToSession: (sessionId: string, message: JSONRPCMessage) => boolean
+    mcpBroadcastNotification: (notification: JSONRPCNotification) => Promise<void>
+    mcpSendToSession: (sessionId: string, message: JSONRPCMessage) => Promise<boolean>
   }
 }
 
@@ -44,6 +43,14 @@ export interface MCPPluginOptions {
   capabilities?: ServerCapabilities
   instructions?: string
   enableSSE?: boolean
+  sessionStore?: 'memory' | 'redis'
+  messageBroker?: 'memory' | 'redis'
+  redis?: {
+    host: string
+    port: number
+    password?: string
+    db?: number
+  }
 }
 
 export interface SSESession {

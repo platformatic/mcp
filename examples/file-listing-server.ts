@@ -33,15 +33,18 @@ interface WatcherData {
 
 const activeWatchers = new Map<string, WatcherData>()
 
+// Track active sessions internally for cleanup
+const activeSessions = new Set<string>()
+
 // Periodic cleanup for orphaned watchers
 const cleanupInterval = setInterval(() => {
   const orphanedWatchers = []
 
   for (const [watchId, watcherData] of activeWatchers.entries()) {
-    const sessionExists = fastify.mcpSessions.has(watcherData.sessionId)
-    const sessionStreams = sessionExists ? fastify.mcpSessions.get(watcherData.sessionId)?.streams.size : 0
+    // In the new architecture, we can test if session is active by trying to send a message
+    const sessionActive = activeSessions.has(watcherData.sessionId)
 
-    if (!sessionExists || sessionStreams === 0) {
+    if (!sessionActive) {
       orphanedWatchers.push(watchId)
     }
   }
@@ -332,28 +335,25 @@ fastify.mcpAddTool({
           }
 
           // Send to specific session
-          const sent = fastify.mcpSendToSession(sessionId, notification)
-          if (sent) {
-            fastify.log.info(`File change sent to session ${sessionId}: ${eventType} ${fileKey}`)
-          } else {
-            // More detailed logging
-            const sessionExists = fastify.mcpSessions.has(sessionId)
-            const sessionStreams = sessionExists ? fastify.mcpSessions.get(sessionId)?.streams.size : 0
-            fastify.log.warn({
-              sessionId,
-              sessionExists,
-              sessionStreams,
-              eventType,
-              filename: fileKey,
-              watchId
-            }, `Failed to send file change - session exists: ${sessionExists}, streams: ${sessionStreams}`)
+          fastify.mcpSendToSession(sessionId, notification).then((sent) => {
+            if (sent) {
+              fastify.log.info(`File change sent to session ${sessionId}: ${eventType} ${fileKey}`)
+              activeSessions.add(sessionId)
+            } else {
+              // Session no longer active, mark for cleanup
+              activeSessions.delete(sessionId)
+              fastify.log.warn({
+                sessionId,
+                eventType,
+                filename: fileKey,
+                watchId
+              }, 'Failed to send file change - session no longer active')
 
-            // Clean up watcher if session has no active streams
-            if (sessionExists && sessionStreams === 0) {
+              // Clean up watcher if session is no longer active
               fastify.log.info({
                 watchId,
                 sessionId
-              }, 'Cleaning up watcher for session with no active streams')
+              }, 'Cleaning up watcher for inactive session')
 
               // Clear all debounce timers
               for (const timer of watcherData.debounceTimers.values()) {
@@ -364,7 +364,9 @@ fastify.mcpAddTool({
               watcher.close()
               activeWatchers.delete(watchId)
             }
-          }
+          }).catch((error) => {
+            fastify.log.error('Error sending notification:', error)
+          })
 
           // Clean up the timer from the map
           watcherData.debounceTimers.delete(debounceKey)
@@ -400,16 +402,13 @@ fastify.mcpAddTool({
       activeWatchers.delete(watchId)
     })
 
-    // Log session status when starting watch
-    const sessionExists = fastify.mcpSessions.has(sessionId)
-    const sessionStreams = sessionExists ? fastify.mcpSessions.get(sessionId)?.streams.size : 0
+    // Log session status when starting watch and track the session
+    activeSessions.add(sessionId)
     fastify.log.info({
       watchId,
       sessionId,
-      sessionExists,
-      sessionStreams,
       path
-    }, `Started file watcher - session exists: ${sessionExists}, streams: ${sessionStreams}`)
+    }, 'Started file watcher for session')
 
     return {
       content: [{

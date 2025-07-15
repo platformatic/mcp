@@ -16,16 +16,16 @@ import type {
   ReadResourceResult,
   GetPromptRequest,
   GetPromptResult
-} from '../schema.ts'
+} from './schema.ts'
 
 import {
   JSONRPC_VERSION,
   LATEST_PROTOCOL_VERSION,
   METHOD_NOT_FOUND,
   INTERNAL_ERROR
-} from '../schema.ts'
+} from './schema.ts'
 
-import type { MCPTool, MCPResource, MCPPrompt, MCPPluginOptions } from '../types.ts'
+import type { MCPTool, MCPResource, MCPPrompt, MCPPluginOptions } from './types.ts'
 
 type HandlerDependencies = {
   app: FastifyInstance
