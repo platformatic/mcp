@@ -25,6 +25,7 @@ import {
 
 import type { MCPTool, MCPResource, MCPPrompt, MCPPluginOptions } from './types.ts'
 import { validate, CallToolRequestSchema, typeBoxToJSONSchema, ReadResourceRequestSchema, GetPromptRequestSchema } from './validation/index.ts'
+import { Kind } from '@sinclair/typebox'
 
 type HandlerDependencies = {
   app: FastifyInstance
@@ -74,7 +75,7 @@ function handleToolsList (request: JSONRPCRequest, dependencies: HandlerDependen
     tools: Array.from(tools.values()).map(t => {
       const tool = t.definition
       // Convert TypeBox schema to JSON Schema for the response if it's a TypeBox schema
-      if (tool.inputSchema && typeof tool.inputSchema === 'object' && 'kind' in tool.inputSchema) {
+      if (tool.inputSchema && typeof tool.inputSchema === 'object' && tool.inputSchema[Kind]) {
         return {
           ...tool,
           inputSchema: typeBoxToJSONSchema(tool.inputSchema)
@@ -144,7 +145,7 @@ async function handleToolsCall (
   if ('inputSchema' in tool.definition) {
     // Check if it's a TypeBox schema (has Kind symbol)
     const schema = tool.definition.inputSchema
-    if (schema && typeof schema === 'object' && 'kind' in schema) {
+    if (schema && typeof schema === 'object' && schema[Kind]) {
       // TypeBox schema - use our validation
       const argumentsValidation = validate(schema, toolArguments)
       if (!argumentsValidation.success) {
@@ -242,7 +243,7 @@ async function handleResourcesRead (
   // Validate URI against resource's URI schema if present
   if ('uriSchema' in resource.definition && resource.definition.uriSchema) {
     const schema = resource.definition.uriSchema
-    if (schema && typeof schema === 'object' && 'kind' in schema) {
+    if (schema && typeof schema === 'object' && schema[Kind]) {
       // TypeBox schema - use our validation
       const uriValidation = validate(schema, uri)
       if (!uriValidation.success) {
@@ -313,7 +314,7 @@ async function handlePromptsGet (
   if ('argumentSchema' in prompt.definition && prompt.definition.argumentSchema) {
     // Check if it's a TypeBox schema (has Kind symbol)
     const schema = prompt.definition.argumentSchema
-    if (schema && typeof schema === 'object' && 'kind' in schema) {
+    if (schema && typeof schema === 'object' && schema[Kind]) {
       // TypeBox schema - use our validation
       const argumentsValidation = validate(schema, promptArguments)
       if (!argumentsValidation.success) {

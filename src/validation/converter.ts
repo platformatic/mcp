@@ -204,10 +204,11 @@ export function getEnumValues (schema: TSchema): string[] | undefined {
 }
 
 /**
- * Check if schema represents an optional field
+ * Check if a property is optional in an object schema
  */
-export function isOptionalSchema (schema: TSchema): boolean {
-  return schema[Kind] === 'Optional'
+export function isOptionalProperty (objectSchema: TObject, propertyName: string): boolean {
+  const required = objectSchema.required || []
+  return !required.includes(propertyName)
 }
 
 /**
