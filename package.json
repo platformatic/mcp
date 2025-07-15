@@ -44,6 +44,7 @@
     "undici": "^7.11.0"
   },
   "dependencies": {
+    "@sinclair/typebox": "^0.34.37",
     "fastify-plugin": "^5.0.1",
     "ioredis": "^5.0.0",
     "mqemitter": "^7.1.0"

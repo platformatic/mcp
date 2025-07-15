@@ -10,7 +10,6 @@ import type {
   ListToolsResult,
   ListResourcesResult,
   ListPromptsResult,
-  CallToolRequest,
   CallToolResult,
   ReadResourceRequest,
   ReadResourceResult,
@@ -22,10 +21,12 @@ import {
   JSONRPC_VERSION,
   LATEST_PROTOCOL_VERSION,
   METHOD_NOT_FOUND,
-  INTERNAL_ERROR
+  INTERNAL_ERROR,
+  INVALID_PARAMS
 } from './schema.ts'
 
 import type { MCPTool, MCPResource, MCPPrompt, MCPPluginOptions } from './types.ts'
+import { validate, CallToolRequestSchema, typeBoxToJSONSchema } from './validation/index.ts'
 
 type HandlerDependencies = {
   app: FastifyInstance
@@ -72,7 +73,17 @@ function handlePing (request: JSONRPCRequest): JSONRPCResponse {
 function handleToolsList (request: JSONRPCRequest, dependencies: HandlerDependencies): JSONRPCResponse {
   const { tools } = dependencies
   const result: ListToolsResult = {
-    tools: Array.from(tools.values()).map(t => t.definition),
+    tools: Array.from(tools.values()).map(t => {
+      const tool = t.definition
+      // Convert TypeBox schema to JSON Schema for the response if it's a TypeBox schema
+      if (tool.inputSchema && typeof tool.inputSchema === 'object' && 'kind' in tool.inputSchema) {
+        return {
+          ...tool,
+          inputSchema: typeBoxToJSONSchema(tool.inputSchema)
+        }
+      }
+      return tool
+    }),
     nextCursor: undefined
   }
   return createResponse(request.id, result)
@@ -102,12 +113,17 @@ async function handleToolsCall (
   dependencies: HandlerDependencies
 ): Promise<JSONRPCResponse | JSONRPCError> {
   const { tools } = dependencies
-  const params = request.params as CallToolRequest['params']
-  const toolName = params?.name
-
-  if (!toolName) {
-    return createError(request.id, INTERNAL_ERROR, 'Tool name is required')
+  
+  // Validate the request parameters structure
+  const paramsValidation = validate(CallToolRequestSchema, request.params)
+  if (!paramsValidation.success) {
+    return createError(request.id, INVALID_PARAMS, 'Invalid tool call parameters', {
+      validation: paramsValidation.error
+    })
   }
+
+  const params = paramsValidation.data
+  const toolName = params.name
 
   const tool = tools.get(toolName)
   if (!tool) {
@@ -125,18 +141,70 @@ async function handleToolsCall (
     return createResponse(request.id, result)
   }
 
-  try {
-    const result = await tool.handler(params.arguments || {}, { sessionId })
-    return createResponse(request.id, result)
-  } catch (error: any) {
-    const result: CallToolResult = {
-      content: [{
-        type: 'text',
-        text: `Tool execution failed: ${error.message || error}`
-      }],
-      isError: true
+  // Validate tool arguments against the tool's input schema
+  const toolArguments = params.arguments || {}
+  if ('inputSchema' in tool.definition) {
+    // Check if it's a TypeBox schema (has Kind symbol)
+    const schema = tool.definition.inputSchema
+    if (schema && typeof schema === 'object' && 'kind' in schema) {
+      // TypeBox schema - use our validation
+      const argumentsValidation = validate(schema, toolArguments)
+      if (!argumentsValidation.success) {
+        const result: CallToolResult = {
+          content: [{
+            type: 'text',
+            text: `Invalid tool arguments: ${argumentsValidation.error.message}`
+          }],
+          isError: true
+        }
+        return createResponse(request.id, result)
+      }
+      
+      // Use validated arguments
+      try {
+        const result = await tool.handler(argumentsValidation.data, { sessionId })
+        return createResponse(request.id, result)
+      } catch (error: any) {
+        const result: CallToolResult = {
+          content: [{
+            type: 'text',
+            text: `Tool execution failed: ${error.message || error}`
+          }],
+          isError: true
+        }
+        return createResponse(request.id, result)
+      }
+    } else {
+      // Regular JSON Schema - basic validation or pass through
+      try {
+        const result = await tool.handler(toolArguments, { sessionId })
+        return createResponse(request.id, result)
+      } catch (error: any) {
+        const result: CallToolResult = {
+          content: [{
+            type: 'text',
+            text: `Tool execution failed: ${error.message || error}`
+          }],
+          isError: true
+        }
+        return createResponse(request.id, result)
+      }
     }
-    return createResponse(request.id, result)
+  } else {
+    // Legacy tool without schema - pass arguments as-is
+    try {
+      const result = await tool.handler(toolArguments, { sessionId })
+      return createResponse(request.id, result)
+    } catch (error: any) {
+      const result: CallToolResult = {
+        content: [{
+          type: 'text',
+          text: `Tool execution failed: ${error.message || error}`
+        }],
+        isError: true
+      }
+      return createResponse(request.id, result)
+    }
   }
 }
 
@@ -214,7 +282,7 @@ async function handlePromptsGet (
   }
 
   try {
-    const result = await prompt.handler(promptName, params.arguments)
+    const result = await prompt.handler(promptName, params.arguments || {})
     return createResponse(request.id, result)
   } catch (error: any) {
     const result: GetPromptResult = {
