@@ -1,26 +1,18 @@
 import type { FastifyPluginAsync } from 'fastify'
 import fp from 'fastify-plugin'
 import type { JSONRPCMessage, JSONRPCNotification } from '../schema.ts'
-import type { MCPTool, MCPResource, MCPPrompt } from '../types.ts'
 import type { SessionStore } from '../stores/session-store.ts'
 import type { MessageBroker } from '../brokers/message-broker.ts'
-import mcpDecoratorsPlugin from './decorators.ts'
 
 interface MCPPubSubDecoratorsOptions {
   enableSSE: boolean
-  tools: Map<string, MCPTool>
-  resources: Map<string, MCPResource>
-  prompts: Map<string, MCPPrompt>
   sessionStore: SessionStore
   messageBroker: MessageBroker
   localStreams: Map<string, Set<any>>
 }
 
 const mcpPubSubDecoratorsPlugin: FastifyPluginAsync<MCPPubSubDecoratorsOptions> = async (app, options) => {
-  const { enableSSE, tools, resources, prompts, messageBroker, sessionStore, localStreams } = options
-
-  // Register the base MCP decorators
-  await app.register(mcpDecoratorsPlugin, { tools, resources, prompts })
+  const { enableSSE, messageBroker, sessionStore, localStreams } = options
 
   app.decorate('mcpBroadcastNotification', async (notification: JSONRPCNotification) => {
     if (!enableSSE) {

@@ -12,8 +12,9 @@ import { MemoryMessageBroker } from './brokers/memory-message-broker.ts'
 import { RedisSessionStore } from './stores/redis-session-store.ts'
 import { RedisMessageBroker } from './brokers/redis-message-broker.ts'
 import type { MCPPluginOptions, MCPTool, MCPResource, MCPPrompt } from './types.ts'
-import mcpPubSubDecoratorsPlugin from './decorators/pubsub-decorators.ts'
-import mcpPubSubRoutesPlugin from './routes.ts'
+import pubsubDecorators from './decorators/pubsub.ts'
+import metaDecorators from './decorators/meta.ts'
+import routes from './routes.ts'
 
 export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) {
   const serverInfo: Implementation = opts.serverInfo ?? {
@@ -52,18 +53,20 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
   const localStreams = new Map<string, Set<any>>()
 
   // Register decorators first
-  await app.register(mcpPubSubDecoratorsPlugin, {
-    enableSSE,
+  app.register(metaDecorators, {
     tools,
     resources,
-    prompts,
+    prompts
+  })
+  app.register(pubsubDecorators, {
+    enableSSE,
     sessionStore,
     messageBroker,
     localStreams
   })
 
   // Register routes
-  await app.register(mcpPubSubRoutesPlugin, {
+  await app.register(routes, {
     enableSSE,
     opts,
     capabilities,
