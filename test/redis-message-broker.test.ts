@@ -34,8 +34,10 @@ describe('RedisMessageBroker', () => {
     await broker.close()
   })
 
-  testWithRedis('should handle multiple subscribers to same topic', async (redis) => {
+  testWithRedis('should handle multiple subscribers to same topic', async (redis, t) => {
     const redis2 = await redis.duplicate()
+    t.after(() => redis2.disconnect())
+
     const broker1 = new RedisMessageBroker(redis)
     const broker2 = new RedisMessageBroker(redis2)
 

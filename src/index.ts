@@ -35,10 +35,11 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
   // Initialize stores and brokers based on configuration
   let sessionStore: SessionStore
   let messageBroker: MessageBroker
+  let redis: Redis | null = null
 
   if (opts.redis) {
     // Redis implementations for horizontal scaling
-    const redis = new Redis(opts.redis)
+    redis = new Redis(opts.redis)
     sessionStore = new RedisSessionStore({ redis, maxMessages: 100 })
     messageBroker = new RedisMessageBroker(redis)
   } else {
@@ -73,6 +74,14 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
     sessionStore,
     messageBroker,
     localStreams
+  })
+
+  // Add close hook to clean up Redis connections
+  app.addHook('onClose', async () => {
+    if (redis) {
+      await redis.quit()
+    }
+    await messageBroker.close()
   })
 }, {
   name: 'fastify-mcp'

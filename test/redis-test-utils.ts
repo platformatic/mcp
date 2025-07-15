@@ -41,7 +41,7 @@ export async function cleanupRedis (redis: Redis): Promise<void> {
   }
 }
 
-export function testWithRedis (testName: string, testFn: (redis: Redis) => Promise<void>) {
+export function testWithRedis (testName: string, testFn: (redis: Redis, t: any) => Promise<void>) {
   test(testName, async (t) => {
     let redis: Redis
     try {
@@ -54,7 +54,7 @@ export function testWithRedis (testName: string, testFn: (redis: Redis) => Promi
         }
       })
 
-      await testFn(redis)
+      await testFn(redis, t)
     } catch (error) {
       if (error instanceof Error && error.message.includes('Redis connection failed')) {
         // Skip test if Redis is not available

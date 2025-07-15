@@ -6,8 +6,9 @@ import { testWithRedis } from './redis-test-utils.ts'
 import type { JSONRPCMessage } from '../src/schema.ts'
 
 describe('Redis Integration Tests', () => {
-  testWithRedis('should initialize plugin with Redis configuration', async (redis) => {
+  testWithRedis('should initialize plugin with Redis configuration', async (redis, t) => {
     const app = fastify()
+    t.after(() => app.close())
 
     await app.register(mcpPlugin, {
       enableSSE: true,
@@ -24,12 +25,11 @@ describe('Redis Integration Tests', () => {
     assert.ok(app.mcpAddPrompt)
     assert.ok(app.mcpBroadcastNotification)
     assert.ok(app.mcpSendToSession)
-
-    await app.close()
   })
 
-  testWithRedis('should handle MCP requests with Redis backend', async (redis) => {
+  testWithRedis('should handle MCP requests with Redis backend', async (redis, t) => {
     const app = fastify()
+    t.after(() => app.close())
 
     await app.register(mcpPlugin, {
       enableSSE: true,
@@ -89,12 +89,11 @@ describe('Redis Integration Tests', () => {
     assert.ok(Array.isArray(toolsResult.result.tools))
     assert.strictEqual(toolsResult.result.tools.length, 1)
     assert.strictEqual(toolsResult.result.tools[0].name, 'test-tool')
-
-    await app.close()
   })
 
-  testWithRedis('should handle SSE sessions with Redis persistence', async (redis) => {
+  testWithRedis('should handle SSE sessions with Redis persistence', async (redis, t) => {
     const app = fastify()
+    t.after(() => app.close())
 
     await app.register(mcpPlugin, {
       enableSSE: true,
@@ -137,15 +136,16 @@ describe('Redis Integration Tests', () => {
     // Verify session has TTL
     const ttl = await redis.ttl(`session:${sessionId}`)
     assert.ok(ttl > 0)
-
-    await app.close()
   })
 
-  testWithRedis('should handle message broadcasting across Redis instances', async (redis) => {
+  testWithRedis('should handle message broadcasting across Redis instances', async (redis, t) => {
     const redis2 = await redis.duplicate()
+    t.after(() => redis2.disconnect())
 
     const app1 = fastify()
     const app2 = fastify()
+    t.after(() => app1.close())
+    t.after(() => app2.close())
 
     await app1.register(mcpPlugin, {
       enableSSE: true,
@@ -202,14 +202,11 @@ describe('Redis Integration Tests', () => {
     // Verify message was stored in session history
     const history = await redis.xrange(`session:${sessionId}:history`, '-', '+')
     assert.ok(history.length > 0)
-
-    await app1.close()
-    await app2.close()
-    await redis2.disconnect()
   })
 
-  testWithRedis('should handle session message sending with Redis', async (redis) => {
+  testWithRedis('should handle session message sending with Redis', async (redis, t) => {
     const app = fastify()
+    t.after(() => app.close())
 
     await app.register(mcpPlugin, {
       enableSSE: true,
@@ -254,12 +251,11 @@ describe('Redis Integration Tests', () => {
     // (the session exists but no active SSE connections)
     const result = await app.mcpSendToSession(sessionId, message)
     assert.strictEqual(result, false)
-
-    await app.close()
   })
 
-  testWithRedis('should handle Redis connection failures gracefully', async () => {
+  testWithRedis('should handle Redis connection failures gracefully', async (_, t) => {
     const app = fastify()
+    t.after(() => app.close())
 
     // Use invalid Redis configuration
     await app.register(mcpPlugin, {
@@ -274,12 +270,11 @@ describe('Redis Integration Tests', () => {
     // Plugin should still register (connection failures are handled by Redis client)
     assert.ok(app.mcpAddTool)
     assert.ok(app.mcpBroadcastNotification)
-
-    await app.close()
   })
 
-  testWithRedis('should fallback to memory when Redis not configured', async () => {
+  testWithRedis('should fallback to memory when Redis not configured', async (_, t) => {
     const app = fastify()
+    t.after(() => app.close())
 
     await app.register(mcpPlugin, {
       enableSSE: true
@@ -309,7 +304,5 @@ describe('Redis Integration Tests', () => {
     const result = JSON.parse(response.payload)
     assert.strictEqual(result.id, 1)
     assert.ok(result.result)
-
-    await app.close()
   })
 })
