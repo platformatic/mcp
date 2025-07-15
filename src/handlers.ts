@@ -11,9 +11,7 @@ import type {
   ListResourcesResult,
   ListPromptsResult,
   CallToolResult,
-  ReadResourceRequest,
   ReadResourceResult,
-  GetPromptRequest,
   GetPromptResult
 } from './schema.ts'
 
@@ -26,7 +24,7 @@ import {
 } from './schema.ts'
 
 import type { MCPTool, MCPResource, MCPPrompt, MCPPluginOptions } from './types.ts'
-import { validate, CallToolRequestSchema, typeBoxToJSONSchema } from './validation/index.ts'
+import { validate, CallToolRequestSchema, typeBoxToJSONSchema, ReadResourceRequestSchema, GetPromptRequestSchema } from './validation/index.ts'
 
 type HandlerDependencies = {
   app: FastifyInstance
@@ -213,12 +211,17 @@ async function handleResourcesRead (
   dependencies: HandlerDependencies
 ): Promise<JSONRPCResponse | JSONRPCError> {
   const { resources } = dependencies
-  const params = request.params as ReadResourceRequest['params']
-  const uri = params?.uri
 
-  if (!uri) {
-    return createError(request.id, INTERNAL_ERROR, 'Resource URI is required')
+  // Validate the request parameters structure
+  const paramsValidation = validate(ReadResourceRequestSchema, request.params)
+  if (!paramsValidation.success) {
+    return createError(request.id, INVALID_PARAMS, 'Invalid resource read parameters', {
+      validation: paramsValidation.error
+    })
   }
+
+  const params = paramsValidation.data
+  const uri = params.uri
 
   const resource = resources.get(uri)
   if (!resource) {
@@ -234,6 +237,25 @@ async function handleResourcesRead (
       }]
     }
     return createResponse(request.id, result)
+  }
+
+  // Validate URI against resource's URI schema if present
+  if ('uriSchema' in resource.definition && resource.definition.uriSchema) {
+    const schema = resource.definition.uriSchema
+    if (schema && typeof schema === 'object' && 'kind' in schema) {
+      // TypeBox schema - use our validation
+      const uriValidation = validate(schema, uri)
+      if (!uriValidation.success) {
+        const result: ReadResourceResult = {
+          contents: [{
+            uri,
+            text: `Invalid resource URI: ${uriValidation.error.message}`,
+            mimeType: 'text/plain'
+          }]
+        }
+        return createResponse(request.id, result)
+      }
+    }
   }
 
   try {
@@ -256,12 +278,17 @@ async function handlePromptsGet (
   dependencies: HandlerDependencies
 ): Promise<JSONRPCResponse | JSONRPCError> {
   const { prompts } = dependencies
-  const params = request.params as GetPromptRequest['params']
-  const promptName = params?.name
 
-  if (!promptName) {
-    return createError(request.id, INTERNAL_ERROR, 'Prompt name is required')
+  // Validate the request parameters structure
+  const paramsValidation = validate(GetPromptRequestSchema, request.params)
+  if (!paramsValidation.success) {
+    return createError(request.id, INVALID_PARAMS, 'Invalid prompt get parameters', {
+      validation: paramsValidation.error
+    })
   }
+
+  const params = paramsValidation.data
+  const promptName = params.name
 
   const prompt = prompts.get(promptName)
   if (!prompt) {
@@ -281,20 +308,78 @@ async function handlePromptsGet (
     return createResponse(request.id, result)
   }
 
-  try {
-    const result = await prompt.handler(promptName, params.arguments || {})
-    return createResponse(request.id, result)
-  } catch (error: any) {
-    const result: GetPromptResult = {
-      messages: [{
-        role: 'user',
-        content: {
-          type: 'text',
-          text: `Prompt execution failed: ${error.message || error}`
+  // Validate prompt arguments against the prompt's argument schema
+  const promptArguments = params.arguments || {}
+  if ('argumentSchema' in prompt.definition && prompt.definition.argumentSchema) {
+    // Check if it's a TypeBox schema (has Kind symbol)
+    const schema = prompt.definition.argumentSchema
+    if (schema && typeof schema === 'object' && 'kind' in schema) {
+      // TypeBox schema - use our validation
+      const argumentsValidation = validate(schema, promptArguments)
+      if (!argumentsValidation.success) {
+        const result: GetPromptResult = {
+          messages: [{
+            role: 'user',
+            content: {
+              type: 'text',
+              text: `Invalid prompt arguments: ${argumentsValidation.error.message}`
+            }
+          }]
         }
-      }]
+        return createResponse(request.id, result)
+      }
+
+      // Use validated arguments
+      try {
+        const result = await prompt.handler(promptName, argumentsValidation.data)
+        return createResponse(request.id, result)
+      } catch (error: any) {
+        const result: GetPromptResult = {
+          messages: [{
+            role: 'user',
+            content: {
+              type: 'text',
+              text: `Prompt execution failed: ${error.message || error}`
+            }
+          }]
+        }
+        return createResponse(request.id, result)
+      }
+    } else {
+      // Regular JSON Schema - basic validation or pass through
+      try {
+        const result = await prompt.handler(promptName, promptArguments)
+        return createResponse(request.id, result)
+      } catch (error: any) {
+        const result: GetPromptResult = {
+          messages: [{
+            role: 'user',
+            content: {
+              type: 'text',
+              text: `Prompt execution failed: ${error.message || error}`
+            }
+          }]
+        }
+        return createResponse(request.id, result)
+      }
     }
-    return createResponse(request.id, result)
+  } else {
+    // Legacy prompt without schema - pass arguments as-is
+    try {
+      const result = await prompt.handler(promptName, promptArguments)
+      return createResponse(request.id, result)
+    } catch (error: any) {
+      const result: GetPromptResult = {
+        messages: [{
+          role: 'user',
+          content: {
+            type: 'text',
+            text: `Prompt execution failed: ${error.message || error}`
+          }
+        }]
+      }
+      return createResponse(request.id, result)
+    }
   }
 }
 

@@ -122,6 +122,10 @@ export const BlobResourceContentsSchema = Type.Intersect([
   })
 ])
 
+export const ReadResourceRequestSchema = Type.Object({
+  uri: Type.String({ minLength: 1 })
+})
+
 export const ReadResourceResultSchema = Type.Object({
   contents: Type.Array(Type.Union([
     TextResourceContentsSchema,
@@ -148,6 +152,11 @@ export const PromptMessageSchema = Type.Object({
   content: ContentSchema
 })
 
+export const GetPromptRequestSchema = Type.Object({
+  name: Type.String({ minLength: 1 }),
+  arguments: Type.Optional(Type.Record(Type.String(), Type.Unknown()))
+})
+
 export const GetPromptResultSchema = Type.Object({
   description: Type.Optional(Type.String()),
   messages: Type.Array(PromptMessageSchema),
@@ -169,8 +178,10 @@ export type CallToolResult = Static<typeof CallToolResultSchema>
 export type ResourceDefinition = Static<typeof ResourceDefinitionSchema>
 export type TextResourceContents = Static<typeof TextResourceContentsSchema>
 export type BlobResourceContents = Static<typeof BlobResourceContentsSchema>
+export type ReadResourceRequest = Static<typeof ReadResourceRequestSchema>
 export type ReadResourceResult = Static<typeof ReadResourceResultSchema>
 export type PromptArgument = Static<typeof PromptArgumentSchema>
 export type PromptDefinition = Static<typeof PromptDefinitionSchema>
 export type PromptMessage = Static<typeof PromptMessageSchema>
+export type GetPromptRequest = Static<typeof GetPromptRequestSchema>
 export type GetPromptResult = Static<typeof GetPromptResultSchema>
