@@ -1,6 +1,7 @@
 import type { Static, TSchema, TObject } from '@sinclair/typebox'
 import { Value } from '@sinclair/typebox/value'
 import { TypeCompiler } from '@sinclair/typebox/compiler'
+import stringify from 'safe-stable-stringify'
 import type { ValidationError } from './schemas.ts'
 
 // Compiled validator cache
@@ -10,7 +11,7 @@ const compiledValidators = new Map<string, ReturnType<typeof TypeCompiler.Compil
  * Get a compiled validator for a schema, with caching
  */
 function getValidator<T extends TSchema> (schema: T): ReturnType<typeof TypeCompiler.Compile> {
-  const key = JSON.stringify(schema)
+  const key = stringify(schema)
   if (!compiledValidators.has(key)) {
     compiledValidators.set(key, TypeCompiler.Compile(schema))
   }
@@ -170,5 +171,5 @@ export function validateSchema<TParams extends TObject, TResult extends TSchema>
  * Utility to get schema hash for caching
  */
 export function getSchemaHash (schema: TSchema): string {
-  return JSON.stringify(schema)
+  return stringify(schema)
 }

@@ -47,7 +47,8 @@
   "dependencies": {
     "fastify-plugin": "^5.0.1",
     "ioredis": "^5.0.0",
-    "mqemitter": "^7.1.0"
+    "mqemitter": "^7.1.0",
+    "safe-stable-stringify": "^2.5.0"
   },
   "peerDependencies": {
     "@sinclair/typebox": "^0.34.0"
