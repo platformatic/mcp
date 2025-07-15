@@ -34,6 +34,7 @@
   "devDependencies": {
     "@modelcontextprotocol/inspector": "^0.16.0",
     "@modelcontextprotocol/sdk": "^1.13.3",
+    "@sinclair/typebox": "^0.34.37",
     "@types/node": "^24.0.10",
     "eslint": "^9.30.0",
     "fastify": "^5.4.0",
