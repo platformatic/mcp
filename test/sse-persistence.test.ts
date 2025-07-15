@@ -44,7 +44,7 @@ test('POST SSE connections should persist and receive notifications', async (t) 
     sessionIdFromTool = context?.sessionId
 
     // Send a notification after a short delay
-    setTimeout(async () => {
+    setTimeout(() => {
       const notification = {
         jsonrpc: '2.0' as const,
         method: 'notifications/test',
