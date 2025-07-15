@@ -2,12 +2,11 @@ import { describe } from 'node:test'
 import assert from 'node:assert'
 import fastify from 'fastify'
 import mcpPlugin from '../src/index.ts'
-import { createTestRedis, cleanupRedis, skipIfNoRedis } from './redis-test-utils.ts'
+import { testWithRedis } from './redis-test-utils.ts'
 import type { JSONRPCMessage } from '../src/schema.ts'
 
 describe('Redis Integration Tests', () => {
-  skipIfNoRedis('should initialize plugin with Redis configuration', async () => {
-    const redis = await createTestRedis()
+  testWithRedis('should initialize plugin with Redis configuration', async (redis) => {
     const app = fastify()
 
     await app.register(mcpPlugin, {
@@ -27,11 +26,9 @@ describe('Redis Integration Tests', () => {
     assert.ok(app.mcpSendToSession)
 
     await app.close()
-    await cleanupRedis(redis)
   })
 
-  skipIfNoRedis('should handle MCP requests with Redis backend', async () => {
-    const redis = await createTestRedis()
+  testWithRedis('should handle MCP requests with Redis backend', async (redis) => {
     const app = fastify()
 
     await app.register(mcpPlugin, {
@@ -94,11 +91,9 @@ describe('Redis Integration Tests', () => {
     assert.strictEqual(toolsResult.result.tools[0].name, 'test-tool')
 
     await app.close()
-    await cleanupRedis(redis)
   })
 
-  skipIfNoRedis('should handle SSE sessions with Redis persistence', async () => {
-    const redis = await createTestRedis()
+  testWithRedis('should handle SSE sessions with Redis persistence', async (redis) => {
     const app = fastify()
 
     await app.register(mcpPlugin, {
@@ -144,12 +139,10 @@ describe('Redis Integration Tests', () => {
     assert.ok(ttl > 0)
 
     await app.close()
-    await cleanupRedis(redis)
   })
 
-  skipIfNoRedis('should handle message broadcasting across Redis instances', async () => {
-    const redis1 = await createTestRedis()
-    const redis2 = await createTestRedis()
+  testWithRedis('should handle message broadcasting across Redis instances', async (redis) => {
+    const redis2 = await redis.duplicate()
 
     const app1 = fastify()
     const app2 = fastify()
@@ -157,9 +150,9 @@ describe('Redis Integration Tests', () => {
     await app1.register(mcpPlugin, {
       enableSSE: true,
       redis: {
-        host: redis1.options.host!,
-        port: redis1.options.port!,
-        db: redis1.options.db!
+        host: redis.options.host!,
+        port: redis.options.port!,
+        db: redis.options.db!
       }
     })
 
@@ -207,17 +200,15 @@ describe('Redis Integration Tests', () => {
     await new Promise(resolve => setTimeout(resolve, 200))
 
     // Verify message was stored in session history
-    const history = await redis1.xrange(`session:${sessionId}:history`, '-', '+')
+    const history = await redis.xrange(`session:${sessionId}:history`, '-', '+')
     assert.ok(history.length > 0)
 
     await app1.close()
     await app2.close()
-    await cleanupRedis(redis1)
-    await cleanupRedis(redis2)
+    await redis2.disconnect()
   })
 
-  skipIfNoRedis('should handle session message sending with Redis', async () => {
-    const redis = await createTestRedis()
+  testWithRedis('should handle session message sending with Redis', async (redis) => {
     const app = fastify()
 
     await app.register(mcpPlugin, {
@@ -265,10 +256,9 @@ describe('Redis Integration Tests', () => {
     assert.strictEqual(result, false)
 
     await app.close()
-    await cleanupRedis(redis)
   })
 
-  skipIfNoRedis('should handle Redis connection failures gracefully', async () => {
+  testWithRedis('should handle Redis connection failures gracefully', async () => {
     const app = fastify()
 
     // Use invalid Redis configuration
@@ -288,7 +278,7 @@ describe('Redis Integration Tests', () => {
     await app.close()
   })
 
-  skipIfNoRedis('should fallback to memory when Redis not configured', async () => {
+  testWithRedis('should fallback to memory when Redis not configured', async () => {
     const app = fastify()
 
     await app.register(mcpPlugin, {

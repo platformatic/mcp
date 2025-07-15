@@ -1,13 +1,12 @@
 import { describe } from 'node:test'
 import assert from 'node:assert'
 import { RedisSessionStore } from '../src/stores/redis-session-store.ts'
-import { createTestRedis, cleanupRedis, skipIfNoRedis } from './redis-test-utils.ts'
+import { testWithRedis } from './redis-test-utils.ts'
 import type { SessionMetadata } from '../src/stores/session-store.ts'
 import type { JSONRPCMessage } from '../src/schema.ts'
 
 describe('RedisSessionStore', () => {
-  skipIfNoRedis('should create and retrieve session metadata', async () => {
-    const redis = await createTestRedis()
+  testWithRedis('should create and retrieve session metadata', async (redis) => {
     const store = new RedisSessionStore({ redis, maxMessages: 100 })
 
     const metadata: SessionMetadata = {
@@ -27,22 +26,16 @@ describe('RedisSessionStore', () => {
     assert.strictEqual(retrieved.lastEventId, metadata.lastEventId)
     assert.deepStrictEqual(retrieved.createdAt, metadata.createdAt)
     assert.deepStrictEqual(retrieved.lastActivity, metadata.lastActivity)
-
-    await cleanupRedis(redis)
   })
 
-  skipIfNoRedis('should return null for non-existent session', async () => {
-    const redis = await createTestRedis()
+  testWithRedis('should return null for non-existent session', async (redis) => {
     const store = new RedisSessionStore({ redis, maxMessages: 100 })
 
     const result = await store.get('non-existent-session')
     assert.strictEqual(result, null)
-
-    await cleanupRedis(redis)
   })
 
-  skipIfNoRedis('should delete session and its history', async () => {
-    const redis = await createTestRedis()
+  testWithRedis('should delete session and its history', async (redis) => {
     const store = new RedisSessionStore({ redis, maxMessages: 100 })
 
     const metadata: SessionMetadata = {
@@ -76,12 +69,9 @@ describe('RedisSessionStore', () => {
     // Verify history is deleted
     const history = await store.getMessagesFrom('test-session-2', '0')
     assert.strictEqual(history.length, 0)
-
-    await cleanupRedis(redis)
   })
 
-  skipIfNoRedis('should add messages to history and update session metadata', async () => {
-    const redis = await createTestRedis()
+  testWithRedis('should add messages to history and update session metadata', async (redis) => {
     const store = new RedisSessionStore({ redis, maxMessages: 100 })
 
     const metadata: SessionMetadata = {
@@ -120,12 +110,9 @@ describe('RedisSessionStore', () => {
     assert.deepStrictEqual(history[0].message, message1)
     assert.strictEqual(history[1].eventId, '2')
     assert.deepStrictEqual(history[1].message, message2)
-
-    await cleanupRedis(redis)
   })
 
-  skipIfNoRedis('should replay messages from specific event ID', async () => {
-    const redis = await createTestRedis()
+  testWithRedis('should replay messages from specific event ID', async (redis) => {
     const store = new RedisSessionStore({ redis, maxMessages: 100 })
 
     const metadata: SessionMetadata = {
@@ -154,12 +141,9 @@ describe('RedisSessionStore', () => {
     assert.deepStrictEqual(history[0].message, messages[1])
     assert.strictEqual(history[1].eventId, '3')
     assert.deepStrictEqual(history[1].message, messages[2])
-
-    await cleanupRedis(redis)
   })
 
-  skipIfNoRedis('should trim message history to max messages', async () => {
-    const redis = await createTestRedis()
+  testWithRedis('should trim message history to max messages', async (redis) => {
     const store = new RedisSessionStore({ redis, maxMessages: 3 })
 
     const metadata: SessionMetadata = {
@@ -187,12 +171,9 @@ describe('RedisSessionStore', () => {
     assert.strictEqual(history[0].eventId, '3')
     assert.strictEqual(history[1].eventId, '4')
     assert.strictEqual(history[2].eventId, '5')
-
-    await cleanupRedis(redis)
   })
 
-  skipIfNoRedis('should handle cleanup of orphaned message histories', async () => {
-    const redis = await createTestRedis()
+  testWithRedis('should handle cleanup of orphaned message histories', async (redis) => {
     const store = new RedisSessionStore({ redis, maxMessages: 100 })
 
     const metadata: SessionMetadata = {
@@ -221,12 +202,9 @@ describe('RedisSessionStore', () => {
     // Verify history was cleaned up
     const exists = await redis.exists('session:test-session-6:history')
     assert.strictEqual(exists, 0)
-
-    await cleanupRedis(redis)
   })
 
-  skipIfNoRedis('should handle session expiration', async () => {
-    const redis = await createTestRedis()
+  testWithRedis('should handle session expiration', async (redis) => {
     const store = new RedisSessionStore({ redis, maxMessages: 100 })
 
     const metadata: SessionMetadata = {
@@ -252,17 +230,12 @@ describe('RedisSessionStore', () => {
 
     const newTtl = await redis.ttl('session:test-session-7')
     assert.ok(newTtl > 3500 && newTtl <= 3600)
-
-    await cleanupRedis(redis)
   })
 
-  skipIfNoRedis('should return empty array for non-existent message history', async () => {
-    const redis = await createTestRedis()
+  testWithRedis('should return empty array for non-existent message history', async (redis) => {
     const store = new RedisSessionStore({ redis, maxMessages: 100 })
 
     const history = await store.getMessagesFrom('non-existent-session', '0')
     assert.strictEqual(history.length, 0)
-
-    await cleanupRedis(redis)
   })
 })

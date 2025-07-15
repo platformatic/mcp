@@ -41,23 +41,27 @@ export async function cleanupRedis (redis: Redis): Promise<void> {
   }
 }
 
-export function skipIfNoRedis (testName: string, testFn: () => Promise<void>) {
-  test(testName, async () => {
+export function testWithRedis (testName: string, testFn: (redis: Redis) => Promise<void>) {
+  test(testName, async (t) => {
     let redis: Redis
     try {
       redis = await createTestRedis()
-      await testFn()
+
+      // Set up cleanup to run after test completes
+      t.after(async () => {
+        if (redis) {
+          await cleanupRedis(redis)
+        }
+      })
+
+      await testFn(redis)
     } catch (error) {
       if (error instanceof Error && error.message.includes('Redis connection failed')) {
         // Skip test if Redis is not available
-        console.log(`Skipping ${testName} - Redis not available`)
+        t.skip('Redis not available')
         return
       }
       throw error
-    } finally {
-      if (redis!) {
-        await cleanupRedis(redis)
-      }
     }
   })
 }

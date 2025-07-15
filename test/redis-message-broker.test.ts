@@ -1,12 +1,11 @@
 import { describe } from 'node:test'
 import assert from 'node:assert'
 import { RedisMessageBroker } from '../src/brokers/redis-message-broker.ts'
-import { createTestRedis, cleanupRedis, skipIfNoRedis } from './redis-test-utils.ts'
+import { testWithRedis } from './redis-test-utils.ts'
 import type { JSONRPCMessage } from '../src/schema.ts'
 
 describe('RedisMessageBroker', () => {
-  skipIfNoRedis('should publish and receive messages', async () => {
-    const redis = await createTestRedis()
+  testWithRedis('should publish and receive messages', async (redis) => {
     const broker = new RedisMessageBroker(redis)
 
     const testMessage: JSONRPCMessage = {
@@ -33,13 +32,11 @@ describe('RedisMessageBroker', () => {
     assert.deepStrictEqual(receivedMessage, testMessage)
 
     await broker.close()
-    await cleanupRedis(redis)
   })
 
-  skipIfNoRedis('should handle multiple subscribers to same topic', async () => {
-    const redis1 = await createTestRedis()
-    const redis2 = await createTestRedis()
-    const broker1 = new RedisMessageBroker(redis1)
+  testWithRedis('should handle multiple subscribers to same topic', async (redis) => {
+    const redis2 = await redis.duplicate()
+    const broker1 = new RedisMessageBroker(redis)
     const broker2 = new RedisMessageBroker(redis2)
 
     const testMessage: JSONRPCMessage = {
@@ -71,12 +68,10 @@ describe('RedisMessageBroker', () => {
 
     await broker1.close()
     await broker2.close()
-    await cleanupRedis(redis1)
-    await cleanupRedis(redis2)
+    await redis2.disconnect()
   })
 
-  skipIfNoRedis('should handle session-specific topics', async () => {
-    const redis = await createTestRedis()
+  testWithRedis('should handle session-specific topics', async (redis) => {
     const broker = new RedisMessageBroker(redis)
 
     const sessionId = 'test-session-123'
@@ -104,11 +99,9 @@ describe('RedisMessageBroker', () => {
     assert.deepStrictEqual(receivedMessage, testMessage)
 
     await broker.close()
-    await cleanupRedis(redis)
   })
 
-  skipIfNoRedis('should handle broadcast notifications', async () => {
-    const redis = await createTestRedis()
+  testWithRedis('should handle broadcast notifications', async (redis) => {
     const broker = new RedisMessageBroker(redis)
 
     const notification: JSONRPCMessage = {
@@ -135,11 +128,9 @@ describe('RedisMessageBroker', () => {
     assert.deepStrictEqual(receivedNotification, notification)
 
     await broker.close()
-    await cleanupRedis(redis)
   })
 
-  skipIfNoRedis('should handle unsubscribe', async () => {
-    const redis = await createTestRedis()
+  testWithRedis('should handle unsubscribe', async (redis) => {
     const broker = new RedisMessageBroker(redis)
 
     const testMessage: JSONRPCMessage = {
@@ -169,11 +160,9 @@ describe('RedisMessageBroker', () => {
     assert.strictEqual(messageReceived, false)
 
     await broker.close()
-    await cleanupRedis(redis)
   })
 
-  skipIfNoRedis('should handle multiple topics on same broker', async () => {
-    const redis = await createTestRedis()
+  testWithRedis('should handle multiple topics on same broker', async (redis) => {
     const broker = new RedisMessageBroker(redis)
 
     const message1: JSONRPCMessage = {
@@ -215,11 +204,9 @@ describe('RedisMessageBroker', () => {
     assert.ok(receivedMessages.some(msg => 'method' in msg && msg.method === 'test2'))
 
     await broker.close()
-    await cleanupRedis(redis)
   })
 
-  skipIfNoRedis('should handle complex JSON-RPC messages', async () => {
-    const redis = await createTestRedis()
+  testWithRedis('should handle complex JSON-RPC messages', async (redis) => {
     const broker = new RedisMessageBroker(redis)
 
     const complexMessage: JSONRPCMessage = {
@@ -255,11 +242,9 @@ describe('RedisMessageBroker', () => {
     assert.deepStrictEqual(receivedMessage, complexMessage)
 
     await broker.close()
-    await cleanupRedis(redis)
   })
 
-  skipIfNoRedis('should handle broker close gracefully', async () => {
-    const redis = await createTestRedis()
+  testWithRedis('should handle broker close gracefully', async (redis) => {
     const broker = new RedisMessageBroker(redis)
 
     const testMessage: JSONRPCMessage = {
@@ -277,7 +262,5 @@ describe('RedisMessageBroker', () => {
 
     // Close should not throw
     await broker.close()
-
-    await cleanupRedis(redis)
   })
 })
