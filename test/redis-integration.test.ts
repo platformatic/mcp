@@ -201,7 +201,7 @@ describe('Redis Integration Tests', () => {
       const data = chunk.toString()
       if (data.includes('Cross-instance notification')) {
         // Verify the notification was received
-        t.assert.ok(data.includes('Cross-instance notification'))
+        (t.assert.ok as (value: unknown, message?: string) => void)(data.includes('Cross-instance notification'), 'Should receive cross-instance notification')
         break
       }
     }
@@ -247,7 +247,7 @@ describe('Redis Integration Tests', () => {
     })
 
     const sessionId = sessionResponse.headers['mcp-session-id'] as string
-    t.assert.ok(sessionId)
+    (t.assert.ok as (value: unknown, message?: string) => void)(sessionId, 'Session ID should be present')
 
     // Send message to session
     const message: JSONRPCMessage = {
@@ -257,15 +257,15 @@ describe('Redis Integration Tests', () => {
       id: 2
     }
 
-    const result = await app.mcpSendToSession(sessionId, message)
-    t.assert.strictEqual(result, true)
+    const result: boolean = await app.mcpSendToSession(sessionId, message);
+    (t.assert.strictEqual as (actual: unknown, expected: unknown, message?: string) => void)(result, true, 'Message should be sent successfully')
 
     // Verify message was stored in session history
     for await (const chunk of sessionResponse.stream()) {
       const data = chunk.toString()
       if (data.includes('test-message')) {
         // Verify the message was received
-        t.assert.ok(data.includes('test-message'))
+        (t.assert.ok as (value: unknown, message?: string) => void)(data.includes('test-message'), 'Should receive test message')
         break
       }
     }

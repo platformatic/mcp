@@ -1,6 +1,6 @@
 import { Redis } from 'ioredis'
 import { test } from 'node:test'
-import type { TestOptions } from 'node:test'
+import type { TestOptions, TestContext } from 'node:test'
 
 export interface RedisTestConfig {
   host: string
@@ -43,9 +43,11 @@ export async function cleanupRedis (redis: Redis): Promise<void> {
   }
 }
 
-type testFn = (redis: Redis, t: any) => Promise<void>
+type testFn = (redis: Redis, t: TestContext) => Promise<void>
 
-export function testWithRedis (testName: string, opts: TestOptions, testFn: testFn) {
+export function testWithRedis (testName: string, testFn: testFn): void
+export function testWithRedis (testName: string, opts: TestOptions, testFn: testFn): void
+export function testWithRedis (testName: string, opts: TestOptions | testFn, testFn?: testFn): void {
   if (typeof opts === 'function') {
     testFn = opts
     opts = {}
@@ -63,7 +65,7 @@ export function testWithRedis (testName: string, opts: TestOptions, testFn: test
         }
       })
 
-      await testFn(redis, t)
+      await testFn!(redis, t)
     } catch (error) {
       if (error instanceof Error && error.message.includes('Redis connection failed')) {
         // Skip test if Redis is not available
