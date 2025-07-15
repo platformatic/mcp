@@ -33,7 +33,7 @@ jobs:
         node-version: ${{ matrix.node-version }}
     
     - name: Install dependencies
-      run: npm install
+      run: npm ci 
     
     - name: Run CI pipeline
       run: npm run ci
