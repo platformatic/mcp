@@ -38,6 +38,7 @@ export class StdioTransport {
   private app: FastifyInstance
   private readline: any
   private transportOpts: StdioTransportOptions
+  private isShuttingDown = false
 
   constructor (
     app: FastifyInstance,
@@ -74,23 +75,33 @@ export class StdioTransport {
     // Handle close/error events
     this.readline.on('close', () => {
       this.log('Stdio transport closed')
-      process.exit(0)
+      // Trigger graceful shutdown when readline closes
+      this.stop().catch(error => {
+        this.logError('Error during shutdown:', error)
+      })
     })
 
     this.readline.on('error', (error: Error) => {
       this.logError('Readline error:', error)
-      process.exit(1)
+      // Trigger graceful shutdown on readline error
+      this.stop().catch(shutdownError => {
+        this.logError('Error during shutdown:', shutdownError)
+      })
     })
 
-    // Handle process signals
+    // Handle process signals for graceful shutdown
     process.on('SIGINT', () => {
       this.log('Received SIGINT, shutting down...')
-      this.stop()
+      this.stop().catch(error => {
+        this.logError('Error during shutdown:', error)
+      })
     })
 
     process.on('SIGTERM', () => {
       this.log('Received SIGTERM, shutting down...')
-      this.stop()
+      this.stop().catch(error => {
+        this.logError('Error during shutdown:', error)
+      })
     })
 
     this.log('MCP stdio transport started successfully')
@@ -99,11 +110,25 @@ export class StdioTransport {
   /**
    * Stop the stdio transport
    */
-  stop (): void {
+  async stop (): Promise<void> {
+    if (this.isShuttingDown) {
+      return
+    }
+
+    this.isShuttingDown = true
+    this.log('Stopping stdio transport...')
+
     if (this.readline) {
       this.readline.close()
     }
-    process.exit(0)
+
+    // Close the Fastify app gracefully
+    try {
+      await this.app.close()
+      this.log('Fastify app closed successfully')
+    } catch (error) {
+      this.logError('Error closing Fastify app:', error)
+    }
   }
 
   /**
@@ -285,6 +310,19 @@ export async function runStdioServer (
 
   transport.start()
 
-  // Return a promise that never resolves to keep the process running
-  return new Promise(() => {})
+  // Return a promise that resolves when the process should shut down
+  return new Promise((resolve) => {
+    const shutdown = async () => {
+      await transport.stop()
+      resolve()
+    }
+
+    // Handle graceful shutdown signals
+    process.once('SIGINT', shutdown)
+    process.once('SIGTERM', shutdown)
+
+    // Handle stdin close (when parent process closes our stdin)
+    process.stdin.on('close', shutdown)
+    process.stdin.on('end', shutdown)
+  })
 }
