@@ -151,7 +151,7 @@ async function handleToolsCall (
         const result: CallToolResult = {
           content: [{
             type: 'text',
-            text: `Invalid tool arguments: ${argumentsValidation.error.message}`
+            text: `Invalid tool arguments provided.`
           }],
           isError: true
         }
