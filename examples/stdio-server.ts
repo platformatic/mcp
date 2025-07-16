@@ -1,6 +1,5 @@
 import fastify from 'fastify'
-import mcpPlugin from '../src/index.ts'
-import { runStdioServer } from '../src/stdio.ts'
+import mcpPlugin, { runStdioServer } from '../src/index.ts'
 
 // Create a Fastify server
 const app = fastify({

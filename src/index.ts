@@ -89,3 +89,51 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
 }, {
   name: '@platformatic/mcp'
 })
+
+// Export stdio transport functionality
+export {
+  StdioTransport,
+  createStdioTransport,
+  runStdioServer
+} from './stdio.ts'
+
+export type {
+  StdioTransportOptions
+} from './stdio.ts'
+
+// Export plugin types
+export type {
+  MCPPluginOptions,
+  MCPTool,
+  MCPResource,
+  MCPPrompt,
+  ToolHandler,
+  ResourceHandler,
+  PromptHandler,
+  UnsafeMCPTool,
+  UnsafeMCPResource,
+  UnsafeMCPPrompt,
+  UnsafeToolHandler,
+  UnsafeResourceHandler,
+  UnsafePromptHandler,
+  SSESession
+} from './types.ts'
+
+// Export MCP protocol types
+export type {
+  JSONRPCMessage,
+  JSONRPCRequest,
+  JSONRPCResponse,
+  JSONRPCError,
+  JSONRPCNotification,
+  JSONRPCBatchRequest,
+  JSONRPCBatchResponse,
+  ServerCapabilities,
+  Implementation,
+  Tool,
+  Resource,
+  Prompt,
+  CallToolResult,
+  ReadResourceResult,
+  GetPromptResult
+} from './schema.ts'
