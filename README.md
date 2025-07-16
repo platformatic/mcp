@@ -1,11 +1,11 @@
-# Fastify MCP
+# Fastify MCP Server
 
 A Fastify plugin that implements the Model Context Protocol (MCP) server using JSON-RPC 2.0. This plugin enables Fastify applications to expose tools, resources, and prompts following the MCP specification.
 
 ## Installation
 
 ```bash
-npm install fastify-mcp
+npm install fastify-mcp-server
 ```
 
 ### TypeBox Support (Optional)
@@ -31,7 +31,7 @@ npm install @sinclair/typebox
 
 ```typescript
 import Fastify from 'fastify'
-import mcpPlugin from 'fastify-mcp'
+import mcpPlugin from 'fastify-mcp-server'
 
 const app = Fastify({ logger: true })
 
@@ -135,7 +135,7 @@ The plugin supports TypeBox schemas for type-safe validation with automatic Type
 ```typescript
 import { Type } from '@sinclair/typebox'
 import Fastify from 'fastify'
-import mcpPlugin from 'fastify-mcp'
+import mcpPlugin from 'fastify-mcp-server'
 
 const app = Fastify({ logger: true })
 
@@ -363,7 +363,7 @@ This transforms the plugin from a single-instance application into a distributed
 
 ```typescript
 import Fastify from 'fastify'
-import mcpPlugin from 'fastify-mcp'
+import mcpPlugin from 'fastify-mcp-server'
 
 const app = Fastify({ logger: true })
 
@@ -478,7 +478,7 @@ The plugin provides methods to send notifications and messages to connected SSE 
 
 ```typescript
 import Fastify from 'fastify'
-import mcpPlugin from 'fastify-mcp'
+import mcpPlugin from 'fastify-mcp-server'
 
 const app = Fastify({ logger: true })
 
@@ -579,8 +579,8 @@ The plugin includes a built-in stdio transport utility for MCP communication ove
 
 ```typescript
 import fastify from 'fastify'
-import mcpPlugin from 'fastify-mcp'
-import { runStdioServer } from 'fastify-mcp/stdio'
+import mcpPlugin from 'fastify-mcp-server'
+import { runStdioServer } from 'fastify-mcp-server/stdio'
 
 const app = fastify({
   logger: false // Disable HTTP logging to avoid interference with stdio
@@ -710,7 +710,7 @@ npm install @fastify/bearer-auth
 
 ```typescript
 import Fastify from 'fastify'
-import mcpPlugin from 'fastify-mcp'
+import mcpPlugin from 'fastify-mcp-server'
 
 const app = Fastify({ logger: true })
 
@@ -855,4 +855,4 @@ The plugin exposes the following endpoints:
 
 ## License
 
-MIT
+Apache 2.0
