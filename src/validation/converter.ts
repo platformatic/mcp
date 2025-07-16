@@ -1,6 +1,7 @@
 import type { TObject, TSchema, TUnion, TArray, TLiteral } from '@sinclair/typebox'
 import { Kind } from '@sinclair/typebox'
 import type { PromptArgument } from './schemas.ts'
+import { isTypeBoxSchema } from './validator.ts'
 
 /**
  * Convert a TypeBox schema to MCP prompt arguments array
@@ -225,7 +226,7 @@ export function validateToolSchema (schema: any): string[] {
   const errors: string[] = []
 
   // Handle TypeBox schemas
-  if (schema[Kind]) {
+  if (isTypeBoxSchema(schema)) {
     if (schema[Kind] !== 'Object') {
       errors.push('Tool parameter schema must be an object')
       return errors

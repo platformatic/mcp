@@ -189,24 +189,24 @@ describe('Validation Utils', () => {
       const args = schemaToArguments(schema)
 
       const stringArg = args.find(arg => arg.name === 'stringField')
-      assert.ok(stringArg?.description.includes('String'))
+      assert.ok(stringArg?.description?.includes('String'))
 
       const numberArg = args.find(arg => arg.name === 'numberField')
-      assert.ok(numberArg?.description.includes('Number'))
-      assert.ok(numberArg?.description.includes('min: 0'))
-      assert.ok(numberArg?.description.includes('max: 100'))
+      assert.ok(numberArg?.description?.includes('Number'))
+      assert.ok(numberArg?.description?.includes('min: 0'))
+      assert.ok(numberArg?.description?.includes('max: 100'))
 
       const booleanArg = args.find(arg => arg.name === 'booleanField')
-      assert.ok(booleanArg?.description.includes('Boolean'))
+      assert.ok(booleanArg?.description?.includes('Boolean'))
 
       const arrayArg = args.find(arg => arg.name === 'arrayField')
-      assert.ok(arrayArg?.description.includes('Array'))
+      assert.ok(arrayArg?.description?.includes('Array'))
 
       const enumArg = args.find(arg => arg.name === 'enumField')
-      assert.ok(enumArg?.description.includes('one of: a, b, c'))
+      assert.ok(enumArg?.description?.includes('one of: a, b, c'))
 
       const literalArg = args.find(arg => arg.name === 'literalField')
-      assert.ok(literalArg?.description.includes('Literal value: fixed-value'))
+      assert.ok(literalArg?.description?.includes('Literal value: fixed-value'))
 
       const optionalArg = args.find(arg => arg.name === 'optionalField')
       assert.strictEqual(optionalArg?.required, false)
@@ -358,10 +358,10 @@ describe('Validation Utils', () => {
       const args = schemaToArguments(schema)
 
       const statusArg = args.find(arg => arg.name === 'status')
-      assert.ok(statusArg?.description.includes('One of:'))
-      assert.ok(statusArg?.description.includes('active'))
-      assert.ok(statusArg?.description.includes('inactive'))
-      assert.ok(statusArg?.description.includes('pending'))
+      assert.ok(statusArg?.description?.includes('One of:'))
+      assert.ok(statusArg?.description?.includes('active'))
+      assert.ok(statusArg?.description?.includes('inactive'))
+      assert.ok(statusArg?.description?.includes('pending'))
     })
   })
 

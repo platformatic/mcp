@@ -8,6 +8,22 @@ import type { ValidationError } from './schemas.ts'
 const compiledValidators = new Map<string, ReturnType<typeof TypeCompiler.Compile>>()
 
 /**
+ * Check if a schema is a valid TypeBox schema by attempting to compile it
+ */
+export function isTypeBoxSchema (schema: any): boolean {
+  if (!schema || typeof schema !== 'object') {
+    return false
+  }
+
+  try {
+    TypeCompiler.Compile(schema)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
  * Get a compiled validator for a schema, with caching
  */
 function getValidator<T extends TSchema> (schema: T): ReturnType<typeof TypeCompiler.Compile> {

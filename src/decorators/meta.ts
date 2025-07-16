@@ -5,8 +5,7 @@ import type {
   MCPResource,
   MCPPrompt
 } from '../types.ts'
-import { schemaToArguments, validateToolSchema, typeBoxToJSONSchema } from '../validation/index.ts'
-import { Kind } from '@sinclair/typebox'
+import { schemaToArguments, validateToolSchema, typeBoxToJSONSchema, isTypeBoxSchema } from '../validation/index.ts'
 
 interface MCPDecoratorsOptions {
   tools: Map<string, MCPTool>
@@ -37,7 +36,7 @@ const mcpDecoratorsPlugin: FastifyPluginAsync<MCPDecoratorsOptions> = async (app
 
     // Create tool definition with proper schema conversion
     let toolDefinition = definition
-    if (definition.inputSchema && typeof definition.inputSchema === 'object' && definition.inputSchema[Kind]) {
+    if (isTypeBoxSchema(definition.inputSchema)) {
       // TypeBox schema - convert to JSON Schema for the definition
       toolDefinition = {
         ...definition,

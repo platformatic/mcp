@@ -61,7 +61,7 @@ describe('TypeBox Validation', () => {
       assert.strictEqual(validBody.id, 1)
       const validResult = validBody.result as CallToolResult
       assert.strictEqual(validResult.content[0].type, 'text')
-      assert.ok(validResult.content[0].text.includes('Found test'))
+      assert.ok((validResult.content[0] as any).text.includes('Found test'))
     })
 
     test('should reject invalid tool arguments with validation errors', async (t) => {
@@ -110,7 +110,7 @@ describe('TypeBox Validation', () => {
       assert.strictEqual(invalidBody.id, 1)
       const invalidResult = invalidBody.result as CallToolResult
       assert.strictEqual(invalidResult.isError, true)
-      assert.ok(invalidResult.content[0].text.includes('Invalid tool arguments'))
+      assert.ok((invalidResult.content[0] as any).text.includes('Invalid tool arguments'))
     })
 
     test('should reject arguments with wrong types', async (t) => {
@@ -157,7 +157,7 @@ describe('TypeBox Validation', () => {
       const wrongTypeBody = wrongTypeResponse.json() as JSONRPCResponse
       const wrongTypeResult = wrongTypeBody.result as CallToolResult
       assert.strictEqual(wrongTypeResult.isError, true)
-      assert.ok(wrongTypeResult.content[0].text.includes('Invalid tool arguments'))
+      assert.ok((wrongTypeResult.content[0] as any).text.includes('Invalid tool arguments'))
     })
 
     test('should handle tools with complex nested schemas', async (t) => {
@@ -213,7 +213,7 @@ describe('TypeBox Validation', () => {
       assert.strictEqual(complexResponse.statusCode, 200)
       const complexBody = complexResponse.json() as JSONRPCResponse
       const complexResult = complexBody.result as CallToolResult
-      assert.ok(complexResult.content[0].text.includes('User: Alice, Age: 30'))
+      assert.ok((complexResult.content[0] as any).text.includes('User: Alice, Age: 30'))
     })
 
     test('should work with unsafe tools without schemas', async (t) => {
@@ -252,7 +252,7 @@ describe('TypeBox Validation', () => {
       assert.strictEqual(unsafeResponse.statusCode, 200)
       const unsafeBody = unsafeResponse.json() as JSONRPCResponse
       const unsafeResult = unsafeBody.result as CallToolResult
-      assert.ok(unsafeResult.content[0].text.includes('Unsafe tool called'))
+      assert.ok((unsafeResult.content[0] as any).text.includes('Unsafe tool called'))
     })
 
     test('should convert TypeBox schemas to JSON Schema in tools/list', async (t) => {
@@ -348,7 +348,7 @@ describe('TypeBox Validation', () => {
       assert.strictEqual(validResponse.statusCode, 200)
       const validBody = validResponse.json() as JSONRPCResponse
       const validResult = validBody.result as ReadResourceResult
-      assert.ok(validResult.contents[0].text.includes('File content'))
+      assert.ok((validResult.contents[0] as any).text.includes('File content'))
     })
 
     test('should reject invalid resource read parameters', async (t) => {
@@ -421,7 +421,7 @@ describe('TypeBox Validation', () => {
       assert.strictEqual(invalidResponse.statusCode, 200)
       const invalidBody = invalidResponse.json() as JSONRPCResponse
       const invalidResult = invalidBody.result as ReadResourceResult
-      assert.ok(invalidResult.contents[0].text.includes('File content'))
+      assert.ok((invalidResult.contents[0] as any).text.includes('File content'))
     })
   })
 
@@ -449,7 +449,7 @@ describe('TypeBox Validation', () => {
         name: 'code-review',
         description: 'Generate code review',
         argumentSchema: ReviewPromptSchema
-      }, async (name, args) => {
+      }, async (_name, args) => {
         return {
           messages: [{
             role: 'user',
@@ -483,7 +483,7 @@ describe('TypeBox Validation', () => {
       assert.strictEqual(validResponse.statusCode, 200)
       const validBody = validResponse.json() as JSONRPCResponse
       const validResult = validBody.result as GetPromptResult
-      assert.ok(validResult.messages[0].content.text.includes('Review typescript code'))
+      assert.ok((validResult.messages[0].content as any).text.includes('Review typescript code'))
     })
 
     test('should reject invalid prompt arguments with validation errors', async (t) => {
@@ -509,7 +509,7 @@ describe('TypeBox Validation', () => {
         name: 'code-review',
         description: 'Generate code review',
         argumentSchema: ReviewPromptSchema
-      }, async (name, args) => {
+      }, async (_name, args) => {
         return {
           messages: [{
             role: 'user',
@@ -543,7 +543,7 @@ describe('TypeBox Validation', () => {
       assert.strictEqual(invalidResponse.statusCode, 200)
       const invalidBody = invalidResponse.json() as JSONRPCResponse
       const invalidResult = invalidBody.result as GetPromptResult
-      assert.ok(invalidResult.messages[0].content.text.includes('Invalid prompt arguments'))
+      assert.ok((invalidResult.messages[0].content as any).text.includes('Invalid prompt arguments'))
     })
 
     test('should reject invalid prompt get parameters', async (t) => {
@@ -594,7 +594,7 @@ describe('TypeBox Validation', () => {
         name: 'code-review',
         description: 'Generate code review',
         argumentSchema: ReviewPromptSchema
-      }, async (name, args) => {
+      }, async (_name, args) => {
         return {
           messages: [{
             role: 'user',
@@ -650,7 +650,7 @@ describe('TypeBox Validation', () => {
       app.mcpAddPrompt({
         name: 'unsafe-prompt',
         description: 'Unsafe prompt without schema'
-      }, async (name, args) => {
+      }, async (_name, args) => {
         return {
           messages: [{
             role: 'user',
@@ -683,7 +683,7 @@ describe('TypeBox Validation', () => {
       assert.strictEqual(unsafeResponse.statusCode, 200)
       const unsafeBody = unsafeResponse.json() as JSONRPCResponse
       const unsafeResult = unsafeBody.result as GetPromptResult
-      assert.ok(unsafeResult.messages[0].content.text.includes('Unsafe prompt called'))
+      assert.ok((unsafeResult.messages[0].content as any).text.includes('Unsafe prompt called'))
     })
   })
 
@@ -730,7 +730,7 @@ describe('TypeBox Validation', () => {
         name: 'strict',
         description: 'Strict validation tool',
         inputSchema: StrictToolSchema
-      }, async (params) => {
+      }, async (_params) => {
         return {
           content: [{ type: 'text', text: 'Success' }]
         }
@@ -763,7 +763,7 @@ describe('TypeBox Validation', () => {
       const wrongBody = wrongResponse.json() as JSONRPCResponse
       const wrongResult = wrongBody.result as CallToolResult
       assert.strictEqual(wrongResult.isError, true)
-      assert.ok(wrongResult.content[0].text.includes('Invalid tool arguments'))
+      assert.ok((wrongResult.content[0] as any).text.includes('Invalid tool arguments'))
     })
   })
 })
