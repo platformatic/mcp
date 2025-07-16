@@ -855,4 +855,4 @@ The plugin exposes the following endpoints:
 
 ## License
 
-MIT
+Apache 2.0
