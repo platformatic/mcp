@@ -28,9 +28,9 @@
   "author": "Platformatic Inc. <oss@platformatic.dev> (https://platformatic.dev)",
   "license": "Apache-2.0",
   "bugs": {
-    "url": "https://github.com/platformatic/fastify-mcp/issues"
+    "url": "https://github.com/platformatic/fastify-mcp-server/issues"
   },
-  "homepage": "https://github.com/platformatic/fastify-mcp#readme",
+  "homepage": "https://github.com/platformatic/fastify-mcp-server#readme",
   "devDependencies": {
     "@modelcontextprotocol/inspector": "^0.16.0",
     "@modelcontextprotocol/sdk": "^1.13.3",
