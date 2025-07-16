@@ -6,36 +6,110 @@ import type {
   ReadResourceResult,
   GetPromptResult,
   ServerCapabilities,
-  Implementation
+  Implementation,
+  Tool,
+  Resource,
+  Prompt
 } from './schema.ts'
+import type { Static, TSchema, TObject, TString } from '@sinclair/typebox'
 
+// Generic handler types with TypeBox schema support
+export type ToolHandler<TSchema extends TObject = TObject> = (
+  params: Static<TSchema>,
+  context?: { sessionId?: string }
+) => Promise<CallToolResult> | CallToolResult
+
+export type ResourceHandler<TUriSchema extends TSchema = TString> = (
+  uri: Static<TUriSchema>
+) => Promise<ReadResourceResult> | ReadResourceResult
+
+export type PromptHandler<TArgsSchema extends TObject = TObject> = (
+  name: string,
+  args: Static<TArgsSchema>
+) => Promise<GetPromptResult> | GetPromptResult
+
+// Generic MCP interfaces with TypeBox schema support
+export interface MCPTool<TSchema extends TObject = TObject> {
+  definition: Tool & {
+    inputSchema: TSchema
+  }
+  handler?: ToolHandler<TSchema>
+}
+
+export interface MCPResource<TUriSchema extends TSchema = TString> {
+  definition: Resource & {
+    uriSchema?: TUriSchema
+  }
+  handler?: ResourceHandler<TUriSchema>
+}
+
+export interface MCPPrompt<TArgsSchema extends TObject = TObject> {
+  definition: Prompt & {
+    argumentSchema?: TArgsSchema
+  }
+  handler?: PromptHandler<TArgsSchema>
+}
+
+// Enhanced Fastify module declaration with generic types
 declare module 'fastify' {
   interface FastifyInstance {
-    mcpAddTool: (definition: any, handler?: ToolHandler) => void
-    mcpAddResource: (definition: any, handler?: ResourceHandler) => void
-    mcpAddPrompt: (definition: any, handler?: PromptHandler) => void
+    // Overloaded methods to support both TypeBox schemas and unsafe usage
+    mcpAddTool<TSchema extends TObject>(
+      definition: Omit<Tool, 'inputSchema'> & { inputSchema: TSchema },
+      handler?: ToolHandler<TSchema>
+    ): void
+    mcpAddTool(
+      definition: any,
+      handler?: UnsafeToolHandler
+    ): void
+
+    mcpAddResource<TUriSchema extends TSchema = TString>(
+      definition: Omit<Resource, 'uri'> & {
+        uriPattern: string,
+        uriSchema?: TUriSchema
+      },
+      handler?: ResourceHandler<TUriSchema>
+    ): void
+    mcpAddResource(
+      definition: any,
+      handler?: UnsafeResourceHandler
+    ): void
+
+    mcpAddPrompt<TArgsSchema extends TObject>(
+      definition: Omit<Prompt, 'arguments'> & {
+        argumentSchema?: TArgsSchema
+      },
+      handler?: PromptHandler<TArgsSchema>
+    ): void
+    mcpAddPrompt(
+      definition: any,
+      handler?: UnsafePromptHandler
+    ): void
+
     mcpBroadcastNotification: (notification: JSONRPCNotification) => Promise<void>
     mcpSendToSession: (sessionId: string, message: JSONRPCMessage) => Promise<boolean>
   }
 }
 
-export type ToolHandler = (params: any, context?: { sessionId?: string }) => Promise<CallToolResult> | CallToolResult
-export type ResourceHandler = (uri: string) => Promise<ReadResourceResult> | ReadResourceResult
-export type PromptHandler = (name: string, args?: any) => Promise<GetPromptResult> | GetPromptResult
+// Unsafe handler types for backward compatibility
+export type UnsafeToolHandler = (params: any, context?: { sessionId?: string }) => Promise<CallToolResult> | CallToolResult
+export type UnsafeResourceHandler = (uri: string) => Promise<ReadResourceResult> | ReadResourceResult
+export type UnsafePromptHandler = (name: string, args?: any) => Promise<GetPromptResult> | GetPromptResult
 
-export interface MCPTool {
+// Unsafe interfaces for backward compatibility
+export interface UnsafeMCPTool {
   definition: any
-  handler?: ToolHandler
+  handler?: UnsafeToolHandler
 }
 
-export interface MCPResource {
+export interface UnsafeMCPResource {
   definition: any
-  handler?: ResourceHandler
+  handler?: UnsafeResourceHandler
 }
 
-export interface MCPPrompt {
+export interface UnsafeMCPPrompt {
   definition: any
-  handler?: PromptHandler
+  handler?: UnsafePromptHandler
 }
 
 export interface MCPPluginOptions {

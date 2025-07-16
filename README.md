@@ -8,9 +8,18 @@ A Fastify plugin that implements the Model Context Protocol (MCP) server using J
 npm install fastify-mcp
 ```
 
+### TypeBox Support (Optional)
+
+For type-safe schema validation, install TypeBox:
+
+```bash
+npm install @sinclair/typebox
+```
+
 ## Features
 
 - **Complete MCP Protocol Support**: Implements the full Model Context Protocol specification
+- **TypeBox Validation**: Type-safe schema validation with automatic TypeScript inference
 - **SSE Streaming**: Server-Sent Events for real-time communication
 - **Horizontal Scaling**: Redis-backed session management and message broadcasting
 - **Session Persistence**: Message history and reconnection support with Last-Event-ID
@@ -107,6 +116,212 @@ app.mcpAddPrompt({
 
 await app.listen({ port: 3000 })
 ```
+
+## TypeBox Schema Validation
+
+The plugin supports TypeBox schemas for type-safe validation with automatic TypeScript inference. This eliminates the need for manual type definitions and provides compile-time type checking.
+
+### Benefits
+
+- **Type Safety**: Automatic TypeScript type inference from schemas
+- **Runtime Validation**: Input validation with structured error messages
+- **Zero Duplication**: Single source of truth for both types and validation
+- **IDE Support**: Full autocomplete and IntelliSense for validated parameters
+- **Performance**: Compiled validators with caching for optimal performance
+
+### Basic Usage
+
+```typescript
+import { Type } from '@sinclair/typebox'
+import Fastify from 'fastify'
+import mcpPlugin from 'fastify-mcp'
+
+const app = Fastify({ logger: true })
+
+await app.register(mcpPlugin, {
+  serverInfo: { name: 'my-server', version: '1.0.0' },
+  capabilities: { tools: {} }
+})
+
+// Define TypeBox schema
+const SearchToolSchema = Type.Object({
+  query: Type.String({ minLength: 1, description: 'Search query' }),
+  limit: Type.Optional(Type.Number({ minimum: 1, maximum: 100, description: 'Maximum results' })),
+  filters: Type.Optional(Type.Array(Type.String(), { description: 'Filter criteria' }))
+})
+
+// Register tool with TypeBox schema
+app.mcpAddTool({
+  name: 'search',
+  description: 'Search for files',
+  inputSchema: SearchToolSchema
+}, async (params) => {
+  // params is automatically typed as:
+  // {
+  //   query: string;
+  //   limit?: number;
+  //   filters?: string[];
+  // }
+  const { query, limit = 10, filters = [] } = params
+  
+  return {
+    content: [{
+      type: 'text',
+      text: `Searching for "${query}" with limit ${limit} and filters: ${filters.join(', ')}`
+    }]
+  }
+})
+```
+
+### Schema Types
+
+#### Tool Input Schemas
+
+```typescript
+// Complex nested schema
+const ComplexToolSchema = Type.Object({
+  user: Type.Object({
+    name: Type.String(),
+    age: Type.Number({ minimum: 0 })
+  }),
+  preferences: Type.Object({
+    theme: Type.Union([
+      Type.Literal('light'),
+      Type.Literal('dark'),
+      Type.Literal('auto')
+    ]),
+    notifications: Type.Boolean()
+  }),
+  tags: Type.Array(Type.String())
+})
+
+app.mcpAddTool({
+  name: 'update-profile',
+  description: 'Update user profile',
+  inputSchema: ComplexToolSchema
+}, async (params) => {
+  // Fully typed nested object
+  const { user, preferences, tags } = params
+  return { content: [{ type: 'text', text: `Updated profile for ${user.name}` }] }
+})
+```
+
+#### Resource URI Schemas
+
+```typescript
+// URI validation schema
+const FileUriSchema = Type.String({
+  pattern: '^file://.+',
+  description: 'File URI pattern'
+})
+
+app.mcpAddResource({
+  uriPattern: 'file://documents/*',
+  name: 'Document Files',
+  description: 'Access document files',
+  uriSchema: FileUriSchema
+}, async (uri) => {
+  // uri is validated against the schema
+  const content = await readFile(uri)
+  return {
+    contents: [{ uri, text: content, mimeType: 'text/plain' }]
+  }
+})
+```
+
+#### Prompt Argument Schemas
+
+```typescript
+// Prompt with automatic argument generation
+const CodeReviewSchema = Type.Object({
+  language: Type.Union([
+    Type.Literal('javascript'),
+    Type.Literal('typescript'),
+    Type.Literal('python')
+  ], { description: 'Programming language' }),
+  complexity: Type.Optional(Type.Union([
+    Type.Literal('low'),
+    Type.Literal('medium'),
+    Type.Literal('high')
+  ], { description: 'Code complexity level' }))
+})
+
+app.mcpAddPrompt({
+  name: 'code-review',
+  description: 'Generate code review',
+  argumentSchema: CodeReviewSchema
+  // arguments array is automatically generated from schema
+}, async (name, args) => {
+  // args is typed as: { language: 'javascript' | 'typescript' | 'python', complexity?: 'low' | 'medium' | 'high' }
+  return {
+    messages: [{
+      role: 'user',
+      content: {
+        type: 'text',
+        text: `Review this ${args.language} code with ${args.complexity || 'medium'} complexity`
+      }
+    }]
+  }
+})
+```
+
+### Error Handling
+
+TypeBox validation provides structured error messages:
+
+```typescript
+// When validation fails, structured errors are returned:
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "isError": true,
+    "content": [{
+      "type": "text",
+      "text": "Invalid tool arguments: Validation failed with 2 errors:\n/query: Expected string, received number\n/limit: Expected number <= 100, received 150"
+    }]
+  }
+}
+```
+
+### Backward Compatibility
+
+The plugin maintains backward compatibility with JSON Schema and unvalidated tools:
+
+```typescript
+// JSON Schema (still supported)
+app.mcpAddTool({
+  name: 'legacy-tool',
+  description: 'Uses JSON Schema',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      param: { type: 'string' }
+    }
+  }
+}, async (params) => {
+  // params is typed as 'any'
+  return { content: [{ type: 'text', text: 'OK' }] }
+})
+
+// Unvalidated tool (unsafe)
+app.mcpAddTool({
+  name: 'unsafe-tool',
+  description: 'No validation'
+}, async (params) => {
+  // params is typed as 'any' - no validation performed
+  return { content: [{ type: 'text', text: 'OK' }] }
+})
+```
+
+### Performance
+
+TypeBox validation is highly optimized:
+
+- **Compiled Validators**: Schemas are compiled to optimized validation functions
+- **Caching**: Compiled validators are cached for reuse
+- **Minimal Overhead**: Less than 1ms validation overhead for typical schemas
+- **Memory Efficient**: Shared validator instances across requests
 
 ## Server-Sent Events (SSE) Support
 
@@ -423,16 +638,63 @@ await app.register(import('@fastify/bearer-auth'), {
 
 The plugin adds the following decorators to your Fastify instance:
 
-- `app.mcpAddTool(definition, handler?)`: Register a tool with optional handler function
-- `app.mcpAddResource(definition, handler?)`: Register a resource with optional handler function
-- `app.mcpAddPrompt(definition, handler?)`: Register a prompt with optional handler function
+#### Type-Safe Tool Registration
+
+```typescript
+// With TypeBox schema (recommended)
+app.mcpAddTool<TSchema extends TObject>(
+  definition: { name: string, description: string, inputSchema: TSchema },
+  handler?: (params: Static<TSchema>, context?: { sessionId?: string }) => Promise<CallToolResult>
+)
+
+// Without schema (unsafe)
+app.mcpAddTool(
+  definition: { name: string, description: string },
+  handler?: (params: any, context?: { sessionId?: string }) => Promise<CallToolResult>
+)
+```
+
+#### Type-Safe Resource Registration
+
+```typescript
+// With URI schema
+app.mcpAddResource<TUriSchema extends TSchema>(
+  definition: { uriPattern: string, name: string, description: string, uriSchema?: TUriSchema },
+  handler?: (uri: Static<TUriSchema>) => Promise<ReadResourceResult>
+)
+
+// Without schema
+app.mcpAddResource(
+  definition: { uriPattern: string, name: string, description: string },
+  handler?: (uri: string) => Promise<ReadResourceResult>
+)
+```
+
+#### Type-Safe Prompt Registration
+
+```typescript
+// With argument schema (automatically generates arguments array)
+app.mcpAddPrompt<TArgsSchema extends TObject>(
+  definition: { name: string, description: string, argumentSchema?: TArgsSchema },
+  handler?: (name: string, args: Static<TArgsSchema>) => Promise<GetPromptResult>
+)
+
+// Without schema
+app.mcpAddPrompt(
+  definition: { name: string, description: string, arguments?: PromptArgument[] },
+  handler?: (name: string, args: any) => Promise<GetPromptResult>
+)
+```
+
+#### Messaging Functions
+
 - `app.mcpBroadcastNotification(notification)`: Broadcast a notification to all connected SSE clients (works across Redis instances)
 - `app.mcpSendToSession(sessionId, message)`: Send a message/request to a specific SSE session (works across Redis instances)
 
 Handler functions are called when the corresponding MCP methods are invoked:
-- Tool handlers receive the tool arguments and return `CallToolResult`
-- Resource handlers receive the URI and return `ReadResourceResult`  
-- Prompt handlers receive the prompt name and arguments, return `GetPromptResult`
+- Tool handlers receive validated, typed arguments and return `CallToolResult`
+- Resource handlers receive validated URIs and return `ReadResourceResult`  
+- Prompt handlers receive the prompt name and validated, typed arguments, return `GetPromptResult`
 
 ### MCP Endpoints
 

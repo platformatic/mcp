@@ -1,6 +1,7 @@
 import Fastify from 'fastify'
 import { promises as fs, watch } from 'fs'
 import { join, relative } from 'path'
+import { Type } from '@sinclair/typebox'
 import mcpPlugin from '../src/index.ts'
 
 const fastify = Fastify({
@@ -104,24 +105,21 @@ fastify.addHook('onClose', async () => {
 })
 
 // Add a tool to list files in a directory
+const ListFilesSchema = Type.Object({
+  path: Type.Optional(Type.String({
+    description: 'The directory path to list files from (defaults to current directory)',
+    default: '.'
+  })),
+  showHidden: Type.Optional(Type.Boolean({
+    description: 'Whether to show hidden files (files starting with .)',
+    default: false
+  }))
+})
+
 fastify.mcpAddTool({
   name: 'list_files',
   description: 'List files and directories in a given path',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      path: {
-        type: 'string',
-        description: 'The directory path to list files from (defaults to current directory)',
-        default: '.'
-      },
-      showHidden: {
-        type: 'boolean',
-        description: 'Whether to show hidden files (files starting with .)',
-        default: false
-      }
-    }
-  }
+  inputSchema: ListFilesSchema
 }, async (params) => {
   const { path = '.', showHidden = false } = params
 
@@ -161,19 +159,16 @@ fastify.mcpAddTool({
 })
 
 // Add a tool to get file info
+const GetFileInfoSchema = Type.Object({
+  path: Type.String({
+    description: 'The file or directory path to get info about'
+  })
+})
+
 fastify.mcpAddTool({
   name: 'get_file_info',
   description: 'Get detailed information about a file or directory',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      path: {
-        type: 'string',
-        description: 'The file or directory path to get info about'
-      }
-    },
-    required: ['path']
-  }
+  inputSchema: GetFileInfoSchema
 }, async (params) => {
   const { path } = params
 
@@ -204,11 +199,17 @@ fastify.mcpAddTool({
 })
 
 // Add a resource to read file contents
+const FileUriSchema = Type.String({
+  pattern: '^file://read\\?path=.+',
+  description: 'URI pattern for file reading with path parameter'
+})
+
 fastify.mcpAddResource({
-  uri: 'file://read',
+  uriPattern: 'file://read',
   name: 'Read File',
   description: 'Read the contents of a file',
-  mimeType: 'text/plain'
+  mimeType: 'text/plain',
+  uriSchema: FileUriSchema
 }, async (uri) => {
   // Extract file path from URI query parameter
   const url = new URL(uri)
@@ -247,24 +248,20 @@ fastify.mcpAddResource({
 })
 
 // Add a tool to watch for file changes
+const WatchFilesSchema = Type.Object({
+  path: Type.Optional(Type.String({
+    description: 'The directory path to watch for changes (defaults to current directory)',
+    default: '.'
+  })),
+  watchId: Type.String({
+    description: 'Unique identifier for this watch session'
+  })
+})
+
 fastify.mcpAddTool({
   name: 'watch_files',
   description: 'Watch for file changes in a directory and send notifications via SSE to the current session',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      path: {
-        type: 'string',
-        description: 'The directory path to watch for changes (defaults to current directory)',
-        default: '.'
-      },
-      watchId: {
-        type: 'string',
-        description: 'Unique identifier for this watch session'
-      }
-    },
-    required: ['watchId']
-  }
+  inputSchema: WatchFilesSchema
 }, async (params, context) => {
   const { path = '.', watchId } = params
   const sessionId = context?.sessionId
@@ -428,19 +425,16 @@ fastify.mcpAddTool({
 })
 
 // Add a tool to stop watching files
+const StopWatchSchema = Type.Object({
+  watchId: Type.String({
+    description: 'The watch ID to stop'
+  })
+})
+
 fastify.mcpAddTool({
   name: 'stop_watch',
   description: 'Stop watching for file changes',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      watchId: {
-        type: 'string',
-        description: 'The watch ID to stop'
-      }
-    },
-    required: ['watchId']
-  }
+  inputSchema: StopWatchSchema
 }, async (params) => {
   const { watchId } = params
 
@@ -483,13 +477,12 @@ fastify.mcpAddTool({
 })
 
 // Add a tool to list active watchers
+const ListWatchersSchema = Type.Object({})
+
 fastify.mcpAddTool({
   name: 'list_watchers',
   description: 'List all active file watchers',
-  inputSchema: {
-    type: 'object',
-    properties: {}
-  }
+  inputSchema: ListWatchersSchema
 }, async (_params) => {
   const watcherEntries = Array.from(activeWatchers.entries())
 
