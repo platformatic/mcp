@@ -1,12 +1,12 @@
-# Announcing fastify-mcp: Production-Ready MCP Server with Horizontal Scaling
+# Announcing fastify-mcp-server: Production-Ready MCP Server with Horizontal Scaling
 
-Today we're excited to announce **fastify-mcp**, a production-ready Fastify adapter for the Model Context Protocol (MCP) that brings enterprise-grade scalability and type safety to MCP server implementations.
+Today we're excited to announce **fastify-mcp-server**, a production-ready Fastify adapter for the Model Context Protocol (MCP) that brings enterprise-grade scalability and type safety to MCP server implementations.
 
-## Why fastify-mcp?
+## Why fastify-mcp-server?
 
 The Model Context Protocol is revolutionizing how AI applications connect to data sources and tools. However, most existing MCP implementations are designed for single-instance development scenarios. As organizations scale their AI applications, they need MCP servers that can handle production workloads with high availability, horizontal scaling, and robust type safety.
 
-fastify-mcp fills this gap by providing:
+fastify-mcp-server fills this gap by providing:
 
 - **Horizontal Scaling**: Redis-backed session management and message broadcasting
 - **High Availability**: Session persistence with automatic reconnection and failover
@@ -18,10 +18,10 @@ fastify-mcp fills this gap by providing:
 
 ### 🚀 **Horizontal Scaling with Redis**
 
-Unlike traditional MCP servers that are limited to single instances, fastify-mcp supports true horizontal scaling:
+Unlike traditional MCP servers that are limited to single instances, fastify-mcp-server supports true horizontal scaling:
 
 ```typescript
-import fastifyMcp from 'fastify-mcp'
+import fastifyMcp from 'fastify-mcp-server'
 
 const app = fastify()
 
@@ -38,7 +38,7 @@ With Redis configuration, messages sent from any server instance reach all conne
 
 ### 🔒 **Complete Type Safety with TypeBox**
 
-fastify-mcp leverages TypeBox for runtime type validation and compile-time type safety. The complete MCP protocol is fully typed, including:
+fastify-mcp-server leverages TypeBox for runtime type validation and compile-time type safety. The complete MCP protocol is fully typed, including:
 
 - JSON-RPC 2.0 message types (requests, responses, notifications)
 - MCP protocol lifecycle (initialization, capabilities, ping)
@@ -74,7 +74,7 @@ Real-time streaming communication with robust session management:
 
 #### Session Reconnection & Message Replay
 
-One of fastify-mcp's most powerful features is its ability to handle client reconnections seamlessly. When a client reconnects after a network interruption, the server automatically replays missed messages using the SSE `Last-Event-ID` header. This ensures no data is lost during temporary disconnections.
+One of fastify-mcp-server's most powerful features is its ability to handle client reconnections seamlessly. When a client reconnects after a network interruption, the server automatically replays missed messages using the SSE `Last-Event-ID` header. This ensures no data is lost during temporary disconnections.
 
 ```mermaid
 sequenceDiagram
@@ -114,7 +114,7 @@ The plugin automatically selects the appropriate backend based on configuration�
 
 ## Production-Ready Architecture
 
-fastify-mcp is designed from the ground up for production environments with horizontal scaling, high availability, and fault tolerance.
+fastify-mcp-server is designed from the ground up for production environments with horizontal scaling, high availability, and fault tolerance.
 
 ```mermaid
 graph TB
@@ -155,7 +155,7 @@ graph TB
 
 ### Horizontal Scaling Architecture
 
-In a production deployment, multiple fastify-mcp server instances work together seamlessly:
+In a production deployment, multiple fastify-mcp-server instances work together seamlessly:
 
 - **Load Balancer**: Distributes incoming connections across available server instances
 - **Server Instances**: Each server can handle thousands of concurrent connections
@@ -178,10 +178,10 @@ Sessions include:
 
 ## Getting Started
 
-Install fastify-mcp:
+Install fastify-mcp-server:
 
 ```bash
-npm install fastify-mcp @sinclair/typebox
+npm install fastify-mcp-server @sinclair/typebox
 ```
 
 ## Step-by-Step Tutorial: Building a File System MCP Server
@@ -193,7 +193,7 @@ Let's build a complete file system MCP server that demonstrates tools, resources
 ```typescript
 import Fastify from 'fastify'
 import { Type } from '@sinclair/typebox'
-import mcpPlugin from 'fastify-mcp'
+import mcpPlugin from 'fastify-mcp-server'
 
 const fastify = Fastify({
   logger: { level: 'info' }
@@ -481,7 +481,7 @@ try {
 
 **For stdio Transport:**
 ```typescript
-import { runStdioServer } from 'fastify-mcp/stdio'
+import { runStdioServer } from 'fastify-mcp-server/stdio'
 
 try {
   await fastify.ready()
@@ -498,7 +498,7 @@ try {
 
 ### Multiple Transport Support
 
-One of fastify-mcp's unique features is its support for multiple transport protocols:
+One of fastify-mcp-server's unique features is its support for multiple transport protocols:
 
 - **HTTP/SSE**: Perfect for web applications, real-time notifications, and horizontal scaling
 - **stdio**: Ideal for command-line tools, text editors, and local development
@@ -613,19 +613,19 @@ Every aspect of fastify-mcp is designed with TypeScript in mind:
 
 ## Community & Support
 
-fastify-mcp is open source and built by [Platformatic](https://platformatic.dev), the team behind the production-ready Node.js platform. The project follows Fastify's proven patterns and best practices.
+fastify-mcp-server is open source and built by [Platformatic](https://platformatic.dev), the team behind the production-ready Node.js platform. The project follows Fastify's proven patterns and best practices.
 
-- **GitHub**: [platformatic/fastify-mcp](https://github.com/platformatic/fastify-mcp)
+- **GitHub**: [platformatic/fastify-mcp-server](https://github.com/platformatic/fastify-mcp-server)
 - **License**: Apache 2.0
 - **Documentation**: Complete API documentation and examples
 - **Support**: Enterprise support available through Platformatic
 
 ## What's Next
 
-We're excited to see how the community uses fastify-mcp to build scalable, production-ready MCP servers. Whether you're building a simple development server or a enterprise-grade AI platform, fastify-mcp provides the foundation you need.
+We're excited to see how the community uses fastify-mcp-server to build scalable, production-ready MCP servers. Whether you're building a simple development server or a enterprise-grade AI platform, fastify-mcp-server provides the foundation you need.
 
 Get started today and join the growing community of developers building the future of AI connectivity with the Model Context Protocol.
 
 ---
 
-*fastify-mcp v0.0.1 is available now on npm. Try it out and let us know what you build!*
+*fastify-mcp-server v0.0.1 is available now on npm. Try it out and let us know what you build!*
