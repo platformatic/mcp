@@ -176,15 +176,6 @@ function generateUnionDescription (schema: TUnion): string {
 }
 
 /**
- * Convert TypeBox schema to JSON Schema for MCP tool definition
- */
-export function typeBoxToJSONSchema (schema: TSchema): any {
-  // TypeBox schemas are already JSON Schema compatible
-  // We just need to clean up any TypeBox-specific properties
-  return JSON.parse(JSON.stringify(schema))
-}
-
-/**
  * Extract enum values from a schema if it's an enum
  */
 export function getEnumValues (schema: TSchema): string[] | undefined {

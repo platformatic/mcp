@@ -24,7 +24,7 @@ import {
 } from './schema.ts'
 
 import type { MCPTool, MCPResource, MCPPrompt, MCPPluginOptions } from './types.ts'
-import { validate, CallToolRequestSchema, typeBoxToJSONSchema, ReadResourceRequestSchema, GetPromptRequestSchema, isTypeBoxSchema } from './validation/index.ts'
+import { validate, CallToolRequestSchema, ReadResourceRequestSchema, GetPromptRequestSchema, isTypeBoxSchema } from './validation/index.ts'
 
 type HandlerDependencies = {
   app: FastifyInstance
@@ -73,11 +73,11 @@ function handleToolsList (request: JSONRPCRequest, dependencies: HandlerDependen
   const result: ListToolsResult = {
     tools: Array.from(tools.values()).map(t => {
       const tool = t.definition
-      // Convert TypeBox schema to JSON Schema for the response if it's a TypeBox schema
+      // TypeBox schemas are already JSON Schema compatible
       if (isTypeBoxSchema(tool.inputSchema)) {
         return {
           ...tool,
-          inputSchema: typeBoxToJSONSchema(tool.inputSchema)
+          inputSchema: tool.inputSchema
         }
       }
       return tool

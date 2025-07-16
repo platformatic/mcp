@@ -5,7 +5,7 @@ import type {
   MCPResource,
   MCPPrompt
 } from '../types.ts'
-import { schemaToArguments, validateToolSchema, typeBoxToJSONSchema, isTypeBoxSchema } from '../validation/index.ts'
+import { schemaToArguments, validateToolSchema } from '../validation/index.ts'
 
 interface MCPDecoratorsOptions {
   tools: Map<string, MCPTool>
@@ -34,15 +34,8 @@ const mcpDecoratorsPlugin: FastifyPluginAsync<MCPDecoratorsOptions> = async (app
       }
     }
 
-    // Create tool definition with proper schema conversion
-    let toolDefinition = definition
-    if (isTypeBoxSchema(definition.inputSchema)) {
-      // TypeBox schema - convert to JSON Schema for the definition
-      toolDefinition = {
-        ...definition,
-        inputSchema: typeBoxToJSONSchema(definition.inputSchema)
-      }
-    }
+    // TypeBox schemas are already JSON Schema compatible
+    const toolDefinition = definition
 
     tools.set(name, {
       definition: {

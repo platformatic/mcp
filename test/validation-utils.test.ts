@@ -11,7 +11,6 @@ import {
 } from '../src/validation/validator.ts'
 import {
   schemaToArguments,
-  typeBoxToJSONSchema,
   validateToolSchema,
   getEnumValues,
   isOptionalProperty
@@ -212,21 +211,20 @@ describe('Validation Utils', () => {
       assert.strictEqual(optionalArg?.required, false)
     })
 
-    test('should convert TypeBox schema to JSON Schema', () => {
+    test('should verify TypeBox schema is already JSON Schema compatible', () => {
       const schema = Type.Object({
         name: Type.String(),
         age: Type.Number({ minimum: 0 })
       })
 
-      const jsonSchema = typeBoxToJSONSchema(schema)
-
-      assert.strictEqual(jsonSchema.type, 'object')
-      assert.ok(jsonSchema.properties)
-      assert.ok(jsonSchema.properties.name)
-      assert.ok(jsonSchema.properties.age)
-      assert.strictEqual(jsonSchema.properties.name.type, 'string')
-      assert.strictEqual(jsonSchema.properties.age.type, 'number')
-      assert.strictEqual(jsonSchema.properties.age.minimum, 0)
+      // TypeBox schemas are already JSON Schema compatible
+      assert.strictEqual(schema.type, 'object')
+      assert.ok(schema.properties)
+      assert.ok(schema.properties.name)
+      assert.ok(schema.properties.age)
+      assert.strictEqual(schema.properties.name.type, 'string')
+      assert.strictEqual(schema.properties.age.type, 'number')
+      assert.strictEqual(schema.properties.age.minimum, 0)
     })
 
     test('should validate tool schema structure', () => {
