@@ -20,6 +20,7 @@ npm install @sinclair/typebox
 
 - **Complete MCP Protocol Support**: Implements the full Model Context Protocol specification
 - **TypeBox Validation**: Type-safe schema validation with automatic TypeScript inference
+- **Multiple Transport Support**: HTTP/SSE and stdio transports for flexible communication
 - **SSE Streaming**: Server-Sent Events for real-time communication
 - **Horizontal Scaling**: Redis-backed session management and message broadcasting
 - **Session Persistence**: Message history and reconnection support with Last-Event-ID
@@ -561,6 +562,141 @@ function onDataChange(newData: any) {
   })
 }
 ```
+
+## Stdio Transport
+
+The plugin includes a built-in stdio transport utility for MCP communication over stdin/stdout, following the MCP stdio transport specification. This enables command-line tools and local applications to communicate with your Fastify MCP server.
+
+### Key Features
+
+- **Complete MCP stdio transport implementation** following the official specification
+- **Fastify integration** using the `.inject()` method for consistency with HTTP routes
+- **Comprehensive error handling** with proper JSON-RPC error responses
+- **Batch request support** for processing multiple messages at once
+- **Debug logging** to stderr without interfering with the stdio protocol
+
+### Quick Start
+
+```typescript
+import fastify from 'fastify'
+import mcpPlugin from 'fastify-mcp'
+import { runStdioServer } from 'fastify-mcp/stdio'
+
+const app = fastify({
+  logger: false // Disable HTTP logging to avoid interference with stdio
+})
+
+await app.register(mcpPlugin, {
+  serverInfo: {
+    name: 'my-mcp-server',
+    version: '1.0.0'
+  },
+  capabilities: {
+    tools: {},
+    resources: {},
+    prompts: {}
+  }
+})
+
+// Register your tools, resources, and prompts
+app.mcpAddTool({
+  name: 'echo',
+  description: 'Echo back the input text',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      text: { type: 'string' }
+    },
+    required: ['text']
+  }
+}, async (args) => {
+  return {
+    content: [{
+      type: 'text',
+      text: `Echo: ${args.text}`
+    }]
+  }
+})
+
+await app.ready()
+
+// Start the stdio transport
+await runStdioServer(app, {
+  debug: process.env.DEBUG === 'true'
+})
+```
+
+### Usage Examples
+
+```bash
+# Initialize the server
+echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test-client","version":"1.0.0"}}}' | node server.js
+
+# Ping the server
+echo '{"jsonrpc":"2.0","id":2,"method":"ping"}' | node server.js
+
+# List available tools
+echo '{"jsonrpc":"2.0","id":3,"method":"tools/list"}' | node server.js
+
+# Call a tool
+echo '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"echo","arguments":{"text":"Hello, stdio!"}}}' | node server.js
+```
+
+### API Reference
+
+#### `runStdioServer(app, options)`
+
+Starts a Fastify MCP server in stdio mode.
+
+**Parameters:**
+- `app` - Fastify instance with MCP plugin registered
+- `options` - Optional stdio transport options
+
+**Options:**
+- `debug` - Enable debug logging to stderr (default: false)
+- `input` - Custom input stream (default: process.stdin)
+- `output` - Custom output stream (default: process.stdout)
+- `error` - Custom error stream (default: process.stderr)
+
+#### `createStdioTransport(app, options)`
+
+Creates a stdio transport instance without starting it.
+
+**Parameters:**
+- `app` - Fastify instance with MCP plugin registered
+- `options` - Optional stdio transport options
+
+**Returns:** `StdioTransport` instance with `start()` and `stop()` methods
+
+### Transport Protocol
+
+The stdio transport follows the MCP stdio transport specification:
+
+- Messages are exchanged over stdin/stdout
+- Each message is a single line of JSON
+- Messages are delimited by newlines
+- Messages must NOT contain embedded newlines
+- Server logs can be written to stderr
+- Supports both single messages and batch requests
+
+### Error Handling
+
+The stdio transport provides comprehensive error handling:
+
+- JSON parsing errors return appropriate JSON-RPC error responses
+- Invalid method calls return "Method not found" errors
+- Tool execution errors are captured and returned in the response
+- Connection errors are logged to stderr
+
+### Use Cases
+
+The stdio transport is particularly useful for:
+
+- **Command-line tools** that need to communicate with MCP servers
+- **Local development and testing** without HTTP overhead
+- **Integration with text editors and IDEs** that support stdio protocols
+- **Simple client-server communication** in controlled environments
+- **Batch processing** of MCP requests from scripts
 
 ## Authentication & Security
 
