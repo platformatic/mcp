@@ -9,7 +9,9 @@ This is a production-ready Fastify adapter for the Model Context Protocol (MCP).
 ## Key Features
 
 - **Complete MCP Protocol Support**: Implements the full Model Context Protocol specification
+- **Multiple Transport Support**: HTTP/SSE and stdio transports for flexible communication
 - **Server-Sent Events (SSE)**: Real-time streaming communication with session management
+- **Stdio Transport**: Built-in stdio transport for command-line tools and local applications
 - **Horizontal Scaling**: Redis-backed session management and message broadcasting
 - **Session Persistence**: Message history and reconnection support with Last-Event-ID
 - **Dual Backend Support**: Memory-based for development, Redis-based for production
@@ -49,6 +51,13 @@ The main entry point is `src/index.ts` which exports a Fastify plugin built with
 - Heartbeat mechanism for connection health monitoring
 - Support for both GET and POST endpoints
 
+**Stdio Transport:**
+- Built-in stdio transport implementation following MCP stdio transport specification
+- Fastify `.inject()` method integration for consistency with HTTP routes
+- Comprehensive error handling with proper JSON-RPC error responses
+- Batch request support for processing multiple messages at once
+- Debug logging to stderr without interfering with stdio protocol
+
 ### File Structure
 
 ```
@@ -66,6 +75,7 @@ src/
 │   └── pubsub-decorators.ts       # Pub/sub decorators
 ├── handlers.ts                    # MCP protocol handlers
 ├── routes.ts                      # SSE connection handling
+├── stdio.ts                       # Stdio transport implementation
 ├── index.ts                       # Plugin entry point with backend selection
 ├── schema.ts                      # MCP protocol types
 └── types.ts                       # Plugin types
@@ -121,3 +131,32 @@ The project includes comprehensive test coverage:
 - **Test utilities**: Redis test helpers with automatic cleanup
 
 Run tests with: `npm run test` (requires Redis running on localhost:6379)
+
+## Running the Project
+
+### HTTP/SSE Transport
+```bash
+npm run build
+node dist/examples/file-listing-server.js
+```
+
+### Stdio Transport
+```bash
+npm run build
+node dist/examples/stdio-server.js
+```
+
+The stdio transport enables command-line communication with the MCP server using stdin/stdout. This is particularly useful for:
+- Integration with text editors and IDEs
+- Command-line tools and scripts
+- Local development and testing
+- MCP Inspector integration
+
+#### Example stdio usage:
+```bash
+# Initialize the server
+echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test-client","version":"1.0.0"}}}' | node dist/examples/stdio-server.js
+
+# List available tools
+echo '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | node dist/examples/stdio-server.js
+```
