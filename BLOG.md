@@ -11,6 +11,7 @@ fastify-mcp fills this gap by providing:
 - **Horizontal Scaling**: Redis-backed session management and message broadcasting
 - **High Availability**: Session persistence with automatic reconnection and failover
 - **Type Safety**: Complete TypeScript definitions powered by TypeBox
+- **Multiple Transports**: HTTP/SSE for web applications and stdio for command-line tools
 - **Production Ready**: Built on Fastify's battle-tested foundation
 
 ## Key Features
@@ -455,6 +456,9 @@ fastify.mcpAddTool({
 
 ### Step 6: Start the Server
 
+Choose your transport method:
+
+**For HTTP/SSE Transport:**
 ```typescript
 try {
   const port = process.env.PORT ? Number(process.env.PORT) : 3000
@@ -475,12 +479,39 @@ try {
 }
 ```
 
+**For stdio Transport:**
+```typescript
+import { runStdioServer } from 'fastify-mcp/stdio'
+
+try {
+  await fastify.ready()
+  
+  // Start the stdio transport
+  await runStdioServer(fastify, {
+    debug: process.env.DEBUG === 'true'
+  })
+} catch (err) {
+  fastify.log.error(err)
+  process.exit(1)
+}
+```
+
+### Multiple Transport Support
+
+One of fastify-mcp's unique features is its support for multiple transport protocols:
+
+- **HTTP/SSE**: Perfect for web applications, real-time notifications, and horizontal scaling
+- **stdio**: Ideal for command-line tools, text editors, and local development
+
+This flexibility allows you to use the same server code across different environments without changes—just switch the transport layer.
+
 ### Testing Your Server
 
 #### Using the MCP Inspector (Recommended)
 
 The easiest way to test your MCP server is with the official MCP Inspector:
 
+**For HTTP/SSE Transport:**
 ```bash
 # First, start your server (Node 22+ supports TypeScript natively)
 node --experimental-strip-types server.ts
@@ -489,12 +520,18 @@ node --experimental-strip-types server.ts
 npx @modelcontextprotocol/inspector http://localhost:3000/mcp
 ```
 
+**For stdio Transport:**
+```bash
+# Test directly with stdio (no HTTP server needed)
+npx @modelcontextprotocol/inspector node --experimental-strip-types server.ts
+```
+
 This opens an interactive web UI at `http://localhost:6274` where you can:
 - **Initialize** the MCP connection
 - **Browse available tools** and their schemas
 - **Call tools** with a user-friendly interface
 - **View resources** and test URI patterns
-- **Monitor SSE events** in real-time
+- **Monitor SSE events** in real-time (HTTP transport)
 - **Inspect all MCP messages** with detailed logging
 
 #### Manual Testing with curl
