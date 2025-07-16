@@ -613,11 +613,12 @@ Every aspect of fastify-mcp is designed with TypeScript in mind:
 
 ## Community & Support
 
-fastify-mcp is open source and built by [Matteo Collina](https://github.com/mcollina), creator of Fastify. The project follows Fastify's proven patterns and best practices.
+fastify-mcp is open source and built by [Platformatic](https://platformatic.dev), the team behind the production-ready Node.js platform. The project follows Fastify's proven patterns and best practices.
 
-- **GitHub**: [mcollina/fastify-mcp](https://github.com/mcollina/fastify-mcp)
-- **License**: MIT
+- **GitHub**: [platformatic/fastify-mcp](https://github.com/platformatic/fastify-mcp)
+- **License**: Apache 2.0
 - **Documentation**: Complete API documentation and examples
+- **Support**: Enterprise support available through Platformatic
 
 ## What's Next
 
