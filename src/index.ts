@@ -87,5 +87,5 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
     await messageBroker.close()
   })
 }, {
-  name: 'fastify-mcp'
+  name: 'fastify-mcp-server'
 })
