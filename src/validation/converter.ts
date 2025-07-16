@@ -1,5 +1,4 @@
 import type { TObject, TSchema, TUnion, TArray, TLiteral } from '@sinclair/typebox'
-import { Kind } from '@sinclair/typebox'
 import type { PromptArgument } from './schemas.ts'
 import { isTypeBoxSchema } from './validator.ts'
 
@@ -27,27 +26,32 @@ function getSchemaDescription (schema: TSchema): string {
   }
 
   // Generate description based on schema type
-  switch (schema[Kind]) {
-    case 'String':
+  // Check for literal first (has const property)
+  if ('const' in schema) {
+    return `Literal value: ${(schema as TLiteral).const}`
+  }
+
+  // Check for union (has anyOf property)
+  if ('anyOf' in schema && Array.isArray(schema.anyOf)) {
+    return generateUnionDescription(schema as TUnion)
+  }
+
+  // Use standard JSON Schema type property
+  switch (schema.type) {
+    case 'string':
       return generateStringDescription(schema as any)
-    case 'Number':
+    case 'number':
       return generateNumberDescription(schema as any)
-    case 'Integer':
+    case 'integer':
       return generateIntegerDescription(schema as any)
-    case 'Boolean':
+    case 'boolean':
       return 'Boolean value'
-    case 'Array':
+    case 'array':
       return generateArrayDescription(schema as TArray)
-    case 'Object':
+    case 'object':
       return 'Object value'
-    case 'Union':
-      return generateUnionDescription(schema as TUnion)
-    case 'Optional':
-      return getSchemaDescription((schema as any).anyOf[1])
-    case 'Literal':
-      return `Literal value: ${(schema as TLiteral).const}`
     default:
-      return `Parameter of type ${schema[Kind] || 'unknown'}`
+      return `Parameter of type ${schema.type || 'unknown'}`
   }
 }
 
@@ -184,9 +188,9 @@ export function getEnumValues (schema: TSchema): string[] | undefined {
   }
 
   // Check for union of literals (enum-like)
-  if (schema[Kind] === 'Union') {
+  if ('anyOf' in schema && Array.isArray(schema.anyOf)) {
     const union = schema as TUnion
-    const literals = union.anyOf.filter(s => s[Kind] === 'Literal')
+    const literals = union.anyOf.filter(s => 'const' in s)
     if (literals.length === union.anyOf.length) {
       return literals.map(l => (l as TLiteral).const as string)
     }
@@ -218,7 +222,7 @@ export function validateToolSchema (schema: any): string[] {
 
   // Handle TypeBox schemas
   if (isTypeBoxSchema(schema)) {
-    if (schema[Kind] !== 'Object') {
+    if (schema.type !== 'object') {
       errors.push('Tool parameter schema must be an object')
       return errors
     }
@@ -261,18 +265,18 @@ function validatePropertySchema (name: string, schema: TSchema): string[] {
 
   // Check for unsupported types
   const unsupportedTypes = ['Function', 'Symbol', 'Undefined', 'Null', 'Void']
-  if (unsupportedTypes.includes(schema[Kind])) {
-    errors.push(`Property '${name}' uses unsupported type: ${schema[Kind]}`)
+  if (schema.type && unsupportedTypes.includes(schema.type)) {
+    errors.push(`Property '${name}' uses unsupported type: ${schema.type}`)
   }
 
   // Validate nested objects
-  if (schema[Kind] === 'Object') {
+  if (schema.type === 'object') {
     const nestedErrors = validateToolSchema(schema)
     errors.push(...nestedErrors.map(err => `${name}.${err}`))
   }
 
   // Validate arrays
-  if (schema[Kind] === 'Array') {
+  if (schema.type === 'array') {
     const arraySchema = schema as TArray
     const itemErrors = validatePropertySchema(`${name}[]`, arraySchema.items)
     errors.push(...itemErrors)
