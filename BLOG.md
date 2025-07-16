@@ -123,8 +123,10 @@ graph TB
     
     LB[Load Balancer<br/>nginx/ALB]
     
-    Server1[fastify-mcp Server 1<br/>:3000]
-    Server2[fastify-mcp Server 2<br/>:3001]
+    subgraph "Server Layer"
+        Server1[fastify-mcp Server 1<br/>:3000]
+        Server2[fastify-mcp Server 2<br/>:3001]
+    end
     
     Redis[(Redis Cluster<br/>Session Store<br/>Message Broker)]
     
