@@ -128,7 +128,9 @@ graph TB
         Server2[fastify-mcp Server 2<br/>:3001]
     end
     
-    Redis[(Redis Cluster<br/>Session Store<br/>Message Broker)]
+    subgraph "Data Layer"
+        Redis[(Redis Cluster<br/>Session Store<br/>Message Broker)]
+    end
     
     Client1 --> LB
     Client2 --> LB
