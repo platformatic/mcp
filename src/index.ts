@@ -16,7 +16,7 @@ import pubsubDecorators from './decorators/pubsub.ts'
 import metaDecorators from './decorators/meta.ts'
 import routes from './routes.ts'
 
-export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) {
+const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOptions) {
   const serverInfo: Implementation = opts.serverInfo ?? {
     name: '@platformatic/mcp',
     version: '1.0.0'
@@ -89,3 +89,55 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
 }, {
   name: '@platformatic/mcp'
 })
+
+// Export the plugin as both default and named export
+export default mcpPlugin
+export { mcpPlugin }
+
+// Export stdio transport functionality
+export {
+  StdioTransport,
+  createStdioTransport,
+  runStdioServer
+} from './stdio.ts'
+
+export type {
+  StdioTransportOptions
+} from './stdio.ts'
+
+// Export plugin types
+export type {
+  MCPPluginOptions,
+  MCPTool,
+  MCPResource,
+  MCPPrompt,
+  ToolHandler,
+  ResourceHandler,
+  PromptHandler,
+  UnsafeMCPTool,
+  UnsafeMCPResource,
+  UnsafeMCPPrompt,
+  UnsafeToolHandler,
+  UnsafeResourceHandler,
+  UnsafePromptHandler,
+  SSESession
+} from './types.ts'
+
+// Export MCP protocol types
+export type {
+  JSONRPCMessage,
+  JSONRPCRequest,
+  JSONRPCResponse,
+  JSONRPCError,
+  JSONRPCNotification,
+  JSONRPCBatchRequest,
+  JSONRPCBatchResponse,
+  ServerCapabilities,
+  Implementation,
+  Tool,
+  Resource,
+  Prompt,
+  CallToolResult,
+  ReadResourceResult,
+  GetPromptResult
+} from './schema.ts'

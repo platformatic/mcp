@@ -612,4 +612,56 @@ describe('MCP Fastify Plugin', () => {
       t.assert.strictEqual(result.prompts[0].name, 'test-prompt')
     })
   })
+
+  describe('Top-Level Exports', () => {
+    test('should export stdio transport functions', async (t: TestContext) => {
+      const { runStdioServer, createStdioTransport, StdioTransport } = await import('../src/index.ts')
+
+      t.assert.ok(typeof runStdioServer === 'function', 'runStdioServer should be exported as a function')
+      t.assert.ok(typeof createStdioTransport === 'function', 'createStdioTransport should be exported as a function')
+      t.assert.ok(typeof StdioTransport === 'function', 'StdioTransport should be exported as a class/function')
+    })
+
+    test('should export plugin types', async (t: TestContext) => {
+      // Test that TypeScript types are properly exported by importing them
+      const module = await import('../src/index.ts')
+
+      // We can't test types directly at runtime, but we can verify the module exports exist
+      t.assert.ok(module.default, 'Default export (mcpPlugin) should exist')
+      t.assert.ok(typeof module.default === 'function', 'Default export should be a function')
+    })
+
+    test('should export MCP protocol types', async (t: TestContext) => {
+      // Test that we can import types from the main module
+      const module = await import('../src/index.ts')
+
+      // Verify that the main plugin export exists and is functional
+      t.assert.ok(module.default, 'Default export should exist')
+      t.assert.ok(typeof module.default === 'function', 'Default export should be a function')
+
+      // Verify stdio exports are available
+      t.assert.ok(module.runStdioServer, 'runStdioServer should be exported')
+      t.assert.ok(module.createStdioTransport, 'createStdioTransport should be exported')
+      t.assert.ok(module.StdioTransport, 'StdioTransport should be exported')
+    })
+
+    test('should allow importing with unified syntax', async (t: TestContext) => {
+      // Test the new unified import syntax that was added in the refactor
+      const { default: mcpPlugin, runStdioServer, createStdioTransport, StdioTransport } = await import('../src/index.ts')
+
+      t.assert.ok(typeof mcpPlugin === 'function', 'Default export should be a function')
+      t.assert.ok(typeof runStdioServer === 'function', 'runStdioServer should be exported')
+      t.assert.ok(typeof createStdioTransport === 'function', 'createStdioTransport should be exported')
+      t.assert.ok(typeof StdioTransport === 'function', 'StdioTransport should be exported')
+    })
+
+    test('should export mcpPlugin as a named export', async (t: TestContext) => {
+      // Test that mcpPlugin is available as a named export in addition to default export
+      const { mcpPlugin, default: defaultExport } = await import('../src/index.ts')
+
+      t.assert.ok(typeof mcpPlugin === 'function', 'mcpPlugin should be exported as a named function')
+      t.assert.ok(typeof defaultExport === 'function', 'Default export should be a function')
+      t.assert.strictEqual(mcpPlugin, defaultExport, 'Named export should be the same as default export')
+    })
+  })
 })

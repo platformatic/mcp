@@ -32,6 +32,8 @@ npm install @sinclair/typebox
 ```typescript
 import Fastify from 'fastify'
 import mcpPlugin from '@platformatic/mcp'
+// Or use named import:
+// import { mcpPlugin } from '@platformatic/mcp'
 
 const app = Fastify({ logger: true })
 
@@ -579,8 +581,7 @@ The plugin includes a built-in stdio transport utility for MCP communication ove
 
 ```typescript
 import fastify from 'fastify'
-import mcpPlugin from '@platformatic/mcp'
-import { runStdioServer } from '@platformatic/mcp/stdio'
+import mcpPlugin, { runStdioServer } from '@platformatic/mcp'
 
 const app = fastify({
   logger: false // Disable HTTP logging to avoid interference with stdio
