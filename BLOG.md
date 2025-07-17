@@ -48,18 +48,17 @@ With Redis configuration, messages sent from any server instance reach all conne
 ```typescript
 import { Type } from '@sinclair/typebox'
 
-app.addMcpTool({
+app.mcpAddTool({
   name: 'file_read',
   description: 'Read file contents',
   inputSchema: Type.Object({
     path: Type.String(),
     encoding: Type.Optional(Type.String())
-  }),
-  handler: async (params) => {
-    // params are fully typed based on schema
-    const { path, encoding } = params
-    // ...
-  }
+  })
+}, async (params) => {
+  // params are fully typed based on schema
+  const { path, encoding } = params
+  // ...
 })
 ```
 
@@ -572,7 +571,7 @@ curl -X POST http://localhost:3000/mcp \
 3. **Test SSE notifications**:
 ```bash
 curl -N -H "Accept: text/event-stream" \
-  "http://localhost:3000/mcp?sessionId=test-session"
+  "http://localhost:3000/mcp?mcp-session-id=test-session"
 ```
 
 This complete example demonstrates:
