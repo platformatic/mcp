@@ -18,7 +18,7 @@ import routes from './routes.ts'
 
 export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) {
   const serverInfo: Implementation = opts.serverInfo ?? {
-    name: 'fastify-mcp-server',
+    name: 'famps',
     version: '1.0.0'
   }
 
@@ -87,5 +87,5 @@ export default fp(async function (app: FastifyInstance, opts: MCPPluginOptions) 
     await messageBroker.close()
   })
 }, {
-  name: 'fastify-mcp-server'
+  name: 'famps'
 })

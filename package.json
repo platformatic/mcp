@@ -1,7 +1,7 @@
 {
-  "name": "fastify-mcp-server",
+  "name": "famps",
   "version": "0.0.1",
-  "description": "Fastify adapter for MCP",
+  "description": "Fastify Adapter MCP Server - Horizontal scaling MCP protocol server for Fastify",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "type": "module",

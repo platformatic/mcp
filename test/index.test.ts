@@ -30,7 +30,7 @@ describe('MCP Fastify Plugin', () => {
     await app.register(mcpPlugin)
     await app.ready()
 
-    t.assert.ok(app.hasPlugin('fastify-mcp-server'))
+    t.assert.ok(app.hasPlugin('famps'))
   })
 
   test('should register plugin with custom options', async (t: TestContext) => {
@@ -44,7 +44,7 @@ describe('MCP Fastify Plugin', () => {
     })
     await app.ready()
 
-    t.assert.ok(app.hasPlugin('fastify-mcp-server'))
+    t.assert.ok(app.hasPlugin('famps'))
   })
 
   describe('MCP Protocol Handlers', () => {
