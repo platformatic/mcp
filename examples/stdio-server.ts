@@ -10,7 +10,7 @@ const app = fastify({
 // Register the MCP plugin
 await app.register(mcpPlugin, {
   serverInfo: {
-    name: 'fastify-mcp-stdio-example',
+    name: '@platformatic/mcp-stdio-example',
     version: '1.0.0'
   },
   capabilities: {

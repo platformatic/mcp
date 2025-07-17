@@ -86,7 +86,7 @@ test('stdio transport - full integration test', async () => {
     assert.strictEqual(initResponse.id, 1)
     assert(initResponse.result, 'Should have result')
     assert(initResponse.result.serverInfo, 'Should have serverInfo')
-    assert.strictEqual(initResponse.result.serverInfo.name, 'fastify-mcp-stdio-example')
+    assert.strictEqual(initResponse.result.serverInfo.name, '@platformatic/mcp-stdio-example')
 
     // Test 2: Ping request
     const pingRequest = {
