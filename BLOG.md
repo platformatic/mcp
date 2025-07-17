@@ -82,7 +82,7 @@ sequenceDiagram
     participant Server
     participant Redis
     
-    Client->>Server: Connect to SSE /mcp?sessionId=abc123
+    Client->>Server: Connect to SSE /mcp?mcp-session-id=abc123
     Server->>Redis: Store session metadata
     Server->>Client: Send events (id: 1, 2, 3, 4)
     
@@ -92,7 +92,7 @@ sequenceDiagram
     Server->>Redis: Continue storing events (id: 5, 6, 7)
     
     Note over Client,Server: Client reconnects
-    Client->>Server: Reconnect with Last-Event-ID: 4
+    Client->>Server: Reconnect with mcp-session-id=abc123 + Last-Event-ID: 4
     Server->>Redis: Query messages after ID 4
     Redis-->>Server: Return messages 5, 6, 7
     Server->>Client: Replay missed events (id: 5, 6, 7)
