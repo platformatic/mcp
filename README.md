@@ -32,6 +32,8 @@ npm install @sinclair/typebox
 ```typescript
 import Fastify from 'fastify'
 import mcpPlugin from '@platformatic/mcp'
+// Or use named import:
+// import { mcpPlugin } from '@platformatic/mcp'
 
 const app = Fastify({ logger: true })
 

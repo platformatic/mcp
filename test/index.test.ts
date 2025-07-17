@@ -654,5 +654,14 @@ describe('MCP Fastify Plugin', () => {
       t.assert.ok(typeof createStdioTransport === 'function', 'createStdioTransport should be exported')
       t.assert.ok(typeof StdioTransport === 'function', 'StdioTransport should be exported')
     })
+
+    test('should export mcpPlugin as a named export', async (t: TestContext) => {
+      // Test that mcpPlugin is available as a named export in addition to default export
+      const { mcpPlugin, default: defaultExport } = await import('../src/index.ts')
+      
+      t.assert.ok(typeof mcpPlugin === 'function', 'mcpPlugin should be exported as a named function')
+      t.assert.ok(typeof defaultExport === 'function', 'Default export should be a function')
+      t.assert.strictEqual(mcpPlugin, defaultExport, 'Named export should be the same as default export')
+    })
   })
 })
