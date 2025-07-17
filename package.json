@@ -1,5 +1,5 @@
 {
-  "name": "fastify-mcp-server",
+  "name": "@platformatic/mcp",
   "version": "0.0.1",
   "description": "Fastify adapter for MCP",
   "main": "dist/index.js",
