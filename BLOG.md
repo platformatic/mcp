@@ -1,6 +1,6 @@
 # Announcing @platformatic/mcp: Production-Ready MCP Server with Horizontal Scaling
 
-Today we're excited to announce **@platformatic/mcp**, a production-ready Fastify adapter for the Model Context Protocol (MCP) that brings enterprise-grade scalability and type safety to MCP server implementations.
+Today we're excited to announce **@platformatic/mcp**, a production-ready Fastify adapter for the [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) that brings enterprise-grade scalability and type safety to MCP server implementations.
 
 ## Why @platformatic/mcp?
 
@@ -614,9 +614,9 @@ Every aspect of fastify-mcp-server is designed with TypeScript in mind:
 
 ## Community & Support
 
-@platformatic/mcp is open source and built by [Matteo Collina](https://github.com/mcollina), creator of Fastify. The project follows Fastify's proven patterns and best practices.
+`@platformatic/mcp` is open source and built by [Matteo Collina](https://github.com/mcollina), creator of Fastify. The project follows Fastify's proven patterns and best practices.
 
-- **GitHub**: [platformatic/fastify-mcp](https://github.com/platformatic/fastify-mcp)
+- **GitHub**: [platformatic/mcp](https://github.com/platformatic/mcp)
 - **License**: Apache 2.0
 - **Documentation**: Complete API documentation and examples
 
@@ -628,4 +628,4 @@ Get started today and join the growing community of developers building the futu
 
 ---
 
-*@platformatic/mcp v0.0.1 is available now on npm. Try it out and let us know what you build!*
+*@platformatic/mcp v1.0.0 is available now on npm. Try it out and let us know what you build!*
