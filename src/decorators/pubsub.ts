@@ -1,6 +1,13 @@
 import type { FastifyPluginAsync } from 'fastify'
 import fp from 'fastify-plugin'
-import type { JSONRPCMessage, JSONRPCNotification } from '../schema.ts'
+import type {
+  JSONRPCMessage,
+  JSONRPCNotification,
+  JSONRPCRequest,
+  ElicitRequest,
+  RequestId
+} from '../schema.ts'
+import { JSONRPC_VERSION } from '../schema.ts'
 import type { SessionStore } from '../stores/session-store.ts'
 import type { MessageBroker } from '../brokers/message-broker.ts'
 
@@ -52,6 +59,33 @@ const mcpPubSubDecoratorsPlugin: FastifyPluginAsync<MCPPubSubDecoratorsOptions> 
       app.log.error({ err: error }, 'Failed to send message to session')
       return false
     }
+  })
+
+  app.decorate('mcpElicit', async (
+    sessionId: string,
+    message: string,
+    requestedSchema: ElicitRequest['params']['requestedSchema'],
+    requestId?: RequestId
+  ): Promise<boolean> => {
+    if (!enableSSE) {
+      app.log.warn('Cannot send elicitation request: SSE is disabled')
+      return false
+    }
+
+    // Generate a request ID if not provided
+    const id = requestId ?? `elicit-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
+
+    const elicitRequest: JSONRPCRequest = {
+      jsonrpc: JSONRPC_VERSION,
+      id,
+      method: 'elicitation/create',
+      params: {
+        message,
+        requestedSchema
+      }
+    }
+
+    return await app.mcpSendToSession(sessionId, elicitRequest)
   })
 }
 
