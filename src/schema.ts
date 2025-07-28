@@ -32,22 +32,22 @@ export type JSONRPCMessage =
   | JSONRPCRequest
   | JSONRPCNotification
   | JSONRPCResponse
-  | JSONRPCError;
+  | JSONRPCError
 
 /** @internal */
-export const LATEST_PROTOCOL_VERSION = "2025-06-18";
+export const LATEST_PROTOCOL_VERSION = '2025-06-18'
 /** @internal */
-export const JSONRPC_VERSION = "2.0";
+export const JSONRPC_VERSION = '2.0'
 
 /**
  * A progress token, used to associate progress notifications with the original request.
  */
-export type ProgressToken = string | number;
+export type ProgressToken = string | number
 
 /**
  * An opaque token used to represent a cursor for pagination.
  */
-export type Cursor = string;
+export type Cursor = string
 
 /** @internal */
 export interface Request {
@@ -90,7 +90,7 @@ export interface Result {
 /**
  * A uniquely identifying ID for a request in JSON-RPC.
  */
-export type RequestId = string | number;
+export type RequestId = string | number
 
 /**
  * A request that expects a response.
@@ -118,15 +118,15 @@ export interface JSONRPCResponse {
 
 // Standard JSON-RPC error codes
 /** @internal */
-export const PARSE_ERROR = -32700;
+export const PARSE_ERROR = -32700
 /** @internal */
-export const INVALID_REQUEST = -32600;
+export const INVALID_REQUEST = -32600
 /** @internal */
-export const METHOD_NOT_FOUND = -32601;
+export const METHOD_NOT_FOUND = -32601
 /** @internal */
-export const INVALID_PARAMS = -32602;
+export const INVALID_PARAMS = -32602
 /** @internal */
-export const INTERNAL_ERROR = -32603;
+export const INTERNAL_ERROR = -32603
 
 /**
  * A response to a request that indicates an error occurred.
@@ -154,7 +154,7 @@ export interface JSONRPCError {
 /**
  * A response that indicates success but carries no data.
  */
-export type EmptyResult = Result;
+export type EmptyResult = Result
 
 /* Cancellation */
 /**
@@ -169,7 +169,7 @@ export type EmptyResult = Result;
  * @category notifications/cancelled
  */
 export interface CancelledNotification extends Notification {
-  method: "notifications/cancelled";
+  method: 'notifications/cancelled';
   params: {
     /**
      * The ID of the request to cancel.
@@ -192,7 +192,7 @@ export interface CancelledNotification extends Notification {
  * @category initialize
  */
 export interface InitializeRequest extends Request {
-  method: "initialize";
+  method: 'initialize';
   params: {
     /**
      * The latest version of the Model Context Protocol that the client supports. The client MAY decide to support older versions as well.
@@ -230,7 +230,7 @@ export interface InitializeResult extends Result {
  * @category notifications/initialized
  */
 export interface InitializedNotification extends Notification {
-  method: "notifications/initialized";
+  method: 'notifications/initialized';
 }
 
 /**
@@ -345,7 +345,7 @@ export interface Implementation extends BaseMetadata {
  * @category ping
  */
 export interface PingRequest extends Request {
-  method: "ping";
+  method: 'ping';
 }
 
 /* Progress notifications */
@@ -355,7 +355,7 @@ export interface PingRequest extends Request {
  * @category notifications/progress
  */
 export interface ProgressNotification extends Notification {
-  method: "notifications/progress";
+  method: 'notifications/progress';
   params: {
     /**
      * The progress token which was given in the initial request, used to associate this notification with the request that is proceeding.
@@ -408,7 +408,7 @@ export interface PaginatedResult extends Result {
  * @category resources/list
  */
 export interface ListResourcesRequest extends PaginatedRequest {
-  method: "resources/list";
+  method: 'resources/list';
 }
 
 /**
@@ -426,7 +426,7 @@ export interface ListResourcesResult extends PaginatedResult {
  * @category resources/templates/list
  */
 export interface ListResourceTemplatesRequest extends PaginatedRequest {
-  method: "resources/templates/list";
+  method: 'resources/templates/list';
 }
 
 /**
@@ -444,7 +444,7 @@ export interface ListResourceTemplatesResult extends PaginatedResult {
  * @category resources/read
  */
 export interface ReadResourceRequest extends Request {
-  method: "resources/read";
+  method: 'resources/read';
   params: {
     /**
      * The URI of the resource to read. The URI can use any protocol; it is up to the server how to interpret it.
@@ -470,7 +470,7 @@ export interface ReadResourceResult extends Result {
  * @category notifications/resources/list_changed
  */
 export interface ResourceListChangedNotification extends Notification {
-  method: "notifications/resources/list_changed";
+  method: 'notifications/resources/list_changed';
 }
 
 /**
@@ -479,7 +479,7 @@ export interface ResourceListChangedNotification extends Notification {
  * @category resources/subscribe
  */
 export interface SubscribeRequest extends Request {
-  method: "resources/subscribe";
+  method: 'resources/subscribe';
   params: {
     /**
      * The URI of the resource to subscribe to. The URI can use any protocol; it is up to the server how to interpret it.
@@ -496,7 +496,7 @@ export interface SubscribeRequest extends Request {
  * @category resources/unsubscribe
  */
 export interface UnsubscribeRequest extends Request {
-  method: "resources/unsubscribe";
+  method: 'resources/unsubscribe';
   params: {
     /**
      * The URI of the resource to unsubscribe from.
@@ -513,7 +513,7 @@ export interface UnsubscribeRequest extends Request {
  * @category notifications/resources/updated
  */
 export interface ResourceUpdatedNotification extends Notification {
-  method: "notifications/resources/updated";
+  method: 'notifications/resources/updated';
   params: {
     /**
      * The URI of the resource that has been updated. This might be a sub-resource of the one that the client actually subscribed to.
@@ -643,7 +643,7 @@ export interface BlobResourceContents extends ResourceContents {
  * @category prompts/list
  */
 export interface ListPromptsRequest extends PaginatedRequest {
-  method: "prompts/list";
+  method: 'prompts/list';
 }
 
 /**
@@ -661,7 +661,7 @@ export interface ListPromptsResult extends PaginatedResult {
  * @category prompts/get
  */
 export interface GetPromptRequest extends Request {
-  method: "prompts/get";
+  method: 'prompts/get';
   params: {
     /**
      * The name of the prompt or prompt template.
@@ -723,7 +723,7 @@ export interface PromptArgument extends BaseMetadata {
 /**
  * The sender or recipient of messages and data in a conversation.
  */
-export type Role = "user" | "assistant";
+export type Role = 'user' | 'assistant'
 
 /**
  * Describes a message returned as part of a prompt.
@@ -742,7 +742,7 @@ export interface PromptMessage {
  * Note: resource links returned by tools are not guaranteed to appear in the results of `resources/list` requests.
  */
 export interface ResourceLink extends Resource {
-  type: "resource_link";
+  type: 'resource_link';
 }
 
 /**
@@ -752,7 +752,7 @@ export interface ResourceLink extends Resource {
  * of the LLM and/or the user.
  */
 export interface EmbeddedResource {
-  type: "resource";
+  type: 'resource';
   resource: TextResourceContents | BlobResourceContents;
 
   /**
@@ -771,7 +771,7 @@ export interface EmbeddedResource {
  * @category notifications/prompts/list_changed
  */
 export interface PromptListChangedNotification extends Notification {
-  method: "notifications/prompts/list_changed";
+  method: 'notifications/prompts/list_changed';
 }
 
 /* Tools */
@@ -781,7 +781,7 @@ export interface PromptListChangedNotification extends Notification {
  * @category tools/list
  */
 export interface ListToolsRequest extends PaginatedRequest {
-  method: "tools/list";
+  method: 'tools/list';
 }
 
 /**
@@ -832,7 +832,7 @@ export interface CallToolResult extends Result {
  * @category tools/call
  */
 export interface CallToolRequest extends Request {
-  method: "tools/call";
+  method: 'tools/call';
   params: {
     name: string;
     arguments?: { [key: string]: unknown };
@@ -845,7 +845,7 @@ export interface CallToolRequest extends Request {
  * @category notifications/tools/list_changed
  */
 export interface ToolListChangedNotification extends Notification {
-  method: "notifications/tools/list_changed";
+  method: 'notifications/tools/list_changed';
 }
 
 /**
@@ -917,7 +917,7 @@ export interface Tool extends BaseMetadata {
    * A JSON Schema object defining the expected parameters for the tool.
    */
   inputSchema: {
-    type: "object";
+    type: 'object';
     properties?: { [key: string]: object };
     required?: string[];
   };
@@ -927,7 +927,7 @@ export interface Tool extends BaseMetadata {
    * the structuredContent field of a CallToolResult.
    */
   outputSchema?: {
-    type: "object";
+    type: 'object';
     properties?: { [key: string]: object };
     required?: string[];
   };
@@ -952,7 +952,7 @@ export interface Tool extends BaseMetadata {
  * @category logging/setLevel
  */
 export interface SetLevelRequest extends Request {
-  method: "logging/setLevel";
+  method: 'logging/setLevel';
   params: {
     /**
      * The level of logging that the client wants to receive from the server. The server should send all logs at this level and higher (i.e., more severe) to the client as notifications/message.
@@ -967,7 +967,7 @@ export interface SetLevelRequest extends Request {
  * @category notifications/message
  */
 export interface LoggingMessageNotification extends Notification {
-  method: "notifications/message";
+  method: 'notifications/message';
   params: {
     /**
      * The severity of this log message.
@@ -991,14 +991,14 @@ export interface LoggingMessageNotification extends Notification {
  * https://datatracker.ietf.org/doc/html/rfc5424#section-6.2.1
  */
 export type LoggingLevel =
-  | "debug"
-  | "info"
-  | "notice"
-  | "warning"
-  | "error"
-  | "critical"
-  | "alert"
-  | "emergency";
+  | 'debug'
+  | 'info'
+  | 'notice'
+  | 'warning'
+  | 'error'
+  | 'critical'
+  | 'alert'
+  | 'emergency'
 
 /* Sampling */
 /**
@@ -1007,7 +1007,7 @@ export type LoggingLevel =
  * @category sampling/createMessage
  */
 export interface CreateMessageRequest extends Request {
-  method: "sampling/createMessage";
+  method: 'sampling/createMessage';
   params: {
     messages: SamplingMessage[];
     /**
@@ -1021,7 +1021,7 @@ export interface CreateMessageRequest extends Request {
     /**
      * A request to include context from one or more MCP servers (including the caller), to be attached to the prompt. The client MAY ignore this request.
      */
-    includeContext?: "none" | "thisServer" | "allServers";
+    includeContext?: 'none' | 'thisServer' | 'allServers';
     /**
      * @TJS-type number
      */
@@ -1051,7 +1051,7 @@ export interface CreateMessageResult extends Result, SamplingMessage {
   /**
    * The reason why sampling stopped, if known.
    */
-  stopReason?: "endTurn" | "stopSequence" | "maxTokens" | string;
+  stopReason?: 'endTurn' | 'stopSequence' | 'maxTokens' | string;
 }
 
 /**
@@ -1102,13 +1102,13 @@ export type ContentBlock =
   | ImageContent
   | AudioContent
   | ResourceLink
-  | EmbeddedResource;
+  | EmbeddedResource
 
 /**
  * Text provided to or from an LLM.
  */
 export interface TextContent {
-  type: "text";
+  type: 'text';
 
   /**
    * The text content of the message.
@@ -1130,7 +1130,7 @@ export interface TextContent {
  * An image provided to or from an LLM.
  */
 export interface ImageContent {
-  type: "image";
+  type: 'image';
 
   /**
    * The base64-encoded image data.
@@ -1159,7 +1159,7 @@ export interface ImageContent {
  * Audio provided to or from an LLM.
  */
 export interface AudioContent {
-  type: "audio";
+  type: 'audio';
 
   /**
    * The base64-encoded audio data.
@@ -1271,7 +1271,7 @@ export interface ModelHint {
  * @category completion/complete
  */
 export interface CompleteRequest extends Request {
-  method: "completion/complete";
+  method: 'completion/complete';
   params: {
     ref: PromptReference | ResourceTemplateReference;
     /**
@@ -1326,7 +1326,7 @@ export interface CompleteResult extends Result {
  * A reference to a resource or resource template definition.
  */
 export interface ResourceTemplateReference {
-  type: "ref/resource";
+  type: 'ref/resource';
   /**
    * The URI or URI template of the resource.
    *
@@ -1339,7 +1339,7 @@ export interface ResourceTemplateReference {
  * Identifies a prompt.
  */
 export interface PromptReference extends BaseMetadata {
-  type: "ref/prompt";
+  type: 'ref/prompt';
 }
 
 /* Roots */
@@ -1355,7 +1355,7 @@ export interface PromptReference extends BaseMetadata {
  * @category roots/list
  */
 export interface ListRootsRequest extends Request {
-  method: "roots/list";
+  method: 'roots/list';
 }
 
 /**
@@ -1402,7 +1402,7 @@ export interface Root {
  * @category notifications/roots/list_changed
  */
 export interface RootsListChangedNotification extends Notification {
-  method: "notifications/roots/list_changed";
+  method: 'notifications/roots/list_changed';
 }
 
 /**
@@ -1411,7 +1411,7 @@ export interface RootsListChangedNotification extends Notification {
  * @category elicitation/create
  */
 export interface ElicitRequest extends Request {
-  method: "elicitation/create";
+  method: 'elicitation/create';
   params: {
     /**
      * The message to present to the user.
@@ -1422,7 +1422,7 @@ export interface ElicitRequest extends Request {
      * Only top-level properties are allowed, without nesting.
      */
     requestedSchema: {
-      type: "object";
+      type: 'object';
       properties: {
         [key: string]: PrimitiveSchemaDefinition;
       };
@@ -1439,19 +1439,19 @@ export type PrimitiveSchemaDefinition =
   | StringSchema
   | NumberSchema
   | BooleanSchema
-  | EnumSchema;
+  | EnumSchema
 
 export interface StringSchema {
-  type: "string";
+  type: 'string';
   title?: string;
   description?: string;
   minLength?: number;
   maxLength?: number;
-  format?: "email" | "uri" | "date" | "date-time";
+  format?: 'email' | 'uri' | 'date' | 'date-time';
 }
 
 export interface NumberSchema {
-  type: "number" | "integer";
+  type: 'number' | 'integer';
   title?: string;
   description?: string;
   minimum?: number;
@@ -1459,14 +1459,14 @@ export interface NumberSchema {
 }
 
 export interface BooleanSchema {
-  type: "boolean";
+  type: 'boolean';
   title?: string;
   description?: string;
   default?: boolean;
 }
 
 export interface EnumSchema {
-  type: "string";
+  type: 'string';
   title?: string;
   description?: string;
   enum: string[];
@@ -1485,7 +1485,7 @@ export interface ElicitResult extends Result {
    * - "decline": User explicitly declined the action
    * - "cancel": User dismissed without making an explicit choice
    */
-  action: "accept" | "decline" | "cancel";
+  action: 'accept' | 'decline' | 'cancel';
 
   /**
    * The submitted form data, only present when action is "accept".
@@ -1509,21 +1509,21 @@ export type ClientRequest =
   | SubscribeRequest
   | UnsubscribeRequest
   | CallToolRequest
-  | ListToolsRequest;
+  | ListToolsRequest
 
 /** @internal */
 export type ClientNotification =
   | CancelledNotification
   | ProgressNotification
   | InitializedNotification
-  | RootsListChangedNotification;
+  | RootsListChangedNotification
 
 /** @internal */
 export type ClientResult =
   | EmptyResult
   | CreateMessageResult
   | ListRootsResult
-  | ElicitResult;
+  | ElicitResult
 
 /* Server messages */
 /** @internal */
@@ -1531,7 +1531,7 @@ export type ServerRequest =
   | PingRequest
   | CreateMessageRequest
   | ListRootsRequest
-  | ElicitRequest;
+  | ElicitRequest
 
 /** @internal */
 export type ServerNotification =
@@ -1541,7 +1541,7 @@ export type ServerNotification =
   | ResourceUpdatedNotification
   | ResourceListChangedNotification
   | ToolListChangedNotification
-  | PromptListChangedNotification;
+  | PromptListChangedNotification
 
 /** @internal */
 export type ServerResult =
@@ -1554,4 +1554,4 @@ export type ServerResult =
   | ListResourcesResult
   | ReadResourceResult
   | CallToolResult
-  | ListToolsResult;
+  | ListToolsResult

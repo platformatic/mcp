@@ -5,9 +5,13 @@ import type {
   JSONRPCMessage,
   JSONRPCResponse,
   JSONRPCError,
-  JSONRPCBatchRequest,
-  JSONRPCBatchResponse
+  JSONRPCRequest,
+  JSONRPCNotification
 } from './schema.ts'
+
+// Local batch types for JSON-RPC 2.0 compatibility
+type JSONRPCBatchRequest = (JSONRPCRequest | JSONRPCNotification)[]
+type JSONRPCBatchResponse = (JSONRPCResponse | JSONRPCError)[]
 
 /**
  * Options for the stdio transport

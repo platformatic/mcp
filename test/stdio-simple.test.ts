@@ -63,7 +63,7 @@ test('stdio transport - full integration test', async () => {
       id: 1,
       method: 'initialize',
       params: {
-        protocolVersion: '2025-03-26',
+        protocolVersion: '2025-06-18',
         capabilities: {},
         clientInfo: {
           name: 'test-client',

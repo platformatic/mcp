@@ -631,7 +631,7 @@ await runStdioServer(app, {
 
 ```bash
 # Initialize the server
-echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test-client","version":"1.0.0"}}}' | node server.js
+echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test-client","version":"1.0.0"}}}' | node server.js
 
 # Ping the server
 echo '{"jsonrpc":"2.0","id":2,"method":"ping"}' | node server.js

@@ -85,7 +85,7 @@ test('POST SSE connections should persist and receive notifications', async (t) 
       id: 1,
       method: 'initialize',
       params: {
-        protocolVersion: '2025-03-26',
+        protocolVersion: '2025-06-18',
         capabilities: {},
         clientInfo: {
           name: 'test-client',
@@ -220,7 +220,7 @@ test('Session cleanup on connection close', async (t) => {
       id: 1,
       method: 'initialize',
       params: {
-        protocolVersion: '2025-03-26',
+        protocolVersion: '2025-06-18',
         capabilities: {},
         clientInfo: {
           name: 'test-client',

@@ -30,7 +30,7 @@ You can test the server by sending JSON-RPC messages via stdin:
 
 ```bash
 # Initialize the server
-echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test-client","version":"1.0.0"}}}' | node --experimental-strip-types --no-warnings examples/stdio-server.ts
+echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test-client","version":"1.0.0"}}}' | node --experimental-strip-types --no-warnings examples/stdio-server.ts
 
 # Ping the server
 echo '{"jsonrpc":"2.0","id":2,"method":"ping"}' | node --experimental-strip-types --no-warnings examples/stdio-server.ts
