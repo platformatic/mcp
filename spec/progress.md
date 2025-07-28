@@ -1,6 +1,10 @@
-# Progress
+---
+title: Progress
+---
 
-<Info>**Protocol Revision**: 2025-03-26</Info>
+<div id="enable-section-numbers" />
+
+<Info>**Protocol Revision**: 2025-06-18</Info>
 
 The Model Context Protocol (MCP) supports optional progress tracking for long-running
 operations through notification messages. Either side can send progress notifications to
@@ -8,11 +12,11 @@ provide updates about operation status.
 
 ## Progress Flow
 
-When a party wants to *receive* progress updates for a request, it includes a
+When a party wants to _receive_ progress updates for a request, it includes a
 `progressToken` in the request metadata.
 
-* Progress tokens **MUST** be a string or integer value
-* Progress tokens can be chosen by the sender using any means, but **MUST** be unique
+- Progress tokens **MUST** be a string or integer value
+- Progress tokens can be chosen by the sender using any means, but **MUST** be unique
   across all active requests.
 
 ```json
@@ -30,10 +34,10 @@ When a party wants to *receive* progress updates for a request, it includes a
 
 The receiver **MAY** then send progress notifications containing:
 
-* The original progress token
-* The current progress value so far
-* An optional "total" value
-* An optional "message" value
+- The original progress token
+- The current progress value so far
+- An optional "total" value
+- An optional "message" value
 
 ```json
 {
@@ -48,22 +52,22 @@ The receiver **MAY** then send progress notifications containing:
 }
 ```
 
-* The `progress` value **MUST** increase with each notification, even if the total is
+- The `progress` value **MUST** increase with each notification, even if the total is
   unknown.
-* The `progress` and the `total` values **MAY** be floating point.
-* The `message` field **SHOULD** provide relevant human readable progress information.
+- The `progress` and the `total` values **MAY** be floating point.
+- The `message` field **SHOULD** provide relevant human readable progress information.
 
 ## Behavior Requirements
 
 1. Progress notifications **MUST** only reference tokens that:
 
-   * Were provided in an active request
-   * Are associated with an in-progress operation
+   - Were provided in an active request
+   - Are associated with an in-progress operation
 
 2. Receivers of progress requests **MAY**:
-   * Choose not to send any progress notifications
-   * Send notifications at whatever frequency they deem appropriate
-   * Omit the total value if unknown
+   - Choose not to send any progress notifications
+   - Send notifications at whatever frequency they deem appropriate
+   - Omit the total value if unknown
 
 ```mermaid
 sequenceDiagram
@@ -74,11 +78,9 @@ sequenceDiagram
     Sender->>Receiver: Method request with progressToken
 
     Note over Sender,Receiver: Progress updates
-    loop Progress Updates
-        Receiver-->>Sender: Progress notification (0.2/1.0)
-        Receiver-->>Sender: Progress notification (0.6/1.0)
-        Receiver-->>Sender: Progress notification (1.0/1.0)
-    end
+    Receiver-->>Sender: Progress notification (0.2/1.0)
+    Receiver-->>Sender: Progress notification (0.6/1.0)
+    Receiver-->>Sender: Progress notification (1.0/1.0)
 
     Note over Sender,Receiver: Operation complete
     Receiver->>Sender: Method response
@@ -86,7 +88,6 @@ sequenceDiagram
 
 ## Implementation Notes
 
-* Senders and receivers **SHOULD** track active progress tokens
-* Both parties **SHOULD** implement rate limiting to prevent flooding
-* Progress notifications **MUST** stop after completion
-
+- Senders and receivers **SHOULD** track active progress tokens
+- Both parties **SHOULD** implement rate limiting to prevent flooding
+- Progress notifications **MUST** stop after completion

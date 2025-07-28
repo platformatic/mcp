@@ -1,6 +1,10 @@
-# Lifecycle
+---
+title: Lifecycle
+---
 
-<Info>**Protocol Revision**: 2025-03-26</Info>
+<div id="enable-section-numbers" />
+
+<Info>**Protocol Revision**: 2025-06-18</Info>
 
 The Model Context Protocol (MCP) defines a rigorous lifecycle for client-server
 connections that ensures proper capability negotiation and state management.
@@ -38,15 +42,15 @@ sequenceDiagram
 The initialization phase **MUST** be the first interaction between client and server.
 During this phase, the client and server:
 
-* Establish protocol version compatibility
-* Exchange and negotiate capabilities
-* Share implementation details
+- Establish protocol version compatibility
+- Exchange and negotiate capabilities
+- Share implementation details
 
 The client **MUST** initiate this phase by sending an `initialize` request containing:
 
-* Protocol version supported
-* Client capabilities
-* Client implementation information
+- Protocol version supported
+- Client capabilities
+- Client implementation information
 
 ```json
 {
@@ -54,26 +58,22 @@ The client **MUST** initiate this phase by sending an `initialize` request conta
   "id": 1,
   "method": "initialize",
   "params": {
-    "protocolVersion": "2025-03-26",
+    "protocolVersion": "2024-11-05",
     "capabilities": {
       "roots": {
         "listChanged": true
       },
-      "sampling": {}
+      "sampling": {},
+      "elicitation": {}
     },
     "clientInfo": {
       "name": "ExampleClient",
+      "title": "Example Client Display Name",
       "version": "1.0.0"
     }
   }
 }
 ```
-
-The initialize request **MUST NOT** be part of a JSON-RPC
-[batch](https://www.jsonrpc.org/specification#batch), as other requests and notifications
-are not possible until initialization has completed. This also permits backwards
-compatibility with prior protocol versions that do not explicitly support JSON-RPC
-batches.
 
 The server **MUST** respond with its own capabilities and information:
 
@@ -82,7 +82,7 @@ The server **MUST** respond with its own capabilities and information:
   "jsonrpc": "2.0",
   "id": 1,
   "result": {
-    "protocolVersion": "2025-03-26",
+    "protocolVersion": "2024-11-05",
     "capabilities": {
       "logging": {},
       "prompts": {
@@ -98,6 +98,7 @@ The server **MUST** respond with its own capabilities and information:
     },
     "serverInfo": {
       "name": "ExampleServer",
+      "title": "Example Server Display Name",
       "version": "1.0.0"
     },
     "instructions": "Optional instructions for the client"
@@ -115,25 +116,32 @@ to indicate it is ready to begin normal operations:
 }
 ```
 
-* The client **SHOULD NOT** send requests other than
-  [pings](/specification/2025-03-26/basic/utilities/ping) before the server has responded to the
+- The client **SHOULD NOT** send requests other than
+  [pings](/specification/2025-06-18/basic/utilities/ping) before the server has responded to the
   `initialize` request.
-* The server **SHOULD NOT** send requests other than
-  [pings](/specification/2025-03-26/basic/utilities/ping) and
-  [logging](/specification/2025-03-26/server/utilities/logging) before receiving the `initialized`
+- The server **SHOULD NOT** send requests other than
+  [pings](/specification/2025-06-18/basic/utilities/ping) and
+  [logging](/specification/2025-06-18/server/utilities/logging) before receiving the `initialized`
   notification.
 
 #### Version Negotiation
 
 In the `initialize` request, the client **MUST** send a protocol version it supports.
-This **SHOULD** be the *latest* version supported by the client.
+This **SHOULD** be the _latest_ version supported by the client.
 
 If the server supports the requested protocol version, it **MUST** respond with the same
 version. Otherwise, the server **MUST** respond with another protocol version it
-supports. This **SHOULD** be the *latest* version supported by the server.
+supports. This **SHOULD** be the _latest_ version supported by the server.
 
 If the client does not support the version in the server's response, it **SHOULD**
 disconnect.
+
+<Note>
+If using HTTP, the client **MUST** include the `MCP-Protocol-Version:
+<protocol-version>` HTTP header on all subsequent requests to the MCP
+server.
+For details, see [the Protocol Version Header section in Transports](/specification/2025-06-18/basic/transports#protocol-version-header).
+</Note>
 
 #### Capability Negotiation
 
@@ -144,31 +152,32 @@ Key capabilities include:
 
 | Category | Capability     | Description                                                                               |
 | -------- | -------------- | ----------------------------------------------------------------------------------------- |
-| Client   | `roots`        | Ability to provide filesystem [roots](/specification/2025-03-26/client/roots)             |
-| Client   | `sampling`     | Support for LLM [sampling](/specification/2025-03-26/client/sampling) requests            |
+| Client   | `roots`        | Ability to provide filesystem [roots](/specification/2025-06-18/client/roots)             |
+| Client   | `sampling`     | Support for LLM [sampling](/specification/2025-06-18/client/sampling) requests            |
+| Client   | `elicitation`  | Support for server [elicitation](/specification/2025-06-18/client/elicitation) requests   |
 | Client   | `experimental` | Describes support for non-standard experimental features                                  |
-| Server   | `prompts`      | Offers [prompt templates](/specification/2025-03-26/server/prompts)                       |
-| Server   | `resources`    | Provides readable [resources](/specification/2025-03-26/server/resources)                 |
-| Server   | `tools`        | Exposes callable [tools](/specification/2025-03-26/server/tools)                          |
-| Server   | `logging`      | Emits structured [log messages](/specification/2025-03-26/server/utilities/logging)       |
-| Server   | `completions`  | Supports argument [autocompletion](/specification/2025-03-26/server/utilities/completion) |
+| Server   | `prompts`      | Offers [prompt templates](/specification/2025-06-18/server/prompts)                       |
+| Server   | `resources`    | Provides readable [resources](/specification/2025-06-18/server/resources)                 |
+| Server   | `tools`        | Exposes callable [tools](/specification/2025-06-18/server/tools)                          |
+| Server   | `logging`      | Emits structured [log messages](/specification/2025-06-18/server/utilities/logging)       |
+| Server   | `completions`  | Supports argument [autocompletion](/specification/2025-06-18/server/utilities/completion) |
 | Server   | `experimental` | Describes support for non-standard experimental features                                  |
 
 Capability objects can describe sub-capabilities like:
 
-* `listChanged`: Support for list change notifications (for prompts, resources, and
+- `listChanged`: Support for list change notifications (for prompts, resources, and
   tools)
-* `subscribe`: Support for subscribing to individual items' changes (resources only)
+- `subscribe`: Support for subscribing to individual items' changes (resources only)
 
 ### Operation
 
 During the operation phase, the client and server exchange messages according to the
 negotiated capabilities.
 
-Both parties **SHOULD**:
+Both parties **MUST**:
 
-* Respect the negotiated protocol version
-* Only use capabilities that were successfully negotiated
+- Respect the negotiated protocol version
+- Only use capabilities that were successfully negotiated
 
 ### Shutdown
 
@@ -178,7 +187,7 @@ mechanism should be used to signal connection termination:
 
 #### stdio
 
-For the stdio [transport](/specification/2025-03-26/basic/transports), the client **SHOULD** initiate
+For the stdio [transport](/specification/2025-06-18/basic/transports), the client **SHOULD** initiate
 shutdown by:
 
 1. First, closing the input stream to the child process (the server)
@@ -191,7 +200,7 @@ exiting.
 
 #### HTTP
 
-For HTTP [transports](/specification/2025-03-26/basic/transports), shutdown is indicated by closing the
+For HTTP [transports](/specification/2025-06-18/basic/transports), shutdown is indicated by closing the
 associated HTTP connection(s).
 
 ## Timeouts
@@ -199,14 +208,14 @@ associated HTTP connection(s).
 Implementations **SHOULD** establish timeouts for all sent requests, to prevent hung
 connections and resource exhaustion. When the request has not received a success or error
 response within the timeout period, the sender **SHOULD** issue a [cancellation
-notification](/specification/2025-03-26/basic/utilities/cancellation) for that request and stop waiting for
+notification](/specification/2025-06-18/basic/utilities/cancellation) for that request and stop waiting for
 a response.
 
 SDKs and other middleware **SHOULD** allow these timeouts to be configured on a
 per-request basis.
 
 Implementations **MAY** choose to reset the timeout clock when receiving a [progress
-notification](/specification/2025-03-26/basic/utilities/progress) corresponding to the request, as this
+notification](/specification/2025-06-18/basic/utilities/progress) corresponding to the request, as this
 implies that work is actually happening. However, implementations **SHOULD** always
 enforce a maximum timeout, regardless of progress notifications, to limit the impact of a
 misbehaving client or server.
@@ -215,9 +224,9 @@ misbehaving client or server.
 
 Implementations **SHOULD** be prepared to handle these error cases:
 
-* Protocol version mismatch
-* Failure to negotiate required capabilities
-* Request [timeouts](#timeouts)
+- Protocol version mismatch
+- Failure to negotiate required capabilities
+- Request [timeouts](#timeouts)
 
 Example initialization error:
 
