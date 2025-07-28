@@ -304,4 +304,136 @@ describe('Redis Integration Tests', () => {
     assert.strictEqual(result.id, 1)
     assert.ok(result.result)
   })
+
+  testWithRedis('should handle elicitation requests with Redis backend', async (redis, t) => {
+    const app1 = fastify()
+    const app2 = fastify()
+
+    t.after(() => app1.close())
+    t.after(() => app2.close())
+
+    // Configure both apps with Redis
+    const redisConfig = {
+      host: redis.options.host!,
+      port: redis.options.port!,
+      db: redis.options.db!
+    }
+
+    await app1.register(mcpPlugin, {
+      enableSSE: true,
+      redis: redisConfig
+    })
+
+    await app2.register(mcpPlugin, {
+      enableSSE: true,
+      redis: redisConfig
+    })
+
+    // Create SSE session on app1
+    const sessionResponse = await app1.inject({
+      method: 'POST',
+      url: '/mcp',
+      headers: {
+        accept: 'text/event-stream'
+      },
+      payloadAsStream: true,
+      payload: {
+        jsonrpc: '2.0',
+        method: 'initialize',
+        params: {
+          protocolVersion: '2025-06-18',
+          capabilities: { elicitation: {} },
+          clientInfo: { name: 'test-client', version: '1.0.0' }
+        },
+        id: 1
+      }
+    })
+
+    const sessionId = sessionResponse.headers['mcp-session-id'] as string
+    assert.ok(sessionId, 'Session ID should be present')
+
+    // Verify mcpElicit decorator is available on both instances
+    assert.ok(typeof app1.mcpElicit === 'function', 'app1 should have mcpElicit decorator')
+    assert.ok(typeof app2.mcpElicit === 'function', 'app2 should have mcpElicit decorator')
+
+    // Send elicitation request from app2 to session created on app1 (cross-instance)
+    const elicitResult = await app2.mcpElicit(sessionId, 'Please enter your details', {
+      type: 'object',
+      properties: {
+        name: {
+          type: 'string',
+          description: 'Your full name',
+          minLength: 1
+        },
+        age: {
+          type: 'integer',
+          description: 'Your age',
+          minimum: 0
+        },
+        category: {
+          type: 'string',
+          description: 'Your category',
+          enum: ['student', 'professional', 'retired']
+        }
+      },
+      required: ['name']
+    }, 'test-elicit-123')
+
+    assert.strictEqual(elicitResult, true, 'Elicitation request should succeed across Redis instances')
+
+    // Verify the elicitation request was received via SSE stream
+    let elicitRequestReceived = false
+    for await (const chunk of sessionResponse.stream()) {
+      const data = chunk.toString()
+
+      // Look for the elicitation request in the SSE stream
+      if (data.includes('elicitation/create') && data.includes('test-elicit-123')) {
+        const eventData = data.replace(/^data: /, '').trim()
+        try {
+          const message = JSON.parse(eventData)
+
+          // Verify it's a proper elicitation request
+          assert.strictEqual(message.jsonrpc, '2.0')
+          assert.strictEqual(message.method, 'elicitation/create')
+          assert.strictEqual(message.id, 'test-elicit-123')
+          assert.strictEqual(message.params.message, 'Please enter your details')
+          assert.ok(message.params.requestedSchema)
+          assert.strictEqual(message.params.requestedSchema.type, 'object')
+          assert.ok(message.params.requestedSchema.properties.name)
+          assert.ok(message.params.requestedSchema.properties.age)
+          assert.ok(message.params.requestedSchema.properties.category)
+          assert.deepStrictEqual(message.params.requestedSchema.required, ['name'])
+
+          elicitRequestReceived = true
+          break
+        } catch (parseError) {
+          // Continue looking for the right message
+        }
+      }
+    }
+
+    assert.ok(elicitRequestReceived, 'Elicitation request should be received via SSE stream')
+
+    // Verify the message was stored in Redis session history
+    const history = await redis.xrange(`session:${sessionId}:history`, '-', '+')
+    assert.ok(history.length > 0, 'Session history should contain messages')
+
+    // Look for the elicitation request in the history
+    const elicitMessage = history.find(([_, fields]) => {
+      const messageField = fields.find((field, index) => index % 2 === 0 && field === 'message')
+      if (messageField) {
+        const messageIndex = fields.indexOf(messageField)
+        const messageData = fields[messageIndex + 1]
+        try {
+          const message = JSON.parse(messageData)
+          return message.method === 'elicitation/create' && message.id === 'test-elicit-123'
+        } catch {
+          return false
+        }
+      }
+      return false
+    })
+
+    assert.ok(elicitMessage, 'Elicitation request should be stored in Redis session history')
+  })
 })
