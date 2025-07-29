@@ -408,7 +408,7 @@ describe('Redis Integration Tests', () => {
     })
 
     assert.ok(elicitMessage, 'Elicitation request should be stored in Redis session history')
-    
+
     // Verify the elicitation message structure
     if (elicitMessage) {
       const messageField = elicitMessage[1].find((field, index) => index % 2 === 0 && field === 'message')
@@ -416,7 +416,7 @@ describe('Redis Integration Tests', () => {
         const messageIndex = elicitMessage[1].indexOf(messageField)
         const messageData = elicitMessage[1][messageIndex + 1]
         const message = JSON.parse(messageData)
-        
+
         assert.strictEqual(message.jsonrpc, '2.0')
         assert.strictEqual(message.method, 'elicitation/create')
         assert.strictEqual(message.id, 'test-elicit-123')
