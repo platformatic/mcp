@@ -93,10 +93,14 @@ export function createTestAuthConfig (overrides: Partial<AuthorizationConfig> = 
 }
 
 export function createTestJWT (payload: TestJWTOptions = {}): string {
+  let kid = payload.kid || 'test-key-1'
+  if (Object.hasOwnProperty(payload, 'kid') === true && (payload.kid === null || payload.kid === undefined)) {
+    kid = undefined
+  }
   const signer = createSigner({
     key: TEST_PRIVATE_KEY,
     algorithm: 'RS256',
-    kid: payload.kid || 'test-key-1'
+    kid
   })
 
   const defaultPayload = {
@@ -153,14 +157,14 @@ export function setupMockAgent (responses: Record<string, any>) {
     mockPool.intercept({
       path: urlObj.pathname + urlObj.search,
       method: 'GET'
-    }).reply(statusCode, JSON.stringify(responseBody), headers)
+    }).reply(statusCode, JSON.stringify(responseBody), headers).persist()
     
     // Also intercept POST for introspection endpoints
     if (url.includes('/introspect')) {
       mockPool.intercept({
         path: urlObj.pathname + urlObj.search,
         method: 'POST'
-      }).reply(statusCode, JSON.stringify(responseBody), headers)
+      }).reply(statusCode, JSON.stringify(responseBody), headers).persist()
     }
   }
   

@@ -288,12 +288,14 @@ describe('Authorization Integration Tests', () => {
       const response = await app.inject({
         method: 'GET',
         url: '/mcp',
+        payloadAsStream: true,
         headers: {
           accept: 'text/event-stream'
         }
       })
 
       t.assert.strictEqual(response.statusCode, 401)
+      response.stream().destroy()
     })
 
     test('should allow SSE connections with valid tokens', async (t: TestContext) => {
@@ -312,6 +314,7 @@ describe('Authorization Integration Tests', () => {
       const response = await app.inject({
         method: 'GET',
         url: '/mcp',
+        payloadAsStream: true,
         headers: {
           accept: 'text/event-stream',
           authorization: `Bearer ${token}`
@@ -320,6 +323,7 @@ describe('Authorization Integration Tests', () => {
 
       t.assert.strictEqual(response.statusCode, 200)
       t.assert.strictEqual(response.headers['content-type'], 'text/event-stream')
+      response.stream().destroy()
     })
   })
 
@@ -509,11 +513,13 @@ describe('Authorization Integration Tests', () => {
       const getResponse = await app.inject({
         method: 'GET',
         url: '/mcp',
+        payloadAsStream: true,
         headers: { 
           authorization: `Bearer ${token}`,
           accept: 'text/event-stream'
         }
       })
+      getResponse.stream().destroy()
       t.assert.strictEqual(getResponse.statusCode, 200)
 
       // Test that well-known endpoints don't require auth

@@ -149,12 +149,13 @@ describe('TokenValidator', () => {
     test('should reject JWT with missing kid', async (t: TestContext) => {
       const config = createTestAuthConfig()
       restoreMock = setupMockAgent({
-        'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse()
+        'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse({
+          kid: undefined
+        }),
       })
 
       const validator = new TokenValidator(config, app)
       
-      // Create JWT without kid in header
       const token = createTestJWT({ kid: undefined })
 
       const result = await validator.validateToken(token)

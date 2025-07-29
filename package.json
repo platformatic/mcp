@@ -11,7 +11,7 @@
     "lint": "eslint --cache",
     "lint:fix": "eslint --cache --fix",
     "typecheck": "tsc -p . --noEmit",
-    "test": "node --experimental-strip-types --no-warnings --test --test-concurrency=1 test/*.test.ts",
+    "test": "node --experimental-strip-types --no-warnings --test --test-timeout=30000 --test-concurrency=1 test/*.test.ts",
     "ci": "npm run build && npm run lint && npm run test",
     "start-demo": "node --watch examples/file-listing-server.ts | pino-pretty --colorize --translateTime 'SYS:standard' --ignore pid,hostname"
   },

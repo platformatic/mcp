@@ -24,18 +24,16 @@ export class TokenValidator {
       })
 
       this.jwtVerifier = createVerifier({
-        key: async (token: any) => {
-          const { header } = JSON.parse(Buffer.from(token.split('.')[0], 'base64url').toString())
-          if (!header.kid) {
-            throw new Error('Token missing kid in header')
-          }
-          const key = await this.getJwks!.getPublicKey({
+        key: async (obj = {}) => {
+          const header = obj.header
+          const publicKey = await this.getJwks!.getPublicKey({
             kid: header.kid,
+            alg: header.alg,
             domain,
-            alg: header.alg
           })
-          return key
+          return publicKey
         },
+
         algorithms: ['RS256', 'ES256']
       })
     }
