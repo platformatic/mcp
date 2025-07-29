@@ -9,7 +9,9 @@ import type {
   Implementation,
   Tool,
   Resource,
-  Prompt
+  Prompt,
+  ElicitRequest,
+  RequestId
 } from './schema.ts'
 import type { Static, TSchema, TObject, TString } from '@sinclair/typebox'
 
@@ -88,6 +90,12 @@ declare module 'fastify' {
 
     mcpBroadcastNotification: (notification: JSONRPCNotification) => Promise<void>
     mcpSendToSession: (sessionId: string, message: JSONRPCMessage) => Promise<boolean>
+    mcpElicit: (
+      sessionId: string,
+      message: string,
+      requestedSchema: ElicitRequest['params']['requestedSchema'],
+      requestId?: RequestId
+    ) => Promise<boolean>
   }
 }
 

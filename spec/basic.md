@@ -1,15 +1,20 @@
-# Overview
+---
+title: Overview
+---
 
-<Info>**Protocol Revision**: 2025-03-26</Info>
+<div id="enable-section-numbers" />
+
+<Info>**Protocol Revision**: 2025-06-18</Info>
 
 The Model Context Protocol consists of several key components that work together:
 
-* **Base Protocol**: Core JSON-RPC message types
-* **Lifecycle Management**: Connection initialization, capability negotiation, and
+- **Base Protocol**: Core JSON-RPC message types
+- **Lifecycle Management**: Connection initialization, capability negotiation, and
   session control
-* **Server Features**: Resources, prompts, and tools exposed by servers
-* **Client Features**: Sampling and root directory lists provided by clients
-* **Utilities**: Cross-cutting concerns like logging and argument completion
+- **Authorization**: Authentication and authorization framework for HTTP-based transports
+- **Server Features**: Resources, prompts, and tools exposed by servers
+- **Client Features**: Sampling and root directory lists provided by clients
+- **Utilities**: Cross-cutting concerns like logging and argument completion
 
 All implementations **MUST** support the base protocol and lifecycle management
 components. Other components **MAY** be implemented based on the specific needs of the
@@ -40,9 +45,9 @@ Requests are sent from the client to the server or vice versa, to initiate an op
 }
 ```
 
-* Requests **MUST** include a string or integer ID.
-* Unlike base JSON-RPC, the ID **MUST NOT** be `null`.
-* The request ID **MUST NOT** have been previously used by the requestor within the same
+- Requests **MUST** include a string or integer ID.
+- Unlike base JSON-RPC, the ID **MUST NOT** be `null`.
+- The request ID **MUST NOT** have been previously used by the requestor within the same
   session.
 
 ### Responses
@@ -64,13 +69,13 @@ Responses are sent in reply to requests, containing the result or error of the o
 }
 ```
 
-* Responses **MUST** include the same ID as the request they correspond to.
-* **Responses** are further sub-categorized as either **successful results** or
+- Responses **MUST** include the same ID as the request they correspond to.
+- **Responses** are further sub-categorized as either **successful results** or
   **errors**. Either a `result` or an `error` **MUST** be set. A response **MUST NOT**
   set both.
-* Results **MAY** follow any JSON object structure, while errors **MUST** include an
+- Results **MAY** follow any JSON object structure, while errors **MUST** include an
   error code and message at minimum.
-* Error codes **MUST** be integers.
+- Error codes **MUST** be integers.
 
 ### Notifications
 
@@ -87,18 +92,11 @@ The receiver **MUST NOT** send a response.
 }
 ```
 
-* Notifications **MUST NOT** include an ID.
-
-### Batching
-
-JSON-RPC also defines a means to
-[batch multiple requests and notifications](https://www.jsonrpc.org/specification#batch),
-by sending them in an array. MCP implementations **MAY** support sending JSON-RPC
-batches, but **MUST** support receiving JSON-RPC batches.
+- Notifications **MUST NOT** include an ID.
 
 ## Auth
 
-MCP provides an [Authorization](/specification/2025-03-26/basic/authorization) framework for use with HTTP.
+MCP provides an [Authorization](/specification/2025-06-18/basic/authorization) framework for use with HTTP.
 Implementations using an HTTP-based transport **SHOULD** conform to this specification,
 whereas implementations using STDIO transport **SHOULD NOT** follow this specification,
 and instead retrieve credentials from the environment.
@@ -114,10 +112,38 @@ to help shape the future of the protocol!
 ## Schema
 
 The full specification of the protocol is defined as a
-[TypeScript schema](https://github.com/modelcontextprotocol/specification/blob/main/schema/2025-03-26/schema.ts).
+[TypeScript schema](https://github.com/modelcontextprotocol/specification/blob/main/schema/2025-06-18/schema.ts).
 This is the source of truth for all protocol messages and structures.
 
 There is also a
-[JSON Schema](https://github.com/modelcontextprotocol/specification/blob/main/schema/2025-03-26/schema.json),
+[JSON Schema](https://github.com/modelcontextprotocol/specification/blob/main/schema/2025-06-18/schema.json),
 which is automatically generated from the TypeScript source of truth, for use with
 various automated tooling.
+
+### General fields
+
+#### `_meta`
+
+The `_meta` property/parameter is reserved by MCP to allow clients and servers
+to attach additional metadata to their interactions.
+
+Certain key names are reserved by MCP for protocol-level metadata, as specified below;
+implementations MUST NOT make assumptions about values at these keys.
+
+Additionally, definitions in the [schema](https://github.com/modelcontextprotocol/specification/blob/main/schema/2025-06-18/schema.ts)
+may reserve particular names for purpose-specific metadata, as declared in those definitions.
+
+**Key name format:** valid `_meta` key names have two segments: an optional **prefix**, and a **name**.
+
+**Prefix:**
+
+- If specified, MUST be a series of labels separated by dots (`.`), followed by a slash (`/`).
+  - Labels MUST start with a letter and end with a letter or digit; interior characters can be letters, digits, or hyphens (`-`).
+- Any prefix beginning with zero or more valid labels, followed by `modelcontextprotocol` or `mcp`, followed by any valid label,
+  is **reserved** for MCP use.
+  - For example: `modelcontextprotocol.io/`, `mcp.dev/`, `api.modelcontextprotocol.org/`, and `tools.mcp.com/` are all reserved.
+
+**Name:**
+
+- Unless empty, MUST begin and end with an alphanumeric character (`[a-z0-9A-Z]`).
+- MAY contain hyphens (`-`), underscores (`_`), dots (`.`), and alphanumerics in between.

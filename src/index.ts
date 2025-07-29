@@ -1,10 +1,6 @@
 import type { FastifyInstance } from 'fastify'
 import fp from 'fastify-plugin'
 import { Redis } from 'ioredis'
-import type {
-  ServerCapabilities,
-  Implementation
-} from './schema.ts'
 import type { SessionStore } from './stores/session-store.ts'
 import type { MessageBroker } from './brokers/message-broker.ts'
 import { MemorySessionStore } from './stores/memory-session-store.ts'
@@ -15,6 +11,23 @@ import type { MCPPluginOptions, MCPTool, MCPResource, MCPPrompt } from './types.
 import pubsubDecorators from './decorators/pubsub.ts'
 import metaDecorators from './decorators/meta.ts'
 import routes from './routes.ts'
+
+// Import and export MCP protocol types
+import type {
+  JSONRPCMessage,
+  JSONRPCRequest,
+  JSONRPCResponse,
+  JSONRPCError,
+  JSONRPCNotification,
+  ServerCapabilities,
+  Implementation,
+  Tool,
+  Resource,
+  Prompt,
+  CallToolResult,
+  ReadResourceResult,
+  GetPromptResult
+} from './schema.ts'
 
 const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOptions) {
   const serverInfo: Implementation = opts.serverInfo ?? {
@@ -123,15 +136,12 @@ export type {
   SSESession
 } from './types.ts'
 
-// Export MCP protocol types
 export type {
   JSONRPCMessage,
   JSONRPCRequest,
   JSONRPCResponse,
   JSONRPCError,
   JSONRPCNotification,
-  JSONRPCBatchRequest,
-  JSONRPCBatchResponse,
   ServerCapabilities,
   Implementation,
   Tool,
@@ -140,4 +150,4 @@ export type {
   CallToolResult,
   ReadResourceResult,
   GetPromptResult
-} from './schema.ts'
+}

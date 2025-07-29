@@ -1,6 +1,6 @@
 # Fastify MCP Server
 
-A Fastify plugin that implements the Model Context Protocol (MCP) server using JSON-RPC 2.0. This plugin enables Fastify applications to expose tools, resources, and prompts following the MCP specification.
+A Fastify plugin that implements the Model Context Protocol (MCP) server using JSON-RPC 2.0. This plugin enables Fastify applications to expose tools, resources, and prompts following the MCP 2025-06-18 specification with full elicitation support.
 
 ## Installation
 
@@ -18,14 +18,16 @@ npm install @sinclair/typebox
 
 ## Features
 
-- **Complete MCP Protocol Support**: Implements the full Model Context Protocol specification
+- **Complete MCP 2025-06-18 Support**: Implements the full Model Context Protocol specification with elicitation
+- **Elicitation Support**: Server-to-client information requests with schema validation
 - **TypeBox Validation**: Type-safe schema validation with automatic TypeScript inference
+- **Security Enhancements**: Input sanitization, rate limiting, and security assessment
 - **Multiple Transport Support**: HTTP/SSE and stdio transports for flexible communication
 - **SSE Streaming**: Server-Sent Events for real-time communication
 - **Horizontal Scaling**: Redis-backed session management and message broadcasting
 - **Session Persistence**: Message history and reconnection support with Last-Event-ID
 - **Memory & Redis Backends**: Seamless switching between local and distributed storage
-- **Production Ready**: Comprehensive test coverage and authentication support
+- **Production Ready**: Comprehensive test coverage, security features, and authentication support
 
 ## Quick Start
 
@@ -119,6 +121,117 @@ app.mcpAddPrompt({
 
 await app.listen({ port: 3000 })
 ```
+
+## Elicitation Support (MCP 2025-06-18)
+
+The plugin supports the elicitation capability, allowing servers to request structured information from clients. This enables dynamic data collection with schema validation.
+
+### Basic Elicitation
+
+```typescript
+import { Type } from '@sinclair/typebox'
+
+// Register plugin with elicitation support
+await app.register(mcpPlugin, {
+  enableSSE: true, // Required for elicitation
+  capabilities: {
+    elicitation: {} // Enable elicitation capability
+  }
+})
+
+// In your tool handler, request information from the client
+app.mcpAddTool({
+  name: 'collect-user-info',
+  description: 'Collect user information',
+  inputSchema: Type.Object({})
+}, async (params, { sessionId }) => {
+  if (!sessionId) {
+    return { 
+      content: [{ type: 'text', text: 'No session available' }],
+      isError: true 
+    }
+  }
+
+  // Request user details with schema validation
+  const success = await app.mcpElicit(sessionId, 'Please enter your details', {
+    type: 'object',
+    properties: {
+      name: { 
+        type: 'string', 
+        description: 'Your full name',
+        minLength: 1,
+        maxLength: 100
+      },
+      email: {
+        type: 'string',
+        description: 'Your email address',
+        format: 'email'
+      },
+      age: {
+        type: 'integer',
+        description: 'Your age',
+        minimum: 0,
+        maximum: 150
+      },
+      preferences: {
+        type: 'array',
+        items: {
+          type: 'string',
+          enum: ['newsletter', 'updates', 'marketing']
+        },
+        description: 'Communication preferences'
+      }
+    },
+    required: ['name', 'email']
+  })
+
+  if (success) {
+    return { 
+      content: [{ type: 'text', text: 'Information request sent to client' }] 
+    }
+  } else {
+    return { 
+      content: [{ type: 'text', text: 'Failed to send elicitation request' }],
+      isError: true 
+    }
+  }
+})
+```
+
+### Advanced Elicitation with Custom Request IDs
+
+```typescript
+// Request with custom ID for tracking
+const requestId = 'user-profile-123'
+const success = await app.mcpElicit(
+  sessionId, 
+  'Complete your profile setup',
+  {
+    type: 'object',
+    properties: {
+      avatar: { type: 'string', description: 'Avatar URL' },
+      bio: { type: 'string', maxLength: 500, description: 'Short bio' },
+      skills: {
+        type: 'array',
+        items: { type: 'string' },
+        maxItems: 10,
+        description: 'Your skills'
+      }
+    }
+  },
+  requestId
+)
+```
+
+### Security Considerations for Elicitation
+
+⚠️ **Important Security Notes:**
+
+- Elicitation requests are automatically validated for length and complexity
+- Schema depth and size are limited to prevent DoS attacks
+- Rate limiting should be implemented for production use
+- Always validate client responses before using the data
+- Never request sensitive information without explicit user consent
 
 ## TypeBox Schema Validation
 
@@ -631,7 +744,7 @@ await runStdioServer(app, {
 
 ```bash
 # Initialize the server
-echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test-client","version":"1.0.0"}}}' | node server.js
+echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test-client","version":"1.0.0"}}}' | node server.js
 
 # Ping the server
 echo '{"jsonrpc":"2.0","id":2,"method":"ping"}' | node server.js
@@ -701,9 +814,88 @@ The stdio transport is particularly useful for:
 
 ## Authentication & Security
 
+The plugin implements comprehensive security measures to protect against common attacks and ensure safe operation with untrusted inputs.
+
+### Security Features
+
+- **Input Sanitization**: Automatic sanitization of tool parameters and elicitation requests
+- **Schema Validation**: TypeBox-based validation with length and complexity limits
+- **Rate Limiting**: Built-in rate limiting capabilities for high-risk operations
+- **Security Assessment**: Automatic risk assessment for tool annotations
+- **DoS Protection**: Object depth limits, string length limits, and circular reference detection
+
+### Tool Security Assessment
+
+The plugin automatically assesses tool security risks based on annotations:
+
+```typescript
+app.mcpAddTool({
+  name: 'file-operations',
+  description: 'File system operations',
+  annotations: {
+    destructiveHint: true,  // ⚠️ High risk - logs security warning
+    openWorldHint: false,   // 🔒 Closed world - medium risk
+    readOnlyHint: false     // ✏️ Can modify environment
+  },
+  inputSchema: Type.Object({
+    operation: Type.Union([
+      Type.Literal('read'),
+      Type.Literal('write'), 
+      Type.Literal('delete')
+    ]),
+    path: Type.String({ maxLength: 1000 })
+  })
+}, async (params) => {
+  // Tool parameters are automatically sanitized and validated
+  // Security warnings are logged for high-risk operations
+  return { content: [{ type: 'text', text: 'Operation completed' }] }
+})
+```
+
+### Input Validation and Sanitization
+
+All inputs undergo automatic security processing:
+
+```typescript
+// Automatic security measures applied:
+// ✅ String length limits (max 10,000 chars)
+// ✅ Object depth limits (max 10 levels)
+// ✅ Property count limits (max 100 per object)
+// ✅ Control character removal
+// ✅ Circular reference detection
+// ✅ Schema complexity validation
+```
+
+### Rate Limiting
+
+Implement rate limiting for production deployments:
+
+```typescript
+import { RateLimiter } from '@platformatic/mcp/security'
+
+const rateLimiter = new RateLimiter(100, 60000) // 100 requests per minute
+
+// Use in tool handlers
+app.mcpAddTool({
+  name: 'rate-limited-tool',
+  description: 'Tool with rate limiting',
+  inputSchema: Type.Object({})
+}, async (params, { sessionId }) => {
+  if (sessionId && !rateLimiter.isAllowed(sessionId)) {
+    return {
+      content: [{ type: 'text', text: 'Rate limit exceeded' }],
+      isError: true
+    }
+  }
+  
+  // Process request...
+  return { content: [{ type: 'text', text: 'Success' }] }
+})
+```
+
 ### Bearer Token Authentication
 
-For production deployments, it's recommended to secure the MCP endpoint using the `@fastify/bearer-auth` plugin:
+For production deployments, secure the MCP endpoint using the `@fastify/bearer-auth` plugin:
 
 ```bash
 npm install @fastify/bearer-auth
@@ -853,6 +1045,307 @@ The plugin exposes the following endpoints:
 - `resources/read`: Read a resource (calls registered handler or returns error)
 - `prompts/list`: List available prompts
 - `prompts/get`: Get a prompt (calls registered handler or returns error)
+
+## Security Best Practices
+
+This section outlines security considerations and best practices when using the Fastify MCP plugin implementation.
+
+### ⚠️ Important Security Notices
+
+#### Tool Annotations Are Hints Only
+
+**🚨 CRITICAL:** Tool annotations (such as `destructiveHint`, `openWorldHint`, etc.) are **hints from potentially untrusted servers** and should **NEVER** be used for security decisions.
+
+- Annotations can be provided by untrusted MCP servers
+- They are not guaranteed to accurately describe tool behavior  
+- Always implement your own security validation regardless of annotations
+- Use annotations only for UI/UX improvements, not security controls
+
+#### Elicitation Security
+
+When using the elicitation feature (server-to-client information requests):
+
+- **Validate all user inputs** before processing elicitation responses
+- **Limit elicitation message length** to prevent DoS attacks
+- **Validate schema complexity** to prevent resource exhaustion
+- **Implement rate limiting** for elicitation requests
+- **Always require user consent** before sharing sensitive information
+
+### Input Validation and Sanitization
+
+#### Tool Parameters
+
+The plugin automatically sanitizes tool parameters to prevent common attacks:
+
+- **String length limits:** Maximum 10,000 characters per string
+- **Object depth limits:** Maximum 10 levels of nesting
+- **Property count limits:** Maximum 100 properties per object
+- **Control character removal:** Strips null bytes and control characters
+- **Circular reference detection:** Prevents infinite loops
+
+#### Schema Validation
+
+All inputs are validated against TypeBox schemas:
+
+```typescript
+// Example: Secure tool definition
+app.mcpAddTool({
+  name: 'secure-tool',
+  description: 'A tool with proper validation',
+  inputSchema: Type.Object({
+    message: Type.String({ 
+      minLength: 1, 
+      maxLength: 1000,
+      description: 'User message'
+    }),
+    priority: Type.Union([
+      Type.Literal('low'),
+      Type.Literal('medium'), 
+      Type.Literal('high')
+    ])
+  })
+}, async (params) => {
+  // params are automatically validated and sanitized
+  return { content: [{ type: 'text', text: 'OK' }] }
+})
+```
+
+### Tool Security Assessment
+
+The plugin automatically assesses tool security risks:
+
+#### Risk Levels
+
+- **Low Risk:** Read-only tools with closed-world domains
+- **Medium Risk:** Tools that interact with external entities
+- **High Risk:** Destructive tools that modify the environment
+
+#### Security Warnings
+
+The following warnings are logged for different tool types:
+
+```typescript
+// High-risk tool example
+app.mcpAddTool({
+  name: 'file-delete',
+  description: 'Delete files',
+  annotations: {
+    destructiveHint: true,  // ⚠️ Triggers high-risk warning
+    openWorldHint: false
+  },
+  inputSchema: Type.Object({
+    path: Type.String()
+  })
+}, handler)
+```
+
+### Rate Limiting
+
+Implement rate limiting to prevent abuse:
+
+```typescript
+import { RateLimiter } from '@platformatic/mcp/security'
+
+const rateLimiter = new RateLimiter(100, 60000) // 100 requests per minute
+
+// Check before processing requests
+if (!rateLimiter.isAllowed(sessionId)) {
+  throw new Error('Rate limit exceeded')
+}
+```
+
+### Redis Security (Production Deployments)
+
+When using Redis for horizontal scaling:
+
+#### Connection Security
+
+```typescript
+await app.register(mcpPlugin, {
+  enableSSE: true,
+  redis: {
+    host: 'your-redis-host',
+    port: 6379,
+    password: process.env.REDIS_PASSWORD, // Always use authentication
+    db: 0,
+    // Enable TLS for production
+    tls: {
+      rejectUnauthorized: true
+    }
+  }
+})
+```
+
+#### Redis Best Practices
+
+- **Always use authentication:** Set `requirepass` in Redis config
+- **Enable TLS encryption:** Especially for remote Redis instances
+- **Use dedicated Redis database:** Isolate MCP data with `db` parameter
+- **Implement network security:** Use VPCs, security groups, firewalls
+- **Regular updates:** Keep Redis version up-to-date
+- **Monitor access:** Log and monitor Redis access patterns
+
+### Session Security
+
+#### Session Management
+
+- **Session IDs are cryptographically secure:** Generated using Node.js crypto
+- **Automatic cleanup:** Sessions expire after 1 hour by default
+- **Message history limits:** Prevents unbounded memory growth
+- **Cross-instance isolation:** Sessions are properly isolated between instances
+
+#### SSE Security
+
+Server-Sent Events implementation includes:
+
+- **Proper CORS handling:** Configure CORS policies appropriately
+- **Connection limits:** Implement connection limits per client
+- **Heartbeat monitoring:** Automatic cleanup of dead connections
+- **Message replay security:** Last-Event-ID validation
+
+### Environment Security
+
+#### Environment Variables
+
+Never expose sensitive configuration:
+
+```bash
+# ✅ Good: Use environment variables
+REDIS_PASSWORD=your-secure-password
+MCP_SECRET_KEY=your-secret-key
+
+# ❌ Bad: Hardcoded secrets
+const redis = { password: 'hardcoded-password' }
+```
+
+#### Logging Security
+
+- **Sanitize log output:** Remove sensitive data from logs
+- **Log security events:** Tool executions, validation failures
+- **Monitor logs:** Set up alerts for suspicious activity
+
+```typescript
+// Example: Secure logging
+app.log.info({
+  tool: toolName,
+  sessionId,
+  // ❌ Never log sensitive parameters
+  // params: toolParams
+}, 'Tool executed successfully')
+```
+
+### Transport Security
+
+#### HTTPS Requirements
+
+**Always use HTTPS in production:**
+
+```typescript
+const app = fastify({
+  https: {
+    key: fs.readFileSync('path/to/key.pem'),
+    cert: fs.readFileSync('path/to/cert.pem')
+  }
+})
+```
+
+### Error Handling Security
+
+#### Information Disclosure
+
+Prevent information leakage in error messages:
+
+```typescript
+// ✅ Good: Generic error messages
+return createError(request.id, INVALID_PARAMS, 'Invalid parameters')
+
+// ❌ Bad: Detailed error messages
+return createError(request.id, INVALID_PARAMS, `SQL injection attempt detected: ${details}`)
+```
+
+#### Error Logging
+
+Log detailed errors securely:
+
+```typescript
+try {
+  // risky operation
+} catch (error) {
+  // Log detailed error for debugging
+  app.log.error({ error, sessionId, toolName }, 'Tool execution failed')
+  
+  // Return generic error to client
+  return { content: [{ type: 'text', text: 'Operation failed' }], isError: true }
+}
+```
+
+### Security Monitoring and Alerting
+
+#### Security Metrics
+
+Monitor these security-related metrics:
+
+- Failed validation attempts per session
+- Rate limit violations
+- High-risk tool executions  
+- Unusual session patterns
+- Redis connection failures
+
+#### Alert Conditions
+
+Set up alerts for:
+
+- Multiple validation failures from same IP
+- Rapid tool execution patterns
+- Large payload sizes
+- Suspicious schema patterns in elicitation
+
+### Security Updates
+
+#### Keeping Secure
+
+- **Regular updates:** Keep all dependencies up-to-date
+- **Security advisories:** Subscribe to security notifications
+- **Vulnerability scanning:** Regularly scan for known vulnerabilities
+- **Security testing:** Include security tests in your CI/CD pipeline
+
+### Quick Security Checklist
+
+- [ ] All tool inputs are validated with TypeBox schemas
+- [ ] Rate limiting is implemented for high-risk operations
+- [ ] Redis authentication and TLS are configured
+- [ ] HTTPS is enabled in production
+- [ ] Error messages don't leak sensitive information
+- [ ] Security monitoring and alerting are in place
+- [ ] Regular security updates are applied
+- [ ] Audit logging is configured
+- [ ] Tool annotations are treated as untrusted hints only
+- [ ] Elicitation requests include user consent mechanisms
+
+Remember: Security is a layered approach. No single measure provides complete protection.
+
+## Migration from Earlier Versions
+
+### Upgrading to MCP 2025-06-18
+
+This version introduces elicitation support and enhanced security features:
+
+**New Features:**
+- Elicitation capability for server-to-client information requests
+- Enhanced input sanitization and validation
+- Automatic security assessment for tool annotations
+- Built-in rate limiting utilities
+
+**Breaking Changes:**
+- Protocol version updated to `2025-06-18`
+- Enhanced validation may reject previously accepted inputs
+- Security logging may produce additional log entries
+
+**Migration Steps:**
+1. Update client applications to support MCP 2025-06-18
+2. Add elicitation capability if needed: `capabilities: { elicitation: {} }`
+3. Review security logs for any validation warnings
+4. Consider implementing rate limiting for production deployments
 
 ## License
 
