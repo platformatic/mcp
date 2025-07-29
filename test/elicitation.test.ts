@@ -1,10 +1,10 @@
-import { test } from 'node:test'
+import { describe, test } from 'node:test'
 import { strict as assert } from 'node:assert'
 import Fastify from 'fastify'
 import mcpPlugin from '../src/index.ts'
 
-test('Elicitation Support', async (t) => {
-  await t.test('should provide mcpElicit decorator when SSE is enabled', async () => {
+describe('Elicitation Support', () => {
+  test('should provide mcpElicit decorator when SSE is enabled', async (t) => {
     const app = Fastify({ logger: false })
 
     t.after(async () => {
@@ -23,7 +23,7 @@ test('Elicitation Support', async (t) => {
     assert.ok(typeof app.mcpElicit === 'function')
   })
 
-  await t.test('should warn and return false when SSE is disabled', async () => {
+  test('should warn and return false when SSE is disabled', async (t) => {
     const app = Fastify({ logger: false })
 
     t.after(async () => {
@@ -49,7 +49,7 @@ test('Elicitation Support', async (t) => {
     assert.strictEqual(result, false)
   })
 
-  await t.test('should send elicitation request to valid session', async () => {
+  test('should send elicitation request to valid session', async (t) => {
     const app = Fastify({ logger: false })
 
     t.after(async () => {
@@ -110,7 +110,7 @@ test('Elicitation Support', async (t) => {
     response.body?.cancel()
   })
 
-  await t.test('should return false for non-existent session', async () => {
+  test('should return false for non-existent session', async (t) => {
     const app = Fastify({ logger: false })
 
     t.after(async () => {
@@ -135,7 +135,7 @@ test('Elicitation Support', async (t) => {
     assert.strictEqual(result, false)
   })
 
-  await t.test('should generate request ID when not provided', async () => {
+  test('should generate request ID when not provided', async (t) => {
     const app = Fastify({ logger: false })
 
     t.after(async () => {
@@ -203,7 +203,7 @@ test('Elicitation Support', async (t) => {
     response.body?.cancel()
   })
 
-  await t.test('should handle complex elicitation schemas', async () => {
+  test('should handle complex elicitation schemas', async (t) => {
     const app = Fastify({ logger: false })
 
     t.after(async () => {
