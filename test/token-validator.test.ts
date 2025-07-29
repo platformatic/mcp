@@ -9,22 +9,22 @@ import {
   createExpiredJWT,
   createJWTWithInvalidAudience,
   createIntrospectionResponse,
-  mockFetch,
-  MOCK_JWKS_RESPONSE
+  setupMockAgent,
+  generateMockJWKSResponse
 } from './auth-test-utils.ts'
 
 describe('TokenValidator', () => {
   let app: Awaited<ReturnType<typeof Fastify>>
-  let restoreFetch: (() => void) | null = null
+  let restoreMock: (() => void) | null = null
 
   beforeEach(async () => {
     app = Fastify({ logger: false })
   })
 
   afterEach(async () => {
-    if (restoreFetch) {
-      restoreFetch()
-      restoreFetch = null
+    if (restoreMock) {
+      restoreMock()
+      restoreMock = null
     }
     await app.close()
   })
@@ -55,8 +55,8 @@ describe('TokenValidator', () => {
   describe('JWT Validation', () => {
     test('should validate valid JWT token', async (t: TestContext) => {
       const config = createTestAuthConfig()
-      restoreFetch = mockFetch({
-        'https://auth.example.com/.well-known/jwks.json': MOCK_JWKS_RESPONSE
+      restoreMock = setupMockAgent({
+        'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse()
       })
 
       const validator = new TokenValidator(config, app)
@@ -73,8 +73,8 @@ describe('TokenValidator', () => {
 
     test('should reject expired JWT token', async (t: TestContext) => {
       const config = createTestAuthConfig()
-      restoreFetch = mockFetch({
-        'https://auth.example.com/.well-known/jwks.json': MOCK_JWKS_RESPONSE
+      restoreMock = setupMockAgent({
+        'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse()
       })
 
       const validator = new TokenValidator(config, app)
@@ -90,8 +90,8 @@ describe('TokenValidator', () => {
 
     test('should reject JWT with invalid audience when validation enabled', async (t: TestContext) => {
       const config = createTestAuthConfig()
-      restoreFetch = mockFetch({
-        'https://auth.example.com/.well-known/jwks.json': MOCK_JWKS_RESPONSE
+      restoreMock = setupMockAgent({
+        'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse()
       })
 
       const validator = new TokenValidator(config, app)
@@ -112,8 +112,8 @@ describe('TokenValidator', () => {
           validateAudience: false
         }
       })
-      restoreFetch = mockFetch({
-        'https://auth.example.com/.well-known/jwks.json': MOCK_JWKS_RESPONSE
+      restoreMock = setupMockAgent({
+        'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse()
       })
 
       const validator = new TokenValidator(config, app)
@@ -129,8 +129,8 @@ describe('TokenValidator', () => {
 
     test('should handle JWT with array audience', async (t: TestContext) => {
       const config = createTestAuthConfig()
-      restoreFetch = mockFetch({
-        'https://auth.example.com/.well-known/jwks.json': MOCK_JWKS_RESPONSE
+      restoreMock = setupMockAgent({
+        'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse()
       })
 
       const validator = new TokenValidator(config, app)
@@ -148,8 +148,8 @@ describe('TokenValidator', () => {
 
     test('should reject JWT with missing kid', async (t: TestContext) => {
       const config = createTestAuthConfig()
-      restoreFetch = mockFetch({
-        'https://auth.example.com/.well-known/jwks.json': MOCK_JWKS_RESPONSE
+      restoreMock = setupMockAgent({
+        'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse()
       })
 
       const validator = new TokenValidator(config, app)
@@ -175,7 +175,7 @@ describe('TokenValidator', () => {
         }
       })
       
-      restoreFetch = mockFetch({
+      restoreMock = setupMockAgent({
         'https://auth.example.com/introspect': createIntrospectionResponse(true)
       })
 
@@ -198,7 +198,7 @@ describe('TokenValidator', () => {
         }
       })
       
-      restoreFetch = mockFetch({
+      restoreMock = setupMockAgent({
         'https://auth.example.com/introspect': createIntrospectionResponse(false)
       })
 
@@ -219,7 +219,7 @@ describe('TokenValidator', () => {
         }
       })
       
-      restoreFetch = mockFetch({
+      restoreMock = setupMockAgent({
         'https://auth.example.com/introspect': createIntrospectionResponse(true, {
           aud: 'https://different.example.com'
         })
@@ -242,7 +242,7 @@ describe('TokenValidator', () => {
         }
       })
       
-      restoreFetch = mockFetch({
+      restoreMock = setupMockAgent({
         'https://auth.example.com/introspect': {
           status: 500,
           body: { error: 'Internal server error' }
@@ -266,7 +266,7 @@ describe('TokenValidator', () => {
         }
       })
       
-      restoreFetch = mockFetch({})
+      restoreMock = setupMockAgent({})
 
       const validator = new TokenValidator(config, app)
       const result = await validator.validateToken('opaque-token-123')
@@ -288,8 +288,8 @@ describe('TokenValidator', () => {
         }
       })
       
-      restoreFetch = mockFetch({
-        'https://auth.example.com/.well-known/jwks.json': MOCK_JWKS_RESPONSE,
+      restoreMock = setupMockAgent({
+        'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse(),
         'https://auth.example.com/introspect': createIntrospectionResponse(true)
       })
 
@@ -324,8 +324,8 @@ describe('TokenValidator', () => {
   describe('Error Handling', () => {
     test('should handle malformed JWT tokens', async (t: TestContext) => {
       const config = createTestAuthConfig()
-      restoreFetch = mockFetch({
-        'https://auth.example.com/.well-known/jwks.json': MOCK_JWKS_RESPONSE
+      restoreMock = setupMockAgent({
+        'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse()
       })
 
       const validator = new TokenValidator(config, app)
@@ -339,7 +339,7 @@ describe('TokenValidator', () => {
 
     test('should handle JWKS fetch errors', async (t: TestContext) => {
       const config = createTestAuthConfig()
-      restoreFetch = mockFetch({})
+      restoreMock = setupMockAgent({})
 
       const validator = new TokenValidator(config, app)
       const token = createTestJWT()
@@ -355,8 +355,8 @@ describe('TokenValidator', () => {
   describe('Audience Validation', () => {
     test('should validate single audience string', async (t: TestContext) => {
       const config = createTestAuthConfig()
-      restoreFetch = mockFetch({
-        'https://auth.example.com/.well-known/jwks.json': MOCK_JWKS_RESPONSE
+      restoreMock = setupMockAgent({
+        'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse()
       })
 
       const validator = new TokenValidator(config, app)
@@ -371,8 +371,8 @@ describe('TokenValidator', () => {
 
     test('should validate audience array', async (t: TestContext) => {
       const config = createTestAuthConfig()
-      restoreFetch = mockFetch({
-        'https://auth.example.com/.well-known/jwks.json': MOCK_JWKS_RESPONSE
+      restoreMock = setupMockAgent({
+        'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse()
       })
 
       const validator = new TokenValidator(config, app)
@@ -389,8 +389,8 @@ describe('TokenValidator', () => {
 
     test('should reject token with no audience when validation enabled', async (t: TestContext) => {
       const config = createTestAuthConfig()
-      restoreFetch = mockFetch({
-        'https://auth.example.com/.well-known/jwks.json': MOCK_JWKS_RESPONSE
+      restoreMock = setupMockAgent({
+        'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse()
       })
 
       const validator = new TokenValidator(config, app)

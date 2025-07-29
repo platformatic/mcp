@@ -105,6 +105,7 @@ describe('Authorization Compatibility Tests', () => {
     const response = await app.inject({
       method: 'GET',
       url: '/mcp',
+      payloadAsStream: true,
       headers: {
         accept: 'text/event-stream'
       }
@@ -112,6 +113,7 @@ describe('Authorization Compatibility Tests', () => {
 
     t.assert.strictEqual(response.statusCode, 200)
     t.assert.strictEqual(response.headers['content-type'], 'text/event-stream')
+    response.stream().destroy()
   })
 
   test('should handle tool registration when authorization disabled', async (t: TestContext) => {

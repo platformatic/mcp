@@ -1,4 +1,6 @@
 import { createSigner, createVerifier } from 'fast-jwt'
+import { createPublicKey } from 'crypto'
+import { MockAgent, setGlobalDispatcher, getGlobalDispatcher } from 'undici'
 import type { AuthorizationConfig } from '../src/types/auth-types.ts'
 
 export interface TestJWTOptions {
@@ -20,46 +22,60 @@ export interface MockJWKSKey {
   e: string
 }
 
-// Test RSA key pair for JWT signing/verification
+// Test RSA key pair for JWT signing/verification (compatible with fast-jwt)
 export const TEST_PRIVATE_KEY = `-----BEGIN PRIVATE KEY-----
-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
+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
+EHQXdOk6vtShUdWYQPjMiq8=
 -----END PRIVATE KEY-----`
 
 export const TEST_PUBLIC_KEY = `-----BEGIN PUBLIC KEY-----
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAu1SU1L7VLPHCgcBIjn0C
-FOfvJ18AJifDuQnAWFQpkA8tKN1U36kxc+3SR+2xhX1yEFCptTAQ+3u729bO0BLu
-40RgvYdsd/Eyx+ubh+alguFw9yn6mX5ju08vCiXRF5tByJQtpi+ogrtIQBEEFm/C
-UKO6x1DuAawZ9pxygABX83yj+4URe6mXuYdZe01OhvYiyYT4TQ840umYazNCTSrP
-CxWEfQU0hXDaz7K6gPs1OU5jGO2EKX6inBAg7hcP1/HAGOUJ0BZkf3AbzUw2ziz7
-u3olQGy7DQfCiVfvMi7ojxke4ql832ZeQ/lZzC8jV438zfpI0JuGXWS5/h+2eHfG
-DQIDAQAB
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAhWTiI/JvAWKFd0T8KULs
+jyEIXGW4HwenUyTki8G7oZm8pPWzw0bCGz3kMRtp5lS4d8xOGItB62bGUlNXOccB
+AGAxsKNESkW1uIXUpDHog3+28fZKD2y66i5vw2gc+EYNRYV+pCGTvLJBXY8GWl5B
+uKUqOPKMzB0PNjJTnYkgy8DPsQTpBuiFOCMoFNtjPF3qRusRMSo8JScqu/ajt/9h
+eeDNDx4t8BmF3m2rTz+8BWHPQ67d+vyOBgzPle7L5eFb44EoaauyPmsXP8TIINQr
+k7J2qlD6/u2VXu1i7TyapPDOA2BOJ3Z3yGpmfLD4OJP7iojgnCyHxtpaCfH+mQfd
+HwIDAQAB
 -----END PUBLIC KEY-----`
 
-export const MOCK_JWKS_RESPONSE = {
-  keys: [
-    {
-      kid: 'test-key-1',
-      kty: 'RSA',
-      alg: 'RS256',
-      use: 'sig',
-      n: 'u1SU1L7VLPHCgcBIjn0CFOfvJ18AJifDuQnAWFQpkA8tKN1U36kxc-3SR-2xhX1yEFCptTAQ-3u729bO0BLu40RgvYdsd_Eyx-ubh-alguFw9yn6mX5ju08vCiXRF5tByJQtpi-ogrtIQBEEFm_CUKO6x1DuAawZ9pxygABX83yj-4URe6mXuYdZe01OhvYiyYT4TQ840umYazNCTSrPCxWEfQU0hXDaz7K6gPs1OU5jGO2EKX6inBAg7hcP1_HAGOUJBZkf3AbzUw2ziz7u3olQGy7DQfCiVfvMi7ojxke4ql832ZeQ_lZzC8jV438zfpI0JuGXWS5_h-2eHfGDQ',
-      e: 'AQAB'
-    }
-  ]
+export function generateMockJWKSResponse(kid: string = 'test-key-1'): any {
+  const publicKey = createPublicKey(TEST_PUBLIC_KEY)
+  const jwk = publicKey.export({ format: 'jwk' })
+  
+  return {
+    keys: [
+      {
+        ...jwk,
+        kid,
+        alg: 'RS256',
+        use: 'sig'
+      }
+    ]
+  }
 }
 
 export function createTestAuthConfig (overrides: Partial<AuthorizationConfig> = {}): AuthorizationConfig {
@@ -118,32 +134,39 @@ export function verifyTestJWT (token: string): any {
   return verifier(token)
 }
 
-export function mockFetch (responses: Record<string, any>) {
-  const originalFetch = global.fetch
+export function setupMockAgent (responses: Record<string, any>) {
+  const mockAgent = new MockAgent()
+  mockAgent.disableNetConnect()
   
-  global.fetch = async (url: string | URL, options?: any) => {
-    const urlString = url.toString()
+  const originalDispatcher = getGlobalDispatcher()
+  setGlobalDispatcher(mockAgent)
+  
+  // Setup mock responses
+  for (const [url, response] of Object.entries(responses)) {
+    const urlObj = new URL(url)
+    const mockPool = mockAgent.get(urlObj.origin)
     
-    if (responses[urlString]) {
-      const response = responses[urlString]
-      return Promise.resolve({
-        ok: response.status ? response.status < 400 : true,
-        status: response.status || 200,
-        json: async () => response.body || response,
-        headers: response.headers || {}
-      } as Response)
+    const statusCode = response.status || 200
+    const responseBody = response.body || response
+    const headers = response.headers || { 'content-type': 'application/json' }
+    
+    mockPool.intercept({
+      path: urlObj.pathname + urlObj.search,
+      method: 'GET'
+    }).reply(statusCode, JSON.stringify(responseBody), headers)
+    
+    // Also intercept POST for introspection endpoints
+    if (url.includes('/introspect')) {
+      mockPool.intercept({
+        path: urlObj.pathname + urlObj.search,
+        method: 'POST'
+      }).reply(statusCode, JSON.stringify(responseBody), headers)
     }
-    
-    // Fallback to original fetch or throw error
-    if (originalFetch) {
-      return originalFetch(url, options)
-    }
-    
-    throw new Error(`No mock response configured for ${urlString}`)
   }
   
   return () => {
-    global.fetch = originalFetch
+    setGlobalDispatcher(originalDispatcher)
+    mockAgent.close()
   }
 }
 

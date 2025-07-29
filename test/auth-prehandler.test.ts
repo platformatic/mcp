@@ -9,22 +9,22 @@ import {
   createTestJWT,
   createExpiredJWT,
   createJWTWithInvalidAudience,
-  mockFetch,
-  MOCK_JWKS_RESPONSE
+  setupMockAgent,
+  generateMockJWKSResponse
 } from './auth-test-utils.ts'
 
 describe('Authorization PreHandler', () => {
   let app: Awaited<ReturnType<typeof Fastify>>
-  let restoreFetch: (() => void) | null = null
+  let restoreMock: (() => void) | null = null
 
   beforeEach(async () => {
     app = Fastify({ logger: false })
   })
 
   afterEach(async () => {
-    if (restoreFetch) {
-      restoreFetch()
-      restoreFetch = null
+    if (restoreMock) {
+      restoreMock()
+      restoreMock = null
     }
     await app.close()
   })
@@ -156,8 +156,8 @@ describe('Authorization PreHandler', () => {
 
   test('should allow request with valid token', async (t: TestContext) => {
     const config = createTestAuthConfig()
-    restoreFetch = mockFetch({
-      'https://auth.example.com/.well-known/jwks.json': MOCK_JWKS_RESPONSE
+    restoreMock = setupMockAgent({
+      'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse()
     })
 
     const validator = new TokenValidator(config, app)
@@ -191,8 +191,8 @@ describe('Authorization PreHandler', () => {
 
   test('should return 401 with invalid token', async (t: TestContext) => {
     const config = createTestAuthConfig()
-    restoreFetch = mockFetch({
-      'https://auth.example.com/.well-known/jwks.json': MOCK_JWKS_RESPONSE
+    restoreMock = setupMockAgent({
+      'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse()
     })
 
     const validator = new TokenValidator(config, app)
@@ -222,8 +222,8 @@ describe('Authorization PreHandler', () => {
 
   test('should return 401 with expired token', async (t: TestContext) => {
     const config = createTestAuthConfig()
-    restoreFetch = mockFetch({
-      'https://auth.example.com/.well-known/jwks.json': MOCK_JWKS_RESPONSE
+    restoreMock = setupMockAgent({
+      'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse()
     })
 
     const validator = new TokenValidator(config, app)
@@ -253,8 +253,8 @@ describe('Authorization PreHandler', () => {
 
   test('should return 401 with token having invalid audience', async (t: TestContext) => {
     const config = createTestAuthConfig()
-    restoreFetch = mockFetch({
-      'https://auth.example.com/.well-known/jwks.json': MOCK_JWKS_RESPONSE
+    restoreMock = setupMockAgent({
+      'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse()
     })
 
     const validator = new TokenValidator(config, app)
@@ -285,8 +285,8 @@ describe('Authorization PreHandler', () => {
 
   test('should add token payload to request context', async (t: TestContext) => {
     const config = createTestAuthConfig()
-    restoreFetch = mockFetch({
-      'https://auth.example.com/.well-known/jwks.json': MOCK_JWKS_RESPONSE
+    restoreMock = setupMockAgent({
+      'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse()
     })
 
     const validator = new TokenValidator(config, app)
@@ -333,8 +333,8 @@ describe('Authorization PreHandler', () => {
 
   test('should handle multiple endpoints with authorization', async (t: TestContext) => {
     const config = createTestAuthConfig()
-    restoreFetch = mockFetch({
-      'https://auth.example.com/.well-known/jwks.json': MOCK_JWKS_RESPONSE
+    restoreMock = setupMockAgent({
+      'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse()
     })
 
     const validator = new TokenValidator(config, app)

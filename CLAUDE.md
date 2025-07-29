@@ -114,10 +114,53 @@ Uses a base TypeScript configuration (`tsconfig.base.json`) extended by the main
 ## Testing
 
 The project includes comprehensive test coverage:
-- **54 tests total** covering all functionality
+- **178 tests total** covering all functionality including OAuth 2.1 authorization
 - **Memory backend tests**: Session management, message broadcasting, SSE handling
 - **Redis backend tests**: Session persistence, cross-instance messaging, failover
 - **Integration tests**: Full plugin lifecycle, multi-instance deployment
-- **Test utilities**: Redis test helpers with automatic cleanup
+- **Authorization tests**: JWT validation, token introspection, OAuth 2.1 compliance
+- **Test utilities**: Redis test helpers with automatic cleanup, JWT utilities with dynamic JWKS generation
 
 Run tests with: `npm run test` (requires Redis running on localhost:6379)
+
+### SSE Testing Best Practices
+
+When testing Server-Sent Events (SSE) endpoints, it's critical to properly clean up streams to prevent hanging event loops:
+
+```typescript
+// ✅ Correct way to test SSE endpoints
+const response = await app.inject({
+  method: 'GET',
+  url: '/mcp',
+  payloadAsStream: true,  // Required for SSE responses
+  headers: {
+    accept: 'text/event-stream'
+  }
+})
+
+t.assert.strictEqual(response.statusCode, 200)
+t.assert.strictEqual(response.headers['content-type'], 'text/event-stream')
+response.stream().destroy()  // ⚠️ CRITICAL: Always destroy the stream
+```
+
+**Why this is important:**
+- SSE responses create readable streams that keep the event loop alive
+- Without explicit cleanup, tests will hang with "Promise resolution is still pending" errors
+- The `payloadAsStream: true` option is required for proper SSE response handling
+- Always call `response.stream().destroy()` after assertions to clean up resources
+
+### Test Utilities
+
+**JWT Testing**: Uses dynamic JWKS generation with proper RSA key pairs:
+- `generateMockJWKSResponse()`: Dynamically generates JWKS from RSA public key
+- `setupMockAgent()`: Uses undici MockAgent for HTTP mocking instead of custom fetch mocks
+- `createTestJWT()`: Creates properly signed JWT tokens for testing
+
+**Mock HTTP Requests**: Uses undici's MockAgent for robust HTTP mocking:
+```typescript
+const restoreMock = setupMockAgent({
+  'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse()
+})
+// Test code here
+restoreMock() // Clean up
+```

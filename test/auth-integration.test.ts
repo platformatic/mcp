@@ -9,23 +9,23 @@ import {
   createTestJWT,
   createExpiredJWT,
   createJWTWithInvalidAudience,
-  mockFetch,
-  MOCK_JWKS_RESPONSE,
+  setupMockAgent,
+  generateMockJWKSResponse,
   createIntrospectionResponse
 } from './auth-test-utils.ts'
 
 describe('Authorization Integration Tests', () => {
   let app: Awaited<ReturnType<typeof Fastify>>
-  let restoreFetch: (() => void) | null = null
+  let restoreMock: (() => void) | null = null
 
   beforeEach(async () => {
     app = Fastify({ logger: false })
   })
 
   afterEach(async () => {
-    if (restoreFetch) {
-      restoreFetch()
-      restoreFetch = null
+    if (restoreMock) {
+      restoreMock()
+      restoreMock = null
     }
     await app.close()
   })
@@ -127,8 +127,8 @@ describe('Authorization Integration Tests', () => {
   describe('MCP Protocol with Authorization', () => {
     test('should require authorization for MCP initialize request', async (t: TestContext) => {
       const authConfig = createTestAuthConfig()
-      restoreFetch = mockFetch({
-        'https://auth.example.com/.well-known/jwks.json': MOCK_JWKS_RESPONSE
+      restoreMock = setupMockAgent({
+        'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse()
       })
 
       await app.register(mcpPlugin, {
@@ -180,8 +180,8 @@ describe('Authorization Integration Tests', () => {
 
     test('should reject MCP requests with invalid tokens', async (t: TestContext) => {
       const authConfig = createTestAuthConfig()
-      restoreFetch = mockFetch({
-        'https://auth.example.com/.well-known/jwks.json': MOCK_JWKS_RESPONSE
+      restoreMock = setupMockAgent({
+        'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse()
       })
 
       await app.register(mcpPlugin, {
@@ -274,8 +274,8 @@ describe('Authorization Integration Tests', () => {
   describe('SSE with Authorization', () => {
     test('should require authorization for SSE connections', async (t: TestContext) => {
       const authConfig = createTestAuthConfig()
-      restoreFetch = mockFetch({
-        'https://auth.example.com/.well-known/jwks.json': MOCK_JWKS_RESPONSE
+      restoreMock = setupMockAgent({
+        'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse()
       })
 
       await app.register(mcpPlugin, {
@@ -298,8 +298,8 @@ describe('Authorization Integration Tests', () => {
 
     test('should allow SSE connections with valid tokens', async (t: TestContext) => {
       const authConfig = createTestAuthConfig()
-      restoreFetch = mockFetch({
-        'https://auth.example.com/.well-known/jwks.json': MOCK_JWKS_RESPONSE
+      restoreMock = setupMockAgent({
+        'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse()
       })
 
       await app.register(mcpPlugin, {
@@ -332,7 +332,7 @@ describe('Authorization Integration Tests', () => {
         }
       })
 
-      restoreFetch = mockFetch({
+      restoreMock = setupMockAgent({
         'https://auth.example.com/introspect': createIntrospectionResponse(true)
       })
 
@@ -376,7 +376,7 @@ describe('Authorization Integration Tests', () => {
         }
       })
 
-      restoreFetch = mockFetch({
+      restoreMock = setupMockAgent({
         'https://auth.example.com/introspect': createIntrospectionResponse(false)
       })
 
@@ -413,7 +413,7 @@ describe('Authorization Integration Tests', () => {
     test('should handle JWT validation errors gracefully', async (t: TestContext) => {
       const authConfig = createTestAuthConfig()
       // Don't mock fetch to trigger JWKS fetch errors
-      restoreFetch = mockFetch({})
+      restoreMock = setupMockAgent({})
 
       await app.register(mcpPlugin, {
         authorization: authConfig
@@ -475,8 +475,8 @@ describe('Authorization Integration Tests', () => {
   describe('Multi-endpoint Authorization', () => {
     test('should protect all MCP endpoints consistently', async (t: TestContext) => {
       const authConfig = createTestAuthConfig()
-      restoreFetch = mockFetch({
-        'https://auth.example.com/.well-known/jwks.json': MOCK_JWKS_RESPONSE
+      restoreMock = setupMockAgent({
+        'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse()
       })
 
       await app.register(mcpPlugin, {

@@ -111,6 +111,27 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
 
   // Add close hook to clean up Redis connections and authorization components
   app.addHook('onClose', async () => {
+    // Clean up all SSE streams and sessions
+    const unsubscribePromises: Promise<void>[] = []
+    for (const [sessionId, streams] of localStreams.entries()) {
+      for (const stream of streams) {
+        try {
+          if (stream.raw && !stream.raw.destroyed) {
+            stream.raw.destroy()
+          }
+        } catch (error) {
+          app.log.debug({ error, sessionId }, 'Error destroying SSE stream')
+        }
+      }
+      streams.clear()
+      // Collect unsubscribe promises for parallel execution
+      unsubscribePromises.push(messageBroker.unsubscribe(`mcp/session/${sessionId}/message`))
+    }
+    localStreams.clear()
+
+    // Execute all unsubscribes in parallel
+    await Promise.all(unsubscribePromises)
+
     if (redis) {
       await redis.quit()
     }
