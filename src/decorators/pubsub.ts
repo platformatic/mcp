@@ -7,6 +7,7 @@ import type {
   ElicitRequest,
   RequestId
 } from '../schema.ts'
+import { validateElicitationRequest } from '../security.ts'
 import { JSONRPC_VERSION } from '../schema.ts'
 import type { SessionStore } from '../stores/session-store.ts'
 import type { MessageBroker } from '../brokers/message-broker.ts'
@@ -46,12 +47,8 @@ const mcpPubSubDecoratorsPlugin: FastifyPluginAsync<MCPPubSubDecoratorsOptions> 
       return false
     }
 
-    // Check if there are active streams for this session
-    const streams = localStreams.get(sessionId)
-    if (!streams || streams.size === 0) {
-      return false
-    }
-
+    // Always publish to messageBroker to support cross-instance messaging in Redis deployments
+    // This ensures the message reaches the correct instance where the SSE connection exists
     try {
       await messageBroker.publish(`mcp/session/${sessionId}/message`, message)
       return true
@@ -69,6 +66,17 @@ const mcpPubSubDecoratorsPlugin: FastifyPluginAsync<MCPPubSubDecoratorsOptions> 
   ): Promise<boolean> => {
     if (!enableSSE) {
       app.log.warn('Cannot send elicitation request: SSE is disabled')
+      return false
+    }
+
+    // Validate elicitation request for security
+    try {
+      validateElicitationRequest(message, requestedSchema)
+    } catch (validationError) {
+      app.log.warn({
+        sessionId,
+        error: validationError instanceof Error ? validationError.message : 'Unknown validation error'
+      }, 'Elicitation request validation failed')
       return false
     }
 

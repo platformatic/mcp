@@ -25,6 +25,7 @@ import {
 
 import type { MCPTool, MCPResource, MCPPrompt, MCPPluginOptions } from './types.ts'
 import { validate, CallToolRequestSchema, ReadResourceRequestSchema, GetPromptRequestSchema, isTypeBoxSchema } from './validation/index.ts'
+import { sanitizeToolParams, assessToolSecurity, SECURITY_WARNINGS } from './security.ts'
 
 type HandlerDependencies = {
   app: FastifyInstance
@@ -139,8 +140,33 @@ async function handleToolsCall (
     return createResponse(request.id, result)
   }
 
-  // Validate tool arguments against the tool's input schema
-  const toolArguments = params.arguments || {}
+  // Assess security risks from tool annotations
+  const securityAssessment = assessToolSecurity(tool.definition.annotations)
+
+  // Log security warnings for high-risk tools
+  if (securityAssessment.riskLevel === 'high') {
+    dependencies.app.log.warn({
+      tool: toolName,
+      sessionId,
+      warnings: securityAssessment.warnings
+    }, 'High-risk tool execution attempted')
+  }
+
+  // Validate and sanitize tool arguments against the tool's input schema
+  let toolArguments = params.arguments || {}
+
+  try {
+    // Sanitize arguments to prevent injection attacks
+    toolArguments = sanitizeToolParams(toolArguments)
+  } catch (sanitizeError) {
+    dependencies.app.log.warn({
+      tool: toolName,
+      sessionId,
+      error: sanitizeError instanceof Error ? sanitizeError.message : 'Unknown sanitization error'
+    }, 'Tool arguments sanitization failed')
+
+    return createError(request.id, INVALID_PARAMS, `${SECURITY_WARNINGS.UNVALIDATED_INPUT}: ${sanitizeError instanceof Error ? sanitizeError.message : 'Sanitization failed'}`)
+  }
   if ('inputSchema' in tool.definition) {
     // Check if it's a TypeBox schema
     const schema = tool.definition.inputSchema
