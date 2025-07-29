@@ -11,6 +11,9 @@ import type { MCPPluginOptions, MCPTool, MCPResource, MCPPrompt } from './types.
 import pubsubDecorators from './decorators/pubsub.ts'
 import metaDecorators from './decorators/meta.ts'
 import routes from './routes.ts'
+import wellKnownRoutes from './routes/well-known.ts'
+import { TokenValidator } from './auth/token-validator.ts'
+import { createAuthPreHandler } from './auth/prehandler.ts'
 
 // Import and export MCP protocol types
 import type {
@@ -65,6 +68,20 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
   // Local stream management per server instance
   const localStreams = new Map<string, Set<any>>()
 
+  // Initialize authorization components if enabled
+  let tokenValidator: TokenValidator | null = null
+  if (opts.authorization?.enabled) {
+    tokenValidator = new TokenValidator(opts.authorization, app)
+
+    // Register authorization preHandler for all routes
+    app.addHook('preHandler', createAuthPreHandler(opts.authorization, tokenValidator))
+  }
+
+  // Register well-known routes for OAuth metadata
+  await app.register(wellKnownRoutes, {
+    authConfig: opts.authorization
+  })
+
   // Register decorators first
   app.register(metaDecorators, {
     tools,
@@ -92,12 +109,17 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     localStreams
   })
 
-  // Add close hook to clean up Redis connections
+  // Add close hook to clean up Redis connections and authorization components
   app.addHook('onClose', async () => {
     if (redis) {
       await redis.quit()
     }
     await messageBroker.close()
+
+    // Clean up token validator
+    if (tokenValidator) {
+      tokenValidator.close()
+    }
   })
 }, {
   name: '@platformatic/mcp'
@@ -135,6 +157,14 @@ export type {
   UnsafePromptHandler,
   SSESession
 } from './types.ts'
+
+// Export authorization types
+export type {
+  AuthorizationConfig,
+  TokenValidationResult,
+  ProtectedResourceMetadata,
+  TokenIntrospectionResponse
+} from './types/auth-types.ts'
 
 export type {
   JSONRPCMessage,
