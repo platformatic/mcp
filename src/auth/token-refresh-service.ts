@@ -1,8 +1,19 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import type { FastifyInstance } from 'fastify'
+import type { Redis } from 'ioredis'
 import type { SessionStore } from '../stores/session-store.ts'
 import type { MessageBroker } from '../brokers/message-broker.ts'
 import { shouldAttemptRefresh, createTokenRefreshInfo } from './token-utils.ts'
+import { createDistributedLock, type DistributedLock } from '../utils/distributed-lock.ts'
+
+export interface TokenRefreshCoordinationOptions {
+  /** Lock timeout in seconds (default: 30) */
+  lockTimeoutSeconds?: number
+  /** Maximum number of lock extensions (default: 3) */
+  maxLockExtensions?: number
+  /** Enable detailed coordination logging (default: false) */
+  enableCoordinationLogging?: boolean
+}
 
 export interface TokenRefreshServiceOptions {
   sessionStore: SessionStore
@@ -10,10 +21,15 @@ export interface TokenRefreshServiceOptions {
   oauthClient?: any // OAuth client for token refresh
   checkIntervalMs?: number // How often to check for tokens needing refresh
   refreshBufferMinutes?: number // How many minutes before expiry to refresh
+  
+  // Distributed coordination options
+  redis?: Redis // Redis instance for distributed coordination
+  coordination?: TokenRefreshCoordinationOptions
 }
 
 /**
  * Background service that automatically refreshes tokens for active sessions
+ * Supports distributed coordination to prevent duplicate refresh attempts across multiple instances
  */
 export class TokenRefreshService {
   private sessionStore: SessionStore
@@ -24,6 +40,13 @@ export class TokenRefreshService {
   private intervalId?: NodeJS.Timeout
   private isRunning = false
   private fastify?: FastifyInstance
+  
+  // Distributed coordination
+  private distributedLock?: DistributedLock
+  private instanceId: string
+  private lockTimeoutSeconds: number
+  private maxLockExtensions: number
+  private enableCoordinationLogging: boolean
 
   constructor (options: TokenRefreshServiceOptions) {
     this.sessionStore = options.sessionStore
@@ -31,6 +54,15 @@ export class TokenRefreshService {
     this.oauthClient = options.oauthClient
     this.checkIntervalMs = options.checkIntervalMs || 5 * 60 * 1000 // 5 minutes default
     this.refreshBufferMinutes = options.refreshBufferMinutes || 5 // 5 minutes default
+    
+    // Initialize distributed coordination
+    this.instanceId = randomUUID()
+    this.lockTimeoutSeconds = options.coordination?.lockTimeoutSeconds || 30
+    this.maxLockExtensions = options.coordination?.maxLockExtensions || 3
+    this.enableCoordinationLogging = options.coordination?.enableCoordinationLogging || false
+    
+    // Always create distributed lock (Redis or in-memory)
+    this.distributedLock = createDistributedLock(options.redis, 'token-refresh')
   }
 
   /**
@@ -46,16 +78,19 @@ export class TokenRefreshService {
 
     if (fastify) {
       fastify.log.info({
+        instanceId: this.instanceId,
         checkIntervalMs: this.checkIntervalMs,
-        refreshBufferMinutes: this.refreshBufferMinutes
-      }, 'Starting token refresh service')
+        refreshBufferMinutes: this.refreshBufferMinutes,
+        lockTimeoutSeconds: this.lockTimeoutSeconds,
+        useDistributedCoordination: !!this.distributedLock
+      }, 'Starting token refresh service with distributed coordination')
     }
 
     // Start periodic check
     this.intervalId = setInterval(() => {
       this.checkAndRefreshTokens().catch(error => {
         if (fastify) {
-          fastify.log.error({ error }, 'Token refresh check failed')
+          fastify.log.error({ error, instanceId: this.instanceId }, 'Token refresh check failed')
         }
       })
     }, this.checkIntervalMs)
@@ -67,7 +102,7 @@ export class TokenRefreshService {
   /**
    * Stop the token refresh service
    */
-  stop (): void {
+  async stop (): Promise<void> {
     if (!this.isRunning) {
       return
     }
@@ -79,26 +114,121 @@ export class TokenRefreshService {
       this.intervalId = undefined
     }
 
+    // Clean up distributed lock resources
+    if (this.distributedLock?.close) {
+      await this.distributedLock.close()
+    }
+
     if (this.fastify) {
-      this.fastify.log.info('Token refresh service stopped')
+      this.fastify.log.info({ instanceId: this.instanceId }, 'Token refresh service stopped')
     }
   }
 
   /**
    * Check all active sessions and refresh tokens that are close to expiry
+   * Uses distributed coordination to ensure only one instance performs refresh
    */
   private async checkAndRefreshTokens (): Promise<void> {
     if (!this.oauthClient) {
       return // No OAuth client available for refresh
     }
 
-    // This is a simplified implementation
-    // In practice, you'd need a way to iterate through active sessions
-    // Since our SessionStore interface doesn't include this, we'll need to add it
-    // For now, we'll log that the service is running
+    if (!this.distributedLock) {
+      // Fallback to single-instance behavior
+      await this.performTokenRefresh()
+      return
+    }
+
+    // Use distributed coordination
+    await this.checkAndRefreshWithLock()
+  }
+
+  /**
+   * Perform token refresh with distributed locking coordination
+   */
+  private async checkAndRefreshWithLock (): Promise<void> {
+    if (!this.distributedLock) {
+      return
+    }
+
+    // Create time-based lock key to ensure fair scheduling
+    const lockWindow = Math.floor(Date.now() / this.checkIntervalMs)
+    const lockKey = `refresh-cycle:${lockWindow}`
+
+    const lockAcquired = await this.distributedLock.acquire(
+      lockKey,
+      this.lockTimeoutSeconds,
+      this.instanceId
+    )
+
+    if (!lockAcquired) {
+      if (this.enableCoordinationLogging && this.fastify) {
+        this.fastify.log.debug({
+          instanceId: this.instanceId,
+          lockKey,
+          lockWindow
+        }, 'Token refresh lock not acquired, skipping cycle')
+      }
+      return
+    }
+
+    if (this.enableCoordinationLogging && this.fastify) {
+      this.fastify.log.info({
+        instanceId: this.instanceId,
+        lockKey,
+        lockWindow,
+        lockTimeoutSeconds: this.lockTimeoutSeconds
+      }, 'Token refresh coordination lock acquired')
+    }
+
+    try {
+      await this.performTokenRefresh()
+
+      if (this.enableCoordinationLogging && this.fastify) {
+        this.fastify.log.info({
+          instanceId: this.instanceId,
+          lockKey
+        }, 'Token refresh cycle completed successfully')
+      }
+    } catch (error) {
+      if (this.fastify) {
+        this.fastify.log.error({
+          error,
+          instanceId: this.instanceId,
+          lockKey
+        }, 'Token refresh cycle failed')
+      }
+      throw error
+    } finally {
+      // Always release the lock
+      const released = await this.distributedLock.release(lockKey, this.instanceId)
+      
+      if (this.enableCoordinationLogging && this.fastify) {
+        this.fastify.log.debug({
+          instanceId: this.instanceId,
+          lockKey,
+          released
+        }, 'Token refresh lock released')
+      }
+    }
+  }
+
+  /**
+   * Perform the actual token refresh logic
+   * This is separated from coordination logic for clarity
+   */
+  private async performTokenRefresh (): Promise<void> {
+    // This is a simplified implementation placeholder
+    // In a complete implementation, you would:
+    // 1. Query session store for sessions with expiring tokens
+    // 2. Iterate through sessions and refresh tokens as needed
+    // 3. Update session store with new token information
+    // 4. Send notifications to affected sessions
 
     if (this.fastify) {
-      this.fastify.log.debug('Token refresh service check completed')
+      this.fastify.log.debug({
+        instanceId: this.instanceId
+      }, 'Token refresh service check completed')
     }
   }
 
@@ -224,7 +354,7 @@ export async function registerTokenRefreshService (
 
   // Stop the service when Fastify closes
   fastify.addHook('onClose', async () => {
-    service.stop()
+    await service.stop()
   })
 }
 
