@@ -15,7 +15,7 @@ import wellKnownRoutes from './routes/well-known.ts'
 import { TokenValidator } from './auth/token-validator.ts'
 import { createAuthPreHandler } from './auth/prehandler.ts'
 import oauthClientPlugin from './auth/oauth-client.ts'
-import { registerAuthRoutes } from './routes/auth-routes.ts'
+import authRoutesPlugin from './routes/auth-routes.ts'
 
 // Import and export MCP protocol types
 import type {
@@ -91,7 +91,7 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
 
   // Register OAuth client routes if OAuth client is configured
   if (opts.authorization?.enabled && opts.authorization?.oauth2Client) {
-    await registerAuthRoutes(app)
+    await app.register(authRoutesPlugin, { sessionStore })
   }
 
   // Register decorators first

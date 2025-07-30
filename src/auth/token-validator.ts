@@ -24,8 +24,8 @@ export class TokenValidator {
       })
 
       this.jwtVerifier = createVerifier({
-        key: async (obj = {}) => {
-          const header = obj.header
+        key: async (obj: { header?: { kid?: string; alg?: string } } = {}) => {
+          const header = obj.header || {}
           const publicKey = await this.getJwks!.getPublicKey({
             kid: header.kid,
             alg: header.alg,

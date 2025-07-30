@@ -1,5 +1,7 @@
-import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify'
-import type { PKCEChallenge, TokenResponse } from '../auth/oauth-client.ts'
+import type { FastifyInstance, FastifyRequest, FastifyReply, FastifyPluginAsync } from 'fastify'
+import fp from 'fastify-plugin'
+import type { PKCEChallenge } from '../auth/oauth-client.ts'
+import type { SessionStore } from '../stores/session-store.ts'
 
 export interface AuthSession {
   state: string
@@ -19,33 +21,40 @@ export interface TokenRefreshBody {
   refresh_token: string
 }
 
-// In-memory storage for auth sessions (in production, use Redis)
-const authSessions = new Map<string, AuthSession>()
+export interface AuthRoutesOptions {
+  sessionStore: SessionStore
+}
 
-export async function registerAuthRoutes(fastify: FastifyInstance) {
+const authRoutesPlugin: FastifyPluginAsync<AuthRoutesOptions> = async (fastify: FastifyInstance, opts) => {
+  const { sessionStore } = opts
   // Initiate OAuth authorization flow
   fastify.get('/oauth/authorize', async (request: FastifyRequest, reply: FastifyReply) => {
     try {
       const query = request.query as { resource?: string; redirect_uri?: string }
-      
+
       // Create authorization request with PKCE
       const authRequest = await fastify.oauthClient.createAuthorizationRequest({
         ...(query.resource && { resource: query.resource })
       })
 
-      // Store session data temporarily
+      // Store session data in session store
       const sessionData: AuthSession = {
         state: authRequest.state,
         pkce: authRequest.pkce,
         resourceUri: query.resource,
         originalUrl: query.redirect_uri
       }
-      authSessions.set(authRequest.state, sessionData)
 
-      // Set session expiration (5 minutes)
-      setTimeout(() => {
-        authSessions.delete(authRequest.state)
-      }, 5 * 60 * 1000)
+      // Create session metadata with auth session data
+      const sessionMetadata = {
+        id: authRequest.state,
+        eventId: 0,
+        createdAt: new Date(),
+        lastActivity: new Date(),
+        authSession: sessionData
+      }
+
+      await sessionStore.create(sessionMetadata)
 
       // Redirect to authorization server
       return reply.redirect(authRequest.authorizationUrl)
@@ -80,17 +89,19 @@ export async function registerAuthRoutes(fastify: FastifyInstance) {
         })
       }
 
-      // Retrieve session data
-      const sessionData = authSessions.get(query.state)
-      if (!sessionData) {
+      // Retrieve session data from session store
+      const sessionMetadata = await sessionStore.get(query.state)
+      if (!sessionMetadata || !sessionMetadata.authSession) {
         return reply.status(400).send({
           error: 'invalid_request',
           error_description: 'Invalid or expired state parameter'
         })
       }
 
+      const sessionData = sessionMetadata.authSession as AuthSession
+
       // Clean up session data
-      authSessions.delete(query.state)
+      await sessionStore.delete(query.state)
 
       // Exchange authorization code for tokens
       const tokens = await fastify.oauthClient.exchangeCodeForToken(
@@ -134,8 +145,10 @@ export async function registerAuthRoutes(fastify: FastifyInstance) {
   // Token refresh endpoint
   fastify.post<{ Body: TokenRefreshBody }>('/oauth/refresh', async (request, reply) => {
     try {
+      // eslint-disable-next-line camelcase
       const { refresh_token } = request.body
 
+      // eslint-disable-next-line camelcase
       if (!refresh_token) {
         return reply.status(400).send({
           error: 'invalid_request',
@@ -212,7 +225,7 @@ export async function registerAuthRoutes(fastify: FastifyInstance) {
   })
 
   // Dynamic client registration endpoint (if enabled)
-  fastify.post('/oauth/register', async (request, reply) => {
+  fastify.post('/oauth/register', async (_, reply) => {
     try {
       const registration = await fastify.oauthClient.dynamicClientRegistration()
 
@@ -262,15 +275,13 @@ export async function registerAuthRoutes(fastify: FastifyInstance) {
   fastify.log.info('OAuth authorization routes registered')
 }
 
-// Utility function to clear expired sessions (call periodically)
-export function cleanupExpiredSessions(): void {
-  // In production, this would be handled by Redis TTL
-  // This is just for the in-memory implementation
-  const now = Date.now()
-  for (const [key, session] of authSessions.entries()) {
-    // Sessions expire after 5 minutes
-    if (now - Date.now() > 5 * 60 * 1000) {
-      authSessions.delete(key)
-    }
-  }
+export default fp(authRoutesPlugin, {
+  name: 'oauth-auth-routes',
+  dependencies: ['oauth-client']
+})
+
+// Legacy function export for backward compatibility
+export async function registerAuthRoutes (_: FastifyInstance) {
+  // This is now handled by the plugin, but we keep this export for existing code
+  // The session store needs to be passed via options when registering the plugin
 }

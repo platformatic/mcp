@@ -62,10 +62,10 @@ k7J2qlD6/u2VXu1i7TyapPDOA2BOJ3Z3yGpmfLD4OJP7iojgnCyHxtpaCfH+mQfd
 HwIDAQAB
 -----END PUBLIC KEY-----`
 
-export function generateMockJWKSResponse(kid: string = 'test-key-1'): any {
+export function generateMockJWKSResponse (kid: string = 'test-key-1'): any {
   const publicKey = createPublicKey(TEST_PUBLIC_KEY)
   const jwk = publicKey.export({ format: 'jwk' })
-  
+
   return {
     keys: [
       {
@@ -94,7 +94,7 @@ export function createTestAuthConfig (overrides: Partial<AuthorizationConfig> = 
 
 export function createTestJWT (payload: TestJWTOptions = {}): string {
   let kid = payload.kid || 'test-key-1'
-  if (Object.hasOwnProperty(payload, 'kid') === true && (payload.kid === null || payload.kid === undefined)) {
+  if (Object.prototype.hasOwnProperty.call(payload, 'kid') === true && (payload.kid === null || payload.kid === undefined)) {
     kid = undefined
   }
   const signer = createSigner({
@@ -141,24 +141,24 @@ export function verifyTestJWT (token: string): any {
 export function setupMockAgent (responses: Record<string, any>) {
   const mockAgent = new MockAgent()
   mockAgent.disableNetConnect()
-  
+
   const originalDispatcher = getGlobalDispatcher()
   setGlobalDispatcher(mockAgent)
-  
+
   // Setup mock responses
   for (const [url, response] of Object.entries(responses)) {
     const urlObj = new URL(url)
     const mockPool = mockAgent.get(urlObj.origin)
-    
+
     const statusCode = response.status || 200
     const responseBody = response.body || response
     const headers = response.headers || { 'content-type': 'application/json' }
-    
+
     mockPool.intercept({
       path: urlObj.pathname + urlObj.search,
       method: 'GET'
     }).reply(statusCode, JSON.stringify(responseBody), headers).persist()
-    
+
     // Also intercept POST for introspection endpoints
     if (url.includes('/introspect')) {
       mockPool.intercept({
@@ -167,7 +167,7 @@ export function setupMockAgent (responses: Record<string, any>) {
       }).reply(statusCode, JSON.stringify(responseBody), headers).persist()
     }
   }
-  
+
   return () => {
     setGlobalDispatcher(originalDispatcher)
     mockAgent.close()

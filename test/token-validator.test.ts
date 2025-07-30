@@ -2,7 +2,6 @@ import { test, describe, beforeEach, afterEach } from 'node:test'
 import type { TestContext } from 'node:test'
 import Fastify from 'fastify'
 import { TokenValidator } from '../src/auth/token-validator.ts'
-import type { AuthorizationConfig } from '../src/types/auth-types.ts'
 import {
   createTestAuthConfig,
   createTestJWT,
@@ -35,7 +34,7 @@ describe('TokenValidator', () => {
 
     t.assert.ok(validator)
     t.assert.strictEqual(typeof validator.validateToken, 'function')
-    
+
     validator.close()
   })
 
@@ -67,7 +66,7 @@ describe('TokenValidator', () => {
       t.assert.strictEqual(result.valid, true)
       t.assert.ok(result.payload)
       t.assert.strictEqual(result.payload.sub, 'test-user')
-      
+
       validator.close()
     })
 
@@ -84,7 +83,7 @@ describe('TokenValidator', () => {
 
       t.assert.strictEqual(result.valid, false)
       t.assert.ok(result.error)
-      
+
       validator.close()
     })
 
@@ -101,7 +100,7 @@ describe('TokenValidator', () => {
 
       t.assert.strictEqual(result.valid, false)
       t.assert.strictEqual(result.error, 'Invalid audience claim')
-      
+
       validator.close()
     })
 
@@ -123,7 +122,7 @@ describe('TokenValidator', () => {
 
       t.assert.strictEqual(result.valid, true)
       t.assert.ok(result.payload)
-      
+
       validator.close()
     })
 
@@ -142,7 +141,7 @@ describe('TokenValidator', () => {
 
       t.assert.strictEqual(result.valid, true)
       t.assert.ok(result.payload)
-      
+
       validator.close()
     })
 
@@ -155,14 +154,14 @@ describe('TokenValidator', () => {
       })
 
       const validator = new TokenValidator(config, app)
-      
+
       const token = createTestJWT({ kid: undefined })
 
       const result = await validator.validateToken(token)
 
       t.assert.strictEqual(result.valid, false)
       t.assert.ok(result.error)
-      
+
       validator.close()
     })
   })
@@ -175,7 +174,7 @@ describe('TokenValidator', () => {
           validateAudience: true
         }
       })
-      
+
       restoreMock = setupMockAgent({
         'https://auth.example.com/introspect': createIntrospectionResponse(true)
       })
@@ -187,7 +186,7 @@ describe('TokenValidator', () => {
       t.assert.ok(result.payload)
       t.assert.strictEqual(result.payload.active, true)
       t.assert.strictEqual(result.payload.sub, 'test-user')
-      
+
       validator.close()
     })
 
@@ -198,7 +197,7 @@ describe('TokenValidator', () => {
           validateAudience: true
         }
       })
-      
+
       restoreMock = setupMockAgent({
         'https://auth.example.com/introspect': createIntrospectionResponse(false)
       })
@@ -208,7 +207,7 @@ describe('TokenValidator', () => {
 
       t.assert.strictEqual(result.valid, false)
       t.assert.strictEqual(result.error, 'Token is not active')
-      
+
       validator.close()
     })
 
@@ -219,7 +218,7 @@ describe('TokenValidator', () => {
           validateAudience: true
         }
       })
-      
+
       restoreMock = setupMockAgent({
         'https://auth.example.com/introspect': createIntrospectionResponse(true, {
           aud: 'https://different.example.com'
@@ -231,7 +230,7 @@ describe('TokenValidator', () => {
 
       t.assert.strictEqual(result.valid, false)
       t.assert.strictEqual(result.error, 'Invalid audience claim')
-      
+
       validator.close()
     })
 
@@ -242,7 +241,7 @@ describe('TokenValidator', () => {
           validateAudience: true
         }
       })
-      
+
       restoreMock = setupMockAgent({
         'https://auth.example.com/introspect': {
           status: 500,
@@ -255,7 +254,7 @@ describe('TokenValidator', () => {
 
       t.assert.strictEqual(result.valid, false)
       t.assert.ok(result.error?.includes('Introspection failed with status 500'))
-      
+
       validator.close()
     })
 
@@ -266,7 +265,7 @@ describe('TokenValidator', () => {
           validateAudience: true
         }
       })
-      
+
       restoreMock = setupMockAgent({})
 
       const validator = new TokenValidator(config, app)
@@ -274,7 +273,7 @@ describe('TokenValidator', () => {
 
       t.assert.strictEqual(result.valid, false)
       t.assert.ok(result.error)
-      
+
       validator.close()
     })
   })
@@ -288,7 +287,7 @@ describe('TokenValidator', () => {
           validateAudience: true
         }
       })
-      
+
       restoreMock = setupMockAgent({
         'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse(),
         'https://auth.example.com/introspect': createIntrospectionResponse(true)
@@ -301,7 +300,7 @@ describe('TokenValidator', () => {
       t.assert.strictEqual(result.valid, true)
       t.assert.ok(result.payload)
       t.assert.strictEqual(result.payload.active, true)
-      
+
       validator.close()
     })
 
@@ -317,7 +316,7 @@ describe('TokenValidator', () => {
 
       t.assert.strictEqual(result.valid, false)
       t.assert.strictEqual(result.error, 'No token validation method configured')
-      
+
       validator.close()
     })
   })
@@ -334,7 +333,7 @@ describe('TokenValidator', () => {
 
       t.assert.strictEqual(result.valid, false)
       t.assert.ok(result.error)
-      
+
       validator.close()
     })
 
@@ -348,7 +347,7 @@ describe('TokenValidator', () => {
 
       t.assert.strictEqual(result.valid, false)
       t.assert.ok(result.error)
-      
+
       validator.close()
     })
   })
@@ -366,7 +365,7 @@ describe('TokenValidator', () => {
       const result = await validator.validateToken(token)
 
       t.assert.strictEqual(result.valid, true)
-      
+
       validator.close()
     })
 
@@ -377,14 +376,14 @@ describe('TokenValidator', () => {
       })
 
       const validator = new TokenValidator(config, app)
-      const token = createTestJWT({ 
-        aud: ['https://mcp.example.com', 'https://api.example.com'] 
+      const token = createTestJWT({
+        aud: ['https://mcp.example.com', 'https://api.example.com']
       })
 
       const result = await validator.validateToken(token)
 
       t.assert.strictEqual(result.valid, true)
-      
+
       validator.close()
     })
 
@@ -401,7 +400,7 @@ describe('TokenValidator', () => {
 
       t.assert.strictEqual(result.valid, false)
       t.assert.strictEqual(result.error, 'Invalid audience claim')
-      
+
       validator.close()
     })
   })

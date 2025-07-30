@@ -3,7 +3,6 @@ import type { TestContext } from 'node:test'
 import Fastify from 'fastify'
 import { createAuthPreHandler } from '../src/auth/prehandler.ts'
 import { TokenValidator } from '../src/auth/token-validator.ts'
-import type { AuthorizationConfig } from '../src/types/auth-types.ts'
 import {
   createTestAuthConfig,
   createTestJWT,
@@ -46,7 +45,7 @@ describe('Authorization PreHandler', () => {
 
     t.assert.strictEqual(response.statusCode, 200)
     t.assert.deepStrictEqual(response.json(), { success: true })
-    
+
     validator.close()
   })
 
@@ -67,7 +66,7 @@ describe('Authorization PreHandler', () => {
 
     t.assert.strictEqual(response.statusCode, 200)
     t.assert.deepStrictEqual(response.json(), { success: true })
-    
+
     validator.close()
   })
 
@@ -87,16 +86,16 @@ describe('Authorization PreHandler', () => {
     })
 
     t.assert.strictEqual(response.statusCode, 401)
-    
+
     const body = response.json()
     t.assert.strictEqual(body.error, 'authorization_required')
     t.assert.strictEqual(body.error_description, 'Authorization header required')
-    
+
     const wwwAuth = response.headers['www-authenticate']
     t.assert.ok(wwwAuth)
     t.assert.ok(wwwAuth.includes('Bearer realm="MCP Server"'))
     t.assert.ok(wwwAuth.includes('resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource"'))
-    
+
     validator.close()
   })
 
@@ -119,11 +118,11 @@ describe('Authorization PreHandler', () => {
     })
 
     t.assert.strictEqual(response.statusCode, 401)
-    
+
     const body = response.json()
     t.assert.strictEqual(body.error, 'invalid_token')
     t.assert.strictEqual(body.error_description, 'Authorization header must use Bearer scheme')
-    
+
     validator.close()
   })
 
@@ -146,11 +145,11 @@ describe('Authorization PreHandler', () => {
     })
 
     t.assert.strictEqual(response.statusCode, 401)
-    
+
     const body = response.json()
     t.assert.strictEqual(body.error, 'invalid_token')
     t.assert.strictEqual(body.error_description, 'Bearer token is empty')
-    
+
     validator.close()
   })
 
@@ -181,11 +180,11 @@ describe('Authorization PreHandler', () => {
     })
 
     t.assert.strictEqual(response.statusCode, 200)
-    
+
     const body = response.json()
     t.assert.strictEqual(body.success, true)
     t.assert.strictEqual(body.user, 'test-user')
-    
+
     validator.close()
   })
 
@@ -212,11 +211,11 @@ describe('Authorization PreHandler', () => {
     })
 
     t.assert.strictEqual(response.statusCode, 401)
-    
+
     const body = response.json()
     t.assert.strictEqual(body.error, 'invalid_token')
     t.assert.ok(body.error_description)
-    
+
     validator.close()
   })
 
@@ -244,10 +243,10 @@ describe('Authorization PreHandler', () => {
     })
 
     t.assert.strictEqual(response.statusCode, 401)
-    
+
     const body = response.json()
     t.assert.strictEqual(body.error, 'invalid_token')
-    
+
     validator.close()
   })
 
@@ -275,11 +274,11 @@ describe('Authorization PreHandler', () => {
     })
 
     t.assert.strictEqual(response.statusCode, 401)
-    
+
     const body = response.json()
     t.assert.strictEqual(body.error, 'invalid_token')
     t.assert.strictEqual(body.error_description, 'Invalid audience claim')
-    
+
     validator.close()
   })
 
@@ -311,7 +310,7 @@ describe('Authorization PreHandler', () => {
       sub: 'custom-user',
       iss: 'https://custom.example.com'
     })
-    
+
     const response = await app.inject({
       method: 'GET',
       url: '/test',
@@ -321,13 +320,13 @@ describe('Authorization PreHandler', () => {
     })
 
     t.assert.strictEqual(response.statusCode, 200)
-    
+
     const body = response.json()
     t.assert.strictEqual(body.success, true)
     t.assert.strictEqual(body.tokenData.sub, 'custom-user')
     t.assert.strictEqual(body.tokenData.iss, 'https://custom.example.com')
     t.assert.strictEqual(body.tokenData.aud, 'https://mcp.example.com')
-    
+
     validator.close()
   })
 
@@ -380,7 +379,7 @@ describe('Authorization PreHandler', () => {
       url: '/protected1'
     })
     t.assert.strictEqual(response4.statusCode, 401)
-    
+
     validator.close()
   })
 })

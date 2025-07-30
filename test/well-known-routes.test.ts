@@ -146,11 +146,11 @@ describe('Well-known Routes', () => {
       t.assert.strictEqual(body.status, 'healthy')
       t.assert.strictEqual(body.resource, 'https://mcp.health.com')
       t.assert.ok(body.timestamp)
-      
+
       // Verify timestamp is valid ISO date
       const timestamp = new Date(body.timestamp)
       t.assert.ok(!isNaN(timestamp.getTime()))
-      
+
       // Timestamp should be recent (within last minute)
       const now = new Date()
       const timeDiff = Math.abs(now.getTime() - timestamp.getTime())
@@ -240,7 +240,7 @@ describe('Well-known Routes', () => {
 
       t.assert.strictEqual(response.statusCode, 200)
       t.assert.strictEqual(response.headers['content-type'], 'application/json; charset=utf-8')
-      
+
       const body = response.json()
       t.assert.ok(body.resource)
       t.assert.ok(body.authorization_servers)
@@ -326,7 +326,7 @@ describe('Well-known Routes', () => {
         })
 
         t.assert.strictEqual(response.statusCode, 200)
-        
+
         const body = response.json()
         t.assert.strictEqual(body.resource, resourceUri)
 

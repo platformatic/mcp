@@ -81,7 +81,7 @@ describe('Authorization Integration Tests', () => {
       })
 
       t.assert.strictEqual(response.statusCode, 200)
-      
+
       const body = response.json()
       t.assert.strictEqual(body.resource, 'https://test.mcp.com')
       t.assert.deepStrictEqual(body.authorization_servers, ['https://auth.test.com'])
@@ -117,7 +117,7 @@ describe('Authorization Integration Tests', () => {
       })
 
       t.assert.strictEqual(response.statusCode, 200)
-      
+
       const body = response.json()
       t.assert.strictEqual(body.status, 'healthy')
       t.assert.strictEqual(body.resource, 'https://health.mcp.com')
@@ -155,7 +155,7 @@ describe('Authorization Integration Tests', () => {
       })
 
       t.assert.strictEqual(response1.statusCode, 401)
-      
+
       const body1 = response1.json()
       t.assert.strictEqual(body1.error, 'authorization_required')
 
@@ -171,7 +171,7 @@ describe('Authorization Integration Tests', () => {
       })
 
       t.assert.strictEqual(response2.statusCode, 200)
-      
+
       const body2 = response2.json() as InitializeResult
       t.assert.strictEqual(body2.jsonrpc, JSONRPC_VERSION)
       t.assert.strictEqual(body2.id, 1)
@@ -263,7 +263,7 @@ describe('Authorization Integration Tests', () => {
       })
 
       t.assert.strictEqual(response.statusCode, 200)
-      
+
       const body = response.json() as InitializeResult
       t.assert.strictEqual(body.jsonrpc, JSONRPC_VERSION)
       t.assert.strictEqual(body.id, 1)
@@ -366,7 +366,7 @@ describe('Authorization Integration Tests', () => {
       })
 
       t.assert.strictEqual(response.statusCode, 200)
-      
+
       const body = response.json() as InitializeResult
       t.assert.strictEqual(body.jsonrpc, JSONRPC_VERSION)
       t.assert.ok(body.result)
@@ -446,7 +446,7 @@ describe('Authorization Integration Tests', () => {
       })
 
       t.assert.strictEqual(response.statusCode, 401)
-      
+
       const body = response.json()
       t.assert.strictEqual(body.error, 'invalid_token')
     })
@@ -468,7 +468,7 @@ describe('Authorization Integration Tests', () => {
       })
 
       t.assert.strictEqual(response.statusCode, 401)
-      
+
       const wwwAuth = response.headers['www-authenticate']
       t.assert.ok(wwwAuth)
       t.assert.ok(wwwAuth.includes('Bearer realm="MCP Server"'))
@@ -514,7 +514,7 @@ describe('Authorization Integration Tests', () => {
         method: 'GET',
         url: '/mcp',
         payloadAsStream: true,
-        headers: { 
+        headers: {
           authorization: `Bearer ${token}`,
           accept: 'text/event-stream'
         }

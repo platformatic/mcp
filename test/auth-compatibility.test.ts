@@ -33,7 +33,7 @@ describe('Authorization Compatibility Tests', () => {
     })
 
     t.assert.strictEqual(response.statusCode, 200)
-    
+
     const body = response.json() as InitializeResult
     t.assert.strictEqual(body.jsonrpc, JSONRPC_VERSION)
     t.assert.strictEqual(body.id, 1)
@@ -68,7 +68,7 @@ describe('Authorization Compatibility Tests', () => {
     })
 
     t.assert.strictEqual(response.statusCode, 200)
-    
+
     const body = response.json() as InitializeResult
     t.assert.strictEqual(body.jsonrpc, JSONRPC_VERSION)
     t.assert.strictEqual(body.id, 1)
@@ -159,7 +159,7 @@ describe('Authorization Compatibility Tests', () => {
     })
 
     t.assert.strictEqual(response.statusCode, 200)
-    
+
     const body = response.json()
     t.assert.strictEqual(body.jsonrpc, JSONRPC_VERSION)
     t.assert.ok(body.result.tools)
@@ -206,7 +206,7 @@ describe('Authorization Compatibility Tests', () => {
     })
 
     t.assert.strictEqual(response.statusCode, 200)
-    
+
     const body = response.json()
     t.assert.strictEqual(body.jsonrpc, JSONRPC_VERSION)
     t.assert.ok(body.result.resources)
@@ -265,7 +265,7 @@ describe('Authorization Compatibility Tests', () => {
       })
 
       t.assert.strictEqual(response.statusCode, 200, `${testCase.method} should return 200`)
-      
+
       const body = response.json()
       t.assert.strictEqual(body.jsonrpc, JSONRPC_VERSION, `${testCase.method} should return valid JSON-RPC`)
       t.assert.strictEqual(body.id, 1, `${testCase.method} should return correct ID`)
@@ -285,7 +285,7 @@ describe('Authorization Compatibility Tests', () => {
 
     // Test that session-specific functionality still works
     const sessionId = 'test-session-123'
-    
+
     const request: JSONRPCRequest = {
       jsonrpc: JSONRPC_VERSION,
       id: 1,
@@ -307,7 +307,7 @@ describe('Authorization Compatibility Tests', () => {
     })
 
     t.assert.strictEqual(response.statusCode, 200)
-    
+
     const body = response.json()
     t.assert.strictEqual(body.jsonrpc, JSONRPC_VERSION)
     t.assert.ok(body.result)

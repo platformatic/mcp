@@ -6,6 +6,7 @@ export interface SessionMetadata {
   lastEventId?: string
   createdAt: Date
   lastActivity: Date
+  authSession?: any // OAuth session data
 }
 
 export interface SessionStore {

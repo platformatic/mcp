@@ -1,4 +1,4 @@
-import type { FastifyInstance, FastifyPluginAsync } from 'fastify'
+import type { FastifyPluginAsync } from 'fastify'
 import fp from 'fastify-plugin'
 import { createHash, randomBytes } from 'node:crypto'
 
@@ -48,28 +48,12 @@ declare module 'fastify' {
 }
 
 const oauthClientPlugin: FastifyPluginAsync<OAuthClientConfig> = async (fastify, opts) => {
-  // Register @fastify/oauth2 plugin first
-  await fastify.register(import('@fastify/oauth2'), {
-    name: 'mcpOAuth2',
-    credentials: {
-      client: {
-        id: opts.clientId || '',
-        secret: opts.clientSecret || ''
-      },
-      auth: {
-        authorizeHost: opts.authorizationServer,
-        authorizePath: '/oauth/authorize',
-        tokenHost: opts.authorizationServer,
-        tokenPath: '/oauth/token'
-      }
-    },
-    startRedirectPath: '/oauth/login',
-    callbackUri: '/oauth/callback',
-    scope: opts.scopes || ['read']
-  })
+  // Our OAuth client implementation is completely independent and doesn't need @fastify/oauth2
+  // @fastify/oauth2 can be optionally registered by users if they want the additional routes,
+  // but our implementation provides all necessary OAuth client functionality
 
   const oauthClientMethods: OAuthClientMethods = {
-    generatePKCEChallenge(): PKCEChallenge {
+    generatePKCEChallenge (): PKCEChallenge {
       const codeVerifier = randomBytes(32).toString('base64url')
       const codeChallenge = createHash('sha256')
         .update(codeVerifier)
@@ -82,11 +66,11 @@ const oauthClientPlugin: FastifyPluginAsync<OAuthClientConfig> = async (fastify,
       }
     },
 
-    generateState(): string {
+    generateState (): string {
       return randomBytes(16).toString('base64url')
     },
 
-    async createAuthorizationRequest(additionalParams?: Record<string, string>): Promise<AuthorizationRequest> {
+    async createAuthorizationRequest (additionalParams?: Record<string, string>): Promise<AuthorizationRequest> {
       const pkce = oauthClientMethods.generatePKCEChallenge()
       const state = oauthClientMethods.generateState()
 
@@ -115,7 +99,7 @@ const oauthClientPlugin: FastifyPluginAsync<OAuthClientConfig> = async (fastify,
       }
     },
 
-    async exchangeCodeForToken(
+    async exchangeCodeForToken (
       code: string,
       pkce: PKCEChallenge,
       state: string,
@@ -131,7 +115,7 @@ const oauthClientPlugin: FastifyPluginAsync<OAuthClientConfig> = async (fastify,
           method: 'POST',
           headers: {
             'Content-Type': 'application/x-www-form-urlencoded',
-            'Accept': 'application/json'
+            Accept: 'application/json'
           },
           body: new URLSearchParams({
             grant_type: 'authorization_code',
@@ -147,8 +131,8 @@ const oauthClientPlugin: FastifyPluginAsync<OAuthClientConfig> = async (fastify,
           throw new Error(`Token exchange failed: ${tokenResponse.status} ${errorText}`)
         }
 
-        const tokens: TokenResponse = await tokenResponse.json()
-        
+        const tokens = await tokenResponse.json() as TokenResponse
+
         // Validate token response structure
         if (!tokens.access_token || !tokens.token_type) {
           throw new Error('Invalid token response: missing required fields')
@@ -160,7 +144,7 @@ const oauthClientPlugin: FastifyPluginAsync<OAuthClientConfig> = async (fastify,
       }
     },
 
-    async refreshToken(refreshToken: string): Promise<TokenResponse> {
+    async refreshToken (refreshToken: string): Promise<TokenResponse> {
       if (!refreshToken) {
         throw new Error('Refresh token is required')
       }
@@ -170,7 +154,7 @@ const oauthClientPlugin: FastifyPluginAsync<OAuthClientConfig> = async (fastify,
           method: 'POST',
           headers: {
             'Content-Type': 'application/x-www-form-urlencoded',
-            'Accept': 'application/json'
+            Accept: 'application/json'
           },
           body: new URLSearchParams({
             grant_type: 'refresh_token',
@@ -185,8 +169,8 @@ const oauthClientPlugin: FastifyPluginAsync<OAuthClientConfig> = async (fastify,
           throw new Error(`Token refresh failed: ${tokenResponse.status} ${errorText}`)
         }
 
-        const tokens: TokenResponse = await tokenResponse.json()
-        
+        const tokens = await tokenResponse.json() as TokenResponse
+
         if (!tokens.access_token || !tokens.token_type) {
           throw new Error('Invalid token response: missing required fields')
         }
@@ -197,14 +181,14 @@ const oauthClientPlugin: FastifyPluginAsync<OAuthClientConfig> = async (fastify,
       }
     },
 
-    async validateToken(accessToken: string): Promise<boolean> {
+    async validateToken (accessToken: string): Promise<boolean> {
       try {
         const introspectionResponse = await fetch(`${opts.authorizationServer}/oauth/introspect`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/x-www-form-urlencoded',
-            'Accept': 'application/json',
-            'Authorization': `Bearer ${accessToken}`
+            Accept: 'application/json',
+            Authorization: `Bearer ${accessToken}`
           },
           body: new URLSearchParams({
             token: accessToken,
@@ -216,14 +200,14 @@ const oauthClientPlugin: FastifyPluginAsync<OAuthClientConfig> = async (fastify,
           return false
         }
 
-        const introspection = await introspectionResponse.json()
+        const introspection = await introspectionResponse.json() as { active: boolean }
         return introspection.active === true
       } catch {
         return false
       }
     },
 
-    async dynamicClientRegistration(): Promise<{ clientId: string; clientSecret?: string }> {
+    async dynamicClientRegistration (): Promise<{ clientId: string; clientSecret?: string }> {
       if (!opts.dynamicRegistration) {
         throw new Error('Dynamic client registration not enabled')
       }
@@ -233,7 +217,7 @@ const oauthClientPlugin: FastifyPluginAsync<OAuthClientConfig> = async (fastify,
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Accept': 'application/json'
+            Accept: 'application/json'
           },
           body: JSON.stringify({
             client_name: 'MCP Server',
@@ -251,8 +235,8 @@ const oauthClientPlugin: FastifyPluginAsync<OAuthClientConfig> = async (fastify,
           throw new Error(`Client registration failed: ${registrationResponse.status} ${errorText}`)
         }
 
-        const registration = await registrationResponse.json()
-        
+        const registration = await registrationResponse.json() as { client_id: string; client_secret?: string }
+
         if (!registration.client_id) {
           throw new Error('Invalid registration response: missing client_id')
         }
@@ -273,6 +257,12 @@ const oauthClientPlugin: FastifyPluginAsync<OAuthClientConfig> = async (fastify,
 
   // Decorate Fastify instance with OAuth client methods
   fastify.decorate('oauthClient', oauthClientMethods)
+
+  // Add cleanup for any potential hanging connections
+  fastify.addHook('onClose', async () => {
+    // No specific cleanup needed for our implementation
+    // @fastify/oauth2 should handle its own cleanup
+  })
 }
 
 export default fp(oauthClientPlugin, {
