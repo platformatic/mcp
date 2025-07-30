@@ -11,6 +11,8 @@ export interface AuthorizationConfig {
     clientId?: string
     clientSecret?: string
     authorizationServer: string
+    resourceUri?: string
+    scopes?: string[]
     dynamicRegistration?: boolean
   }
 }

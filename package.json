@@ -46,6 +46,7 @@
   },
   "dependencies": {
     "@fastify/jwt": "^9.1.0",
+    "@fastify/oauth2": "^8.1.2",
     "fast-jwt": "^6.0.2",
     "fastify-plugin": "^5.0.1",
     "get-jwks": "^11.0.1",
