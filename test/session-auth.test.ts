@@ -19,7 +19,7 @@ after(async () => {
   setGlobalDispatcher(originalDispatcher)
 })
 
-describe('Phase 3: Session-Based Authorization', () => {
+describe('Session-Based Authorization', () => {
   describe('Token Utilities', () => {
     test('should hash token consistently', (t) => {
       const token = 'test-token-123'

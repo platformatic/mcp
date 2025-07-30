@@ -161,7 +161,7 @@ export class RedisSessionStore implements SessionStore {
     }
   }
 
-  // Phase 3: Token-to-session mapping operations
+  // Token-to-session mapping operations
   async getSessionByTokenHash (tokenHash: string): Promise<SessionMetadata | null> {
     const tokenKey = `token:${tokenHash}`
     const sessionId = await this.redis.get(tokenKey)

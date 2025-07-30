@@ -7,7 +7,7 @@ import { TokenRefreshService } from '../src/auth/token-refresh-service.ts'
 import type { AuthorizationContext, TokenRefreshInfo } from '../src/types/auth-types.ts'
 import { hashToken } from '../src/auth/token-utils.ts'
 
-describe('Phase 3: Token Refresh Service', () => {
+describe('Token Refresh Service', () => {
   describe('TokenRefreshService', () => {
     test('should create token refresh service', (t) => {
       const sessionStore = new MemorySessionStore(100)

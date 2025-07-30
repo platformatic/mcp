@@ -9,7 +9,7 @@ export interface SessionMetadata {
   lastActivity: Date
   authSession?: any // OAuth session data (legacy - for Phase 2 compatibility)
 
-  // Phase 3: Enhanced authorization context
+  // Enhanced authorization context
   authorization?: AuthorizationContext
   tokenRefresh?: TokenRefreshInfo
 }
@@ -24,7 +24,7 @@ export interface SessionStore {
   addMessage(sessionId: string, eventId: string, message: JSONRPCMessage): Promise<void>
   getMessagesFrom(sessionId: string, fromEventId: string): Promise<Array<{ eventId: string, message: JSONRPCMessage }>>
 
-  // Phase 3: Token-to-session mapping operations
+  // Token-to-session mapping operations
   getSessionByTokenHash(tokenHash: string): Promise<SessionMetadata | null>
   addTokenMapping(tokenHash: string, sessionId: string): Promise<void>
   removeTokenMapping(tokenHash: string): Promise<void>

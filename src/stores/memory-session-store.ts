@@ -85,7 +85,7 @@ export class MemorySessionStore implements SessionStore {
     }))
   }
 
-  // Phase 3: Token-to-session mapping operations
+  // Token-to-session mapping operations
   async getSessionByTokenHash (tokenHash: string): Promise<SessionMetadata | null> {
     const sessionId = this.tokenToSession.get(tokenHash)
     if (!sessionId) {
