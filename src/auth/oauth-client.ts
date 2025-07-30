@@ -1,6 +1,7 @@
 import type { FastifyPluginAsync } from 'fastify'
 import fp from 'fastify-plugin'
 import { createHash, randomBytes } from 'node:crypto'
+import { validateTokenResponse, validateIntrospectionResponse, validateClientRegistrationResponse } from './oauth-schemas.ts'
 
 export interface OAuthClientConfig {
   clientId?: string
@@ -133,9 +134,9 @@ const oauthClientPlugin: FastifyPluginAsync<OAuthClientConfig> = async (fastify,
 
         const tokens = await tokenResponse.json() as TokenResponse
 
-        // Validate token response structure
-        if (!tokens.access_token || !tokens.token_type) {
-          throw new Error('Invalid token response: missing required fields')
+        // Validate token response structure with TypeBox
+        if (!validateTokenResponse(tokens)) {
+          throw new Error('Invalid token response: does not match OAuth 2.0 specification')
         }
 
         return tokens
@@ -171,8 +172,9 @@ const oauthClientPlugin: FastifyPluginAsync<OAuthClientConfig> = async (fastify,
 
         const tokens = await tokenResponse.json() as TokenResponse
 
-        if (!tokens.access_token || !tokens.token_type) {
-          throw new Error('Invalid token response: missing required fields')
+        // Validate token response structure with TypeBox
+        if (!validateTokenResponse(tokens)) {
+          throw new Error('Invalid token response: does not match OAuth 2.0 specification')
         }
 
         return tokens
@@ -200,8 +202,14 @@ const oauthClientPlugin: FastifyPluginAsync<OAuthClientConfig> = async (fastify,
           return false
         }
 
-        const introspection = await introspectionResponse.json() as { active: boolean }
-        return introspection.active === true
+        const introspection = await introspectionResponse.json()
+
+        // Validate introspection response structure with TypeBox
+        if (!validateIntrospectionResponse(introspection)) {
+          return false
+        }
+
+        return (introspection as { active: boolean }).active === true
       } catch {
         return false
       }
@@ -235,19 +243,22 @@ const oauthClientPlugin: FastifyPluginAsync<OAuthClientConfig> = async (fastify,
           throw new Error(`Client registration failed: ${registrationResponse.status} ${errorText}`)
         }
 
-        const registration = await registrationResponse.json() as { client_id: string; client_secret?: string }
+        const registration = await registrationResponse.json()
 
-        if (!registration.client_id) {
-          throw new Error('Invalid registration response: missing client_id')
+        // Validate registration response structure with TypeBox
+        if (!validateClientRegistrationResponse(registration)) {
+          throw new Error('Invalid registration response: does not match OAuth 2.0 specification')
         }
 
+        const validatedRegistration = registration as { client_id: string; client_secret?: string }
+
         // Update config with new client credentials
-        opts.clientId = registration.client_id
-        opts.clientSecret = registration.client_secret
+        opts.clientId = validatedRegistration.client_id
+        opts.clientSecret = validatedRegistration.client_secret
 
         return {
-          clientId: registration.client_id,
-          clientSecret: registration.client_secret
+          clientId: validatedRegistration.client_id,
+          clientSecret: validatedRegistration.client_secret
         }
       } catch (error) {
         throw new Error(`Dynamic client registration failed: ${error instanceof Error ? error.message : String(error)}`)
