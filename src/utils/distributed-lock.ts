@@ -109,10 +109,11 @@ export class RedisDistributedLock implements DistributedLock {
 }
 
 /**
- * In-memory distributed lock implementation for single-instance or testing
- * Uses Map to store locks with automatic cleanup via setTimeout
+ * Stub lock implementation for single-instance deployments or testing
+ * Uses in-memory Map to simulate locking behavior within a single process
+ * Not actually distributed - all instances share the same memory space
  */
-export class MemoryDistributedLock implements DistributedLock {
+export class StubLock implements DistributedLock {
   private locks = new Map<string, { instanceId: string, timeout: NodeJS.Timeout }>()
   private readonly lockPrefix: string
 
@@ -200,6 +201,6 @@ export function createDistributedLock(redis?: Redis, lockPrefix: string = 'lock'
   if (redis) {
     return new RedisDistributedLock(redis, lockPrefix)
   } else {
-    return new MemoryDistributedLock(lockPrefix)
+    return new StubLock(lockPrefix)
   }
 }

@@ -1,7 +1,7 @@
 import { test, describe, after } from 'node:test'
 import * as assert from 'node:assert'
 import { createTestRedis, cleanupRedis } from './redis-test-utils.ts'
-import { createDistributedLock, RedisDistributedLock, MemoryDistributedLock } from '../src/utils/distributed-lock.ts'
+import { createDistributedLock, RedisDistributedLock, StubLock } from '../src/utils/distributed-lock.ts'
 import type { Redis } from 'ioredis'
 
 let testRedisInstances: Redis[] = []
@@ -21,9 +21,9 @@ async function getTestRedis(): Promise<Redis> {
 }
 
 describe('Distributed Lock', () => {
-  describe('MemoryDistributedLock', () => {
+  describe('StubLock', () => {
     test('should acquire and release locks successfully', async (t) => {
-      const lock = new MemoryDistributedLock('test')
+      const lock = new StubLock('test')
       const instanceId = 'instance-1'
       const key = 'test-key'
 
@@ -47,7 +47,7 @@ describe('Distributed Lock', () => {
     })
 
     test('should prevent duplicate lock acquisition', async (t) => {
-      const lock = new MemoryDistributedLock('test')
+      const lock = new StubLock('test')
       const instance1 = 'instance-1'
       const instance2 = 'instance-2'
       const key = 'test-key'
@@ -72,7 +72,7 @@ describe('Distributed Lock', () => {
     })
 
     test('should handle lock expiration', async (t) => {
-      const lock = new MemoryDistributedLock('test')
+      const lock = new StubLock('test')
       const instanceId = 'instance-1'
       const key = 'test-key'
 
@@ -95,7 +95,7 @@ describe('Distributed Lock', () => {
     })
 
     test('should extend lock TTL', async (t) => {
-      const lock = new MemoryDistributedLock('test')
+      const lock = new StubLock('test')
       const instanceId = 'instance-1'
       const key = 'test-key'
 
@@ -121,7 +121,7 @@ describe('Distributed Lock', () => {
     })
 
     test('should not allow extension by non-owner', async (t) => {
-      const lock = new MemoryDistributedLock('test')
+      const lock = new StubLock('test')
       const instance1 = 'instance-1'
       const instance2 = 'instance-2'
       const key = 'test-key'
@@ -273,9 +273,9 @@ describe('Distributed Lock', () => {
   })
 
   describe('createDistributedLock factory', () => {
-    test('should create MemoryDistributedLock when no Redis provided', async (t) => {
+    test('should create StubLock when no Redis provided', async (t) => {
       const lock = createDistributedLock(undefined, 'test')
-      assert.ok(lock instanceof MemoryDistributedLock)
+      assert.ok(lock instanceof StubLock)
       
       // Test basic functionality
       const acquired = await lock.acquire('key', 10, 'instance-1')
@@ -297,8 +297,8 @@ describe('Distributed Lock', () => {
 
   describe('Lock prefix handling', () => {
     test('should isolate locks with different prefixes', async (t) => {
-      const lock1 = new MemoryDistributedLock('prefix1')
-      const lock2 = new MemoryDistributedLock('prefix2')
+      const lock1 = new StubLock('prefix1')
+      const lock2 = new StubLock('prefix2')
       
       const instanceId = 'instance-1'
       const key = 'same-key'
