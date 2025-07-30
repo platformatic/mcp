@@ -104,17 +104,21 @@ src/
    - ✅ Configuration-driven authorization server discovery
    - ✅ Health check endpoint for resource availability
 
-#### Phase 2: OAuth Client Support ❌ **NOT YET IMPLEMENTED**
-1. **OAuth Client Wrapper** (`src/auth/oauth-client.ts`) ❌ **PENDING**
-   - `@fastify/oauth2` integration
-   - PKCE implementation
-   - Resource parameter injection
-   - Dynamic client registration
+#### Phase 2: OAuth Client Support ✅ **COMPLETED**
+1. **OAuth Client Plugin** (`src/auth/oauth-client.ts`) ✅ **IMPLEMENTED**
+   - ✅ Custom OAuth 2.1 client implementation (independent of external libraries)
+   - ✅ PKCE implementation with S256 challenge method
+   - ✅ Resource parameter injection for MCP-specific flows
+   - ✅ Dynamic client registration (RFC 7591)
+   - ✅ Token validation via introspection (RFC 7662)
+   - ✅ Comprehensive TypeBox validation for OAuth spec compliance
 
-2. **Authorization Routes** (`src/routes/auth-routes.ts`) ❌ **PENDING**
-   - OAuth authorization flow endpoints
-   - Callback handling
-   - Token refresh logic
+2. **Authorization Routes** (`src/routes/auth-routes.ts`) ✅ **IMPLEMENTED**
+   - ✅ OAuth authorization flow endpoints
+   - ✅ Callback handling with state validation
+   - ✅ Token refresh and validation endpoints
+   - ✅ Session store integration for OAuth session management
+   - ✅ TypeBox validation schemas for all requests/responses
 
 #### Phase 3: Enhanced Features ❌ **NOT YET IMPLEMENTED**
 1. **Session-Based Authorization** ❌ **PENDING**
@@ -128,12 +132,18 @@ src/
 
 ## Dependencies
 
-### New Dependencies Required
-- `@fastify/oauth2` (v8.1.2) - OAuth 2.1 flows ❌ **NOT YET ADDED**
+### Dependencies Added
 - `@fastify/jwt` (v9.1.0) - JWT token validation and preHandler hooks ✅ **ADDED**
+- `@fastify/type-provider-typebox` (v5.2.0) - TypeBox validation for OAuth spec compliance ✅ **ADDED**
 - `fast-jwt` (v6.0.2) - Fast JWT implementation ✅ **ADDED**
 - `get-jwks` (v11.0.1) - JWKS key retrieval ✅ **ADDED**
 - `undici` - HTTP requests for token introspection ✅ **ALREADY AVAILABLE**
+
+**Note**: We implemented a complete custom OAuth 2.1 client instead of using `@fastify/oauth2` to provide:
+- Full control over MCP-specific requirements
+- Independent operation without external OAuth library dependencies
+- Comprehensive TypeBox validation ensuring OAuth 2.0/2.1 specification compliance
+- Better integration with existing session store architecture
 
 ## Security Considerations
 
@@ -234,25 +244,33 @@ app.register(mcpPlugin, {
 - Full backward compatibility
 - Horizontal scaling support (Redis backend)
 
-**🚧 PHASE 2 IN PROGRESS (OAuth Client Support):**
-Phase 2 focuses on enabling MCP servers to act as OAuth clients, which is useful when:
+**✅ PHASE 2 COMPLETED (OAuth Client Support):**
+Phase 2 enables MCP servers to act as OAuth clients, which is useful when:
 - MCP servers need to authenticate with other protected services
 - Implementing federated authorization scenarios
 - Supporting OAuth-based service-to-service communication
 
-**Phase 2 Implementation Tasks:**
-1. Add `@fastify/oauth2` dependency for standardized OAuth client flows
-2. Implement OAuth Client Wrapper (`src/auth/oauth-client.ts`)
-   - PKCE support with S256 challenge method
-   - Resource parameter injection for MCP-specific flows
-   - Dynamic client registration capabilities
-   - Token management and refresh logic
-3. Create Authorization Routes (`src/routes/auth-routes.ts`)
-   - OAuth authorization initiation endpoints
-   - Callback handling with state validation
-   - Token exchange and refresh endpoints
-4. Extend plugin configuration for OAuth client scenarios
-5. Add comprehensive test coverage for client flows
+**Phase 2 Implementation Completed:**
+1. ✅ **Custom OAuth 2.1 Client Implementation** (`src/auth/oauth-client.ts`)
+   - ✅ Complete OAuth 2.1 client without external dependencies
+   - ✅ PKCE support with S256 challenge method
+   - ✅ Resource parameter injection for MCP-specific flows
+   - ✅ Dynamic client registration capabilities (RFC 7591)
+   - ✅ Token management, exchange, and refresh logic
+   - ✅ Token introspection support (RFC 7662)
+2. ✅ **Authorization Routes Plugin** (`src/routes/auth-routes.ts`)
+   - ✅ OAuth authorization initiation endpoints
+   - ✅ Callback handling with state validation
+   - ✅ Token exchange and refresh endpoints
+   - ✅ Session store integration for OAuth session management
+   - ✅ TypeBox validation for all OAuth requests/responses
+3. ✅ **OAuth Schema Validation** (`src/auth/oauth-schemas.ts`)
+   - ✅ TypeBox schemas for OAuth 2.0 specification compliance
+   - ✅ Token response validation
+   - ✅ Introspection response validation
+   - ✅ Client registration response validation
+4. ✅ **Plugin Configuration Extended** for OAuth client scenarios
+5. ✅ **Comprehensive Test Coverage** (29 OAuth client and routes tests)
 
 **❌ PHASE 3 PENDING (Enhanced Features):**
 - Session-based authorization with token-to-session mapping
