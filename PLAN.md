@@ -272,7 +272,42 @@ Phase 2 enables MCP servers to act as OAuth clients, which is useful when:
 4. ✅ **Plugin Configuration Extended** for OAuth client scenarios
 5. ✅ **Comprehensive Test Coverage** (29 OAuth client and routes tests)
 
-**❌ PHASE 3 PENDING (Enhanced Features):**
-- Session-based authorization with token-to-session mapping
-- Authorization-aware SSE connections
-- Advanced token lifecycle management
+**✅ PHASE 3 COMPLETED (Enhanced Features):**
+Phase 3 provides advanced session-based authorization capabilities that seamlessly integrate tokens with MCP sessions and enable sophisticated authorization workflows.
+
+**Phase 3 Implementation Completed:**
+1. ✅ **Token-to-Session Mapping** (`src/stores/session-store.ts` + implementations)
+   - ✅ Secure token hashing for session mapping
+   - ✅ Automatic token mapping cleanup on session deletion
+   - ✅ Cross-request token-session persistence
+   - ✅ Support for both Memory and Redis session stores
+2. ✅ **Enhanced Authorization Context** (`src/types/auth-types.ts`)
+   - ✅ Comprehensive `AuthorizationContext` with user, client, and token metadata
+   - ✅ `TokenRefreshInfo` for automatic token lifecycle management
+   - ✅ Token expiration detection and refresh scheduling
+3. ✅ **Session-Aware Authorization PreHandler** (`src/auth/session-auth-prehandler.ts`)
+   - ✅ Token-to-session mapping integration
+   - ✅ Automatic token refresh detection and execution
+   - ✅ Enhanced request context with authorization metadata
+   - ✅ Session linking for MCP protocol requests
+4. ✅ **Authorization-Aware SSE Routes** (`src/routes/auth-aware-sse-routes.ts`)
+   - ✅ User-specific session isolation and access control
+   - ✅ Token-based session authorization validation
+   - ✅ User-specific message broadcasting (`mcp/user/{userId}/message`)
+   - ✅ Automatic session cleanup with authorization context
+5. ✅ **Token Refresh Service** (`src/auth/token-refresh-service.ts`)
+   - ✅ Background automatic token refresh for active sessions
+   - ✅ Configurable refresh buffer and retry logic
+   - ✅ SSE notifications for token refresh events
+   - ✅ Graceful handling of refresh failures with attempt tracking
+6. ✅ **Token Utilities** (`src/auth/token-utils.ts`)
+   - ✅ Secure token hashing with SHA-256
+   - ✅ Authorization context creation from JWT payloads
+   - ✅ Token expiration detection and refresh logic
+   - ✅ Scope parsing and formatting utilities
+7. ✅ **Comprehensive Test Coverage** (23 Phase 3 tests)
+   - ✅ Token utilities and authorization context tests
+   - ✅ Session store token mapping tests
+   - ✅ Session-aware authorization prehandler tests
+   - ✅ Token refresh service tests with failure scenarios
+   - ✅ Authorization context integration tests

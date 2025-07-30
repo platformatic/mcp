@@ -42,3 +42,26 @@ export interface TokenIntrospectionResponse {
   iss?: string
   jti?: string
 }
+
+export interface AuthorizationContext {
+  userId?: string              // Subject from token
+  clientId?: string           // OAuth client ID
+  scopes?: string[]           // Token scopes as array
+  audience?: string[]         // Token audience
+  tokenType?: string          // Token type (Bearer, etc.)
+  tokenHash?: string          // Hash of the token for mapping
+  expiresAt?: Date           // Token expiration time
+  issuedAt?: Date            // Token issued time
+  refreshToken?: string      // Associated refresh token (encrypted)
+  authorizationServer?: string // Which auth server issued the token
+  sessionBoundToken?: string  // Token bound to this specific session (hashed)
+}
+
+export interface TokenRefreshInfo {
+  refreshToken: string        // Encrypted refresh token
+  clientId: string           // OAuth client ID for refresh
+  authorizationServer: string // Authorization server URL
+  scopes: string[]           // Original scopes
+  lastRefreshAt?: Date       // When token was last refreshed
+  refreshAttempts?: number   // Number of refresh attempts
+}

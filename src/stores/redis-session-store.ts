@@ -1,6 +1,7 @@
 import type { Redis } from 'ioredis'
 import type { JSONRPCMessage } from '../schema.ts'
 import type { SessionStore, SessionMetadata } from './session-store.ts'
+import type { AuthorizationContext, TokenRefreshInfo } from '../types/auth-types.ts'
 
 export class RedisSessionStore implements SessionStore {
   private redis: Redis
@@ -13,15 +14,34 @@ export class RedisSessionStore implements SessionStore {
 
   async create (metadata: SessionMetadata): Promise<void> {
     const sessionKey = `session:${metadata.id}`
-    await this.redis.hset(sessionKey, {
+    const sessionData: Record<string, string> = {
       id: metadata.id,
       eventId: metadata.eventId.toString(),
       lastEventId: metadata.lastEventId || '',
       createdAt: metadata.createdAt.toISOString(),
       lastActivity: metadata.lastActivity.toISOString()
-    })
+    }
+
+    // Add authorization context if present
+    if (metadata.authorization) {
+      sessionData.authorization = JSON.stringify(metadata.authorization)
+    }
+    if (metadata.tokenRefresh) {
+      sessionData.tokenRefresh = JSON.stringify(metadata.tokenRefresh)
+    }
+    if (metadata.authSession) {
+      sessionData.authSession = JSON.stringify(metadata.authSession)
+    }
+
+    await this.redis.hset(sessionKey, sessionData)
+
     // Set session expiration to 1 hour
     await this.redis.expire(sessionKey, 3600)
+
+    // Add token mapping if present
+    if (metadata.authorization?.tokenHash) {
+      await this.addTokenMapping(metadata.authorization.tokenHash, metadata.id)
+    }
   }
 
   async get (sessionId: string): Promise<SessionMetadata | null> {
@@ -32,18 +52,52 @@ export class RedisSessionStore implements SessionStore {
       return null
     }
 
-    return {
+    const metadata: SessionMetadata = {
       id: result.id,
       eventId: parseInt(result.eventId, 10),
       lastEventId: result.lastEventId || undefined,
       createdAt: new Date(result.createdAt),
       lastActivity: new Date(result.lastActivity)
     }
+
+    // Parse authorization context if present
+    if (result.authorization) {
+      try {
+        metadata.authorization = JSON.parse(result.authorization)
+      } catch (error) {
+        // Ignore parsing errors for authorization context
+      }
+    }
+
+    if (result.tokenRefresh) {
+      try {
+        metadata.tokenRefresh = JSON.parse(result.tokenRefresh)
+      } catch (error) {
+        // Ignore parsing errors for token refresh
+      }
+    }
+
+    if (result.authSession) {
+      try {
+        metadata.authSession = JSON.parse(result.authSession)
+      } catch (error) {
+        // Ignore parsing errors for auth session
+      }
+    }
+
+    return metadata
   }
 
   async delete (sessionId: string): Promise<void> {
     const sessionKey = `session:${sessionId}`
     const historyKey = `session:${sessionId}:history`
+
+    // Get session to clean up token mappings
+    const session = await this.get(sessionId)
+    if (session?.authorization?.tokenHash) {
+      await this.removeTokenMapping(session.authorization.tokenHash)
+    }
+
     await this.redis.del(sessionKey, historyKey)
   }
 
@@ -104,6 +158,62 @@ export class RedisSessionStore implements SessionStore {
     } catch (error) {
       // If stream doesn't exist, return empty array
       return []
+    }
+  }
+
+  // Phase 3: Token-to-session mapping operations
+  async getSessionByTokenHash (tokenHash: string): Promise<SessionMetadata | null> {
+    const tokenKey = `token:${tokenHash}`
+    const sessionId = await this.redis.get(tokenKey)
+    if (!sessionId) {
+      return null
+    }
+    return this.get(sessionId)
+  }
+
+  async addTokenMapping (tokenHash: string, sessionId: string): Promise<void> {
+    const tokenKey = `token:${tokenHash}`
+    // Set token mapping with same expiration as session (1 hour)
+    await this.redis.setex(tokenKey, 3600, sessionId)
+  }
+
+  async removeTokenMapping (tokenHash: string): Promise<void> {
+    const tokenKey = `token:${tokenHash}`
+    await this.redis.del(tokenKey)
+  }
+
+  async updateAuthorization (sessionId: string, authorization: AuthorizationContext, tokenRefresh?: TokenRefreshInfo): Promise<void> {
+    const sessionKey = `session:${sessionId}`
+
+    // Get existing session to clean up old token mapping
+    const existingSession = await this.get(sessionId)
+    if (!existingSession) {
+      throw new Error(`Session ${sessionId} not found`)
+    }
+
+    // Remove old token mapping if it exists
+    if (existingSession.authorization?.tokenHash) {
+      await this.removeTokenMapping(existingSession.authorization.tokenHash)
+    }
+
+    // Update session with new authorization context
+    const updateData: Record<string, string> = {
+      authorization: JSON.stringify(authorization),
+      lastActivity: new Date().toISOString()
+    }
+
+    if (tokenRefresh) {
+      updateData.tokenRefresh = JSON.stringify(tokenRefresh)
+    }
+
+    await this.redis.hset(sessionKey, updateData)
+
+    // Reset session expiration
+    await this.redis.expire(sessionKey, 3600)
+
+    // Add new token mapping if tokenHash is provided
+    if (authorization.tokenHash) {
+      await this.addTokenMapping(authorization.tokenHash, sessionId)
     }
   }
 }
