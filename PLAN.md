@@ -224,7 +224,7 @@ app.register(mcpPlugin, {
 
 ## Current Implementation Status
 
-**✅ COMPLETED (Production Ready):**
+**✅ PHASE 1 COMPLETED (Production Ready):**
 - OAuth 2.1 Resource Server functionality
 - JWT token validation with JWKS support
 - Token introspection (RFC 7662) support
@@ -234,8 +234,27 @@ app.register(mcpPlugin, {
 - Full backward compatibility
 - Horizontal scaling support (Redis backend)
 
-**❌ REMAINING (Optional for Resource Server Use Cases):**
-- OAuth Client functionality (for MCP servers acting as clients)
-- PKCE support for client flows
-- Dynamic client registration
-- Enhanced session-authorization integration
+**🚧 PHASE 2 IN PROGRESS (OAuth Client Support):**
+Phase 2 focuses on enabling MCP servers to act as OAuth clients, which is useful when:
+- MCP servers need to authenticate with other protected services
+- Implementing federated authorization scenarios
+- Supporting OAuth-based service-to-service communication
+
+**Phase 2 Implementation Tasks:**
+1. Add `@fastify/oauth2` dependency for standardized OAuth client flows
+2. Implement OAuth Client Wrapper (`src/auth/oauth-client.ts`)
+   - PKCE support with S256 challenge method
+   - Resource parameter injection for MCP-specific flows
+   - Dynamic client registration capabilities
+   - Token management and refresh logic
+3. Create Authorization Routes (`src/routes/auth-routes.ts`)
+   - OAuth authorization initiation endpoints
+   - Callback handling with state validation
+   - Token exchange and refresh endpoints
+4. Extend plugin configuration for OAuth client scenarios
+5. Add comprehensive test coverage for client flows
+
+**❌ PHASE 3 PENDING (Enhanced Features):**
+- Session-based authorization with token-to-session mapping
+- Authorization-aware SSE connections
+- Advanced token lifecycle management
