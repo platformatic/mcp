@@ -1,12 +1,12 @@
 import { randomUUID } from 'crypto'
 import type { FastifyRequest, FastifyReply, FastifyPluginAsync } from 'fastify'
 import fp from 'fastify-plugin'
-import type { JSONRPCMessage } from './schema.ts'
-import { JSONRPC_VERSION, INTERNAL_ERROR } from './schema.ts'
-import type { MCPPluginOptions, MCPTool, MCPResource, MCPPrompt } from './types.ts'
-import type { SessionStore, SessionMetadata } from './stores/session-store.ts'
-import type { MessageBroker } from './brokers/message-broker.ts'
-import { processMessage } from './handlers.ts'
+import type { JSONRPCMessage } from '../schema.ts'
+import { JSONRPC_VERSION, INTERNAL_ERROR } from '../schema.ts'
+import type { MCPPluginOptions, MCPTool, MCPResource, MCPPrompt } from '../types.ts'
+import type { SessionStore, SessionMetadata } from '../stores/session-store.ts'
+import type { MessageBroker } from '../brokers/message-broker.ts'
+import { processMessage } from '../handlers.ts'
 
 interface MCPPubSubRoutesOptions {
   enableSSE: boolean
@@ -38,7 +38,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     localStreams.set(sessionId, new Set())
 
     // Subscribe to messages for this session
-    await messageBroker.subscribe(`mcp/session/${sessionId}/message`, (message) => {
+    await messageBroker.subscribe(`mcp/session/${sessionId}/message`, (message: JSONRPCMessage) => {
       const streams = localStreams.get(sessionId)
       if (streams && streams.size > 0) {
         sendSSEToStreams(sessionId, message, streams)
@@ -365,7 +365,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
   // Subscribe to broadcast notifications
   if (enableSSE) {
-    messageBroker.subscribe('mcp/broadcast/notification', (notification) => {
+    messageBroker.subscribe('mcp/broadcast/notification', (notification: JSONRPCMessage) => {
       // Send to all local streams
       for (const [sessionId, streams] of localStreams.entries()) {
         if (streams.size > 0) {

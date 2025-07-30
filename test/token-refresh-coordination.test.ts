@@ -19,7 +19,7 @@ after(async () => {
   testRedisInstances = []
 })
 
-async function getTestRedis(): Promise<Redis> {
+async function getTestRedis (): Promise<Redis> {
   const redis = await createTestRedis()
   testRedisInstances.push(redis)
   return redis
@@ -30,10 +30,9 @@ describe('Token Refresh Service Coordination', () => {
     test('should coordinate token refresh between multiple service instances', async (t) => {
       const sessionStore = new MemorySessionStore(100)
       const messageBroker = new MemoryMessageBroker()
-      
+
       // Track which instances perform refresh
-      const refreshLog: string[] = []
-      
+
       // Mock OAuth client that records which instance calls it
       const mockOAuthClient = {
         refreshToken: async (refreshToken: string) => {
@@ -109,7 +108,7 @@ describe('Token Refresh Service Coordination', () => {
     test('should handle service instance failure gracefully', async (t) => {
       const sessionStore = new MemorySessionStore(100)
       const messageBroker = new MemoryMessageBroker()
-      
+
       const mockOAuthClient = {
         refreshToken: async () => ({ access_token: 'token' })
       }
@@ -167,13 +166,13 @@ describe('Token Refresh Service Coordination', () => {
     test('should coordinate token refresh across Redis instances', async (t) => {
       const redis1 = await getTestRedis()
       const redis2 = await getTestRedis()
-      
+
       const sessionStore1 = new RedisSessionStore({ redis: redis1, maxMessages: 100 })
       const sessionStore2 = new RedisSessionStore({ redis: redis2, maxMessages: 100 })
-      
+
       const messageBroker1 = new RedisMessageBroker(redis1)
       const messageBroker2 = new RedisMessageBroker(redis2)
-      
+
       const mockOAuthClient = {
         refreshToken: async () => ({
           access_token: 'new-token',
@@ -233,7 +232,7 @@ describe('Token Refresh Service Coordination', () => {
       const redis = await getTestRedis()
       const sessionStore = new RedisSessionStore({ redis, maxMessages: 100 })
       const messageBroker = new RedisMessageBroker(redis)
-      
+
       const mockOAuthClient = {
         refreshToken: async () => ({ access_token: 'token' })
       }
@@ -270,17 +269,15 @@ describe('Token Refresh Service Coordination', () => {
     test('should allow lock timeout and recovery', async (t) => {
       const redis1 = await getTestRedis()
       const redis2 = await getTestRedis()
-      
+
       const sessionStore1 = new RedisSessionStore({ redis: redis1, maxMessages: 100 })
       const sessionStore2 = new RedisSessionStore({ redis: redis2, maxMessages: 100 })
-      
+
       const messageBroker1 = new RedisMessageBroker(redis1)
       const messageBroker2 = new RedisMessageBroker(redis2)
-      
-      let refreshCallCount = 0
+
       const mockOAuthClient = {
         refreshToken: async () => {
-          refreshCallCount++
           // Simulate slow refresh that might cause lock timeout
           await new Promise(resolve => setTimeout(resolve, 150))
           return { access_token: 'token' }
@@ -339,7 +336,7 @@ describe('Token Refresh Service Coordination', () => {
     test('should respect coordination configuration options', async (t) => {
       const sessionStore = new MemorySessionStore(100)
       const messageBroker = new MemoryMessageBroker()
-      
+
       const service = new TokenRefreshService({
         sessionStore,
         messageBroker,
@@ -368,7 +365,7 @@ describe('Token Refresh Service Coordination', () => {
     test('should use default coordination options when not specified', async (t) => {
       const sessionStore = new MemorySessionStore(100)
       const messageBroker = new MemoryMessageBroker()
-      
+
       const service = new TokenRefreshService({
         sessionStore,
         messageBroker,
@@ -395,7 +392,7 @@ describe('Token Refresh Service Coordination', () => {
     test('should work alongside distributed coordination', async (t) => {
       const sessionStore = new MemorySessionStore(100)
       const messageBroker = new MemoryMessageBroker()
-      
+
       const mockOAuthClient = {
         refreshToken: async (refreshToken: string) => {
           assert.strictEqual(refreshToken, 'refresh-123')

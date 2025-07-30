@@ -21,7 +21,7 @@ export interface TokenRefreshServiceOptions {
   oauthClient?: any // OAuth client for token refresh
   checkIntervalMs?: number // How often to check for tokens needing refresh
   refreshBufferMinutes?: number // How many minutes before expiry to refresh
-  
+
   // Distributed coordination options
   redis?: Redis // Redis instance for distributed coordination
   coordination?: TokenRefreshCoordinationOptions
@@ -40,12 +40,11 @@ export class TokenRefreshService {
   private intervalId?: NodeJS.Timeout
   private isRunning = false
   private fastify?: FastifyInstance
-  
+
   // Distributed coordination
   private distributedLock?: DistributedLock
   private instanceId: string
   private lockTimeoutSeconds: number
-  private maxLockExtensions: number
   private enableCoordinationLogging: boolean
 
   constructor (options: TokenRefreshServiceOptions) {
@@ -54,13 +53,12 @@ export class TokenRefreshService {
     this.oauthClient = options.oauthClient
     this.checkIntervalMs = options.checkIntervalMs || 5 * 60 * 1000 // 5 minutes default
     this.refreshBufferMinutes = options.refreshBufferMinutes || 5 // 5 minutes default
-    
+
     // Initialize distributed coordination
     this.instanceId = randomUUID()
     this.lockTimeoutSeconds = options.coordination?.lockTimeoutSeconds || 30
-    this.maxLockExtensions = options.coordination?.maxLockExtensions || 3
     this.enableCoordinationLogging = options.coordination?.enableCoordinationLogging || false
-    
+
     // Always create distributed lock (Redis or in-memory)
     this.distributedLock = createDistributedLock(options.redis, 'token-refresh')
   }
@@ -202,7 +200,7 @@ export class TokenRefreshService {
     } finally {
       // Always release the lock
       const released = await this.distributedLock.release(lockKey, this.instanceId)
-      
+
       if (this.enableCoordinationLogging && this.fastify) {
         this.fastify.log.debug({
           instanceId: this.instanceId,

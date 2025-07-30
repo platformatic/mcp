@@ -14,7 +14,7 @@ after(async () => {
   testRedisInstances = []
 })
 
-async function getTestRedis(): Promise<Redis> {
+async function getTestRedis (): Promise<Redis> {
   const redis = await createTestRedis()
   testRedisInstances.push(redis)
   return redis
@@ -169,10 +169,10 @@ describe('Distributed Lock', () => {
     test('should prevent duplicate lock acquisition across Redis instances', async (t) => {
       const redis1 = await getTestRedis()
       const redis2 = await getTestRedis()
-      
+
       const lock1 = new RedisDistributedLock(redis1, 'test')
       const lock2 = new RedisDistributedLock(redis2, 'test')
-      
+
       const instance1 = 'instance-1'
       const instance2 = 'instance-2'
       const key = 'test-key'
@@ -276,11 +276,11 @@ describe('Distributed Lock', () => {
     test('should create StubLock when no Redis provided', async (t) => {
       const lock = createDistributedLock(undefined, 'test')
       assert.ok(lock instanceof StubLock)
-      
+
       // Test basic functionality
       const acquired = await lock.acquire('key', 10, 'instance-1')
       assert.strictEqual(acquired, true)
-      
+
       await lock.close?.()
     })
 
@@ -288,7 +288,7 @@ describe('Distributed Lock', () => {
       const redis = await getTestRedis()
       const lock = createDistributedLock(redis, 'test')
       assert.ok(lock instanceof RedisDistributedLock)
-      
+
       // Test basic functionality
       const acquired = await lock.acquire('key', 10, 'instance-1')
       assert.strictEqual(acquired, true)
@@ -296,24 +296,24 @@ describe('Distributed Lock', () => {
   })
 
   describe('Lock prefix handling', () => {
-    test('should isolate locks with different prefixes', async (t) => {
-      const lock1 = new StubLock('prefix1')
-      const lock2 = new StubLock('prefix2')
-      
+    test('should handle StubLock without prefixes', async (t) => {
+      const lock1 = new StubLock()
+      const lock2 = new StubLock()
+
       const instanceId = 'instance-1'
       const key = 'same-key'
 
-      // Both locks can acquire same key (different prefixes)
+      // StubLock instances have separate memory, so both can acquire same key
       const acquired1 = await lock1.acquire(key, 10, instanceId)
       const acquired2 = await lock2.acquire(key, 10, instanceId)
-      
-      assert.strictEqual(acquired1, true)
-      assert.strictEqual(acquired2, true)
 
-      // Both locks show they hold their respective keys
+      assert.strictEqual(acquired1, true)
+      assert.strictEqual(acquired2, true) // Both can acquire (separate instances)
+
+      // Each lock sees its own state
       const holder1 = await lock1.isLocked(key)
       const holder2 = await lock2.isLocked(key)
-      
+
       assert.strictEqual(holder1, instanceId)
       assert.strictEqual(holder2, instanceId)
 
@@ -325,21 +325,21 @@ describe('Distributed Lock', () => {
       const redis = await getTestRedis()
       const lock1 = new RedisDistributedLock(redis, 'prefix1')
       const lock2 = new RedisDistributedLock(redis, 'prefix2')
-      
+
       const instanceId = 'instance-1'
       const key = 'same-key'
 
       // Both locks can acquire same key (different prefixes)
       const acquired1 = await lock1.acquire(key, 10, instanceId)
       const acquired2 = await lock2.acquire(key, 10, instanceId)
-      
+
       assert.strictEqual(acquired1, true)
       assert.strictEqual(acquired2, true)
 
       // Both locks show they hold their respective keys
       const holder1 = await lock1.isLocked(key)
       const holder2 = await lock2.isLocked(key)
-      
+
       assert.strictEqual(holder1, instanceId)
       assert.strictEqual(holder2, instanceId)
     })
