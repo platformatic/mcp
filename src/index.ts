@@ -10,7 +10,12 @@ import { RedisMessageBroker } from './brokers/redis-message-broker.ts'
 import type { MCPPluginOptions, MCPTool, MCPResource, MCPPrompt } from './types.ts'
 import pubsubDecorators from './decorators/pubsub.ts'
 import metaDecorators from './decorators/meta.ts'
-import routes from './routes.ts'
+import routes from './routes/mcp.ts'
+import wellKnownRoutes from './routes/well-known.ts'
+import { TokenValidator } from './auth/token-validator.ts'
+import { createAuthPreHandler } from './auth/prehandler.ts'
+import oauthClientPlugin from './auth/oauth-client.ts'
+import authRoutesPlugin from './routes/auth-routes.ts'
 
 // Import and export MCP protocol types
 import type {
@@ -65,6 +70,30 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
   // Local stream management per server instance
   const localStreams = new Map<string, Set<any>>()
 
+  // Initialize authorization components if enabled
+  let tokenValidator: TokenValidator | null = null
+  if (opts.authorization?.enabled) {
+    tokenValidator = new TokenValidator(opts.authorization, app)
+
+    // Register authorization preHandler for all routes
+    app.addHook('preHandler', createAuthPreHandler(opts.authorization, tokenValidator))
+
+    // Register OAuth client plugin if configured
+    if (opts.authorization.oauth2Client) {
+      await app.register(oauthClientPlugin, opts.authorization.oauth2Client)
+    }
+  }
+
+  // Register well-known routes for OAuth metadata
+  await app.register(wellKnownRoutes, {
+    authConfig: opts.authorization
+  })
+
+  // Register OAuth client routes if OAuth client is configured
+  if (opts.authorization?.enabled && opts.authorization?.oauth2Client) {
+    await app.register(authRoutesPlugin, { sessionStore })
+  }
+
   // Register decorators first
   app.register(metaDecorators, {
     tools,
@@ -92,12 +121,38 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     localStreams
   })
 
-  // Add close hook to clean up Redis connections
+  // Add close hook to clean up Redis connections and authorization components
   app.addHook('onClose', async () => {
+    // Clean up all SSE streams and sessions
+    const unsubscribePromises: Promise<void>[] = []
+    for (const [sessionId, streams] of localStreams.entries()) {
+      for (const stream of streams) {
+        try {
+          if (stream.raw && !stream.raw.destroyed) {
+            stream.raw.destroy()
+          }
+        } catch (error) {
+          app.log.debug({ error, sessionId }, 'Error destroying SSE stream')
+        }
+      }
+      streams.clear()
+      // Collect unsubscribe promises for parallel execution
+      unsubscribePromises.push(messageBroker.unsubscribe(`mcp/session/${sessionId}/message`))
+    }
+    localStreams.clear()
+
+    // Execute all unsubscribes in parallel
+    await Promise.all(unsubscribePromises)
+
     if (redis) {
       await redis.quit()
     }
     await messageBroker.close()
+
+    // Clean up token validator
+    if (tokenValidator) {
+      tokenValidator.close()
+    }
   })
 }, {
   name: '@platformatic/mcp'
@@ -135,6 +190,14 @@ export type {
   UnsafePromptHandler,
   SSESession
 } from './types.ts'
+
+// Export authorization types
+export type {
+  AuthorizationConfig,
+  TokenValidationResult,
+  ProtectedResourceMetadata,
+  TokenIntrospectionResponse
+} from './types/auth-types.ts'
 
 export type {
   JSONRPCMessage,

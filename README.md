@@ -812,12 +812,412 @@ The stdio transport is particularly useful for:
 - **Simple client-server communication** in controlled environments
 - **Batch processing** of MCP requests from scripts
 
+## OAuth 2.1 Authorization Integration
+
+The plugin includes comprehensive OAuth 2.1 authorization support for secure MCP communication. This enables token-based authentication, session management, and secure multi-user environments.
+
+### Key Features
+
+- **Complete OAuth 2.1 Support**: Authorization Code Flow with PKCE
+- **Session-Based Authorization**: Token-to-session mapping with secure context
+- **Authorization-Aware SSE**: User-specific session isolation and message routing
+- **Automatic Token Refresh**: Background token refresh with retry logic
+- **JWT Token Validation**: Support for JWT tokens with JWKS endpoints
+- **Token Introspection**: RFC 7662 compliant token introspection
+- **Dynamic Client Registration**: RFC 7591 compliant client registration
+- **Horizontal Scaling**: Redis-backed authorization context persistence
+
+### Quick OAuth Setup
+
+```typescript
+import Fastify from 'fastify'
+import mcpPlugin from '@platformatic/mcp'
+
+const app = Fastify({ logger: true })
+
+await app.register(mcpPlugin, {
+  serverInfo: {
+    name: 'secure-mcp-server',
+    version: '1.0.0'
+  },
+  capabilities: {
+    tools: {},
+    resources: {},
+    prompts: {}
+  },
+  enableSSE: true, // Required for session-based authorization
+  // Enable OAuth 2.1 authorization
+  authorization: {
+    enabled: true,
+    // JWT Token Validation
+    tokenValidation: {
+      jwksUri: 'https://auth.example.com/.well-known/jwks.json',
+      validateAudience: ['https://api.example.com'],
+      validateIssuer: 'https://auth.example.com'
+    },
+    // OAuth 2.1 Client Configuration
+    oauthClient: {
+      clientId: process.env.OAUTH_CLIENT_ID,
+      clientSecret: process.env.OAUTH_CLIENT_SECRET,
+      authorizationEndpoint: 'https://auth.example.com/oauth/authorize',
+      tokenEndpoint: 'https://auth.example.com/oauth/token',
+      redirectUri: 'https://yourapp.com/oauth/callback',
+      scopes: ['read', 'write']
+    }
+  },
+  // Redis for session persistence (recommended)
+  redis: {
+    host: process.env.REDIS_HOST || 'localhost',
+    port: parseInt(process.env.REDIS_PORT || '6379')
+  }
+})
+
+await app.listen({ port: 3000 })
+```
+
+### Authorization Workflow
+
+#### 1. OAuth Authorization Flow
+
+```typescript
+// Start OAuth authorization
+const authResponse = await fetch('/oauth/authorize?redirect_uri=https://yourapp.com/dashboard')
+
+// Handle callback with authorization code
+const tokenResponse = await fetch('/oauth/callback', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    code: 'auth_code_from_callback',
+    state: 'csrf_state_token'
+  })
+})
+
+const { access_token, refresh_token } = await tokenResponse.json()
+```
+
+#### 2. Authenticated MCP Requests
+
+```typescript
+// Use access token for MCP requests
+const mcpResponse = await fetch('/mcp', {
+  method: 'POST',
+  headers: {
+    'Authorization': `Bearer ${access_token}`,
+    'Content-Type': 'application/json',
+    'Accept': 'text/event-stream' // For SSE
+  },
+  body: JSON.stringify({
+    jsonrpc: '2.0',
+    method: 'tools/list',
+    id: 1
+  })
+})
+```
+
+#### 3. Session-Based SSE Connections
+
+```typescript
+// SSE connection with authorization
+const eventSource = new EventSource('/mcp', {
+  headers: {
+    'Authorization': `Bearer ${access_token}`,
+    'Accept': 'text/event-stream'
+  }
+})
+
+eventSource.onmessage = (event) => {
+  const message = JSON.parse(event.data)
+  console.log('Received:', message)
+}
+
+// Server can send user-specific messages
+// app.mcpSendToUser(userId, notification)
+```
+
+### Authorization Configuration
+
+#### JWT Token Validation
+
+```typescript
+authorization: {
+  enabled: true,
+  tokenValidation: {
+    // JWKS endpoint for public key retrieval
+    jwksUri: 'https://auth.example.com/.well-known/jwks.json',
+    
+    // Validate token audience
+    validateAudience: ['https://api.example.com', 'mcp-server'],
+    
+    // Validate token issuer
+    validateIssuer: 'https://auth.example.com',
+    
+    // Optional: Custom validation function
+    customValidation: async (payload, token) => {
+      // Custom validation logic
+      return payload.sub && payload.scope?.includes('mcp:access')
+    }
+  }
+}
+```
+
+#### Token Introspection (RFC 7662)
+
+```typescript
+authorization: {
+  enabled: true,
+  tokenValidation: {
+    // Use token introspection instead of JWT
+    introspectionEndpoint: 'https://auth.example.com/oauth/introspect',
+    clientId: process.env.OAUTH_CLIENT_ID,
+    clientSecret: process.env.OAUTH_CLIENT_SECRET
+  }
+}
+```
+
+#### OAuth Client Configuration
+
+```typescript
+authorization: {
+  enabled: true,
+  oauthClient: {
+    clientId: process.env.OAUTH_CLIENT_ID,
+    clientSecret: process.env.OAUTH_CLIENT_SECRET,
+    
+    // Authorization server endpoints
+    authorizationEndpoint: 'https://auth.example.com/oauth/authorize',
+    tokenEndpoint: 'https://auth.example.com/oauth/token',
+    
+    // Application configuration
+    redirectUri: 'https://yourapp.com/oauth/callback',
+    scopes: ['read', 'write', 'admin'],
+    
+    // Optional: Dynamic client registration
+    registrationEndpoint: 'https://auth.example.com/oauth/register',
+    
+    // PKCE configuration (recommended)
+    usePKCE: true
+  }
+}
+```
+
+### Session-Based Authorization
+
+The plugin maps OAuth tokens to MCP sessions for efficient authorization:
+
+```typescript
+// Authorization context automatically added to sessions
+interface SessionMetadata {
+  id: string
+  authorization?: {
+    userId: string
+    clientId: string
+    scopes: string[]
+    tokenHash: string // Secure hash of access token
+    expiresAt: Date
+    // ... additional context
+  }
+  tokenRefresh?: {
+    refreshToken: string
+    clientId: string
+    authorizationServer: string
+    scopes: string[]
+  }
+}
+```
+
+### User-Specific Message Routing
+
+Send messages to specific users across all their sessions:
+
+```typescript
+// In your tool handler
+app.mcpAddTool({
+  name: 'notify-user',
+  description: 'Send notification to user',
+  inputSchema: Type.Object({
+    userId: Type.String(),
+    message: Type.String()
+  })
+}, async (params, { sessionId, authContext }) => {
+  // Send to all sessions for this user
+  await app.mcpSendToUser(params.userId, {
+    jsonrpc: '2.0',
+    method: 'notifications/message',
+    params: {
+      level: 'info',
+      message: params.message
+    }
+  })
+  
+  return { content: [{ type: 'text', text: 'Notification sent' }] }
+})
+```
+
+### Automatic Token Refresh
+
+The plugin includes a background service for automatic token refresh:
+
+```typescript
+// Token refresh configuration
+authorization: {
+  enabled: true,
+  tokenRefresh: {
+    // Check for expiring tokens every 5 minutes
+    checkIntervalMs: 5 * 60 * 1000,
+    
+    // Refresh tokens 5 minutes before expiry
+    refreshBufferMinutes: 5,
+    
+    // Maximum refresh attempts
+    maxRetries: 3
+  }
+}
+
+// Manual token refresh
+const success = await app.tokenRefreshService.refreshSessionToken(sessionId)
+
+// Token refresh notifications sent via SSE
+// Client receives: { method: 'notifications/token_refreshed', params: { access_token: '...' } }
+```
+
+### Authorization-Aware Tools
+
+Access authorization context in tool handlers:
+
+```typescript
+app.mcpAddTool({
+  name: 'user-profile',
+  description: 'Get user profile information',
+  inputSchema: Type.Object({})
+}, async (params, { authContext }) => {
+  if (!authContext?.userId) {
+    return {
+      content: [{ type: 'text', text: 'Authentication required' }],
+      isError: true
+    }
+  }
+  
+  // Check required scopes
+  if (!authContext.scopes?.includes('profile:read')) {
+    return {
+      content: [{ type: 'text', text: 'Insufficient permissions' }],
+      isError: true
+    }
+  }
+  
+  // Use user context
+  const profile = await getUserProfile(authContext.userId)
+  
+  return {
+    content: [{
+      type: 'text',
+      text: `Profile: ${JSON.stringify(profile, null, 2)}`
+    }]
+  }
+})
+```
+
+### OAuth Routes
+
+The plugin automatically registers OAuth management routes:
+
+- `GET /oauth/authorize` - Start OAuth authorization flow
+- `POST /oauth/callback` - Handle authorization callback
+- `POST /oauth/refresh` - Refresh access tokens
+- `POST /oauth/validate` - Validate token
+- `GET /oauth/status` - Check authorization status
+- `POST /oauth/logout` - Revoke tokens and end session
+- `POST /oauth/register` - Dynamic client registration (if enabled)
+
+### Well-Known Endpoints
+
+Authorization-aware metadata endpoints:
+
+- `GET /.well-known/mcp-server` - Server metadata (protected)
+- `GET /health` - Health check (public)
+
+### Security Considerations
+
+#### Token Security
+
+- **Secure Token Storage**: Tokens are hashed using SHA-256 for session mapping
+- **Token Expiration**: Automatic cleanup of expired tokens and sessions
+- **Scope Validation**: Granular permission checking in tool handlers
+- **PKCE Support**: Proof Key for Code Exchange prevents authorization code interception
+
+#### Session Isolation
+
+- **User-Specific Sessions**: Sessions are isolated by user ID
+- **Cross-Session Protection**: Users can only access their own sessions
+- **Token Binding**: Sessions are cryptographically bound to specific tokens
+
+#### Production Deployment
+
+```typescript
+// Production security configuration
+authorization: {
+  enabled: true,
+  tokenValidation: {
+    jwksUri: 'https://auth.company.com/.well-known/jwks.json',
+    validateAudience: ['https://mcp.company.com'],
+    validateIssuer: 'https://auth.company.com',
+    
+    // Custom security validation
+    customValidation: async (payload, token) => {
+      // Check token blacklist
+      const isBlacklisted = await checkTokenBlacklist(token)
+      if (isBlacklisted) return false
+      
+      // Validate custom claims
+      return payload.department === 'engineering' && 
+             payload.clearance_level >= 3
+    }
+  },
+  
+  // Rate limiting for auth endpoints
+  rateLimiting: {
+    enabled: true,
+    maxRequests: 100,
+    windowMs: 60000 // 1 minute
+  }
+}
+```
+
+### Testing Authorization
+
+```typescript
+// Test with valid token
+const response = await app.inject({
+  method: 'POST',
+  url: '/mcp',
+  headers: {
+    'Authorization': 'Bearer valid-jwt-token',
+    'Content-Type': 'application/json'
+  },
+  payload: {
+    jsonrpc: '2.0',
+    method: 'tools/list',
+    id: 1
+  }
+})
+
+// Test authorization failure
+const unauthorized = await app.inject({
+  method: 'POST',
+  url: '/mcp',
+  payload: { jsonrpc: '2.0', method: 'tools/list', id: 1 }
+})
+assert.strictEqual(unauthorized.statusCode, 401)
+```
+
 ## Authentication & Security
 
 The plugin implements comprehensive security measures to protect against common attacks and ensure safe operation with untrusted inputs.
 
 ### Security Features
 
+- **OAuth 2.1 Authorization**: Complete authorization framework with session management
 - **Input Sanitization**: Automatic sanitization of tool parameters and elicitation requests
 - **Schema Validation**: TypeBox-based validation with length and complexity limits
 - **Rate Limiting**: Built-in rate limiting capabilities for high-risk operations
@@ -956,6 +1356,29 @@ await app.register(import('@fastify/bearer-auth'), {
 - `capabilities`: MCP capabilities configuration
 - `instructions`: Optional server instructions
 - `enableSSE`: Enable Server-Sent Events support (default: false)
+- `authorization`: OAuth 2.1 authorization configuration (optional)
+  - `enabled`: Enable OAuth 2.1 authorization (default: false)
+  - `tokenValidation`: JWT token validation configuration
+    - `jwksUri`: JWKS endpoint URL for JWT signature verification
+    - `validateAudience`: Expected token audience(s)
+    - `validateIssuer`: Expected token issuer
+    - `customValidation`: Custom validation function
+    - `introspectionEndpoint`: Token introspection endpoint (alternative to JWT)
+    - `clientId`: OAuth client ID for introspection
+    - `clientSecret`: OAuth client secret for introspection
+  - `oauthClient`: OAuth 2.1 client configuration
+    - `clientId`: OAuth client identifier
+    - `clientSecret`: OAuth client secret
+    - `authorizationEndpoint`: Authorization server authorization endpoint
+    - `tokenEndpoint`: Authorization server token endpoint
+    - `redirectUri`: OAuth redirect URI
+    - `scopes`: Requested OAuth scopes
+    - `registrationEndpoint`: Dynamic client registration endpoint (optional)
+    - `usePKCE`: Enable PKCE (Proof Key for Code Exchange)
+  - `tokenRefresh`: Automatic token refresh configuration
+    - `checkIntervalMs`: Token refresh check interval
+    - `refreshBufferMinutes`: Minutes before expiry to refresh tokens
+    - `maxRetries`: Maximum refresh attempts
 - `redis`: Redis configuration for horizontal scaling (optional)
   - `host`: Redis server hostname
   - `port`: Redis server port
@@ -1019,6 +1442,13 @@ app.mcpAddPrompt(
 
 - `app.mcpBroadcastNotification(notification)`: Broadcast a notification to all connected SSE clients (works across Redis instances)
 - `app.mcpSendToSession(sessionId, message)`: Send a message/request to a specific SSE session (works across Redis instances)
+- `app.mcpSendToUser(userId, message)`: Send a message to all sessions for a specific user (authorization-aware)
+
+#### Authorization Functions
+
+- `app.tokenRefreshService`: Token refresh service instance for manual token refresh
+  - `refreshSessionToken(sessionId)`: Manually refresh token for a session
+  - `notifyTokenRefresh(sessionId, token, response)`: Send token refresh notification
 
 Handler functions are called when the corresponding MCP methods are invoked:
 - Tool handlers receive validated, typed arguments and return `CallToolResult`
@@ -1032,8 +1462,25 @@ The plugin exposes the following endpoints:
 - `POST /mcp`: Handles JSON-RPC 2.0 messages according to the MCP specification
   - Supports both regular JSON responses and SSE streams based on `Accept` header
   - Returns `Content-Type: application/json` or `Content-Type: text/event-stream`
+  - Authorization-aware when OAuth is enabled
 - `GET /mcp`: Long-lived SSE streams for server-initiated communication (when SSE is enabled)
   - Returns `Content-Type: text/event-stream` with periodic heartbeats
+  - Authorization-aware with user-specific session isolation
+
+### OAuth Endpoints (when authorization is enabled)
+
+- `GET /oauth/authorize`: Start OAuth authorization flow with PKCE
+- `POST /oauth/callback`: Handle authorization callback and exchange code for tokens
+- `POST /oauth/refresh`: Refresh access tokens using refresh tokens
+- `POST /oauth/validate`: Validate access tokens (JWT or introspection)
+- `GET /oauth/status`: Check current authorization status
+- `POST /oauth/logout`: Revoke tokens and end OAuth session
+- `POST /oauth/register`: Dynamic client registration (if enabled)
+
+### Well-Known Endpoints
+
+- `GET /.well-known/mcp-server`: Server metadata and capabilities (protected when authorization is enabled)
+- `GET /health`: Health check endpoint (always public)
 
 ## Supported MCP Methods
 

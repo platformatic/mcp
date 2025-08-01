@@ -11,7 +11,7 @@
     "lint": "eslint --cache",
     "lint:fix": "eslint --cache --fix",
     "typecheck": "tsc -p . --noEmit",
-    "test": "node --experimental-strip-types --no-warnings --test --test-concurrency=1 test/*.test.ts",
+    "test": "node --experimental-strip-types --no-warnings --test --test-timeout=30000 --test-concurrency=1 test/*.test.ts",
     "ci": "npm run build && npm run lint && npm run test",
     "start-demo": "node --watch examples/file-listing-server.ts | pino-pretty --colorize --translateTime 'SYS:standard' --ignore pid,hostname"
   },
@@ -45,11 +45,15 @@
     "undici": "^7.11.0"
   },
   "dependencies": {
+    "@fastify/jwt": "^9.1.0",
+    "@fastify/type-provider-typebox": "^5.2.0",
+    "fast-jwt": "^6.0.2",
     "fastify-plugin": "^5.0.1",
+    "get-jwks": "^11.0.1",
     "ioredis": "^5.0.0",
     "mqemitter": "^7.1.0",
-    "safe-stable-stringify": "^2.5.0",
-    "mqemitter-redis": "^7.1.0"
+    "mqemitter-redis": "^7.1.0",
+    "safe-stable-stringify": "^2.5.0"
   },
   "peerDependencies": {
     "@sinclair/typebox": "^0.34.0"

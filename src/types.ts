@@ -14,6 +14,7 @@ import type {
   RequestId
 } from './schema.ts'
 import type { Static, TSchema, TObject, TString } from '@sinclair/typebox'
+import type { AuthorizationConfig } from './types/auth-types.ts'
 
 // Generic handler types with TypeBox schema support
 export type ToolHandler<TSchema extends TObject = TObject> = (
@@ -133,6 +134,7 @@ export interface MCPPluginOptions {
     password?: string
     db?: number
   }
+  authorization?: AuthorizationConfig
 }
 
 export interface SSESession {
