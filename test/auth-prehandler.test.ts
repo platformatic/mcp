@@ -70,6 +70,27 @@ describe('Authorization PreHandler', () => {
     validator.close()
   })
 
+  test('should skip authorization for the start of the OAuth authorization flow', async (t: TestContext) => {
+    const config = createTestAuthConfig()
+    const validator = new TokenValidator(config, app)
+    const preHandler = createAuthPreHandler(config, validator)
+
+    app.addHook('preHandler', preHandler)
+    app.get('/oauth/authorize', async () => ({ success: true }))
+
+    await app.ready()
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/oauth/authorize'
+    })
+
+    t.assert.strictEqual(response.statusCode, 200)
+    t.assert.deepStrictEqual(response.json(), { success: true })
+
+    validator.close()
+  })
+
   test('should return 401 when no Authorization header', async (t: TestContext) => {
     const config = createTestAuthConfig()
     const validator = new TokenValidator(config, app)
