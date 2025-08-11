@@ -849,19 +849,18 @@ await app.register(mcpPlugin, {
   // Enable OAuth 2.1 authorization
   authorization: {
     enabled: true,
+    authorizationServers: ['https://auth.example.com'],
+    resourceUri: 'https://mcp.example.com',
     // JWT Token Validation
     tokenValidation: {
       jwksUri: 'https://auth.example.com/.well-known/jwks.json',
-      validateAudience: ['https://api.example.com'],
-      validateIssuer: 'https://auth.example.com'
+      validateAudience: true
     },
     // OAuth 2.1 Client Configuration
-    oauthClient: {
+    oauth2Client: {
       clientId: process.env.OAUTH_CLIENT_ID,
       clientSecret: process.env.OAUTH_CLIENT_SECRET,
-      authorizationEndpoint: 'https://auth.example.com/oauth/authorize',
-      tokenEndpoint: 'https://auth.example.com/oauth/token',
-      redirectUri: 'https://yourapp.com/oauth/callback',
+      authorizationServer: 'https://auth.example.com',
       scopes: ['read', 'write']
     }
   },
@@ -947,16 +946,7 @@ authorization: {
     jwksUri: 'https://auth.example.com/.well-known/jwks.json',
     
     // Validate token audience
-    validateAudience: ['https://api.example.com', 'mcp-server'],
-    
-    // Validate token issuer
-    validateIssuer: 'https://auth.example.com',
-    
-    // Optional: Custom validation function
-    customValidation: async (payload, token) => {
-      // Custom validation logic
-      return payload.sub && payload.scope?.includes('mcp:access')
-    }
+    validateAudience: true
   }
 }
 ```
@@ -980,23 +970,18 @@ authorization: {
 ```typescript
 authorization: {
   enabled: true,
-  oauthClient: {
+  oauth2Client: {
     clientId: process.env.OAUTH_CLIENT_ID,
     clientSecret: process.env.OAUTH_CLIENT_SECRET,
     
-    // Authorization server endpoints
-    authorizationEndpoint: 'https://auth.example.com/oauth/authorize',
-    tokenEndpoint: 'https://auth.example.com/oauth/token',
+    // Authorization server
+    authorizationServer: 'https://auth.example.com',
     
     // Application configuration
-    redirectUri: 'https://yourapp.com/oauth/callback',
     scopes: ['read', 'write', 'admin'],
     
     // Optional: Dynamic client registration
-    registrationEndpoint: 'https://auth.example.com/oauth/register',
-    
-    // PKCE configuration (recommended)
-    usePKCE: true
+    dynamicRegistration: true
   }
 }
 ```
@@ -1160,26 +1145,7 @@ authorization: {
   enabled: true,
   tokenValidation: {
     jwksUri: 'https://auth.company.com/.well-known/jwks.json',
-    validateAudience: ['https://mcp.company.com'],
-    validateIssuer: 'https://auth.company.com',
-    
-    // Custom security validation
-    customValidation: async (payload, token) => {
-      // Check token blacklist
-      const isBlacklisted = await checkTokenBlacklist(token)
-      if (isBlacklisted) return false
-      
-      // Validate custom claims
-      return payload.department === 'engineering' && 
-             payload.clearance_level >= 3
-    }
-  },
-  
-  // Rate limiting for auth endpoints
-  rateLimiting: {
-    enabled: true,
-    maxRequests: 100,
-    windowMs: 60000 // 1 minute
+    validateAudience: true
   }
 }
 ```
@@ -1358,23 +1324,19 @@ await app.register(import('@fastify/bearer-auth'), {
 - `enableSSE`: Enable Server-Sent Events support (default: false)
 - `authorization`: OAuth 2.1 authorization configuration (optional)
   - `enabled`: Enable OAuth 2.1 authorization (default: false)
+  - `authorizationServers`: Authorization server URIs
+  - `resourceUri`: Resource URI
   - `tokenValidation`: JWT token validation configuration
     - `jwksUri`: JWKS endpoint URL for JWT signature verification
-    - `validateAudience`: Expected token audience(s)
-    - `validateIssuer`: Expected token issuer
-    - `customValidation`: Custom validation function
+    - `validateAudience`: Enable audience validation
     - `introspectionEndpoint`: Token introspection endpoint (alternative to JWT)
-    - `clientId`: OAuth client ID for introspection
-    - `clientSecret`: OAuth client secret for introspection
-  - `oauthClient`: OAuth 2.1 client configuration
+  - `oauth2Client`: OAuth 2.1 client configuration
     - `clientId`: OAuth client identifier
     - `clientSecret`: OAuth client secret
-    - `authorizationEndpoint`: Authorization server authorization endpoint
-    - `tokenEndpoint`: Authorization server token endpoint
-    - `redirectUri`: OAuth redirect URI
+    - `authorizationServer`: Authorization server URI.
+    - `resourceUri`: Resource URI.
     - `scopes`: Requested OAuth scopes
-    - `registrationEndpoint`: Dynamic client registration endpoint (optional)
-    - `usePKCE`: Enable PKCE (Proof Key for Code Exchange)
+    - `dynamicRegistration`: Enable dynamic client registration (default: false)
   - `tokenRefresh`: Automatic token refresh configuration
     - `checkIntervalMs`: Token refresh check interval
     - `refreshBufferMinutes`: Minutes before expiry to refresh tokens
