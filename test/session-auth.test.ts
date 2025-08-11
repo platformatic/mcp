@@ -298,6 +298,45 @@ describe('Session-Based Authorization', () => {
       assert.strictEqual(body.message, 'public')
     })
 
+    test('should skip authorization for the start of the OAuth authorization flow', async (t) => {
+      const fastify = Fastify()
+      t.after(async () => {
+        await fastify.close()
+      })
+
+      const config = {
+        enabled: true,
+        authorizationServers: ['https://auth.example.com'],
+        resourceUri: 'https://api.example.com',
+        tokenValidation: {
+          jwksUri: 'https://auth.example.com/.well-known/jwks.json',
+          validateAudience: true
+        }
+      }
+
+      const sessionStore = new MemorySessionStore(100)
+      const tokenValidator = new TokenValidator(config, fastify)
+
+      const preHandler = createSessionAuthPreHandler({
+        config,
+        tokenValidator,
+        sessionStore
+      })
+
+      fastify.addHook('preHandler', preHandler)
+      fastify.get('/oauth/authorize', async () => ({ message: 'public' }))
+
+      // Should work without authorization
+      const response = await fastify.inject({
+        method: 'GET',
+        url: '/oauth/authorize'
+      })
+
+      assert.strictEqual(response.statusCode, 200)
+      const body = JSON.parse(response.body)
+      assert.strictEqual(body.message, 'public')
+    })
+
     test('should handle invalid bearer token format', async (t) => {
       const fastify = Fastify()
       t.after(async () => {
