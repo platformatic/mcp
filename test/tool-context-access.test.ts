@@ -72,7 +72,8 @@ describe('Tool Context Access', () => {
       t.assert.strictEqual(capturedRequest.headers['x-custom-header'], 'test-value', 'Custom headers should be accessible')
 
       // Check that the result contains the expected content
-      t.assert.ok(result.content[0].text.includes('/mcp?test=true'), 'Result should contain request URL')
+      const textContent = result.content[0] as { type: 'text', text: string }
+      t.assert.ok(textContent.text.includes('/mcp?test=true'), 'Result should contain request URL')
     })
 
     test('should provide access to request query parameters in tool handler', async (t: TestContext) => {
@@ -285,7 +286,8 @@ describe('Tool Context Access', () => {
       t.assert.strictEqual(response.statusCode, 200)
       const body = response.json() as JSONRPCResponse
       const result = body.result as CallToolResult
-      t.assert.strictEqual(result.content[0].text, 'Echo: Hello World', 'Traditional handler should still work')
+      const textContent = result.content[0] as { type: 'text', text: string }
+      t.assert.strictEqual(textContent.text, 'Echo: Hello World', 'Traditional handler should still work')
     })
 
     test('should work with tool handlers that use only sessionId context', async (t: TestContext) => {
@@ -334,7 +336,8 @@ describe('Tool Context Access', () => {
       t.assert.strictEqual(response.statusCode, 200)
       const body = response.json() as JSONRPCResponse
       const result = body.result as CallToolResult
-      t.assert.ok(result.content[0].text.includes('test-session-123'), 'SessionId should still be accessible')
+      const textContent = result.content[0] as { type: 'text', text: string }
+      t.assert.ok(textContent.text.includes('test-session-123'), 'SessionId should still be accessible')
     })
   })
 
@@ -397,7 +400,7 @@ describe('Tool Context Access', () => {
     })
   })
 
-  describe('Resource Context Access', () => {
+  describe('Resource Handler Context Access', () => {
     test('should pass Fastify request/reply context to resource handler', async (t: TestContext) => {
       const app = Fastify()
       t.after(() => app.close())
@@ -515,7 +518,7 @@ describe('Tool Context Access', () => {
     })
   })
 
-  describe('Prompt Context Access', () => {
+  describe('Prompt Handler Context Access', () => {
     test('should pass Fastify request/reply context to prompt handler', async (t: TestContext) => {
       const app = Fastify()
       t.after(() => app.close())

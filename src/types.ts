@@ -14,23 +14,31 @@ import type {
   RequestId
 } from './schema.ts'
 import type { Static, TSchema, TObject, TString } from '@sinclair/typebox'
-import type { AuthorizationConfig } from './types/auth-types.ts'
+import type { AuthorizationConfig, AuthorizationContext } from './types/auth-types.ts'
+
+// Context interface for all handler types
+export interface HandlerContext {
+  sessionId?: string
+  request?: FastifyRequest
+  reply?: FastifyReply
+  authContext?: AuthorizationContext
+}
 
 // Generic handler types with TypeBox schema support
 export type ToolHandler<TSchema extends TObject = TObject> = (
   params: Static<TSchema>,
-  context?: { sessionId?: string; request?: FastifyRequest; reply?: FastifyReply }
+  context?: HandlerContext
 ) => Promise<CallToolResult> | CallToolResult
 
 export type ResourceHandler<TUriSchema extends TSchema = TString> = (
   uri: Static<TUriSchema>,
-  context?: { sessionId?: string; request?: FastifyRequest; reply?: FastifyReply }
+  context?: HandlerContext
 ) => Promise<ReadResourceResult> | ReadResourceResult
 
 export type PromptHandler<TArgsSchema extends TObject = TObject> = (
   name: string,
   args: Static<TArgsSchema>,
-  context?: { sessionId?: string; request?: FastifyRequest; reply?: FastifyReply }
+  context?: HandlerContext
 ) => Promise<GetPromptResult> | GetPromptResult
 
 // Generic MCP interfaces with TypeBox schema support
@@ -103,9 +111,9 @@ declare module 'fastify' {
 }
 
 // Unsafe handler types for backward compatibility
-export type UnsafeToolHandler = (params: any, context?: { sessionId?: string; request?: FastifyRequest; reply?: FastifyReply }) => Promise<CallToolResult> | CallToolResult
-export type UnsafeResourceHandler = (uri: string, context?: { sessionId?: string; request?: FastifyRequest; reply?: FastifyReply }) => Promise<ReadResourceResult> | ReadResourceResult
-export type UnsafePromptHandler = (name: string, args?: any, context?: { sessionId?: string; request?: FastifyRequest; reply?: FastifyReply }) => Promise<GetPromptResult> | GetPromptResult
+export type UnsafeToolHandler = (params: any, context?: HandlerContext) => Promise<CallToolResult> | CallToolResult
+export type UnsafeResourceHandler = (uri: string, context?: HandlerContext) => Promise<ReadResourceResult> | ReadResourceResult
+export type UnsafePromptHandler = (name: string, args?: any, context?: HandlerContext) => Promise<GetPromptResult> | GetPromptResult
 
 // Unsafe interfaces for backward compatibility
 export interface UnsafeMCPTool {
