@@ -1440,7 +1440,9 @@ app.mcpAddPrompt(
 
 #### HTTP Context Access in Tool Handlers
 
-Tool handlers can access the Fastify request and reply objects through the context parameter, enabling tools to interact with HTTP-specific features like headers, query parameters, and custom response headers.
+Tool handlers can access the Fastify request and reply objects through the context parameter, enabling tools to interact with HTTP-specific features like headers, query parameters, and custom response headers. 
+
+**Enhanced in v1.1.0**: The request and reply objects are now consistently provided across all communication modes (HTTP, SSE, and STDIO), ensuring handlers always have access to HTTP context regardless of how they're invoked.
 
 ```typescript
 app.mcpAddTool({
@@ -1451,15 +1453,13 @@ app.mcpAddTool({
   })
 }, async (params, context) => {
   // Access request information
-  const userAgent = context?.request?.headers['user-agent']
-  const queryParams = context?.request?.query
-  const requestUrl = context?.request?.url
+  const userAgent = context.request.headers['user-agent']
+  const queryParams = context.request.query
+  const requestUrl = context.request.url
   
   // Set custom response headers
-  if (context?.reply) {
-    context.reply.header('x-processed-by', 'mcp-tool')
-    context.reply.header('x-request-id', Date.now().toString())
-  }
+  context.reply.header('x-processed-by', 'mcp-tool')
+  context.reply.header('x-request-id', Date.now().toString())
   
   return {
     content: [{
@@ -1471,6 +1471,8 @@ app.mcpAddTool({
 ```
 
 #### Available Context Properties
+
+All handlers receive a consistent context object containing:
 
 - `context.request`: Full Fastify request object with access to:
   - `headers`: HTTP request headers
@@ -1485,7 +1487,7 @@ app.mcpAddTool({
 
 #### Backward Compatibility
 
-The context parameter is always provided to handlers. The request and reply objects are optional properties within the context:
+The context parameter is always provided to handlers. The request and reply objects are now consistently provided in all communication modes (HTTP, SSE, and STDIO):
 
 ```typescript
 // Existing handler (still works)
@@ -1519,7 +1521,7 @@ app.mcpAddResource({
   uriPattern: 'context://data/{id}'
 }, async (uri, context) => {
   // Access request information
-  const userAgent = context?.request?.headers['user-agent']
+  const userAgent = context.request.headers['user-agent']
   const authUser = context?.authContext?.userId
   
   return {
@@ -1571,15 +1573,15 @@ All MCP handlers follow a consistent pattern where the context parameter is alwa
 // HandlerContext interface (available to all handlers)
 interface HandlerContext {
   sessionId?: string              // Session identifier (SSE mode)
-  request?: FastifyRequest        // HTTP request object
-  reply?: FastifyReply           // HTTP reply object
+  request: FastifyRequest         // HTTP request object
+  reply: FastifyReply            // HTTP reply object
   authContext?: AuthorizationContext  // OAuth authorization data
 }
 
 // Normalized handler signatures
-type ToolHandler = (params: any, context?: HandlerContext) => Promise<CallToolResult>
-type ResourceHandler = (uri: string, context?: HandlerContext) => Promise<ReadResourceResult>
-type PromptHandler = (name: string, args: any, context?: HandlerContext) => Promise<GetPromptResult>
+type ToolHandler = (params: any, context: HandlerContext) => Promise<CallToolResult>
+type ResourceHandler = (uri: string, context: HandlerContext) => Promise<ReadResourceResult>
+type PromptHandler = (name: string, args: any, context: HandlerContext) => Promise<GetPromptResult>
 ```
 
 **Handler Invocation Summary:**
