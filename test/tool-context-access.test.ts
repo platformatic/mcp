@@ -68,7 +68,7 @@ describe('Tool Context Access', () => {
       t.assert.strictEqual(capturedRequest.url, '/mcp?test=true', 'Request URL should be accessible')
       t.assert.strictEqual(capturedRequest.headers['user-agent'], 'test-agent', 'Request headers should be accessible')
       t.assert.strictEqual(capturedRequest.headers['x-custom-header'], 'test-value', 'Custom headers should be accessible')
-      
+
       // Check that the result contains the expected content
       t.assert.ok(result.content[0].text.includes('/mcp?test=true'), 'Result should contain request URL')
     })
@@ -141,7 +141,7 @@ describe('Tool Context Access', () => {
         }
       }, async (params, context) => {
         capturedReply = context?.reply
-        
+
         // Test that we can set a custom header via reply
         if (context?.reply) {
           context.reply.header('x-tool-processed', 'true')
@@ -385,10 +385,10 @@ describe('Tool Context Access', () => {
 
       t.assert.strictEqual(response.statusCode, 200)
       t.assert.strictEqual(response.headers['content-type'], 'text/event-stream')
-      
+
       // For SSE, we need to clean up the stream
       response.stream().destroy()
-      
+
       // The request should have been captured during the tool execution
       t.assert.ok(capturedRequest, 'Request should be accessible in SSE mode')
       t.assert.ok(capturedRequest.url.includes('sse=test'), 'Request URL should be accessible in SSE mode')
