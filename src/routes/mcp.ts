@@ -197,7 +197,9 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
           serverInfo,
           tools,
           resources,
-          prompts
+          prompts,
+          request,
+          reply
         })
         if (response) {
           // Send the SSE event but keep the stream open
@@ -222,7 +224,9 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
           serverInfo,
           tools,
           resources,
-          prompts
+          prompts,
+          request,
+          reply
         })
         if (response) {
           reply.send(response)

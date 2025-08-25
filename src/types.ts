@@ -1,4 +1,4 @@
-import type { FastifyReply } from 'fastify'
+import type { FastifyReply, FastifyRequest } from 'fastify'
 import type {
   JSONRPCMessage,
   JSONRPCNotification,
@@ -19,7 +19,7 @@ import type { AuthorizationConfig } from './types/auth-types.ts'
 // Generic handler types with TypeBox schema support
 export type ToolHandler<TSchema extends TObject = TObject> = (
   params: Static<TSchema>,
-  context?: { sessionId?: string }
+  context?: { sessionId?: string; request?: FastifyRequest; reply?: FastifyReply }
 ) => Promise<CallToolResult> | CallToolResult
 
 export type ResourceHandler<TUriSchema extends TSchema = TString> = (
@@ -101,7 +101,7 @@ declare module 'fastify' {
 }
 
 // Unsafe handler types for backward compatibility
-export type UnsafeToolHandler = (params: any, context?: { sessionId?: string }) => Promise<CallToolResult> | CallToolResult
+export type UnsafeToolHandler = (params: any, context?: { sessionId?: string; request?: FastifyRequest; reply?: FastifyReply }) => Promise<CallToolResult> | CallToolResult
 export type UnsafeResourceHandler = (uri: string) => Promise<ReadResourceResult> | ReadResourceResult
 export type UnsafePromptHandler = (name: string, args?: any) => Promise<GetPromptResult> | GetPromptResult
 

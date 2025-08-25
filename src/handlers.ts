@@ -1,4 +1,4 @@
-import type { FastifyInstance } from 'fastify'
+import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify'
 import type {
   JSONRPCMessage,
   JSONRPCRequest,
@@ -35,6 +35,8 @@ type HandlerDependencies = {
   tools: Map<string, MCPTool>
   resources: Map<string, MCPResource>
   prompts: Map<string, MCPPrompt>
+  request?: FastifyRequest
+  reply?: FastifyReply
 }
 
 export function createResponse (id: string | number, result: any): JSONRPCResponse {
@@ -186,7 +188,7 @@ async function handleToolsCall (
 
       // Use validated arguments
       try {
-        const result = await tool.handler(argumentsValidation.data, { sessionId })
+        const result = await tool.handler(argumentsValidation.data, { sessionId, request: dependencies.request, reply: dependencies.reply })
         return createResponse(request.id, result)
       } catch (error: any) {
         const result: CallToolResult = {
@@ -201,7 +203,7 @@ async function handleToolsCall (
     } else {
       // Regular JSON Schema - basic validation or pass through
       try {
-        const result = await tool.handler(toolArguments, { sessionId })
+        const result = await tool.handler(toolArguments, { sessionId, request: dependencies.request, reply: dependencies.reply })
         return createResponse(request.id, result)
       } catch (error: any) {
         const result: CallToolResult = {
