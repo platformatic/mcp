@@ -1396,13 +1396,23 @@ The plugin adds the following decorators to your Fastify instance:
 // With TypeBox schema (recommended)
 app.mcpAddTool<TSchema extends TObject>(
   definition: { name: string, description: string, inputSchema: TSchema },
-  handler?: (params: Static<TSchema>, context?: { sessionId?: string }) => Promise<CallToolResult>
+  handler?: (params: Static<TSchema>, context?: { 
+    sessionId?: string,
+    request?: FastifyRequest,
+    reply?: FastifyReply,
+    authContext?: AuthorizationContext
+  }) => Promise<CallToolResult>
 )
 
 // Without schema (unsafe)
 app.mcpAddTool(
   definition: { name: string, description: string },
-  handler?: (params: any, context?: { sessionId?: string }) => Promise<CallToolResult>
+  handler?: (params: any, context?: { 
+    sessionId?: string,
+    request?: FastifyRequest,
+    reply?: FastifyReply,
+    authContext?: AuthorizationContext
+  }) => Promise<CallToolResult>
 )
 ```
 
@@ -1438,7 +1448,76 @@ app.mcpAddPrompt(
 )
 ```
 
-#### Messaging Functions
+#### HTTP Context Access in Tool Handlers
+
+Tool handlers can access the Fastify request and reply objects through the context parameter, enabling tools to interact with HTTP-specific features like headers, query parameters, and custom response headers.
+
+```typescript
+app.mcpAddTool({
+  name: 'context-aware-tool',
+  description: 'Tool that uses HTTP context',
+  inputSchema: Type.Object({
+    message: Type.String()
+  })
+}, async (params, context) => {
+  // Access request information
+  const userAgent = context?.request?.headers['user-agent']
+  const queryParams = context?.request?.query
+  const requestUrl = context?.request?.url
+  
+  // Set custom response headers
+  if (context?.reply) {
+    context.reply.header('x-processed-by', 'mcp-tool')
+    context.reply.header('x-request-id', Date.now().toString())
+  }
+  
+  return {
+    content: [{
+      type: 'text',
+      text: `Processed "${params.message}" from ${userAgent || 'unknown client'}`
+    }]
+  }
+})
+```
+
+#### Available Context Properties
+
+- `context.request`: Full Fastify request object with access to:
+  - `headers`: HTTP request headers
+  - `query`: Query string parameters
+  - `params`: Route parameters
+  - `url`: Request URL
+  - `method`: HTTP method
+  - `body`: Request body (when applicable)
+- `context.reply`: Fastify reply object for setting response headers
+- `context.sessionId`: Session identifier (when using SSE)
+- `context.authContext`: Authorization context (when OAuth is enabled)
+
+#### Backward Compatibility
+
+Existing tool handlers continue to work unchanged. The request and reply objects are optional in the context parameter:
+
+```typescript
+// Existing handler (still works)
+app.mcpAddTool({
+  name: 'legacy-tool',
+  description: 'Works as before',
+  inputSchema: Type.Object({ msg: Type.String() })
+}, async (params) => {
+  return { content: [{ type: 'text', text: params.msg }] }
+})
+
+// Handler using only sessionId (still works)
+app.mcpAddTool({
+  name: 'session-tool',
+  description: 'Uses session ID only',
+  inputSchema: Type.Object({})
+}, async (params, { sessionId }) => {
+  return { content: [{ type: 'text', text: `Session: ${sessionId}` }] }
+})
+```
+
+### Messaging Functions
 
 - `app.mcpBroadcastNotification(notification)`: Broadcast a notification to all connected SSE clients (works across Redis instances)
 - `app.mcpSendToSession(sessionId, message)`: Send a message/request to a specific SSE session (works across Redis instances)
