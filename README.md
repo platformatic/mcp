@@ -1396,13 +1396,13 @@ The plugin adds the following decorators to your Fastify instance:
 // With TypeBox schema (recommended)
 app.mcpAddTool<TSchema extends TObject>(
   definition: { name: string, description: string, inputSchema: TSchema },
-  handler?: (params: Static<TSchema>, context?: HandlerContext) => Promise<CallToolResult>
+  handler?: (params: Static<TSchema>, context: HandlerContext) => Promise<CallToolResult>
 )
 
 // Without schema (unsafe)
 app.mcpAddTool(
   definition: { name: string, description: string },
-  handler?: (params: any, context?: HandlerContext) => Promise<CallToolResult>
+  handler?: (params: any, context: HandlerContext) => Promise<CallToolResult>
 )
 ```
 
@@ -1412,13 +1412,13 @@ app.mcpAddTool(
 // With URI schema
 app.mcpAddResource<TUriSchema extends TSchema>(
   definition: { uriPattern: string, name: string, description: string, uriSchema?: TUriSchema },
-  handler?: (uri: Static<TUriSchema>, context?: HandlerContext) => Promise<ReadResourceResult>
+  handler?: (uri: Static<TUriSchema>, context: HandlerContext) => Promise<ReadResourceResult>
 )
 
 // Without schema
 app.mcpAddResource(
   definition: { uriPattern: string, name: string, description: string },
-  handler?: (uri: string, context?: HandlerContext) => Promise<ReadResourceResult>
+  handler?: (uri: string, context: HandlerContext) => Promise<ReadResourceResult>
 )
 ```
 
@@ -1428,13 +1428,13 @@ app.mcpAddResource(
 // With argument schema (automatically generates arguments array)
 app.mcpAddPrompt<TArgsSchema extends TObject>(
   definition: { name: string, description: string, argumentSchema?: TArgsSchema },
-  handler?: (name: string, args: Static<TArgsSchema>, context?: HandlerContext) => Promise<GetPromptResult>
+  handler?: (name: string, args: Static<TArgsSchema>, context: HandlerContext) => Promise<GetPromptResult>
 )
 
 // Without schema
 app.mcpAddPrompt(
   definition: { name: string, description: string, arguments?: PromptArgument[] },
-  handler?: (name: string, args: any, context?: HandlerContext) => Promise<GetPromptResult>
+  handler?: (name: string, args: any, context: HandlerContext) => Promise<GetPromptResult>
 )
 ```
 
@@ -1485,7 +1485,7 @@ app.mcpAddTool({
 
 #### Backward Compatibility
 
-Existing tool handlers continue to work unchanged. The request and reply objects are optional in the context parameter:
+The context parameter is always provided to handlers. The request and reply objects are optional properties within the context:
 
 ```typescript
 // Existing handler (still works)
@@ -1565,7 +1565,7 @@ app.mcpAddPrompt({
 
 ## Handler API Reference
 
-All MCP handlers follow a consistent pattern where the context parameter is always optional and available as the final parameter:
+All MCP handlers follow a consistent pattern where the context parameter is always provided as the final parameter:
 
 ```typescript
 // HandlerContext interface (available to all handlers)
