@@ -36,8 +36,8 @@ type HandlerDependencies = {
   tools: Map<string, MCPTool>
   resources: Map<string, MCPResource>
   prompts: Map<string, MCPPrompt>
-  request?: FastifyRequest
-  reply?: FastifyReply
+  request: FastifyRequest
+  reply: FastifyReply
   authContext?: AuthorizationContext
 }
 

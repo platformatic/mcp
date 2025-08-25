@@ -19,8 +19,8 @@ import type { AuthorizationConfig, AuthorizationContext } from './types/auth-typ
 // Context interface for all handler types
 export interface HandlerContext {
   sessionId?: string
-  request?: FastifyRequest
-  reply?: FastifyReply
+  request: FastifyRequest
+  reply: FastifyReply
   authContext?: AuthorizationContext
 }
 
