@@ -23,12 +23,14 @@ export type ToolHandler<TSchema extends TObject = TObject> = (
 ) => Promise<CallToolResult> | CallToolResult
 
 export type ResourceHandler<TUriSchema extends TSchema = TString> = (
-  uri: Static<TUriSchema>
+  uri: Static<TUriSchema>,
+  context?: { sessionId?: string; request?: FastifyRequest; reply?: FastifyReply }
 ) => Promise<ReadResourceResult> | ReadResourceResult
 
 export type PromptHandler<TArgsSchema extends TObject = TObject> = (
   name: string,
-  args: Static<TArgsSchema>
+  args: Static<TArgsSchema>,
+  context?: { sessionId?: string; request?: FastifyRequest; reply?: FastifyReply }
 ) => Promise<GetPromptResult> | GetPromptResult
 
 // Generic MCP interfaces with TypeBox schema support
@@ -102,8 +104,8 @@ declare module 'fastify' {
 
 // Unsafe handler types for backward compatibility
 export type UnsafeToolHandler = (params: any, context?: { sessionId?: string; request?: FastifyRequest; reply?: FastifyReply }) => Promise<CallToolResult> | CallToolResult
-export type UnsafeResourceHandler = (uri: string) => Promise<ReadResourceResult> | ReadResourceResult
-export type UnsafePromptHandler = (name: string, args?: any) => Promise<GetPromptResult> | GetPromptResult
+export type UnsafeResourceHandler = (uri: string, context?: { sessionId?: string; request?: FastifyRequest; reply?: FastifyReply }) => Promise<ReadResourceResult> | ReadResourceResult
+export type UnsafePromptHandler = (name: string, args?: any, context?: { sessionId?: string; request?: FastifyRequest; reply?: FastifyReply }) => Promise<GetPromptResult> | GetPromptResult
 
 // Unsafe interfaces for backward compatibility
 export interface UnsafeMCPTool {

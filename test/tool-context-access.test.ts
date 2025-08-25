@@ -5,7 +5,9 @@ import mcpPlugin from '../src/index.ts'
 import type {
   JSONRPCRequest,
   JSONRPCResponse,
-  CallToolResult
+  CallToolResult,
+  ReadResourceResult,
+  GetPromptResult
 } from '../src/schema.ts'
 import { JSONRPC_VERSION } from '../src/schema.ts'
 
@@ -392,6 +394,265 @@ describe('Tool Context Access', () => {
       // The request should have been captured during the tool execution
       t.assert.ok(capturedRequest, 'Request should be accessible in SSE mode')
       t.assert.ok(capturedRequest.url.includes('sse=test'), 'Request URL should be accessible in SSE mode')
+    })
+  })
+
+  describe('Resource Context Access', () => {
+    test('should pass Fastify request/reply context to resource handler', async (t: TestContext) => {
+      const app = Fastify()
+      t.after(() => app.close())
+
+      await app.register(mcpPlugin)
+      await app.ready()
+
+      let capturedContext: any = null
+
+      // Register a resource that captures the context
+      app.mcpAddResource({
+        uri: 'test://resource',
+        name: 'Test Resource',
+        description: 'Resource that captures HTTP context'
+      }, async (uri, context) => {
+        capturedContext = context
+
+        const userAgent = context?.request?.headers['user-agent'] || 'unknown'
+        const queryParam = context?.request?.query?.test || 'none'
+
+        if (context?.reply) {
+          context.reply.header('x-resource-processed', 'true')
+        }
+
+        return {
+          contents: [{
+            uri,
+            text: `Resource processed by ${userAgent}, query: ${queryParam}`,
+            mimeType: 'text/plain'
+          }]
+        }
+      })
+
+      const request: JSONRPCRequest = {
+        jsonrpc: JSONRPC_VERSION,
+        id: 1,
+        method: 'resources/read',
+        params: {
+          uri: 'test://resource'
+        }
+      }
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/mcp?test=resource',
+        headers: {
+          'user-agent': 'test-resource-agent',
+          'x-custom-header': 'resource-value',
+          'content-type': 'application/json'
+        },
+        payload: request
+      })
+
+      t.assert.strictEqual(response.statusCode, 200)
+      t.assert.strictEqual(response.headers['x-resource-processed'], 'true')
+
+      const body = response.json() as JSONRPCResponse
+      const result = body.result as ReadResourceResult
+
+      // Verify context was passed correctly
+      t.assert.ok(capturedContext, 'Context should be passed to resource handler')
+      t.assert.ok(capturedContext.request, 'Request object should be available')
+      t.assert.ok(capturedContext.reply, 'Reply object should be available')
+      t.assert.strictEqual(capturedContext.request.headers['user-agent'], 'test-resource-agent')
+      t.assert.strictEqual(capturedContext.request.query.test, 'resource')
+
+      // Verify result content
+      t.assert.ok(result.contents[0].text.includes('test-resource-agent'))
+      t.assert.ok(result.contents[0].text.includes('query: resource'))
+    })
+
+    test('should work without context parameter in resource handler (backward compatibility)', async (t: TestContext) => {
+      const app = Fastify()
+      t.after(() => app.close())
+
+      await app.register(mcpPlugin)
+      await app.ready()
+
+      // Register a resource handler that doesn't use context (legacy style)
+      app.mcpAddResource({
+        uri: 'test://legacy-resource',
+        name: 'Legacy Resource',
+        description: 'Resource without context parameter'
+      }, async (uri) => {
+        return {
+          contents: [{
+            uri,
+            text: 'Legacy resource content',
+            mimeType: 'text/plain'
+          }]
+        }
+      })
+
+      const request: JSONRPCRequest = {
+        jsonrpc: JSONRPC_VERSION,
+        id: 1,
+        method: 'resources/read',
+        params: {
+          uri: 'test://legacy-resource'
+        }
+      }
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/mcp',
+        headers: { 'content-type': 'application/json' },
+        payload: request
+      })
+
+      t.assert.strictEqual(response.statusCode, 200)
+
+      const body = response.json() as JSONRPCResponse
+      const result = body.result as ReadResourceResult
+      t.assert.strictEqual(result.contents[0].text, 'Legacy resource content')
+    })
+  })
+
+  describe('Prompt Context Access', () => {
+    test('should pass Fastify request/reply context to prompt handler', async (t: TestContext) => {
+      const app = Fastify()
+      t.after(() => app.close())
+
+      await app.register(mcpPlugin)
+      await app.ready()
+
+      let capturedContext: any = null
+
+      // Register a prompt that captures the context
+      app.mcpAddPrompt({
+        name: 'context-prompt',
+        description: 'Prompt that captures HTTP context',
+        arguments: [{
+          name: 'topic',
+          description: 'Discussion topic',
+          required: true
+        }]
+      }, async (name, args, context) => {
+        capturedContext = context
+
+        const userAgent = context?.request?.headers['user-agent'] || 'unknown'
+        const queryParam = context?.request?.query?.mode || 'default'
+
+        if (context?.reply) {
+          context.reply.header('x-prompt-processed', 'true')
+        }
+
+        return {
+          messages: [{
+            role: 'user',
+            content: {
+              type: 'text',
+              text: `Discuss ${args.topic} (requested by ${userAgent} in ${queryParam} mode)`
+            }
+          }]
+        }
+      })
+
+      const request: JSONRPCRequest = {
+        jsonrpc: JSONRPC_VERSION,
+        id: 1,
+        method: 'prompts/get',
+        params: {
+          name: 'context-prompt',
+          arguments: {
+            topic: 'AI development'
+          }
+        }
+      }
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/mcp?mode=advanced',
+        headers: {
+          'user-agent': 'test-prompt-agent',
+          'content-type': 'application/json'
+        },
+        payload: request
+      })
+
+      t.assert.strictEqual(response.statusCode, 200)
+      t.assert.strictEqual(response.headers['x-prompt-processed'], 'true')
+
+      const body = response.json() as JSONRPCResponse
+      const result = body.result as GetPromptResult
+
+      // Verify context was passed correctly
+      t.assert.ok(capturedContext, 'Context should be passed to prompt handler')
+      t.assert.ok(capturedContext.request, 'Request object should be available')
+      t.assert.ok(capturedContext.reply, 'Reply object should be available')
+      t.assert.strictEqual(capturedContext.request.headers['user-agent'], 'test-prompt-agent')
+      t.assert.strictEqual(capturedContext.request.query.mode, 'advanced')
+
+      // Verify result content
+      t.assert.strictEqual(result.messages[0].content.type, 'text')
+      if (result.messages[0].content.type === 'text') {
+        t.assert.ok(result.messages[0].content.text.includes('test-prompt-agent'))
+        t.assert.ok(result.messages[0].content.text.includes('advanced mode'))
+      }
+    })
+
+    test('should work without context parameter in prompt handler (backward compatibility)', async (t: TestContext) => {
+      const app = Fastify()
+      t.after(() => app.close())
+
+      await app.register(mcpPlugin)
+      await app.ready()
+
+      // Register a prompt handler that doesn't use context (legacy style)
+      app.mcpAddPrompt({
+        name: 'legacy-prompt',
+        description: 'Prompt without context parameter',
+        arguments: [{
+          name: 'message',
+          description: 'Message to include',
+          required: true
+        }]
+      }, async (name, args) => {
+        return {
+          messages: [{
+            role: 'user',
+            content: {
+              type: 'text',
+              text: `Legacy prompt: ${args.message}`
+            }
+          }]
+        }
+      })
+
+      const request: JSONRPCRequest = {
+        jsonrpc: JSONRPC_VERSION,
+        id: 1,
+        method: 'prompts/get',
+        params: {
+          name: 'legacy-prompt',
+          arguments: {
+            message: 'Hello World'
+          }
+        }
+      }
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/mcp',
+        headers: { 'content-type': 'application/json' },
+        payload: request
+      })
+
+      t.assert.strictEqual(response.statusCode, 200)
+
+      const body = response.json() as JSONRPCResponse
+      const result = body.result as GetPromptResult
+      t.assert.strictEqual(result.messages[0].content.type, 'text')
+      if (result.messages[0].content.type === 'text') {
+        t.assert.strictEqual(result.messages[0].content.text, 'Legacy prompt: Hello World')
+      }
     })
   })
 })
