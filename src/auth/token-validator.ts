@@ -13,6 +13,11 @@ export class TokenValidator {
     this.config = config
     this.fastify = fastify
 
+    // Early return if authorization is disabled - no need to set up JWT validation
+    if (!config.enabled) {
+      return
+    }
+
     if (config.tokenValidation.jwksUri) {
       // Extract domain from JWKS URI
       const jwksUrl = new URL(config.tokenValidation.jwksUri)
@@ -40,6 +45,10 @@ export class TokenValidator {
   }
 
   async validateToken (token: string): Promise<TokenValidationResult> {
+    if (!this.config.enabled) {
+      return { valid: false, error: 'Authorization is disabled' }
+    }
+
     try {
       // Try JWT validation first if JWKS is configured
       if (this.jwtVerifier) {
@@ -84,7 +93,7 @@ export class TokenValidator {
   }
 
   private validateAudience (payload: any): boolean {
-    if (!payload.aud) {
+    if (!this.config.enabled || !payload.aud) {
       return false
     }
 
@@ -93,7 +102,7 @@ export class TokenValidator {
   }
 
   private async introspectToken (token: string): Promise<TokenValidationResult> {
-    if (!this.config.tokenValidation.introspectionEndpoint) {
+    if (!this.config.enabled || !this.config.tokenValidation.introspectionEndpoint) {
       return {
         valid: false,
         error: 'No introspection endpoint configured'
@@ -153,6 +162,9 @@ export class TokenValidator {
   }
 
   private validateIntrospectionAudience (aud: string | string[]): boolean {
+    if (!this.config.enabled) {
+      return false
+    }
     const audiences = Array.isArray(aud) ? aud : [aud]
     return audiences.includes(this.config.resourceUri)
   }

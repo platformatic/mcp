@@ -35,7 +35,7 @@ describe('Token Refresh Service Coordination', () => {
 
       // Mock OAuth client that records which instance calls it
       const mockOAuthClient = {
-        refreshToken: async (refreshToken: string) => {
+        refreshToken: async (_refreshToken: string) => {
           return {
             access_token: 'new-access-token',
             token_type: 'Bearer',

@@ -9,7 +9,7 @@ import { hashToken } from '../src/auth/token-utils.ts'
 
 describe('Token Refresh Service', () => {
   describe('TokenRefreshService', () => {
-    test('should create token refresh service', (t) => {
+    test('should create token refresh service', () => {
       const sessionStore = new MemorySessionStore(100)
       const messageBroker = new MemoryMessageBroker()
 
@@ -46,7 +46,7 @@ describe('Token Refresh Service', () => {
       service.stop()
     })
 
-    test('should handle manual token refresh', async (t) => {
+    test('should handle manual token refresh', async (_t) => {
       const sessionStore = new MemorySessionStore(100)
       const messageBroker = new MemoryMessageBroker()
 
@@ -111,7 +111,7 @@ describe('Token Refresh Service', () => {
       assert.ok(updatedSession.authorization.expiresAt > new Date(Date.now() + 3000000)) // Should be much later
     })
 
-    test('should not refresh token when not needed', async (t) => {
+    test('should not refresh token when not needed', async (_t) => {
       const sessionStore = new MemorySessionStore(100)
       const messageBroker = new MemoryMessageBroker()
 
@@ -160,7 +160,7 @@ describe('Token Refresh Service', () => {
       assert.strictEqual(result, false)
     })
 
-    test('should handle refresh failure and increment attempts', async (t) => {
+    test('should handle refresh failure and increment attempts', async (_t) => {
       const sessionStore = new MemorySessionStore(100)
       const messageBroker = new MemoryMessageBroker()
 
@@ -219,7 +219,7 @@ describe('Token Refresh Service', () => {
       assert.strictEqual(updatedSession.tokenRefresh.refreshAttempts, 1)
     })
 
-    test('should not refresh when too many attempts have been made', async (t) => {
+    test('should not refresh when too many attempts have been made', async (_t) => {
       const sessionStore = new MemorySessionStore(100)
       const messageBroker = new MemoryMessageBroker()
 
@@ -268,7 +268,7 @@ describe('Token Refresh Service', () => {
       assert.strictEqual(result, false)
     })
 
-    test('should send token refresh notification', async (t) => {
+    test('should send token refresh notification', async (_t) => {
       const sessionStore = new MemorySessionStore(100)
       const messageBroker = new MemoryMessageBroker()
 
@@ -308,7 +308,7 @@ describe('Token Refresh Service', () => {
       assert.strictEqual(receivedMessage.params.expires_in, 3600)
     })
 
-    test('should handle session without authorization context', async (t) => {
+    test('should handle session without authorization context', async (_t) => {
       const sessionStore = new MemorySessionStore(100)
       const messageBroker = new MemoryMessageBroker()
 
@@ -339,7 +339,7 @@ describe('Token Refresh Service', () => {
       assert.strictEqual(result, false)
     })
 
-    test('should handle non-existent session', async (t) => {
+    test('should handle non-existent session', async (_t) => {
       const sessionStore = new MemorySessionStore(100)
       const messageBroker = new MemoryMessageBroker()
 

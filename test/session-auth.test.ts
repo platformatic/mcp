@@ -21,7 +21,7 @@ after(async () => {
 
 describe('Session-Based Authorization', () => {
   describe('Token Utilities', () => {
-    test('should hash token consistently', (t) => {
+    test('should hash token consistently', () => {
       const token = 'test-token-123'
       const hash1 = hashToken(token)
       const hash2 = hashToken(token)
@@ -31,7 +31,7 @@ describe('Session-Based Authorization', () => {
       assert.notEqual(hash1, token) // Should be different from original
     })
 
-    test('should create authorization context from token payload', (t) => {
+    test('should create authorization context from token payload', () => {
       const tokenPayload = {
         sub: 'user123',
         client_id: 'client456',
@@ -58,7 +58,7 @@ describe('Session-Based Authorization', () => {
       assert.strictEqual(context.authorizationServer, 'https://auth.example.com')
     })
 
-    test('should create token refresh info', (t) => {
+    test('should create token refresh info', () => {
       const refreshInfo = createTokenRefreshInfo(
         'refresh-token-123',
         'client-456',
@@ -74,7 +74,7 @@ describe('Session-Based Authorization', () => {
       assert.strictEqual(refreshInfo.refreshAttempts, 0)
     })
 
-    test('should detect expiring tokens', (t) => {
+    test('should detect expiring tokens', () => {
       const now = new Date()
       const soonExpiring = new Date(now.getTime() + 3 * 60 * 1000) // 3 minutes from now
       const notExpiring = new Date(now.getTime() + 30 * 60 * 1000) // 30 minutes from now
@@ -93,7 +93,7 @@ describe('Session-Based Authorization', () => {
       assert.strictEqual(isTokenExpiring(validContext), false)
     })
 
-    test('should determine when to attempt refresh', (t) => {
+    test('should determine when to attempt refresh', () => {
       const now = new Date()
       const soonExpiring = new Date(now.getTime() + 3 * 60 * 1000) // 3 minutes from now
 
@@ -125,7 +125,7 @@ describe('Session-Based Authorization', () => {
   })
 
   describe('Session Store Token Mapping', () => {
-    test('should add and retrieve token-to-session mapping', async (t) => {
+    test('should add and retrieve token-to-session mapping', async (_t) => {
       const store = new MemorySessionStore(100)
       const tokenHash = hashToken('test-token')
 
@@ -144,7 +144,7 @@ describe('Session-Based Authorization', () => {
       assert.strictEqual(retrievedSession.id, session.id)
     })
 
-    test('should update authorization context and maintain token mapping', async (t) => {
+    test('should update authorization context and maintain token mapping', async (_t) => {
       const store = new MemorySessionStore(100)
       const token1 = 'old-token'
       const token2 = 'new-token'
@@ -188,7 +188,7 @@ describe('Session-Based Authorization', () => {
       assert.strictEqual(newSession.authorization?.tokenHash, tokenHash2)
     })
 
-    test('should clean up token mappings when session is deleted', async (t) => {
+    test('should clean up token mappings when session is deleted', async (_t) => {
       const store = new MemorySessionStore(100)
       const tokenHash = hashToken('test-token')
 
@@ -425,7 +425,7 @@ describe('Session-Based Authorization', () => {
   })
 
   describe('Authorization Context Integration', () => {
-    test('should maintain authorization context across requests', async (t) => {
+    test('should maintain authorization context across requests', async (_t) => {
       const sessionStore = new MemorySessionStore(100)
       const token = 'test-access-token'
       const tokenHash = hashToken(token)
@@ -460,7 +460,7 @@ describe('Session-Based Authorization', () => {
       assert.deepStrictEqual(retrievedSession.authorization?.scopes, ['read', 'write'])
     })
 
-    test('should handle token refresh context updates', async (t) => {
+    test('should handle token refresh context updates', async (_t) => {
       const sessionStore = new MemorySessionStore(100)
       const oldToken = 'old-token'
       const newToken = 'new-token'

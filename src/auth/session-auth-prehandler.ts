@@ -173,6 +173,9 @@ export function createSessionAuthPreHandler (
 }
 
 function generateWWWAuthenticateHeader (config: AuthorizationConfig): string {
+  if (!config.enabled) {
+    throw new Error('Authorization is disabled')
+  }
   const resourceMetadataUrl = `${config.resourceUri}/.well-known/oauth-protected-resource`
   return `Bearer realm="MCP Server", resource_metadata="${resourceMetadataUrl}"`
 }

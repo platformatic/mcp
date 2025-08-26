@@ -184,7 +184,7 @@ describe('Authorization PreHandler', () => {
     const preHandler = createAuthPreHandler(config, validator)
 
     app.addHook('preHandler', preHandler)
-    app.get('/test', async (request) => ({
+    app.get('/test', async (request: any) => ({
       success: true,
       user: (request as any).tokenPayload?.sub
     }))
@@ -313,7 +313,7 @@ describe('Authorization PreHandler', () => {
     const preHandler = createAuthPreHandler(config, validator)
 
     app.addHook('preHandler', preHandler)
-    app.get('/test', async (request) => {
+    app.get('/test', async (request: any) => {
       const payload = (request as any).tokenPayload
       return {
         success: true,
