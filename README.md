@@ -550,41 +550,101 @@ app.mcpSendToSession('session-xyz', {
 })
 ```
 
-### Content-Type Negotiation
+### Dual-Endpoint Architecture
 
-Clients can request SSE streams by including `text/event-stream` in the `Accept` header:
+The plugin uses a dual-endpoint architecture that separates regular MCP protocol communication from SSE streaming:
+
+#### POST `/mcp` - MCP Protocol Communication
+
+Handles all standard MCP protocol requests and returns JSON responses:
 
 ```javascript
-// Request SSE stream
-fetch('/mcp', {
+// Regular MCP request (always returns JSON)
+const response = await fetch('/mcp', {
   method: 'POST',
   headers: {
-    'Accept': 'text/event-stream',
-    'Content-Type': 'application/json'
+    'Content-Type': 'application/json',
+    'Accept': 'application/json'
   },
-  body: JSON.stringify({ jsonrpc: '2.0', method: 'ping', id: 1 })
+  body: JSON.stringify({ 
+    jsonrpc: '2.0', 
+    method: 'tools/call',
+    params: { name: 'my-tool', arguments: {} },
+    id: 1 
+  })
 })
-
-// Request regular JSON
-fetch('/mcp', {
-  method: 'POST', 
-  headers: {
-    'Accept': 'application/json',
-    'Content-Type': 'application/json'
-  },
-  body: JSON.stringify({ jsonrpc: '2.0', method: 'ping', id: 1 })
-})
+const result = await response.json()
 ```
 
-### GET Endpoint for Long-lived Streams
+#### GET `/mcp` - SSE Stream Establishment
 
-The plugin also provides a GET endpoint for server-initiated communication:
+Establishes long-lived Server-Sent Events streams for real-time communication:
 
 ```javascript
-// Long-lived SSE stream
+// Establish SSE stream (separate from protocol requests)
 const eventSource = new EventSource('/mcp', {
-  headers: { 'Accept': 'text/event-stream' }
+  headers: { 
+    'Accept': 'text/event-stream',
+    'mcp-session-id': sessionId  // Use session from POST request
+  }
 })
+
+eventSource.onmessage = (event) => {
+  const message = JSON.parse(event.data)
+  console.log('Server notification:', message)
+}
+```
+
+#### Complete Workflow Example
+
+```javascript
+// 1. Create session and make MCP requests via POST
+const initResponse = await fetch('/mcp', {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+    'Accept': 'application/json'
+  },
+  body: JSON.stringify({
+    jsonrpc: '2.0',
+    method: 'initialize',
+    params: {
+      protocolVersion: '2025-06-18',
+      capabilities: {},
+      clientInfo: { name: 'my-client', version: '1.0.0' }
+    },
+    id: 1
+  })
+})
+
+const sessionId = initResponse.headers.get('mcp-session-id')
+
+// 2. Establish SSE stream for notifications via GET
+const eventSource = new EventSource('/mcp', {
+  headers: {
+    'Accept': 'text/event-stream',
+    'mcp-session-id': sessionId
+  }
+})
+
+// 3. Continue making MCP requests via POST
+const toolResponse = await fetch('/mcp', {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+    'Accept': 'application/json',
+    'mcp-session-id': sessionId
+  },
+  body: JSON.stringify({
+    jsonrpc: '2.0',
+    method: 'tools/call',
+    params: { name: 'my-tool', arguments: {} },
+    id: 2
+  })
+})
+
+// Server can send notifications via the SSE stream
+// while client makes requests via POST
 ```
 
 ### Server-Initiated Notifications
@@ -904,7 +964,7 @@ const mcpResponse = await fetch('/mcp', {
   headers: {
     'Authorization': `Bearer ${access_token}`,
     'Content-Type': 'application/json',
-    'Accept': 'text/event-stream' // For SSE
+    'Accept': 'application/json'
   },
   body: JSON.stringify({
     jsonrpc: '2.0',
@@ -1554,14 +1614,19 @@ type PromptHandler = (name: string, args: any, context: HandlerContext) => Promi
 
 ### MCP Endpoints
 
-The plugin exposes the following endpoints:
+The plugin exposes the following endpoints using a dual-endpoint architecture:
 
-- `POST /mcp`: Handles JSON-RPC 2.0 messages according to the MCP specification
-  - Supports both regular JSON responses and SSE streams based on `Accept` header
-  - Returns `Content-Type: application/json` or `Content-Type: text/event-stream`
+- `POST /mcp`: Handles all JSON-RPC 2.0 MCP protocol messages
+  - Always returns `Content-Type: application/json; charset=utf-8`
+  - Processes initialize, tool calls, resource reads, prompt gets, etc.
+  - Creates and manages session IDs when SSE is enabled
   - Authorization-aware when OAuth is enabled
-- `GET /mcp`: Long-lived SSE streams for server-initiated communication (when SSE is enabled)
-  - Returns `Content-Type: text/event-stream` with periodic heartbeats
+- `GET /mcp`: Establishes Server-Sent Events streams (when SSE is enabled)
+  - Always returns `Content-Type: text/event-stream`
+  - Requires `Accept: text/event-stream` header
+  - Uses session ID from previous POST request or creates new session
+  - Provides real-time server-to-client notifications
+  - Supports message replay with Last-Event-ID
   - Authorization-aware with user-specific session isolation
 
 ### OAuth Endpoints (when authorization is enabled)
