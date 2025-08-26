@@ -30,7 +30,7 @@ describe('Tool Context Access', () => {
           type: 'object',
           properties: {}
         }
-      }, async (params, context) => {
+      }, async (_params, context) => {
         // Request is now always passed
         capturedRequest = context.request
         return {
@@ -92,7 +92,7 @@ describe('Tool Context Access', () => {
           type: 'object',
           properties: {}
         }
-      }, async (params, context) => {
+      }, async (_params, context) => {
         capturedQuery = context.request.query
         return {
           content: [{
@@ -142,7 +142,7 @@ describe('Tool Context Access', () => {
           type: 'object',
           properties: {}
         }
-      }, async (params, context) => {
+      }, async (_params, context) => {
         capturedReply = context.reply
 
         // Test that we can set a custom header via reply
@@ -301,7 +301,7 @@ describe('Tool Context Access', () => {
           type: 'object',
           properties: {}
         }
-      }, async (params, context) => {
+      }, async (_params, context) => {
         return {
           content: [{
             type: 'text',
@@ -354,7 +354,7 @@ describe('Tool Context Access', () => {
           type: 'object',
           properties: {}
         }
-      }, async (params, context) => {
+      }, async (_params, context) => {
         capturedRequest = context.request
         return {
           content: [{
@@ -415,7 +415,7 @@ describe('Tool Context Access', () => {
         capturedContext = context
 
         const userAgent = context.request.headers['user-agent'] || 'unknown'
-        const queryParam = context.request.query?.test || 'none'
+        const queryParam = (context.request.query as any)?.test || 'none'
 
         context.reply.header('x-resource-processed', 'true')
 
@@ -537,7 +537,7 @@ describe('Tool Context Access', () => {
         capturedContext = context
 
         const userAgent = context.request.headers['user-agent'] || 'unknown'
-        const queryParam = context.request.query?.mode || 'default'
+        const queryParam = (context.request.query as any)?.mode || 'default'
 
         context.reply.header('x-prompt-processed', 'true')
 
