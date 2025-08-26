@@ -10,11 +10,13 @@ export class TokenValidator {
   private fastify: FastifyInstance
 
   constructor (config: AuthorizationConfig, fastify: FastifyInstance) {
-    if (!config.enabled) {
-      throw new Error('Authorization is disabled')
-    }
     this.config = config
     this.fastify = fastify
+
+    // Early return if authorization is disabled - no need to set up JWT validation
+    if (!config.enabled) {
+      return
+    }
 
     if (config.tokenValidation.jwksUri) {
       // Extract domain from JWKS URI
