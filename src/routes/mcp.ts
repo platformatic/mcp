@@ -38,13 +38,21 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     localStreams.set(sessionId, new Set())
 
     // Subscribe to messages for this session
-    await messageBroker.subscribe(`mcp/session/${sessionId}/message`, (message: JSONRPCMessage) => {
+    await messageBroker.subscribe(`mcp/session/${sessionId}/message`, async (message: JSONRPCMessage) => {
       const streams = localStreams.get(sessionId)
       if (streams && streams.size > 0) {
         app.log.debug({ sessionId, message }, 'Received message for session via broker, sending to streams')
         sendSSEToStreams(sessionId, message, streams)
       } else {
-        app.log.debug({ sessionId }, 'Received message for session via broker, but no active streams')
+        app.log.debug({ sessionId }, 'Received message for session via broker, storing in history without active streams')
+        // Store message in history even without active streams for session persistence
+        const session = await sessionStore.get(sessionId)
+        if (session) {
+          const eventId = (++session.eventId).toString()
+          session.lastEventId = eventId
+          session.lastActivity = new Date()
+          await sessionStore.addMessage(sessionId, eventId, message)
+        }
       }
     })
 
