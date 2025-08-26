@@ -30,7 +30,7 @@ describe('Tool Context Access', () => {
           type: 'object',
           properties: {}
         }
-      }, async (params, context) => {
+      }, async (_params, context) => {
         // This should fail initially since request isn't passed
         capturedRequest = context?.request
         return {
@@ -72,7 +72,8 @@ describe('Tool Context Access', () => {
       t.assert.strictEqual(capturedRequest.headers['x-custom-header'], 'test-value', 'Custom headers should be accessible')
 
       // Check that the result contains the expected content
-      t.assert.ok(result.content[0].text.includes('/mcp?test=true'), 'Result should contain request URL')
+      const firstContent = result.content[0]
+      t.assert.ok(firstContent.type === 'text' && firstContent.text.includes('/mcp?test=true'), 'Result should contain request URL')
     })
 
     test('should provide access to request query parameters in tool handler', async (t: TestContext) => {
@@ -91,7 +92,7 @@ describe('Tool Context Access', () => {
           type: 'object',
           properties: {}
         }
-      }, async (params, context) => {
+      }, async (_params, context) => {
         capturedQuery = context?.request?.query
         return {
           content: [{
@@ -141,7 +142,7 @@ describe('Tool Context Access', () => {
           type: 'object',
           properties: {}
         }
-      }, async (params, context) => {
+      }, async (_params, context) => {
         capturedReply = context?.reply
 
         // Test that we can set a custom header via reply
@@ -285,7 +286,8 @@ describe('Tool Context Access', () => {
       t.assert.strictEqual(response.statusCode, 200)
       const body = response.json() as JSONRPCResponse
       const result = body.result as CallToolResult
-      t.assert.strictEqual(result.content[0].text, 'Echo: Hello World', 'Traditional handler should still work')
+      const firstContent = result.content[0]
+      t.assert.strictEqual(firstContent.type === 'text' ? firstContent.text : '', 'Echo: Hello World', 'Traditional handler should still work')
     })
 
     test('should work with tool handlers that use only sessionId context', async (t: TestContext) => {
@@ -303,7 +305,7 @@ describe('Tool Context Access', () => {
           type: 'object',
           properties: {}
         }
-      }, async (params, context) => {
+      }, async (_params, context) => {
         return {
           content: [{
             type: 'text',
@@ -334,7 +336,8 @@ describe('Tool Context Access', () => {
       t.assert.strictEqual(response.statusCode, 200)
       const body = response.json() as JSONRPCResponse
       const result = body.result as CallToolResult
-      t.assert.ok(result.content[0].text.includes('test-session-123'), 'SessionId should still be accessible')
+      const firstContent = result.content[0]
+      t.assert.ok(firstContent.type === 'text' && firstContent.text.includes('test-session-123'), 'SessionId should still be accessible')
     })
   })
 
@@ -355,7 +358,7 @@ describe('Tool Context Access', () => {
           type: 'object',
           properties: {}
         }
-      }, async (params, context) => {
+      }, async (_params, context) => {
         capturedRequest = context?.request
         return {
           content: [{
@@ -416,7 +419,7 @@ describe('Tool Context Access', () => {
         capturedContext = context
 
         const userAgent = context?.request?.headers['user-agent'] || 'unknown'
-        const queryParam = context?.request?.query?.test || 'none'
+        const queryParam = (context?.request?.query as any)?.test || 'none'
 
         if (context?.reply) {
           context.reply.header('x-resource-processed', 'true')
@@ -465,8 +468,9 @@ describe('Tool Context Access', () => {
       t.assert.strictEqual(capturedContext.request.query.test, 'resource')
 
       // Verify result content
-      t.assert.ok(result.contents[0].text.includes('test-resource-agent'))
-      t.assert.ok(result.contents[0].text.includes('query: resource'))
+      const firstContent = result.contents[0]
+      t.assert.ok('text' in firstContent && firstContent.text.includes('test-resource-agent'))
+      t.assert.ok('text' in firstContent && firstContent.text.includes('query: resource'))
     })
 
     test('should work without context parameter in resource handler (backward compatibility)', async (t: TestContext) => {
@@ -511,7 +515,8 @@ describe('Tool Context Access', () => {
 
       const body = response.json() as JSONRPCResponse
       const result = body.result as ReadResourceResult
-      t.assert.strictEqual(result.contents[0].text, 'Legacy resource content')
+      const firstContent = result.contents[0]
+      t.assert.strictEqual('text' in firstContent ? firstContent.text : '', 'Legacy resource content')
     })
   })
 
@@ -534,11 +539,11 @@ describe('Tool Context Access', () => {
           description: 'Discussion topic',
           required: true
         }]
-      }, async (name, args, context) => {
+      }, async (_name, args, context) => {
         capturedContext = context
 
         const userAgent = context?.request?.headers['user-agent'] || 'unknown'
-        const queryParam = context?.request?.query?.mode || 'default'
+        const queryParam = (context?.request?.query as any)?.mode || 'default'
 
         if (context?.reply) {
           context.reply.header('x-prompt-processed', 'true')
@@ -614,7 +619,7 @@ describe('Tool Context Access', () => {
           description: 'Message to include',
           required: true
         }]
-      }, async (name, args) => {
+      }, async (_name, args) => {
         return {
           messages: [{
             role: 'user',

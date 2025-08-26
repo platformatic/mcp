@@ -62,38 +62,43 @@ k7J2qlD6/u2VXu1i7TyapPDOA2BOJ3Z3yGpmfLD4OJP7iojgnCyHxtpaCfH+mQfd
 HwIDAQAB
 -----END PUBLIC KEY-----`
 
-export function generateMockJWKSResponse (kid: string = 'test-key-1'): any {
+export function generateMockJWKSResponse (kid: string | undefined = 'test-key-1'): any {
   const publicKey = createPublicKey(TEST_PUBLIC_KEY)
   const jwk = publicKey.export({ format: 'jwk' })
 
+  const key: any = {
+    ...jwk,
+    alg: 'RS256',
+    use: 'sig'
+  }
+
+  if (kid !== undefined) {
+    key.kid = kid
+  }
+
   return {
-    keys: [
-      {
-        ...jwk,
-        kid,
-        alg: 'RS256',
-        use: 'sig'
-      }
-    ]
+    keys: [key]
   }
 }
 
 export function createTestAuthConfig (overrides: Partial<AuthorizationConfig> = {}): AuthorizationConfig {
-  return {
-    enabled: true,
+  const base = {
+    enabled: true as const,
     authorizationServers: ['https://auth.example.com'],
     resourceUri: 'https://mcp.example.com',
     tokenValidation: {
       jwksUri: 'https://auth.example.com/.well-known/jwks.json',
       validateAudience: true,
-      ...overrides.tokenValidation
+      ...('tokenValidation' in overrides ? overrides.tokenValidation : {})
     },
     ...overrides
   }
+
+  return base
 }
 
 export function createTestJWT (payload: TestJWTOptions = {}): string {
-  let kid = payload.kid || 'test-key-1'
+  let kid: string | undefined = payload.kid || 'test-key-1'
   if (Object.prototype.hasOwnProperty.call(payload, 'kid') === true && (payload.kid === null || payload.kid === undefined)) {
     kid = undefined
   }

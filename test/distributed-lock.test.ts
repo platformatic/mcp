@@ -22,8 +22,8 @@ async function getTestRedis (): Promise<Redis> {
 
 describe('Distributed Lock', () => {
   describe('StubLock', () => {
-    test('should acquire and release locks successfully', async (t) => {
-      const lock = new StubLock('test')
+    test('should acquire and release locks successfully', async (_t) => {
+      const lock = new StubLock()
       const instanceId = 'instance-1'
       const key = 'test-key'
 
@@ -46,8 +46,8 @@ describe('Distributed Lock', () => {
       await lock.close()
     })
 
-    test('should prevent duplicate lock acquisition', async (t) => {
-      const lock = new StubLock('test')
+    test('should prevent duplicate lock acquisition', async (_t) => {
+      const lock = new StubLock()
       const instance1 = 'instance-1'
       const instance2 = 'instance-2'
       const key = 'test-key'
@@ -71,8 +71,8 @@ describe('Distributed Lock', () => {
       await lock.close()
     })
 
-    test('should handle lock expiration', async (t) => {
-      const lock = new StubLock('test')
+    test('should handle lock expiration', async (_t) => {
+      const lock = new StubLock()
       const instanceId = 'instance-1'
       const key = 'test-key'
 
@@ -94,8 +94,8 @@ describe('Distributed Lock', () => {
       await lock.close()
     })
 
-    test('should extend lock TTL', async (t) => {
-      const lock = new StubLock('test')
+    test('should extend lock TTL', async (_t) => {
+      const lock = new StubLock()
       const instanceId = 'instance-1'
       const key = 'test-key'
 
@@ -120,8 +120,8 @@ describe('Distributed Lock', () => {
       await lock.close()
     })
 
-    test('should not allow extension by non-owner', async (t) => {
-      const lock = new StubLock('test')
+    test('should not allow extension by non-owner', async (_t) => {
+      const lock = new StubLock()
       const instance1 = 'instance-1'
       const instance2 = 'instance-2'
       const key = 'test-key'
@@ -143,7 +143,7 @@ describe('Distributed Lock', () => {
   })
 
   describe('RedisDistributedLock', () => {
-    test('should acquire and release locks successfully', async (t) => {
+    test('should acquire and release locks successfully', async (_t) => {
       const redis = await getTestRedis()
       const lock = new RedisDistributedLock(redis, 'test')
       const instanceId = 'instance-1'
@@ -166,7 +166,7 @@ describe('Distributed Lock', () => {
       assert.strictEqual(holderAfter, null)
     })
 
-    test('should prevent duplicate lock acquisition across Redis instances', async (t) => {
+    test('should prevent duplicate lock acquisition across Redis instances', async (_t) => {
       const redis1 = await getTestRedis()
       const redis2 = await getTestRedis()
 
@@ -200,7 +200,7 @@ describe('Distributed Lock', () => {
       assert.strictEqual(acquired3, true)
     })
 
-    test('should handle Redis lock expiration', async (t) => {
+    test('should handle Redis lock expiration', async (_t) => {
       const redis = await getTestRedis()
       const lock = new RedisDistributedLock(redis, 'test')
       const instanceId = 'instance-1'
@@ -222,7 +222,7 @@ describe('Distributed Lock', () => {
       assert.strictEqual(acquired2, true)
     })
 
-    test('should extend Redis lock TTL', async (t) => {
+    test('should extend Redis lock TTL', async (_t) => {
       const redis = await getTestRedis()
       const lock = new RedisDistributedLock(redis, 'test')
       const instanceId = 'instance-1'
@@ -247,7 +247,7 @@ describe('Distributed Lock', () => {
       assert.strictEqual(holder, instanceId)
     })
 
-    test('should enforce ownership for Redis operations', async (t) => {
+    test('should enforce ownership for Redis operations', async (_t) => {
       const redis = await getTestRedis()
       const lock = new RedisDistributedLock(redis, 'test')
       const instance1 = 'instance-1'
@@ -273,7 +273,7 @@ describe('Distributed Lock', () => {
   })
 
   describe('createDistributedLock factory', () => {
-    test('should create StubLock when no Redis provided', async (t) => {
+    test('should create StubLock when no Redis provided', async (_t) => {
       const lock = createDistributedLock(undefined, 'test')
       assert.ok(lock instanceof StubLock)
 
@@ -284,7 +284,7 @@ describe('Distributed Lock', () => {
       await lock.close?.()
     })
 
-    test('should create RedisDistributedLock when Redis provided', async (t) => {
+    test('should create RedisDistributedLock when Redis provided', async (_t) => {
       const redis = await getTestRedis()
       const lock = createDistributedLock(redis, 'test')
       assert.ok(lock instanceof RedisDistributedLock)
@@ -296,7 +296,7 @@ describe('Distributed Lock', () => {
   })
 
   describe('Lock prefix handling', () => {
-    test('should handle StubLock without prefixes', async (t) => {
+    test('should handle StubLock without prefixes', async (_t) => {
       const lock1 = new StubLock()
       const lock2 = new StubLock()
 
@@ -321,7 +321,7 @@ describe('Distributed Lock', () => {
       await lock2.close()
     })
 
-    test('should isolate Redis locks with different prefixes', async (t) => {
+    test('should isolate Redis locks with different prefixes', async (_t) => {
       const redis = await getTestRedis()
       const lock1 = new RedisDistributedLock(redis, 'prefix1')
       const lock2 = new RedisDistributedLock(redis, 'prefix2')
