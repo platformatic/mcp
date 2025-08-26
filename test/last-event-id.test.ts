@@ -31,15 +31,14 @@ async function setupServer (t: TestContext) {
 describe('Last-Event-ID Support', () => {
   test('should add message history to SSE sessions', async (t: TestContext) => {
     const { app } = await setupServer(t)
-    // Create a session by sending a POST request with SSE
+    // Create a session by sending a POST request (JSON response)
     const initResponse = await app.inject({
       method: 'POST',
       url: '/mcp',
       headers: {
         'Content-Type': 'application/json',
-        Accept: 'text/event-stream'
+        Accept: 'application/json'
       },
-      payloadAsStream: true,
       payload: {
         jsonrpc: '2.0',
         method: 'initialize',
@@ -57,8 +56,8 @@ describe('Last-Event-ID Support', () => {
       throw new Error(`Expected 200, got ${initResponse.statusCode}`)
     }
 
-    if (initResponse.headers['content-type'] !== 'text/event-stream') {
-      throw new Error('Expected text/event-stream content type')
+    if (initResponse.headers['content-type'] !== 'application/json; charset=utf-8') {
+      throw new Error('Expected application/json content type')
     }
 
     const sessionId = initResponse.headers['mcp-session-id'] as string
@@ -66,8 +65,24 @@ describe('Last-Event-ID Support', () => {
       throw new Error('Expected session ID in response headers')
     }
 
-    // With the new architecture, session management is internal
-    // We verify functionality by testing message history via subsequent requests
+    // Now establish SSE connection with GET request
+    const sseResponse = await app.inject({
+      method: 'GET',
+      url: '/mcp',
+      headers: {
+        Accept: 'text/event-stream',
+        'mcp-session-id': sessionId
+      },
+      payloadAsStream: true
+    })
+
+    if (sseResponse.statusCode !== 200) {
+      throw new Error(`Expected SSE 200, got ${sseResponse.statusCode}`)
+    }
+
+    if (sseResponse.headers['content-type'] !== 'text/event-stream') {
+      throw new Error('Expected text/event-stream content type for SSE')
+    }
 
     // With the new architecture, verify the session functionality works
     // by testing that we can send a message to the session
@@ -80,7 +95,7 @@ describe('Last-Event-ID Support', () => {
     t.assert.ok(canSendMessage, 'Should be able to send messages to active session')
     t.assert.ok(sessionId, 'Session ID should be present for message history tracking')
 
-    initResponse.stream().destroy()
+    sseResponse.stream().destroy()
   })
 
   test('should handle GET request with Last-Event-ID using EventSource', async (t) => {
@@ -114,10 +129,9 @@ describe('Last-Event-ID Support', () => {
     const initResponse = await app.inject({
       method: 'POST',
       url: '/mcp',
-      payloadAsStream: true,
       headers: {
         'Content-Type': 'application/json',
-        Accept: 'text/event-stream'
+        Accept: 'application/json'
       },
       payload: {
         jsonrpc: '2.0',
@@ -132,11 +146,7 @@ describe('Last-Event-ID Support', () => {
     })
 
     const sessionId = initResponse.headers['mcp-session-id'] as string
-    ;(t.assert.ok as any)(sessionId, 'Session ID should be present in headers')
-
-    // For testing purposes, use a known event ID since parsing SSE responses
-    // in inject mode is complex with streams
-    const initEventId = '1' // Use a test event ID
+    t.assert.ok(sessionId, 'Session ID should be present in headers')
 
     // Send additional messages to build message history using the new pub/sub architecture
     await app.mcpSendToSession(sessionId, {
@@ -157,21 +167,19 @@ describe('Last-Event-ID Support', () => {
       params: { level: 'info', message: 'Message 3' }
     })
 
-    // First verify GET endpoint works with inject (use regular JSON since SSE session is active)
-    const injectGetResponse = await app.inject({
+    // Establish an SSE connection first to create message history
+    const firstSseResponse = await app.inject({
       method: 'GET',
       url: '/mcp',
       headers: {
-        Accept: 'application/json',
-        'mcp-session-id': sessionId,
-        'Last-Event-ID': initEventId
-      }
+        Accept: 'text/event-stream',
+        'mcp-session-id': sessionId
+      },
+      payloadAsStream: true
     })
 
-    t.assert.equal(injectGetResponse.statusCode, 405, 'GET request should return 405 status when not requesting SSE')
-
-    // Close the POST SSE stream to allow a new connection
-    initResponse.stream().destroy()
+    // Close the first SSE stream
+    firstSseResponse.stream().destroy()
 
     // Wait for the stream to be cleaned up
     await sleep(500)
