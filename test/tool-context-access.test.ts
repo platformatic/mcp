@@ -386,6 +386,9 @@ describe('Tool Context Access', () => {
       const sessionId = initResponse.headers['mcp-session-id'] as string
       t.assert.ok(sessionId)
 
+      // Wait a brief moment to ensure session is fully established
+      await new Promise(resolve => setTimeout(resolve, 50))
+
       // Establish SSE connection via GET
       const sseResponse = await app.inject({
         method: 'GET',
