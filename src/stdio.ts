@@ -219,7 +219,7 @@ export class StdioTransport {
       // Parse the response
       if (response.statusCode === 200) {
         return JSON.parse(response.body)
-      } else if (response.statusCode === 204) {
+      } else if (response.statusCode === 202) {
         // No content - this is for notifications that don't expect a response
         return null
       } else {
