@@ -397,15 +397,8 @@ describe('Tool Context Access', () => {
         }
       })
 
-      // Handle potential conflict if session already has active SSE
-      if (sseResponse.statusCode === 409) {
-        // Session already has active SSE, which is acceptable for this test
-        // We can still test the tool context access via POST
-        console.log('SSE session already active, proceeding with tool test')
-      } else {
-        t.assert.strictEqual(sseResponse.statusCode, 200)
-        t.assert.strictEqual(sseResponse.headers['content-type'], 'text/event-stream')
-      }
+      t.assert.strictEqual(sseResponse.statusCode, 200)
+      t.assert.strictEqual(sseResponse.headers['content-type'], 'text/event-stream')
 
       // Now call the tool via POST
       const toolRequest: JSONRPCRequest = {
@@ -429,10 +422,8 @@ describe('Tool Context Access', () => {
 
       t.assert.strictEqual(toolResponse.statusCode, 200)
 
-      // Clean up the SSE stream if it was successfully created
-      if (sseResponse.statusCode === 200) {
-        sseResponse.stream().destroy()
-      }
+      // Clean up the SSE stream
+      sseResponse.stream().destroy()
 
       // The request should have been captured during the tool execution
       t.assert.ok(capturedRequest, 'Request should be accessible in SSE mode')
