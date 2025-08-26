@@ -113,7 +113,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
       const messagesToReplay = await sessionStore.getMessagesFrom(sessionId, lastEventId)
 
       for (const entry of messagesToReplay) {
-        const sseEvent = `id: ${entry.eventId}\\ndata: ${JSON.stringify(entry.message)}\\n\\n`
+        const sseEvent = `id: ${entry.eventId}\ndata: ${JSON.stringify(entry.message)}\n\n`
         try {
           stream.raw.write(sseEvent)
         } catch (error) {
@@ -152,7 +152,13 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         sessionId = session.id
       }
 
-      // Regular JSON response
+      // Regular JSON response - get session for auth context
+      let authContext
+      if (sessionId) {
+        const session = await sessionStore.get(sessionId)
+        authContext = session?.authorization
+      }
+
       const response = await processMessage(message, sessionId, {
         app,
         opts,
@@ -160,7 +166,10 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         serverInfo,
         tools,
         resources,
-        prompts
+        prompts,
+        request,
+        reply,
+        authContext
       })
       if (response) {
         return response

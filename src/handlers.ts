@@ -1,4 +1,4 @@
-import type { FastifyInstance } from 'fastify'
+import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify'
 import type {
   JSONRPCMessage,
   JSONRPCRequest,
@@ -24,6 +24,7 @@ import {
 } from './schema.ts'
 
 import type { MCPTool, MCPResource, MCPPrompt, MCPPluginOptions } from './types.ts'
+import type { AuthorizationContext } from './types/auth-types.ts'
 import { validate, CallToolRequestSchema, ReadResourceRequestSchema, GetPromptRequestSchema, isTypeBoxSchema } from './validation/index.ts'
 import { sanitizeToolParams, assessToolSecurity, SECURITY_WARNINGS } from './security.ts'
 
@@ -35,6 +36,9 @@ type HandlerDependencies = {
   tools: Map<string, MCPTool>
   resources: Map<string, MCPResource>
   prompts: Map<string, MCPPrompt>
+  request: FastifyRequest
+  reply: FastifyReply
+  authContext?: AuthorizationContext
 }
 
 export function createResponse (id: string | number, result: any): JSONRPCResponse {
@@ -186,7 +190,7 @@ async function handleToolsCall (
 
       // Use validated arguments
       try {
-        const result = await tool.handler(argumentsValidation.data, { sessionId })
+        const result = await tool.handler(argumentsValidation.data, { sessionId, request: dependencies.request, reply: dependencies.reply, authContext: dependencies.authContext })
         return createResponse(request.id, result)
       } catch (error: any) {
         const result: CallToolResult = {
@@ -201,7 +205,7 @@ async function handleToolsCall (
     } else {
       // Regular JSON Schema - basic validation or pass through
       try {
-        const result = await tool.handler(toolArguments, { sessionId })
+        const result = await tool.handler(toolArguments, { sessionId, request: dependencies.request, reply: dependencies.reply, authContext: dependencies.authContext })
         return createResponse(request.id, result)
       } catch (error: any) {
         const result: CallToolResult = {
@@ -217,7 +221,12 @@ async function handleToolsCall (
   } else {
     // Unsafe tool without schema - pass arguments as-is
     try {
-      const result = await tool.handler(toolArguments, { sessionId })
+      const result = await tool.handler(toolArguments, {
+        sessionId,
+        request: dependencies.request,
+        reply: dependencies.reply,
+        authContext: dependencies.authContext
+      })
       return createResponse(request.id, result)
     } catch (error: any) {
       const result: CallToolResult = {
@@ -234,6 +243,7 @@ async function handleToolsCall (
 
 async function handleResourcesRead (
   request: JSONRPCRequest,
+  sessionId: string | undefined,
   dependencies: HandlerDependencies
 ): Promise<JSONRPCResponse | JSONRPCError> {
   const { resources } = dependencies
@@ -285,7 +295,12 @@ async function handleResourcesRead (
   }
 
   try {
-    const result = await resource.handler(uri)
+    const result = await resource.handler(uri, {
+      sessionId,
+      request: dependencies.request,
+      reply: dependencies.reply,
+      authContext: dependencies.authContext
+    })
     return createResponse(request.id, result)
   } catch (error: any) {
     const result: ReadResourceResult = {
@@ -301,6 +316,7 @@ async function handleResourcesRead (
 
 async function handlePromptsGet (
   request: JSONRPCRequest,
+  sessionId: string | undefined,
   dependencies: HandlerDependencies
 ): Promise<JSONRPCResponse | JSONRPCError> {
   const { prompts } = dependencies
@@ -357,7 +373,12 @@ async function handlePromptsGet (
 
       // Use validated arguments
       try {
-        const result = await prompt.handler(promptName, argumentsValidation.data)
+        const result = await prompt.handler(promptName, argumentsValidation.data, {
+          sessionId,
+          request: dependencies.request,
+          reply: dependencies.reply,
+          authContext: dependencies.authContext
+        })
         return createResponse(request.id, result)
       } catch (error: any) {
         const result: GetPromptResult = {
@@ -374,7 +395,12 @@ async function handlePromptsGet (
     } else {
       // Regular JSON Schema - basic validation or pass through
       try {
-        const result = await prompt.handler(promptName, promptArguments)
+        const result = await prompt.handler(promptName, promptArguments, {
+          sessionId,
+          request: dependencies.request,
+          reply: dependencies.reply,
+          authContext: dependencies.authContext
+        })
         return createResponse(request.id, result)
       } catch (error: any) {
         const result: GetPromptResult = {
@@ -392,7 +418,12 @@ async function handlePromptsGet (
   } else {
     // Unsafe prompt without schema - pass arguments as-is
     try {
-      const result = await prompt.handler(promptName, promptArguments)
+      const result = await prompt.handler(promptName, promptArguments, {
+        sessionId,
+        request: dependencies.request,
+        reply: dependencies.reply,
+        authContext: dependencies.authContext
+      })
       return createResponse(request.id, result)
     } catch (error: any) {
       const result: GetPromptResult = {
@@ -437,9 +468,9 @@ export async function handleRequest (
       case 'tools/call':
         return await handleToolsCall(request, sessionId, dependencies)
       case 'resources/read':
-        return await handleResourcesRead(request, dependencies)
+        return await handleResourcesRead(request, sessionId, dependencies)
       case 'prompts/get':
-        return await handlePromptsGet(request, dependencies)
+        return await handlePromptsGet(request, sessionId, dependencies)
       default:
         return createError(request.id, METHOD_NOT_FOUND, `Method ${request.method} not found`)
     }
