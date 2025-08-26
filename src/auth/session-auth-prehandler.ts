@@ -31,6 +31,11 @@ export function createSessionAuthPreHandler (
       return
     }
 
+    // Skip authorization for the start of the OAuth authorization flow.
+    if (request.url.startsWith('/oauth/authorize')) {
+      return
+    }
+
     // Extract Bearer token from Authorization header
     const authHeader = request.headers.authorization
     if (!authHeader) {
