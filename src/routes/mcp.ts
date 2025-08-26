@@ -41,7 +41,10 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     await messageBroker.subscribe(`mcp/session/${sessionId}/message`, (message: JSONRPCMessage) => {
       const streams = localStreams.get(sessionId)
       if (streams && streams.size > 0) {
+        app.log.debug({ sessionId, message }, 'Received message for session via broker, sending to streams')
         sendSSEToStreams(sessionId, message, streams)
+      } else {
+        app.log.debug({ sessionId }, 'Received message for session via broker, but no active streams')
       }
     })
 
@@ -64,7 +67,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     if (!session) return
 
     const eventId = (++session.eventId).toString()
-    const sseEvent = `id: ${eventId}\\ndata: ${JSON.stringify(message)}\\n\\n`
+    const sseEvent = `id: ${eventId}\ndata: ${JSON.stringify(message)}\n\n`
     session.lastEventId = eventId
     session.lastActivity = new Date()
 
@@ -122,16 +125,9 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
   app.post('/mcp', async (request: FastifyRequest, reply: FastifyReply) => {
     try {
       const message = request.body as JSONRPCMessage
-      const sessionId = request.headers['mcp-session-id'] as string
-      const useSSE = enableSSE && supportsSSE(request) && !hasActiveSSESession(sessionId)
+      let sessionId = request.headers['mcp-session-id'] as string
 
-      if (useSSE) {
-        reply.hijack()
-        request.log.info({ sessionId }, 'Handling SSE request')
-
-        // Set up SSE stream
-        reply.raw.setHeader('content-type', 'text/event-stream')
-
+      if (enableSSE) {
         let session: SessionMetadata
         if (sessionId) {
           const existingSession = await sessionStore.get(sessionId)
@@ -139,96 +135,29 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
             session = existingSession
           } else {
             session = await createSSESession()
-            reply.raw.setHeader('Mcp-Session-Id', session.id)
+            reply.header('Mcp-Session-Id', session.id)
           }
         } else {
           session = await createSSESession()
-          reply.raw.setHeader('Mcp-Session-Id', session.id)
+          reply.header('Mcp-Session-Id', session.id)
         }
+        sessionId = session.id
+      }
 
-        // Set up persistent SSE connection
-        reply.raw.writeHead(200, {
-          'Content-Type': 'text/event-stream',
-          'Cache-Control': 'no-cache',
-          Connection: 'keep-alive',
-          'Access-Control-Allow-Origin': '*',
-          'Mcp-Session-Id': session.id
-        })
-
-        // Add this connection to the local streams
-        let streams = localStreams.get(session.id)
-        if (!streams) {
-          streams = new Set()
-          localStreams.set(session.id, streams)
-        }
-        streams.add(reply)
-
-        app.log.info({
-          sessionId: session.id,
-          totalStreams: streams.size,
-          method: 'POST'
-        }, 'Added new stream to session')
-
-        // Handle connection close
-        reply.raw.on('close', () => {
-          const streams = localStreams.get(session.id)
-          if (streams) {
-            streams.delete(reply)
-            app.log.info({
-              sessionId: session.id,
-              remainingStreams: streams.size
-            }, 'POST SSE connection closed')
-
-            if (streams.size === 0) {
-              app.log.info({
-                sessionId: session.id
-              }, 'Last POST SSE stream closed, cleaning up session')
-              localStreams.delete(session.id)
-              messageBroker.unsubscribe(`mcp/session/${session.id}/message`)
-            }
-          }
-        })
-
-        // Process message and send via SSE
-        const response = await processMessage(message, sessionId, {
-          app,
-          opts,
-          capabilities,
-          serverInfo,
-          tools,
-          resources,
-          prompts
-        })
-        if (response) {
-          // Send the SSE event but keep the stream open
-          const updatedSession = await sessionStore.get(session.id)
-          if (updatedSession) {
-            const eventId = (++updatedSession.eventId).toString()
-            const sseEvent = `id: ${eventId}\\ndata: ${JSON.stringify(response)}\\n\\n`
-            reply.raw.write(sseEvent)
-
-            // Store message in history and update session
-            await sessionStore.addMessage(session.id, eventId, response)
-          }
-        } else {
-          reply.raw.write(': heartbeat\\n\\n')
-        }
+      // Regular JSON response
+      const response = await processMessage(message, sessionId, {
+        app,
+        opts,
+        capabilities,
+        serverInfo,
+        tools,
+        resources,
+        prompts
+      })
+      if (response) {
+        return response
       } else {
-        // Regular JSON response
-        const response = await processMessage(message, sessionId, {
-          app,
-          opts,
-          capabilities,
-          serverInfo,
-          tools,
-          resources,
-          prompts
-        })
-        if (response) {
-          reply.send(response)
-        } else {
-          reply.code(204).send()
-        }
+        reply.code(202)
       }
     } catch (error) {
       app.log.error({ err: error }, 'Error processing MCP message')
@@ -335,12 +264,12 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
       })
 
       // Send initial heartbeat
-      reply.raw.write(': heartbeat\\n\\n')
+      reply.raw.write(': heartbeat\n\n')
 
       // Keep connection alive with periodic heartbeats
       const heartbeatInterval = setInterval(() => {
         try {
-          reply.raw.write(': heartbeat\\n\\n')
+          reply.raw.write(': heartbeat\n\n')
         } catch (error) {
           clearInterval(heartbeatInterval)
           const streams = localStreams.get(session.id)
