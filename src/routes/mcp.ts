@@ -199,7 +199,8 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
           resources,
           prompts,
           request,
-          reply
+          reply,
+          authContext: session.authorization
         })
         if (response) {
           // Send the SSE event but keep the stream open
@@ -217,6 +218,13 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         }
       } else {
         // Regular JSON response
+        // Get session for auth context
+        let authContext
+        if (sessionId) {
+          const session = await sessionStore.get(sessionId)
+          authContext = session?.authorization
+        }
+
         const response = await processMessage(message, sessionId, {
           app,
           opts,
@@ -226,7 +234,8 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
           resources,
           prompts,
           request,
-          reply
+          reply,
+          authContext
         })
         if (response) {
           reply.send(response)

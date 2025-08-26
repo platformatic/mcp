@@ -86,7 +86,7 @@ app.mcpAddResource({
   name: 'Application Config',
   description: 'Server configuration file',
   mimeType: 'application/json'
-}, async (uri) => {
+}, async (uri, context) => {
   // Read and return the configuration file
   const config = { setting1: 'value1', setting2: 'value2' }
   return {
@@ -106,7 +106,7 @@ app.mcpAddPrompt({
     description: 'Programming language',
     required: true
   }]
-}, async (name, args) => {
+}, async (name, args, context) => {
   const language = args?.language || 'javascript'
   return {
     messages: [{
@@ -336,7 +336,7 @@ app.mcpAddResource({
   name: 'Document Files',
   description: 'Access document files',
   uriSchema: FileUriSchema
-}, async (uri) => {
+}, async (uri, context) => {
   // uri is validated against the schema
   const content = await readFile(uri)
   return {
@@ -367,7 +367,7 @@ app.mcpAddPrompt({
   description: 'Generate code review',
   argumentSchema: CodeReviewSchema
   // arguments array is automatically generated from schema
-}, async (name, args) => {
+}, async (name, args, context) => {
   // args is typed as: { language: 'javascript' | 'typescript' | 'python', complexity?: 'low' | 'medium' | 'high' }
   return {
     messages: [{
@@ -1396,23 +1396,13 @@ The plugin adds the following decorators to your Fastify instance:
 // With TypeBox schema (recommended)
 app.mcpAddTool<TSchema extends TObject>(
   definition: { name: string, description: string, inputSchema: TSchema },
-  handler?: (params: Static<TSchema>, context?: { 
-    sessionId?: string,
-    request?: FastifyRequest,
-    reply?: FastifyReply,
-    authContext?: AuthorizationContext
-  }) => Promise<CallToolResult>
+  handler?: (params: Static<TSchema>, context: HandlerContext) => Promise<CallToolResult>
 )
 
 // Without schema (unsafe)
 app.mcpAddTool(
   definition: { name: string, description: string },
-  handler?: (params: any, context?: { 
-    sessionId?: string,
-    request?: FastifyRequest,
-    reply?: FastifyReply,
-    authContext?: AuthorizationContext
-  }) => Promise<CallToolResult>
+  handler?: (params: any, context: HandlerContext) => Promise<CallToolResult>
 )
 ```
 
@@ -1422,13 +1412,13 @@ app.mcpAddTool(
 // With URI schema
 app.mcpAddResource<TUriSchema extends TSchema>(
   definition: { uriPattern: string, name: string, description: string, uriSchema?: TUriSchema },
-  handler?: (uri: Static<TUriSchema>) => Promise<ReadResourceResult>
+  handler?: (uri: Static<TUriSchema>, context: HandlerContext) => Promise<ReadResourceResult>
 )
 
 // Without schema
 app.mcpAddResource(
   definition: { uriPattern: string, name: string, description: string },
-  handler?: (uri: string) => Promise<ReadResourceResult>
+  handler?: (uri: string, context: HandlerContext) => Promise<ReadResourceResult>
 )
 ```
 
@@ -1438,19 +1428,21 @@ app.mcpAddResource(
 // With argument schema (automatically generates arguments array)
 app.mcpAddPrompt<TArgsSchema extends TObject>(
   definition: { name: string, description: string, argumentSchema?: TArgsSchema },
-  handler?: (name: string, args: Static<TArgsSchema>) => Promise<GetPromptResult>
+  handler?: (name: string, args: Static<TArgsSchema>, context: HandlerContext) => Promise<GetPromptResult>
 )
 
 // Without schema
 app.mcpAddPrompt(
   definition: { name: string, description: string, arguments?: PromptArgument[] },
-  handler?: (name: string, args: any) => Promise<GetPromptResult>
+  handler?: (name: string, args: any, context: HandlerContext) => Promise<GetPromptResult>
 )
 ```
 
 #### HTTP Context Access in Tool Handlers
 
-Tool handlers can access the Fastify request and reply objects through the context parameter, enabling tools to interact with HTTP-specific features like headers, query parameters, and custom response headers.
+Tool handlers can access the Fastify request and reply objects through the context parameter, enabling tools to interact with HTTP-specific features like headers, query parameters, and custom response headers. 
+
+The request and reply objects are now consistently provided across all communication modes (HTTP, SSE, and STDIO), ensuring handlers always have access to HTTP context regardless of how they're invoked.
 
 ```typescript
 app.mcpAddTool({
@@ -1461,15 +1453,13 @@ app.mcpAddTool({
   })
 }, async (params, context) => {
   // Access request information
-  const userAgent = context?.request?.headers['user-agent']
-  const queryParams = context?.request?.query
-  const requestUrl = context?.request?.url
+  const userAgent = context.request.headers['user-agent']
+  const queryParams = context.request.query
+  const requestUrl = context.request.url
   
   // Set custom response headers
-  if (context?.reply) {
-    context.reply.header('x-processed-by', 'mcp-tool')
-    context.reply.header('x-request-id', Date.now().toString())
-  }
+  context.reply.header('x-processed-by', 'mcp-tool')
+  context.reply.header('x-request-id', Date.now().toString())
   
   return {
     content: [{
@@ -1481,6 +1471,8 @@ app.mcpAddTool({
 ```
 
 #### Available Context Properties
+
+All handlers receive a consistent context object containing:
 
 - `context.request`: Full Fastify request object with access to:
   - `headers`: HTTP request headers
@@ -1495,7 +1487,7 @@ app.mcpAddTool({
 
 #### Backward Compatibility
 
-Existing tool handlers continue to work unchanged. The request and reply objects are optional in the context parameter:
+The context parameter is always provided to handlers. The request and reply objects are now consistently provided in all communication modes (HTTP, SSE, and STDIO):
 
 ```typescript
 // Existing handler (still works)
@@ -1517,6 +1509,50 @@ app.mcpAddTool({
 })
 ```
 
+#### Context Access in Resource and Prompt Handlers
+
+Resource and prompt handlers also receive the same context object as tool handlers, enabling access to HTTP context and authorization information:
+
+```typescript
+// Resource handler with context
+app.mcpAddResource({
+  name: 'context-aware-resource',
+  description: 'Resource that uses HTTP context',
+  uriPattern: 'context://data/{id}'
+}, async (uri, context) => {
+  // Access request information
+  const userAgent = context.request.headers['user-agent']
+  const authUser = context?.authContext?.userId
+  
+  return {
+    contents: [{
+      uri,
+      text: `Resource ${uri} accessed by ${authUser || 'anonymous'} from ${userAgent || 'unknown client'}`,
+      mimeType: 'text/plain'
+    }]
+  }
+})
+
+// Prompt handler with context
+app.mcpAddPrompt({
+  name: 'context-aware-prompt',
+  description: 'Prompt that uses HTTP context'
+}, async (name, args, context) => {
+  const sessionId = context?.sessionId
+  const userId = context?.authContext?.userId
+  
+  return {
+    messages: [{
+      role: 'user',
+      content: {
+        type: 'text',
+        text: `Prompt ${name} for user ${userId || 'anonymous'} in session ${sessionId || 'none'}`
+      }
+    }]
+  }
+})
+```
+
 ### Messaging Functions
 
 - `app.mcpBroadcastNotification(notification)`: Broadcast a notification to all connected SSE clients (works across Redis instances)
@@ -1529,10 +1565,30 @@ app.mcpAddTool({
   - `refreshSessionToken(sessionId)`: Manually refresh token for a session
   - `notifyTokenRefresh(sessionId, token, response)`: Send token refresh notification
 
-Handler functions are called when the corresponding MCP methods are invoked:
-- Tool handlers receive validated, typed arguments and return `CallToolResult`
-- Resource handlers receive validated URIs and return `ReadResourceResult`  
-- Prompt handlers receive the prompt name and validated, typed arguments, return `GetPromptResult`
+## Handler API Reference
+
+All MCP handlers follow a consistent pattern where the context parameter is always provided as the final parameter:
+
+```typescript
+// HandlerContext interface (available to all handlers)
+interface HandlerContext {
+  sessionId?: string              // Session identifier (SSE mode)
+  request: FastifyRequest         // HTTP request object
+  reply: FastifyReply            // HTTP reply object
+  authContext?: AuthorizationContext  // OAuth authorization data
+}
+
+// Normalized handler signatures
+type ToolHandler = (params: any, context: HandlerContext) => Promise<CallToolResult>
+type ResourceHandler = (uri: string, context: HandlerContext) => Promise<ReadResourceResult>
+type PromptHandler = (name: string, args: any, context: HandlerContext) => Promise<GetPromptResult>
+```
+
+**Handler Invocation Summary:**
+- **Tool handlers**: Receive validated, typed arguments and return `CallToolResult`
+- **Resource handlers**: Receive validated URIs and return `ReadResourceResult`  
+- **Prompt handlers**: Receive the prompt name and validated arguments, return `GetPromptResult`
+- **All handlers**: Optionally receive `HandlerContext` with session, HTTP, and auth information
 
 ### MCP Endpoints
 

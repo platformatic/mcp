@@ -30,13 +30,13 @@ describe('Tool Context Access', () => {
           type: 'object',
           properties: {}
         }
-      }, async (_params, context) => {
-        // This should fail initially since request isn't passed
-        capturedRequest = context?.request
+      }, async (params, context) => {
+        // Request is now always passed
+        capturedRequest = context.request
         return {
           content: [{
             type: 'text',
-            text: `Request URL: ${context?.request?.url || 'undefined'}`
+            text: `Request URL: ${context.request.url}`
           }]
         }
       })
@@ -72,8 +72,8 @@ describe('Tool Context Access', () => {
       t.assert.strictEqual(capturedRequest.headers['x-custom-header'], 'test-value', 'Custom headers should be accessible')
 
       // Check that the result contains the expected content
-      const firstContent = result.content[0]
-      t.assert.ok(firstContent.type === 'text' && firstContent.text.includes('/mcp?test=true'), 'Result should contain request URL')
+      const textContent = result.content[0] as { type: 'text', text: string }
+      t.assert.ok(textContent.text.includes('/mcp?test=true'), 'Result should contain request URL')
     })
 
     test('should provide access to request query parameters in tool handler', async (t: TestContext) => {
@@ -92,12 +92,12 @@ describe('Tool Context Access', () => {
           type: 'object',
           properties: {}
         }
-      }, async (_params, context) => {
-        capturedQuery = context?.request?.query
+      }, async (params, context) => {
+        capturedQuery = context.request.query
         return {
           content: [{
             type: 'text',
-            text: `Query params: ${JSON.stringify(context?.request?.query || {})}`
+            text: `Query params: ${JSON.stringify(context.request.query || {})}`
           }]
         }
       })
@@ -142,13 +142,11 @@ describe('Tool Context Access', () => {
           type: 'object',
           properties: {}
         }
-      }, async (_params, context) => {
-        capturedReply = context?.reply
+      }, async (params, context) => {
+        capturedReply = context.reply
 
         // Test that we can set a custom header via reply
-        if (context?.reply) {
-          context.reply.header('x-tool-processed', 'true')
-        }
+        context.reply.header('x-tool-processed', 'true')
 
         return {
           content: [{
@@ -200,9 +198,7 @@ describe('Tool Context Access', () => {
       }, async (params, context) => {
         const { headerName, headerValue } = params
 
-        if (context?.reply) {
-          context.reply.header(headerName, headerValue)
-        }
+        context.reply.header(headerName, headerValue)
 
         return {
           content: [{
@@ -286,8 +282,8 @@ describe('Tool Context Access', () => {
       t.assert.strictEqual(response.statusCode, 200)
       const body = response.json() as JSONRPCResponse
       const result = body.result as CallToolResult
-      const firstContent = result.content[0]
-      t.assert.strictEqual(firstContent.type === 'text' ? firstContent.text : '', 'Echo: Hello World', 'Traditional handler should still work')
+      const textContent = result.content[0] as { type: 'text', text: string }
+      t.assert.strictEqual(textContent.text, 'Echo: Hello World', 'Traditional handler should still work')
     })
 
     test('should work with tool handlers that use only sessionId context', async (t: TestContext) => {
@@ -305,11 +301,11 @@ describe('Tool Context Access', () => {
           type: 'object',
           properties: {}
         }
-      }, async (_params, context) => {
+      }, async (params, context) => {
         return {
           content: [{
             type: 'text',
-            text: `Session: ${context?.sessionId || 'undefined'}`
+            text: `Session: ${context.sessionId || 'undefined'}`
           }]
         }
       })
@@ -336,8 +332,8 @@ describe('Tool Context Access', () => {
       t.assert.strictEqual(response.statusCode, 200)
       const body = response.json() as JSONRPCResponse
       const result = body.result as CallToolResult
-      const firstContent = result.content[0]
-      t.assert.ok(firstContent.type === 'text' && firstContent.text.includes('test-session-123'), 'SessionId should still be accessible')
+      const textContent = result.content[0] as { type: 'text', text: string }
+      t.assert.ok(textContent.text.includes('test-session-123'), 'SessionId should still be accessible')
     })
   })
 
@@ -358,12 +354,12 @@ describe('Tool Context Access', () => {
           type: 'object',
           properties: {}
         }
-      }, async (_params, context) => {
-        capturedRequest = context?.request
+      }, async (params, context) => {
+        capturedRequest = context.request
         return {
           content: [{
             type: 'text',
-            text: `SSE URL: ${context?.request?.url || 'undefined'}`
+            text: `SSE URL: ${context.request.url}`
           }]
         }
       })
@@ -400,7 +396,7 @@ describe('Tool Context Access', () => {
     })
   })
 
-  describe('Resource Context Access', () => {
+  describe('Resource Handler Context Access', () => {
     test('should pass Fastify request/reply context to resource handler', async (t: TestContext) => {
       const app = Fastify()
       t.after(() => app.close())
@@ -418,12 +414,10 @@ describe('Tool Context Access', () => {
       }, async (uri, context) => {
         capturedContext = context
 
-        const userAgent = context?.request?.headers['user-agent'] || 'unknown'
-        const queryParam = (context?.request?.query as any)?.test || 'none'
+        const userAgent = context.request.headers['user-agent'] || 'unknown'
+        const queryParam = context.request.query?.test || 'none'
 
-        if (context?.reply) {
-          context.reply.header('x-resource-processed', 'true')
-        }
+        context.reply.header('x-resource-processed', 'true')
 
         return {
           contents: [{
@@ -520,7 +514,7 @@ describe('Tool Context Access', () => {
     })
   })
 
-  describe('Prompt Context Access', () => {
+  describe('Prompt Handler Context Access', () => {
     test('should pass Fastify request/reply context to prompt handler', async (t: TestContext) => {
       const app = Fastify()
       t.after(() => app.close())
@@ -542,12 +536,10 @@ describe('Tool Context Access', () => {
       }, async (_name, args, context) => {
         capturedContext = context
 
-        const userAgent = context?.request?.headers['user-agent'] || 'unknown'
-        const queryParam = (context?.request?.query as any)?.mode || 'default'
+        const userAgent = context.request.headers['user-agent'] || 'unknown'
+        const queryParam = context.request.query?.mode || 'default'
 
-        if (context?.reply) {
-          context.reply.header('x-prompt-processed', 'true')
-        }
+        context.reply.header('x-prompt-processed', 'true')
 
         return {
           messages: [{
