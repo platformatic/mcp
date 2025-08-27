@@ -6,7 +6,7 @@
   "types": "dist/index.d.ts",
   "type": "module",
   "scripts": {
-    "prepublish": "npm run build",
+    "prepare": "npm run build",
     "build": "rm -rf dist && tsc -p tsconfig.base.json",
     "lint": "eslint --cache",
     "lint:fix": "eslint --cache --fix",
