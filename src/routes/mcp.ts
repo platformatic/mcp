@@ -8,6 +8,12 @@ import type { SessionStore, SessionMetadata } from '../stores/session-store.ts'
 import type { MessageBroker } from '../brokers/message-broker.ts'
 import { processMessage } from '../handlers.ts'
 
+declare module 'fastify' {
+  interface FastifyRequest {
+    mcpSession?: SessionMetadata
+  }
+}
+
 interface MCPPubSubRoutesOptions {
   enableSSE: boolean
   opts: MCPPluginOptions
@@ -64,20 +70,26 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     if (!session) return
 
     const eventId = (++session.eventId).toString()
-    const sseEvent = `id: ${eventId}\\ndata: ${JSON.stringify(message)}\\n\\n`
     session.lastEventId = eventId
     session.lastActivity = new Date()
 
     // Store message in history
     await sessionStore.addMessage(sessionId, eventId, message)
 
-    // Send to all connected streams in this session
+    // Send to all connected streams in this session using @fastify/sse
     const deadStreams = new Set<FastifyReply>()
     for (const stream of streams) {
       try {
-        stream.raw.write(sseEvent)
+        if (stream.sse && stream.sse.isConnected) {
+          stream.sse.send({
+            id: eventId,
+            data: JSON.stringify(message)
+          })
+        } else {
+          deadStreams.add(stream)
+        }
       } catch (error) {
-        app.log.error({ err: error }, 'Failed to write SSE event')
+        app.log.error({ err: error }, 'Failed to send SSE event')
         deadStreams.add(stream)
       }
     }
@@ -93,7 +105,12 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         sessionId
       }, 'Session has no active streams, cleaning up')
       localStreams.delete(sessionId)
-      await messageBroker.unsubscribe(`mcp/session/${sessionId}/message`)
+      // Properly await unsubscribe to ensure cleanup completes
+      try {
+        await messageBroker.unsubscribe(`mcp/session/${sessionId}/message`)
+      } catch (error) {
+        app.log.warn({ err: error, sessionId }, 'Failed to unsubscribe from message broker')
+      }
     }
   }
 
@@ -102,9 +119,16 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
       const messagesToReplay = await sessionStore.getMessagesFrom(sessionId, lastEventId)
 
       for (const entry of messagesToReplay) {
-        const sseEvent = `id: ${entry.eventId}\\ndata: ${JSON.stringify(entry.message)}\\n\\n`
         try {
-          stream.raw.write(sseEvent)
+          if (stream.sse && stream.sse.isConnected) {
+            stream.sse.send({
+              id: entry.eventId,
+              data: JSON.stringify(entry.message)
+            })
+          } else {
+            app.log.error('SSE stream not connected for replay')
+            break
+          }
         } catch (error) {
           app.log.error({ err: error }, 'Failed to replay SSE event')
           break
@@ -119,43 +143,53 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     }
   }
 
-  app.post('/mcp', async (request: FastifyRequest, reply: FastifyReply) => {
-    try {
-      const message = request.body as JSONRPCMessage
-      const sessionId = request.headers['mcp-session-id'] as string
-      const useSSE = enableSSE && supportsSSE(request) && !hasActiveSSESession(sessionId)
-
-      if (useSSE) {
-        reply.hijack()
-        request.log.info({ sessionId }, 'Handling SSE request')
-
-        // Set up SSE stream
-        reply.raw.setHeader('content-type', 'text/event-stream')
-
+  // POST endpoint for JSON-RPC messages with optional SSE streaming
+  app.post('/mcp', {
+    sse: enableSSE,
+    preHandler: async (request: FastifyRequest, _reply: FastifyReply) => {
+      if (enableSSE && supportsSSE(request)) {
+        // Create or get session and set header before SSE takes over
+        const sessionId = request.headers['mcp-session-id'] as string
         let session: SessionMetadata
+
         if (sessionId) {
           const existingSession = await sessionStore.get(sessionId)
           if (existingSession) {
             session = existingSession
           } else {
             session = await createSSESession()
-            reply.raw.setHeader('Mcp-Session-Id', session.id)
           }
         } else {
           session = await createSSESession()
-          reply.raw.setHeader('Mcp-Session-Id', session.id)
         }
 
-        // Set up persistent SSE connection
-        reply.raw.writeHead(200, {
-          'Content-Type': 'text/event-stream',
-          'Cache-Control': 'no-cache',
-          Connection: 'keep-alive',
-          'Access-Control-Allow-Origin': '*',
-          'Mcp-Session-Id': session.id
-        })
+        // Note: Cannot set session ID header due to @fastify/sse limitation
+        // Headers must be set before SSE initialization (see GitHub issue #3)
 
-        // Add this connection to the local streams
+        // Store session for use in main handler
+        request.mcpSession = session
+      }
+    }
+  }, async (request: FastifyRequest, reply: FastifyReply) => {
+    try {
+      const message = request.body as JSONRPCMessage
+      const sessionId = request.headers['mcp-session-id'] as string
+      const useSSE = enableSSE && supportsSSE(request) && !hasActiveSSESession(sessionId)
+
+      if (useSSE && reply.sse) {
+        // Handle POST SSE: process message AND set up SSE stream
+        request.log.info({ sessionId, method: request.method }, 'Handling POST SSE request')
+
+        // Get session that was created in preHandler
+        const session = request.mcpSession!
+        if (!session) {
+          throw new Error('Session should have been created in preHandler')
+        }
+
+        // Note: Cannot set session ID header here due to @fastify/sse limitation
+        // Headers must be set before SSE initialization (see GitHub issue #3)
+
+        // Add this connection to local streams
         let streams = localStreams.get(session.id)
         if (!streams) {
           streams = new Set()
@@ -166,11 +200,11 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         app.log.info({
           sessionId: session.id,
           totalStreams: streams.size,
-          method: 'POST'
+          method: request.method
         }, 'Added new stream to session')
 
         // Handle connection close
-        reply.raw.on('close', () => {
+        reply.sse.onClose(async () => {
           const streams = localStreams.get(session.id)
           if (streams) {
             streams.delete(reply)
@@ -184,13 +218,17 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
                 sessionId: session.id
               }, 'Last POST SSE stream closed, cleaning up session')
               localStreams.delete(session.id)
-              messageBroker.unsubscribe(`mcp/session/${session.id}/message`)
+              try {
+                await messageBroker.unsubscribe(`mcp/session/${session.id}/message`)
+              } catch (error) {
+                app.log.warn({ err: error, sessionId: session.id }, 'Failed to unsubscribe in POST SSE close handler')
+              }
             }
           }
         })
 
         // Process message and send via SSE
-        const response = await processMessage(message, sessionId, {
+        const response = await processMessage(message, session.id, {
           app,
           opts,
           capabilities,
@@ -199,19 +237,22 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
           resources,
           prompts
         })
+
         if (response) {
-          // Send the SSE event but keep the stream open
           const updatedSession = await sessionStore.get(session.id)
           if (updatedSession) {
             const eventId = (++updatedSession.eventId).toString()
-            const sseEvent = `id: ${eventId}\\ndata: ${JSON.stringify(response)}\\n\\n`
-            reply.raw.write(sseEvent)
 
-            // Store message in history and update session
+            reply.sse.send({
+              id: eventId,
+              data: JSON.stringify(response)
+            })
+            // Store message in history (this also updates session metadata)
             await sessionStore.addMessage(session.id, eventId, response)
           }
         } else {
-          reply.raw.write(': heartbeat\\n\\n')
+          // Send heartbeat if no response
+          reply.sse.send({ data: 'heartbeat' })
         }
       } else {
         // Regular JSON response
@@ -243,21 +284,53 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     }
   })
 
-  // GET endpoint for server-initiated communication via SSE
-  app.get('/mcp', async (request: FastifyRequest, reply: FastifyReply) => {
-    if (!enableSSE) {
-      reply.type('application/json').code(405).send({ error: 'Method Not Allowed: SSE not enabled' })
-      return
-    }
+  // GET endpoint for SSE connections
+  app.get('/mcp', {
+    sse: enableSSE,
+    preHandler: async (request: FastifyRequest, _reply: FastifyReply) => {
+      if (enableSSE && supportsSSE(request)) {
+        // Create or get session and set header before SSE takes over
+        const sessionId = (request.headers['mcp-session-id'] as string) ||
+                         ((request.query as any)?.['mcp-session-id'])
+        let session: SessionMetadata
 
-    if (!supportsSSE(request)) {
-      reply.type('application/json').code(405).send({ error: 'Method Not Allowed: SSE not supported' })
-      return
-    }
+        if (sessionId) {
+          const existingSession = await sessionStore.get(sessionId)
+          if (existingSession) {
+            session = existingSession
+          } else {
+            session = await createSSESession()
+          }
+        } else {
+          session = await createSSESession()
+        }
 
+        // Note: Cannot set session ID header due to @fastify/sse limitation
+        // Headers must be set before SSE initialization (see GitHub issue #3)
+
+        // Store session for use in main handler
+        request.mcpSession = session
+      }
+    }
+  }, async (request: FastifyRequest, reply: FastifyReply) => {
     try {
+      if (!enableSSE) {
+        reply.type('application/json').code(405).send({ error: 'Method Not Allowed: SSE not enabled' })
+        return
+      }
+
+      if (!supportsSSE(request)) {
+        reply.type('application/json').code(405).send({ error: 'Method Not Allowed: SSE not supported' })
+        return
+      }
+
+      // Check if reply.sse is available
+      if (!reply.sse) {
+        throw new Error('SSE functionality not available on reply object')
+      }
+
       const sessionId = (request.headers['mcp-session-id'] as string) ||
-                       (request.query as any)['mcp-session-id']
+                       ((request.query as any)?.['mcp-session-id'])
 
       // Check if there's already an active SSE session
       if (hasActiveSSESession(sessionId)) {
@@ -267,33 +340,21 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         return
       }
 
-      request.log.info({ sessionId }, 'Handling SSE request')
+      request.log.info({ sessionId, method: request.method }, 'Handling SSE request')
 
-      // We are opting out of Fastify proper
-      reply.hijack()
-
-      const raw = reply.raw
-
-      // Set up SSE stream
-      raw.setHeader('Content-type', 'text/event-stream')
-      raw.setHeader('Cache-Control', 'no-cache')
-
-      let session: SessionMetadata
-      if (sessionId) {
-        const existingSession = await sessionStore.get(sessionId)
-        if (existingSession) {
-          session = existingSession
-        } else {
-          session = await createSSESession()
-          raw.setHeader('Mcp-Session-Id', session.id)
-        }
-      } else {
-        session = await createSSESession()
-        raw.setHeader('Mcp-Session-Id', session.id)
+      // Get session that was created in preHandler
+      const session = request.mcpSession!
+      if (!session) {
+        throw new Error('Session should have been created in preHandler')
       }
 
-      raw.writeHead(200)
+      // Note: Cannot set session ID header here due to @fastify/sse limitation
+      // Headers must be set before SSE initialization (see GitHub issue #3)
 
+      // Send initial connection event
+      reply.sse.send({ data: 'connected', id: '0' })
+
+      // Add this connection to local streams
       let streams = localStreams.get(session.id)
       if (!streams) {
         streams = new Set()
@@ -304,10 +365,10 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
       app.log.info({
         sessionId: session.id,
         totalStreams: streams.size,
-        method: 'GET'
+        method: request.method
       }, 'Added new stream to session')
 
-      // Handle resumability with Last-Event-ID
+      // Handle Last-Event-ID for reconnections
       const lastEventId = request.headers['last-event-id'] as string
       if (lastEventId) {
         app.log.info(`Resuming SSE stream from event ID: ${lastEventId}`)
@@ -315,7 +376,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
       }
 
       // Handle connection close
-      reply.raw.on('close', () => {
+      reply.sse.onClose(async () => {
         const streams = localStreams.get(session.id)
         if (streams) {
           streams.delete(reply)
@@ -329,37 +390,23 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
               sessionId: session.id
             }, 'Last SSE stream closed, cleaning up session')
             localStreams.delete(session.id)
-            messageBroker.unsubscribe(`mcp/session/${session.id}/message`)
+            try {
+              await messageBroker.unsubscribe(`mcp/session/${session.id}/message`)
+            } catch (error) {
+              app.log.warn({ err: error, sessionId: session.id }, 'Failed to unsubscribe in GET SSE close handler')
+            }
           }
         }
       })
 
-      // Send initial heartbeat
-      reply.raw.write(': heartbeat\\n\\n')
-
-      // Keep connection alive with periodic heartbeats
-      const heartbeatInterval = setInterval(() => {
-        try {
-          reply.raw.write(': heartbeat\\n\\n')
-        } catch (error) {
-          clearInterval(heartbeatInterval)
-          const streams = localStreams.get(session.id)
-          if (streams) {
-            streams.delete(reply)
-          }
-        }
-      }, 30000) // 30 second heartbeat
-      heartbeatInterval.unref()
-
-      reply.raw.on('close', () => {
-        app.log.info({
-          sessionId: session.id
-        }, 'SSE heartbeat connection closed')
-        clearInterval(heartbeatInterval)
-      })
+      // Send initial heartbeat for GET requests
+      reply.sse.send({ data: 'heartbeat', id: session.lastEventId || '0' })
     } catch (error) {
-      app.log.error({ err: error }, 'Error setting up SSE stream')
-      reply.type('application/json').code(500).send({ error: 'Internal server error' })
+      app.log.error({ err: error }, 'Error in SSE GET endpoint')
+      reply.type('application/json').code(500).send({
+        error: 'Internal server error',
+        message: error instanceof Error ? error.message : 'Unknown error'
+      })
     }
   })
 

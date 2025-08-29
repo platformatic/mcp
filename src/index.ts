@@ -1,5 +1,6 @@
 import type { FastifyInstance } from 'fastify'
 import fp from 'fastify-plugin'
+import fastifySSE, { type SSEPluginOptions } from '@fastify/sse'
 import { Redis } from 'ioredis'
 import type { SessionStore } from './stores/session-store.ts'
 import type { MessageBroker } from './brokers/message-broker.ts'
@@ -92,6 +93,12 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
   // Register OAuth client routes if OAuth client is configured
   if (opts.authorization?.enabled && opts.authorization?.oauth2Client) {
     await app.register(authRoutesPlugin, { sessionStore })
+  }
+
+  // Register @fastify/sse plugin if SSE is enabled
+  if (enableSSE) {
+    const sseOptions: SSEPluginOptions = {}
+    await app.register(fastifySSE as any, sseOptions)
   }
 
   // Register decorators first
