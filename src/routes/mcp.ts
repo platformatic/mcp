@@ -81,10 +81,8 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     if (!session) return
 
     const eventId = (++session.eventId).toString()
-    session.lastEventId = eventId
-    session.lastActivity = new Date()
 
-    // Store message in history
+    // Store message in history (this updates session metadata in the store)
     await sessionStore.addMessage(sessionId, eventId, message)
 
     // Send to all connected streams in this session using @fastify/sse
