@@ -22,7 +22,11 @@ export interface SessionStore {
 
   // Message history operations
   addMessage(sessionId: string, eventId: string, message: JSONRPCMessage): Promise<void>
+  addMessageWithAutoEventId(sessionId: string, message: JSONRPCMessage): Promise<string>
   getMessagesFrom(sessionId: string, fromEventId: string): Promise<Array<{ eventId: string, message: JSONRPCMessage }>>
+
+  // Session listing (for broadcast notifications)
+  getAllSessionIds(): Promise<string[]>
 
   // Token-to-session mapping operations
   getSessionByTokenHash(tokenHash: string): Promise<SessionMetadata | null>

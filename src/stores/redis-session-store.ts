@@ -145,6 +145,49 @@ export class RedisSessionStore implements SessionStore {
     await pipeline.exec()
   }
 
+  async addMessageWithAutoEventId (sessionId: string, message: JSONRPCMessage): Promise<string> {
+    const sessionKey = `session:${sessionId}`
+    const historyKey = `session:${sessionId}:history`
+
+    // Atomically increment eventId and add message
+    const eventId = await this.redis.eval(
+      `
+      local sessionKey = KEYS[1]
+      local historyKey = KEYS[2]
+      local message = ARGV[1]
+      local maxMessages = tonumber(ARGV[2])
+      local ttl = tonumber(ARGV[3])
+      local currentTime = ARGV[4]
+      
+      -- Get and increment eventId atomically
+      local eventId = redis.call('HINCRBY', sessionKey, 'eventId', 1)
+      
+      -- Add message to stream
+      redis.call('XADD', historyKey, eventId .. '-0', 'message', message)
+      
+      -- Trim to max messages
+      redis.call('XTRIM', historyKey, 'MAXLEN', maxMessages)
+      
+      -- Update session metadata
+      redis.call('HSET', sessionKey, 'lastEventId', eventId, 'lastActivity', currentTime)
+      
+      -- Reset expiration
+      redis.call('EXPIRE', sessionKey, ttl)
+      
+      return eventId
+      `,
+      2,
+      sessionKey,
+      historyKey,
+      JSON.stringify(message),
+      this.maxMessages.toString(),
+      '3600',
+      new Date().toISOString()
+    ) as number
+
+    return eventId.toString()
+  }
+
   async getMessagesFrom (sessionId: string, fromEventId: string): Promise<Array<{ eventId: string, message: JSONRPCMessage }>> {
     const historyKey = `session:${sessionId}:history`
 
@@ -159,6 +202,13 @@ export class RedisSessionStore implements SessionStore {
       // If stream doesn't exist, return empty array
       return []
     }
+  }
+
+  async getAllSessionIds (): Promise<string[]> {
+    const sessionKeys = await this.redis.keys('session:*')
+    return sessionKeys
+      .filter(key => !key.includes(':history') && !key.includes(':token'))
+      .map(key => key.replace('session:', ''))
   }
 
   // Token-to-session mapping operations

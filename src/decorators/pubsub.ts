@@ -50,7 +50,9 @@ const mcpPubSubDecoratorsPlugin: FastifyPluginAsync<MCPPubSubDecoratorsOptions> 
     // Always publish to messageBroker to support cross-instance messaging in Redis deployments
     // This ensures the message reaches the correct instance where the SSE connection exists
     try {
-      await messageBroker.publish(`mcp/session/${sessionId}/message`, message)
+      // Use a universal session topic and include sessionId in the message payload
+      const sessionMessage = { sessionId, originalMessage: message }
+      await messageBroker.publish('mcp/session/message', sessionMessage as any)
       return true
     } catch (error) {
       app.log.error({ err: error }, 'Failed to send message to session')

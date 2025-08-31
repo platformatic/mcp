@@ -71,6 +71,32 @@ export class MemorySessionStore implements SessionStore {
     }
   }
 
+  async addMessageWithAutoEventId (sessionId: string, message: JSONRPCMessage): Promise<string> {
+    const session = this.sessions.get(sessionId)
+    if (!session) {
+      throw new Error(`Session ${sessionId} not found`)
+    }
+
+    // Increment eventId atomically
+    const eventId = (++session.eventId).toString()
+
+    // Add to history
+    const history = this.messageHistory.get(sessionId) || []
+    history.push({ eventId, message })
+    this.messageHistory.set(sessionId, history)
+
+    // Auto-trim using constructor maxMessages
+    if (history.length > this.maxMessages) {
+      history.splice(0, history.length - this.maxMessages)
+    }
+
+    // Update session metadata
+    session.lastEventId = eventId
+    session.lastActivity = new Date()
+
+    return eventId
+  }
+
   async getMessagesFrom (sessionId: string, fromEventId: string): Promise<Array<{ eventId: string, message: JSONRPCMessage }>> {
     const history = this.messageHistory.get(sessionId) || []
     const fromIndex = history.findIndex(entry => entry.eventId === fromEventId)
@@ -83,6 +109,10 @@ export class MemorySessionStore implements SessionStore {
       eventId: entry.eventId,
       message: entry.message
     }))
+  }
+
+  async getAllSessionIds (): Promise<string[]> {
+    return Array.from(this.sessions.keys())
   }
 
   // Token-to-session mapping operations

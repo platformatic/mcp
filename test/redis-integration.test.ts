@@ -220,20 +220,26 @@ describe('Redis Integration Tests', () => {
     const notification: JSONRPCMessage = {
       jsonrpc: '2.0',
       method: 'notifications/message',
-      params: { message: 'Cross-instance notification' },
-      id: 2
+      params: { message: 'Cross-instance notification' }
     }
 
-    // Close the SSE stream first to cleanup properly
-    sessionResponse.stream().destroy()
-    
-    // Send message from app2 to session created on app1
-    const result = await app2.mcpSendToSession(sessionId, notification)
-    assert.ok(result, 'Message should be sent successfully across Redis instances')
-    
-    // The core functionality test: cross-instance message sending via Redis pub/sub
-    // This validates that the Redis message broker is working correctly across instances
-    // The fact that mcpSendToSession returned true indicates successful Redis pub/sub
+    await app2.mcpBroadcastNotification(notification)
+
+    for await (const chunk of sessionResponse.stream()) {
+      const data = chunk.toString()
+      if (data.includes('Cross-instance notification')) {
+        // Verify the notification was received
+        assert.ok(data.includes('Cross-instance notification'), 'Should receive cross-instance notification')
+        break
+      }
+    }
+
+    // Wait a bit for broadcast processing to complete
+    await new Promise(resolve => setTimeout(resolve, 100))
+
+    // Verify message was stored in session history
+    const history = await redis.xrange(`session:${sessionId}:history`, '-', '+')
+    assert.ok(history.length > 0)
   })
 
   testWithRedis('should handle session message sending with Redis', async (redis, t) => {
@@ -402,8 +408,8 @@ describe('Redis Integration Tests', () => {
     assert.strictEqual(sessionResponse.statusCode, 200)
     assert.ok(sessionResponse.headers['content-type']?.includes('text/event-stream'))
 
-    // Give time for the session to be properly stored in Redis
-    await new Promise(resolve => setTimeout(resolve, 50))
+    // Give time for the session to be properly stored in Redis and for MQEmitter connections to be established
+    await new Promise(resolve => setTimeout(resolve, 200))
 
     // Verify mcpElicit decorator is available on both instances
     assert.ok(typeof app1.mcpElicit === 'function', 'app1 should have mcpElicit decorator')
@@ -437,11 +443,47 @@ describe('Redis Integration Tests', () => {
     // Give time for the message to propagate through Redis
     await new Promise(resolve => setTimeout(resolve, 100))
 
-    // Verify the session still exists in Redis after elicitation
-    const sessionExists = await redis.exists(`session:${sessionId}`)
-    assert.ok(sessionExists, 'Session should persist in Redis after elicitation')
+    // Verify the message was stored in Redis session history
+    const history = await redis.xrange(`session:${sessionId}:history`, '-', '+')
+    assert.ok(history.length > 0, 'Session history should contain messages')
 
-    // The elicitation functionality works as evidenced by the successful return value
-    // Message history persistence requires active SSE streams, which we can't test after destroying streams
+    // Look for the elicitation request in the history
+    const elicitMessage = history.find(([_, fields]) => {
+      const messageField = fields.find((field, index) => index % 2 === 0 && field === 'message')
+      if (messageField) {
+        const messageIndex = fields.indexOf(messageField)
+        const messageData = fields[messageIndex + 1]
+        try {
+          const message = JSON.parse(messageData)
+          return message.method === 'elicitation/create' && message.id === 'test-elicit-123'
+        } catch {
+          return false
+        }
+      }
+      return false
+    })
+
+    assert.ok(elicitMessage, 'Elicitation request should be stored in Redis session history')
+
+    // Verify the elicitation message structure
+    if (elicitMessage) {
+      const messageField = elicitMessage[1].find((field, index) => index % 2 === 0 && field === 'message')
+      if (messageField) {
+        const messageIndex = elicitMessage[1].indexOf(messageField)
+        const messageData = elicitMessage[1][messageIndex + 1]
+        const message = JSON.parse(messageData)
+
+        assert.strictEqual(message.jsonrpc, '2.0')
+        assert.strictEqual(message.method, 'elicitation/create')
+        assert.strictEqual(message.id, 'test-elicit-123')
+        assert.strictEqual(message.params.message, 'Please enter your details')
+        assert.ok(message.params.requestedSchema)
+        assert.strictEqual(message.params.requestedSchema.type, 'object')
+        assert.ok(message.params.requestedSchema.properties.name)
+        assert.ok(message.params.requestedSchema.properties.age)
+        assert.ok(message.params.requestedSchema.properties.category)
+        assert.deepStrictEqual(message.params.requestedSchema.required, ['name'])
+      }
+    }
   })
 })
