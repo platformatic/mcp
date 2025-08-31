@@ -163,8 +163,8 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
           session = await createSSESession()
         }
 
-        // Note: Cannot set session ID header due to @fastify/sse limitation
-        // Headers must be set before SSE initialization (see GitHub issue #3)
+        // Set session ID header using @fastify/sse v0.2.0 header handling
+        _reply.header('Mcp-Session-Id', session.id)
 
         // Store session for use in main handler
         request.mcpSession = session
@@ -186,8 +186,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
           throw new Error('Session should have been created in preHandler')
         }
 
-        // Note: Cannot set session ID header here due to @fastify/sse limitation
-        // Headers must be set before SSE initialization (see GitHub issue #3)
+        // Header already set in preHandler
 
         // Add this connection to local streams
         let streams = localStreams.get(session.id)
@@ -305,8 +304,8 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
           session = await createSSESession()
         }
 
-        // Note: Cannot set session ID header due to @fastify/sse limitation
-        // Headers must be set before SSE initialization (see GitHub issue #3)
+        // Set session ID header using @fastify/sse v0.2.0 header handling
+        _reply.header('Mcp-Session-Id', session.id)
 
         // Store session for use in main handler
         request.mcpSession = session
@@ -348,8 +347,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         throw new Error('Session should have been created in preHandler')
       }
 
-      // Note: Cannot set session ID header here due to @fastify/sse limitation
-      // Headers must be set before SSE initialization (see GitHub issue #3)
+      // Header already set in preHandler
 
       // Send initial connection event
       reply.sse.send({ data: 'connected', id: '0' })
