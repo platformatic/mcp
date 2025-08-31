@@ -31,15 +31,14 @@ async function setupServer (t: TestContext) {
 describe('Last-Event-ID Support', () => {
   test('should add message history to SSE sessions', async (t: TestContext) => {
     const { app } = await setupServer(t)
-    // Create a session by sending a POST request with SSE
+    // Create a session by sending a POST request (JSON response)
     const initResponse = await app.inject({
       method: 'POST',
       url: '/mcp',
       headers: {
         'Content-Type': 'application/json',
-        Accept: 'text/event-stream'
+        Accept: 'application/json'
       },
-      payloadAsStream: true,
       payload: {
         jsonrpc: '2.0',
         method: 'initialize',
@@ -57,25 +56,39 @@ describe('Last-Event-ID Support', () => {
       throw new Error(`Expected 200, got ${initResponse.statusCode}`)
     }
 
-    if (initResponse.headers['content-type'] !== 'text/event-stream') {
-      throw new Error('Expected text/event-stream content type')
+    if (initResponse.headers['content-type'] !== 'application/json; charset=utf-8') {
+      throw new Error('Expected application/json content type')
     }
 
-    // NOTE: With @fastify/sse, session IDs are not returned in headers
-    // Instead, we verify that SSE functionality is working correctly
-    // The session management is internal to the plugin
+    const sessionId = initResponse.headers['mcp-session-id'] as string
+    t.assert.ok(sessionId, 'Session ID should be present in headers')
 
-    // With the new architecture, session management is internal
-    // We verify functionality by testing that the SSE connection was established
-    // and can be used for streaming (basic connectivity test)
+    // Now establish SSE connection with GET request
+    const sseResponse = await app.inject({
+      method: 'GET',
+      url: '/mcp',
+      headers: {
+        Accept: 'text/event-stream',
+        'mcp-session-id': sessionId
+      },
+      payloadAsStream: true
+    })
 
-    t.assert.strictEqual(initResponse.statusCode, 200, 'SSE connection should be established')
-    t.assert.strictEqual(initResponse.headers['content-type'], 'text/event-stream', 'Should return SSE content type')
+    if (sseResponse.statusCode !== 200) {
+      throw new Error(`Expected SSE 200, got ${sseResponse.statusCode}`)
+    }
+
+    if (sseResponse.headers['content-type'] !== 'text/event-stream') {
+      throw new Error('Expected text/event-stream content type for SSE')
+    }
+
+    t.assert.strictEqual(initResponse.statusCode, 200, 'JSON connection should be established')
+    t.assert.strictEqual(initResponse.headers['content-type'], 'application/json; charset=utf-8', 'Should return JSON content type')
 
     // The session is created internally and message broadcasting works
     // (this is tested via the pub/sub system in integration tests)
 
-    initResponse.stream().destroy()
+    sseResponse.stream().destroy()
   })
 
   test('should handle GET request with Last-Event-ID using EventSource', async (t) => {
@@ -109,10 +122,9 @@ describe('Last-Event-ID Support', () => {
     const initResponse = await app.inject({
       method: 'POST',
       url: '/mcp',
-      payloadAsStream: true,
       headers: {
         'Content-Type': 'application/json',
-        Accept: 'text/event-stream'
+        Accept: 'application/json'
       },
       payload: {
         jsonrpc: '2.0',
@@ -126,17 +138,41 @@ describe('Last-Event-ID Support', () => {
       }
     })
 
-    // NOTE: With @fastify/sse, session IDs are not returned in headers
-    // We test that the basic SSE connection works and validate streaming functionality
-    t.assert.strictEqual(initResponse.statusCode, 200, 'SSE connection should be established')
-    t.assert.strictEqual(initResponse.headers['content-type'], 'text/event-stream', 'Should return SSE content type')
+    const sessionId = initResponse.headers['mcp-session-id'] as string
+    t.assert.ok(sessionId, 'Session ID should be present in headers')
 
-    // Since session ID is not available in headers with @fastify/sse,
-    // this test now focuses on verifying that the Last-Event-ID mechanism works
-    // by testing the GET endpoint which does support Last-Event-ID
+    // Send additional messages to build message history using the new pub/sub architecture
+    await app.mcpSendToSession(sessionId, {
+      jsonrpc: '2.0',
+      method: 'notifications/message',
+      params: { level: 'info', message: 'Message 1' }
+    })
 
-    // Close the POST SSE stream first
-    initResponse.stream().destroy()
+    await app.mcpSendToSession(sessionId, {
+      jsonrpc: '2.0',
+      method: 'notifications/message',
+      params: { level: 'info', message: 'Message 2' }
+    })
+
+    await app.mcpSendToSession(sessionId, {
+      jsonrpc: '2.0',
+      method: 'notifications/message',
+      params: { level: 'info', message: 'Message 3' }
+    })
+
+    // Establish an SSE connection first to create message history
+    const firstSseResponse = await app.inject({
+      method: 'GET',
+      url: '/mcp',
+      headers: {
+        Accept: 'text/event-stream',
+        'mcp-session-id': sessionId
+      },
+      payloadAsStream: true
+    })
+
+    // Close the first SSE stream
+    firstSseResponse.stream().destroy()
 
     // Wait for the stream to be cleaned up
     await sleep(100)

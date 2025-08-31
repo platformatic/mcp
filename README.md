@@ -86,7 +86,7 @@ app.mcpAddResource({
   name: 'Application Config',
   description: 'Server configuration file',
   mimeType: 'application/json'
-}, async (uri) => {
+}, async (uri, context) => {
   // Read and return the configuration file
   const config = { setting1: 'value1', setting2: 'value2' }
   return {
@@ -106,7 +106,7 @@ app.mcpAddPrompt({
     description: 'Programming language',
     required: true
   }]
-}, async (name, args) => {
+}, async (name, args, context) => {
   const language = args?.language || 'javascript'
   return {
     messages: [{
@@ -336,7 +336,7 @@ app.mcpAddResource({
   name: 'Document Files',
   description: 'Access document files',
   uriSchema: FileUriSchema
-}, async (uri) => {
+}, async (uri, context) => {
   // uri is validated against the schema
   const content = await readFile(uri)
   return {
@@ -367,7 +367,7 @@ app.mcpAddPrompt({
   description: 'Generate code review',
   argumentSchema: CodeReviewSchema
   // arguments array is automatically generated from schema
-}, async (name, args) => {
+}, async (name, args, context) => {
   // args is typed as: { language: 'javascript' | 'typescript' | 'python', complexity?: 'low' | 'medium' | 'high' }
   return {
     messages: [{
@@ -550,41 +550,101 @@ app.mcpSendToSession('session-xyz', {
 })
 ```
 
-### Content-Type Negotiation
+### Dual-Endpoint Architecture
 
-Clients can request SSE streams by including `text/event-stream` in the `Accept` header:
+The plugin uses a dual-endpoint architecture that separates regular MCP protocol communication from SSE streaming:
+
+#### POST `/mcp` - MCP Protocol Communication
+
+Handles all standard MCP protocol requests and returns JSON responses:
 
 ```javascript
-// Request SSE stream
-fetch('/mcp', {
+// Regular MCP request (always returns JSON)
+const response = await fetch('/mcp', {
   method: 'POST',
   headers: {
-    'Accept': 'text/event-stream',
-    'Content-Type': 'application/json'
+    'Content-Type': 'application/json',
+    'Accept': 'application/json'
   },
-  body: JSON.stringify({ jsonrpc: '2.0', method: 'ping', id: 1 })
+  body: JSON.stringify({ 
+    jsonrpc: '2.0', 
+    method: 'tools/call',
+    params: { name: 'my-tool', arguments: {} },
+    id: 1 
+  })
 })
-
-// Request regular JSON
-fetch('/mcp', {
-  method: 'POST', 
-  headers: {
-    'Accept': 'application/json',
-    'Content-Type': 'application/json'
-  },
-  body: JSON.stringify({ jsonrpc: '2.0', method: 'ping', id: 1 })
-})
+const result = await response.json()
 ```
 
-### GET Endpoint for Long-lived Streams
+#### GET `/mcp` - SSE Stream Establishment
 
-The plugin also provides a GET endpoint for server-initiated communication:
+Establishes long-lived Server-Sent Events streams for real-time communication:
 
 ```javascript
-// Long-lived SSE stream
+// Establish SSE stream (separate from protocol requests)
 const eventSource = new EventSource('/mcp', {
-  headers: { 'Accept': 'text/event-stream' }
+  headers: { 
+    'Accept': 'text/event-stream',
+    'mcp-session-id': sessionId  // Use session from POST request
+  }
 })
+
+eventSource.onmessage = (event) => {
+  const message = JSON.parse(event.data)
+  console.log('Server notification:', message)
+}
+```
+
+#### Complete Workflow Example
+
+```javascript
+// 1. Create session and make MCP requests via POST
+const initResponse = await fetch('/mcp', {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+    'Accept': 'application/json'
+  },
+  body: JSON.stringify({
+    jsonrpc: '2.0',
+    method: 'initialize',
+    params: {
+      protocolVersion: '2025-06-18',
+      capabilities: {},
+      clientInfo: { name: 'my-client', version: '1.0.0' }
+    },
+    id: 1
+  })
+})
+
+const sessionId = initResponse.headers.get('mcp-session-id')
+
+// 2. Establish SSE stream for notifications via GET
+const eventSource = new EventSource('/mcp', {
+  headers: {
+    'Accept': 'text/event-stream',
+    'mcp-session-id': sessionId
+  }
+})
+
+// 3. Continue making MCP requests via POST
+const toolResponse = await fetch('/mcp', {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+    'Accept': 'application/json',
+    'mcp-session-id': sessionId
+  },
+  body: JSON.stringify({
+    jsonrpc: '2.0',
+    method: 'tools/call',
+    params: { name: 'my-tool', arguments: {} },
+    id: 2
+  })
+})
+
+// Server can send notifications via the SSE stream
+// while client makes requests via POST
 ```
 
 ### Server-Initiated Notifications
@@ -849,19 +909,18 @@ await app.register(mcpPlugin, {
   // Enable OAuth 2.1 authorization
   authorization: {
     enabled: true,
+    authorizationServers: ['https://auth.example.com'],
+    resourceUri: 'https://mcp.example.com',
     // JWT Token Validation
     tokenValidation: {
       jwksUri: 'https://auth.example.com/.well-known/jwks.json',
-      validateAudience: ['https://api.example.com'],
-      validateIssuer: 'https://auth.example.com'
+      validateAudience: true
     },
     // OAuth 2.1 Client Configuration
-    oauthClient: {
+    oauth2Client: {
       clientId: process.env.OAUTH_CLIENT_ID,
       clientSecret: process.env.OAUTH_CLIENT_SECRET,
-      authorizationEndpoint: 'https://auth.example.com/oauth/authorize',
-      tokenEndpoint: 'https://auth.example.com/oauth/token',
-      redirectUri: 'https://yourapp.com/oauth/callback',
+      authorizationServer: 'https://auth.example.com',
       scopes: ['read', 'write']
     }
   },
@@ -905,7 +964,7 @@ const mcpResponse = await fetch('/mcp', {
   headers: {
     'Authorization': `Bearer ${access_token}`,
     'Content-Type': 'application/json',
-    'Accept': 'text/event-stream' // For SSE
+    'Accept': 'application/json'
   },
   body: JSON.stringify({
     jsonrpc: '2.0',
@@ -947,16 +1006,7 @@ authorization: {
     jwksUri: 'https://auth.example.com/.well-known/jwks.json',
     
     // Validate token audience
-    validateAudience: ['https://api.example.com', 'mcp-server'],
-    
-    // Validate token issuer
-    validateIssuer: 'https://auth.example.com',
-    
-    // Optional: Custom validation function
-    customValidation: async (payload, token) => {
-      // Custom validation logic
-      return payload.sub && payload.scope?.includes('mcp:access')
-    }
+    validateAudience: true
   }
 }
 ```
@@ -980,23 +1030,18 @@ authorization: {
 ```typescript
 authorization: {
   enabled: true,
-  oauthClient: {
+  oauth2Client: {
     clientId: process.env.OAUTH_CLIENT_ID,
     clientSecret: process.env.OAUTH_CLIENT_SECRET,
     
-    // Authorization server endpoints
-    authorizationEndpoint: 'https://auth.example.com/oauth/authorize',
-    tokenEndpoint: 'https://auth.example.com/oauth/token',
+    // Authorization server
+    authorizationServer: 'https://auth.example.com',
     
     // Application configuration
-    redirectUri: 'https://yourapp.com/oauth/callback',
     scopes: ['read', 'write', 'admin'],
     
     // Optional: Dynamic client registration
-    registrationEndpoint: 'https://auth.example.com/oauth/register',
-    
-    // PKCE configuration (recommended)
-    usePKCE: true
+    dynamicRegistration: true
   }
 }
 ```
@@ -1160,26 +1205,7 @@ authorization: {
   enabled: true,
   tokenValidation: {
     jwksUri: 'https://auth.company.com/.well-known/jwks.json',
-    validateAudience: ['https://mcp.company.com'],
-    validateIssuer: 'https://auth.company.com',
-    
-    // Custom security validation
-    customValidation: async (payload, token) => {
-      // Check token blacklist
-      const isBlacklisted = await checkTokenBlacklist(token)
-      if (isBlacklisted) return false
-      
-      // Validate custom claims
-      return payload.department === 'engineering' && 
-             payload.clearance_level >= 3
-    }
-  },
-  
-  // Rate limiting for auth endpoints
-  rateLimiting: {
-    enabled: true,
-    maxRequests: 100,
-    windowMs: 60000 // 1 minute
+    validateAudience: true
   }
 }
 ```
@@ -1358,23 +1384,19 @@ await app.register(import('@fastify/bearer-auth'), {
 - `enableSSE`: Enable Server-Sent Events support (default: false)
 - `authorization`: OAuth 2.1 authorization configuration (optional)
   - `enabled`: Enable OAuth 2.1 authorization (default: false)
+  - `authorizationServers`: Authorization server URIs
+  - `resourceUri`: Resource URI
   - `tokenValidation`: JWT token validation configuration
     - `jwksUri`: JWKS endpoint URL for JWT signature verification
-    - `validateAudience`: Expected token audience(s)
-    - `validateIssuer`: Expected token issuer
-    - `customValidation`: Custom validation function
+    - `validateAudience`: Enable audience validation
     - `introspectionEndpoint`: Token introspection endpoint (alternative to JWT)
-    - `clientId`: OAuth client ID for introspection
-    - `clientSecret`: OAuth client secret for introspection
-  - `oauthClient`: OAuth 2.1 client configuration
+  - `oauth2Client`: OAuth 2.1 client configuration
     - `clientId`: OAuth client identifier
     - `clientSecret`: OAuth client secret
-    - `authorizationEndpoint`: Authorization server authorization endpoint
-    - `tokenEndpoint`: Authorization server token endpoint
-    - `redirectUri`: OAuth redirect URI
+    - `authorizationServer`: Authorization server URI.
+    - `resourceUri`: Resource URI.
     - `scopes`: Requested OAuth scopes
-    - `registrationEndpoint`: Dynamic client registration endpoint (optional)
-    - `usePKCE`: Enable PKCE (Proof Key for Code Exchange)
+    - `dynamicRegistration`: Enable dynamic client registration (default: false)
   - `tokenRefresh`: Automatic token refresh configuration
     - `checkIntervalMs`: Token refresh check interval
     - `refreshBufferMinutes`: Minutes before expiry to refresh tokens
@@ -1396,13 +1418,13 @@ The plugin adds the following decorators to your Fastify instance:
 // With TypeBox schema (recommended)
 app.mcpAddTool<TSchema extends TObject>(
   definition: { name: string, description: string, inputSchema: TSchema },
-  handler?: (params: Static<TSchema>, context?: { sessionId?: string }) => Promise<CallToolResult>
+  handler?: (params: Static<TSchema>, context: HandlerContext) => Promise<CallToolResult>
 )
 
 // Without schema (unsafe)
 app.mcpAddTool(
   definition: { name: string, description: string },
-  handler?: (params: any, context?: { sessionId?: string }) => Promise<CallToolResult>
+  handler?: (params: any, context: HandlerContext) => Promise<CallToolResult>
 )
 ```
 
@@ -1412,13 +1434,13 @@ app.mcpAddTool(
 // With URI schema
 app.mcpAddResource<TUriSchema extends TSchema>(
   definition: { uriPattern: string, name: string, description: string, uriSchema?: TUriSchema },
-  handler?: (uri: Static<TUriSchema>) => Promise<ReadResourceResult>
+  handler?: (uri: Static<TUriSchema>, context: HandlerContext) => Promise<ReadResourceResult>
 )
 
 // Without schema
 app.mcpAddResource(
   definition: { uriPattern: string, name: string, description: string },
-  handler?: (uri: string) => Promise<ReadResourceResult>
+  handler?: (uri: string, context: HandlerContext) => Promise<ReadResourceResult>
 )
 ```
 
@@ -1428,17 +1450,132 @@ app.mcpAddResource(
 // With argument schema (automatically generates arguments array)
 app.mcpAddPrompt<TArgsSchema extends TObject>(
   definition: { name: string, description: string, argumentSchema?: TArgsSchema },
-  handler?: (name: string, args: Static<TArgsSchema>) => Promise<GetPromptResult>
+  handler?: (name: string, args: Static<TArgsSchema>, context: HandlerContext) => Promise<GetPromptResult>
 )
 
 // Without schema
 app.mcpAddPrompt(
   definition: { name: string, description: string, arguments?: PromptArgument[] },
-  handler?: (name: string, args: any) => Promise<GetPromptResult>
+  handler?: (name: string, args: any, context: HandlerContext) => Promise<GetPromptResult>
 )
 ```
 
-#### Messaging Functions
+#### HTTP Context Access in Tool Handlers
+
+Tool handlers can access the Fastify request and reply objects through the context parameter, enabling tools to interact with HTTP-specific features like headers, query parameters, and custom response headers. 
+
+The request and reply objects are now consistently provided across all communication modes (HTTP, SSE, and STDIO), ensuring handlers always have access to HTTP context regardless of how they're invoked.
+
+```typescript
+app.mcpAddTool({
+  name: 'context-aware-tool',
+  description: 'Tool that uses HTTP context',
+  inputSchema: Type.Object({
+    message: Type.String()
+  })
+}, async (params, context) => {
+  // Access request information
+  const userAgent = context.request.headers['user-agent']
+  const queryParams = context.request.query
+  const requestUrl = context.request.url
+  
+  // Set custom response headers
+  context.reply.header('x-processed-by', 'mcp-tool')
+  context.reply.header('x-request-id', Date.now().toString())
+  
+  return {
+    content: [{
+      type: 'text',
+      text: `Processed "${params.message}" from ${userAgent || 'unknown client'}`
+    }]
+  }
+})
+```
+
+#### Available Context Properties
+
+All handlers receive a consistent context object containing:
+
+- `context.request`: Full Fastify request object with access to:
+  - `headers`: HTTP request headers
+  - `query`: Query string parameters
+  - `params`: Route parameters
+  - `url`: Request URL
+  - `method`: HTTP method
+  - `body`: Request body (when applicable)
+- `context.reply`: Fastify reply object for setting response headers
+- `context.sessionId`: Session identifier (when using SSE)
+- `context.authContext`: Authorization context (when OAuth is enabled)
+
+#### Backward Compatibility
+
+The context parameter is always provided to handlers. The request and reply objects are now consistently provided in all communication modes (HTTP, SSE, and STDIO):
+
+```typescript
+// Existing handler (still works)
+app.mcpAddTool({
+  name: 'legacy-tool',
+  description: 'Works as before',
+  inputSchema: Type.Object({ msg: Type.String() })
+}, async (params) => {
+  return { content: [{ type: 'text', text: params.msg }] }
+})
+
+// Handler using only sessionId (still works)
+app.mcpAddTool({
+  name: 'session-tool',
+  description: 'Uses session ID only',
+  inputSchema: Type.Object({})
+}, async (params, { sessionId }) => {
+  return { content: [{ type: 'text', text: `Session: ${sessionId}` }] }
+})
+```
+
+#### Context Access in Resource and Prompt Handlers
+
+Resource and prompt handlers also receive the same context object as tool handlers, enabling access to HTTP context and authorization information:
+
+```typescript
+// Resource handler with context
+app.mcpAddResource({
+  name: 'context-aware-resource',
+  description: 'Resource that uses HTTP context',
+  uriPattern: 'context://data/{id}'
+}, async (uri, context) => {
+  // Access request information
+  const userAgent = context.request.headers['user-agent']
+  const authUser = context?.authContext?.userId
+  
+  return {
+    contents: [{
+      uri,
+      text: `Resource ${uri} accessed by ${authUser || 'anonymous'} from ${userAgent || 'unknown client'}`,
+      mimeType: 'text/plain'
+    }]
+  }
+})
+
+// Prompt handler with context
+app.mcpAddPrompt({
+  name: 'context-aware-prompt',
+  description: 'Prompt that uses HTTP context'
+}, async (name, args, context) => {
+  const sessionId = context?.sessionId
+  const userId = context?.authContext?.userId
+  
+  return {
+    messages: [{
+      role: 'user',
+      content: {
+        type: 'text',
+        text: `Prompt ${name} for user ${userId || 'anonymous'} in session ${sessionId || 'none'}`
+      }
+    }]
+  }
+})
+```
+
+### Messaging Functions
 
 - `app.mcpBroadcastNotification(notification)`: Broadcast a notification to all connected SSE clients (works across Redis instances)
 - `app.mcpSendToSession(sessionId, message)`: Send a message/request to a specific SSE session (works across Redis instances)
@@ -1450,21 +1587,46 @@ app.mcpAddPrompt(
   - `refreshSessionToken(sessionId)`: Manually refresh token for a session
   - `notifyTokenRefresh(sessionId, token, response)`: Send token refresh notification
 
-Handler functions are called when the corresponding MCP methods are invoked:
-- Tool handlers receive validated, typed arguments and return `CallToolResult`
-- Resource handlers receive validated URIs and return `ReadResourceResult`  
-- Prompt handlers receive the prompt name and validated, typed arguments, return `GetPromptResult`
+## Handler API Reference
+
+All MCP handlers follow a consistent pattern where the context parameter is always provided as the final parameter:
+
+```typescript
+// HandlerContext interface (available to all handlers)
+interface HandlerContext {
+  sessionId?: string              // Session identifier (SSE mode)
+  request: FastifyRequest         // HTTP request object
+  reply: FastifyReply            // HTTP reply object
+  authContext?: AuthorizationContext  // OAuth authorization data
+}
+
+// Normalized handler signatures
+type ToolHandler = (params: any, context: HandlerContext) => Promise<CallToolResult>
+type ResourceHandler = (uri: string, context: HandlerContext) => Promise<ReadResourceResult>
+type PromptHandler = (name: string, args: any, context: HandlerContext) => Promise<GetPromptResult>
+```
+
+**Handler Invocation Summary:**
+- **Tool handlers**: Receive validated, typed arguments and return `CallToolResult`
+- **Resource handlers**: Receive validated URIs and return `ReadResourceResult`  
+- **Prompt handlers**: Receive the prompt name and validated arguments, return `GetPromptResult`
+- **All handlers**: Optionally receive `HandlerContext` with session, HTTP, and auth information
 
 ### MCP Endpoints
 
-The plugin exposes the following endpoints:
+The plugin exposes the following endpoints using a dual-endpoint architecture:
 
-- `POST /mcp`: Handles JSON-RPC 2.0 messages according to the MCP specification
-  - Supports both regular JSON responses and SSE streams based on `Accept` header
-  - Returns `Content-Type: application/json` or `Content-Type: text/event-stream`
+- `POST /mcp`: Handles all JSON-RPC 2.0 MCP protocol messages
+  - Always returns `Content-Type: application/json; charset=utf-8`
+  - Processes initialize, tool calls, resource reads, prompt gets, etc.
+  - Creates and manages session IDs when SSE is enabled
   - Authorization-aware when OAuth is enabled
-- `GET /mcp`: Long-lived SSE streams for server-initiated communication (when SSE is enabled)
-  - Returns `Content-Type: text/event-stream` with periodic heartbeats
+- `GET /mcp`: Establishes Server-Sent Events streams (when SSE is enabled)
+  - Always returns `Content-Type: text/event-stream`
+  - Requires `Accept: text/event-stream` header
+  - Uses session ID from previous POST request or creates new session
+  - Provides real-time server-to-client notifications
+  - Supports message replay with Last-Event-ID
   - Authorization-aware with user-specific session isolation
 
 ### OAuth Endpoints (when authorization is enabled)

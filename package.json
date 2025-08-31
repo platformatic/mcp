@@ -1,12 +1,12 @@
 {
   "name": "@platformatic/mcp",
-  "version": "1.1.0",
+  "version": "1.2.1",
   "description": "Scalable Fastify adapter for the Model Context Protocol (MCP)",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "type": "module",
   "scripts": {
-    "prepublish": "npm run build",
+    "prepare": "npm run build",
     "build": "rm -rf dist && tsc -p tsconfig.base.json",
     "lint": "eslint --cache",
     "lint:fix": "eslint --cache --fix",
@@ -33,6 +33,7 @@
   },
   "homepage": "https://github.com/platformatic/mcp#readme",
   "devDependencies": {
+    "@fastify/pre-commit": "^2.2.0",
     "@modelcontextprotocol/inspector": "^0.16.0",
     "@modelcontextprotocol/sdk": "^1.13.3",
     "@sinclair/typebox": "^0.34.37",
@@ -63,5 +64,9 @@
     "dist",
     "examples",
     "NOTICE"
+  ],
+  "pre-commit": [
+    "lint",
+    "typecheck"
   ]
 }

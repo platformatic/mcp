@@ -1,21 +1,25 @@
-export interface AuthorizationConfig {
-  enabled: boolean
-  authorizationServers: string[]
-  resourceUri: string
-  tokenValidation: {
-    introspectionEndpoint?: string
-    jwksUri?: string
-    validateAudience: boolean
+export type AuthorizationConfig =
+  | {
+    enabled: false
   }
-  oauth2Client?: {
-    clientId?: string
-    clientSecret?: string
-    authorizationServer: string
-    resourceUri?: string
-    scopes?: string[]
-    dynamicRegistration?: boolean
+  | {
+    enabled: true
+    authorizationServers: string[]
+    resourceUri: string
+    tokenValidation: {
+      introspectionEndpoint?: string
+      jwksUri?: string
+      validateAudience: boolean
+    }
+    oauth2Client?: {
+      clientId?: string
+      clientSecret?: string
+      authorizationServer: string
+      resourceUri?: string
+      scopes?: string[]
+      dynamicRegistration?: boolean
+    }
   }
-}
 
 export interface TokenValidationResult {
   valid: boolean

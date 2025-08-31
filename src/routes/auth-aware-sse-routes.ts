@@ -257,7 +257,10 @@ const authAwareSSERoutesPlugin: FastifyPluginAsync<AuthAwareSSERoutesOptions> = 
           serverInfo,
           tools,
           resources,
-          prompts
+          prompts,
+          request,
+          reply,
+          authContext
         })
         if (response) {
           // Send the SSE event but keep the stream open
@@ -292,7 +295,10 @@ const authAwareSSERoutesPlugin: FastifyPluginAsync<AuthAwareSSERoutesOptions> = 
           serverInfo,
           tools,
           resources,
-          prompts
+          prompts,
+          request,
+          reply,
+          authContext
         })
         if (response) {
           reply.send(response)

@@ -104,14 +104,14 @@ describe('Redis Integration Tests', () => {
       }
     })
 
-    // Make SSE request
-    const response = await app.inject({
+    // Create session via POST
+    const initResponse = await app.inject({
       method: 'POST',
       url: '/mcp',
       headers: {
-        accept: 'text/event-stream'
+        'Content-Type': 'application/json',
+        accept: 'application/json'
       },
-      payloadAsStream: true,
       payload: {
         jsonrpc: '2.0',
         method: 'initialize',
@@ -124,13 +124,27 @@ describe('Redis Integration Tests', () => {
       }
     })
 
+    assert.strictEqual(initResponse.statusCode, 200)
+    assert.ok(initResponse.headers['mcp-session-id'])
+    const sessionId = initResponse.headers['mcp-session-id'] as string
+
+    // Make SSE request via GET
+    const response = await app.inject({
+      method: 'GET',
+      url: '/mcp',
+      headers: {
+        accept: 'text/event-stream',
+        'mcp-session-id': sessionId
+      },
+      payloadAsStream: true
+    })
+
     response.stream().destroy() // Ensure we clean up the stream after test
 
     assert.strictEqual(response.statusCode, 200)
     assert.ok(response.headers['content-type']?.includes('text/event-stream'))
-    assert.ok(response.headers['mcp-session-id'])
 
-    const sessionId = response.headers['mcp-session-id'] as string
+    // sessionId is already available from initResponse
 
     // Verify session exists in Redis
     const sessionExists = await redis.exists(`session:${sessionId}`)
@@ -165,14 +179,14 @@ describe('Redis Integration Tests', () => {
       }
     })
 
-    // Create session on app1
-    const sessionResponse = await app1.inject({
+    // Create session on app1 via POST
+    const initResponse1 = await app1.inject({
       method: 'POST',
       url: '/mcp',
       headers: {
-        accept: 'text/event-stream'
+        'Content-Type': 'application/json',
+        accept: 'application/json'
       },
-      payloadAsStream: true,
       payload: {
         jsonrpc: '2.0',
         method: 'initialize',
@@ -185,32 +199,49 @@ describe('Redis Integration Tests', () => {
       }
     })
 
-    // Clean up the stream immediately to ensure headers are properly set
-    sessionResponse.stream().destroy()
+    const sessionId = initResponse1.headers['mcp-session-id'] as string
+    assert.ok(sessionId)
 
-    const sessionId = sessionResponse.headers['mcp-session-id'] as string
-    assert.ok(sessionId, 'Session ID should be available in response headers')
+    // Establish SSE connection on app1 via GET
+    const sessionResponse = await app1.inject({
+      method: 'GET',
+      url: '/mcp',
+      headers: {
+        accept: 'text/event-stream',
+        'mcp-session-id': sessionId
+      },
+      payloadAsStream: true
+    })
 
-    // Send message to session from app2 (should work across instances)
-    const message: JSONRPCMessage = {
+    assert.strictEqual(sessionResponse.statusCode, 200)
+    assert.ok(sessionResponse.headers['content-type']?.includes('text/event-stream'))
+
+    // Send notification from app2 (should work across instances)
+    const notification: JSONRPCMessage = {
       jsonrpc: '2.0',
       method: 'notifications/message',
       params: { message: 'Cross-instance notification' },
       id: 2
     }
 
-    const result = await app2.mcpSendToSession(sessionId, message)
+    const result = await app2.mcpSendToSession(sessionId, notification)
     assert.ok(result, 'Message should be sent successfully across Redis instances')
 
-    // Verify the cross-instance messaging worked
-    // Note: Message history is only stored when messages are received by active SSE streams
-    // Since we destroyed the stream for header verification, we can't test history persistence
-    // The key test is that mcpSendToSession returned true, indicating successful Redis pub/sub
+    for await (const chunk of sessionResponse.stream()) {
+      const data = chunk.toString()
+      if (data.includes('Cross-instance notification')) {
+        // Verify the notification was received
+        assert.ok(data.includes('Cross-instance notification'), 'Should receive cross-instance notification')
+        break
+      }
+    }
+
+    // Verify message was stored in session history
+    const history = await redis.xrange(`session:${sessionId}:history`, '-', '+')
+    assert.ok(history.length > 0)
   })
 
   testWithRedis('should handle session message sending with Redis', async (redis, t) => {
-    t.plan(2) // Expect two assertions
-
     const app = fastify()
     t.after(() => app.close())
 
@@ -223,14 +254,14 @@ describe('Redis Integration Tests', () => {
       }
     })
 
-    // Create session
-    const sessionResponse = await app.inject({
+    // Create session via POST
+    const initResponse = await app.inject({
       method: 'POST',
       url: '/mcp',
       headers: {
-        accept: 'text/event-stream'
+        'Content-Type': 'application/json',
+        accept: 'application/json'
       },
-      payloadAsStream: true,
       payload: {
         jsonrpc: '2.0',
         method: 'initialize',
@@ -243,11 +274,21 @@ describe('Redis Integration Tests', () => {
       }
     })
 
-    // Clean up the stream immediately to ensure headers are properly set
-    sessionResponse.stream().destroy()
+    const sessionId = initResponse.headers['mcp-session-id'] as string
+    assert.ok(sessionId, 'Session ID should be present')
 
-    const sessionId = sessionResponse.headers['mcp-session-id'] as string
-    (t.assert.ok as (value: unknown, message?: string) => void)(sessionId, 'Session ID should be present')
+    // Establish SSE connection via GET
+    const sessionResponse = await app.inject({
+      method: 'GET',
+      url: '/mcp',
+      headers: {
+        accept: 'text/event-stream',
+        'mcp-session-id': sessionId
+      },
+      payloadAsStream: true
+    })
+
+    assert.strictEqual(sessionResponse.statusCode, 200)
 
     // Send message to session
     const message: JSONRPCMessage = {
@@ -257,11 +298,18 @@ describe('Redis Integration Tests', () => {
       id: 2
     }
 
-    const result: boolean = await app.mcpSendToSession(sessionId, message);
-    (t.assert.strictEqual as (actual: unknown, expected: unknown, message?: string) => void)(result, true, 'Message should be sent successfully')
+    const result: boolean = await app.mcpSendToSession(sessionId, message)
+    assert.strictEqual(result, true)
 
-    // The message sending functionality works as evidenced by the successful return value
-    // Redis persistence is tested in other tests that don't destroy streams
+    // Verify message was stored in session history
+    for await (const chunk of sessionResponse.stream()) {
+      const data = chunk.toString()
+      if (data.includes('test-message')) {
+        // Verify the message was received
+        assert.ok(data.includes('test-message'))
+        break
+      }
+    }
   })
 
   testWithRedis('should fallback to memory when Redis not configured', async (_, t) => {
@@ -322,14 +370,14 @@ describe('Redis Integration Tests', () => {
       redis: redisConfig
     })
 
-    // Create SSE session on app1
-    const sessionResponse = await app1.inject({
+    // Create session via POST
+    const initResponse = await app1.inject({
       method: 'POST',
       url: '/mcp',
       headers: {
-        accept: 'text/event-stream'
+        'Content-Type': 'application/json',
+        accept: 'application/json'
       },
-      payloadAsStream: true,
       payload: {
         jsonrpc: '2.0',
         method: 'initialize',
@@ -342,11 +390,22 @@ describe('Redis Integration Tests', () => {
       }
     })
 
-    // Clean up the stream immediately to ensure headers are properly set
-    sessionResponse.stream().destroy()
-
-    const sessionId = sessionResponse.headers['mcp-session-id'] as string
+    const sessionId = initResponse.headers['mcp-session-id'] as string
     assert.ok(sessionId, 'Session ID should be present')
+
+    // Create SSE session on app1 via GET
+    const sessionResponse = await app1.inject({
+      method: 'GET',
+      url: '/mcp',
+      headers: {
+        accept: 'text/event-stream',
+        'mcp-session-id': sessionId
+      },
+      payloadAsStream: true
+    })
+
+    assert.strictEqual(sessionResponse.statusCode, 200)
+    assert.ok(sessionResponse.headers['content-type']?.includes('text/event-stream'))
 
     // Give time for the session to be properly stored in Redis
     await new Promise(resolve => setTimeout(resolve, 50))

@@ -81,7 +81,9 @@ describe('OAuth Routes', () => {
       url: '/oauth/authorize'
     })
 
-    const location = new URL(authResponse.headers.location)
+    const locationHeader = authResponse.headers.location
+    assert.ok(locationHeader, 'Location header should be present')
+    const location = new URL(locationHeader!)
     const state = location.searchParams.get('state')
 
     // Then handle the callback
@@ -463,7 +465,9 @@ describe('OAuth Routes', () => {
       url: '/oauth/authorize?redirect_uri=https://client.example.com/callback'
     })
 
-    const location = new URL(authResponse.headers.location)
+    const authLocationHeader = authResponse.headers.location
+    assert.ok(authLocationHeader, 'Location header should be present')
+    const location = new URL(authLocationHeader!)
     const state = location.searchParams.get('state')
 
     // Handle callback
@@ -473,7 +477,9 @@ describe('OAuth Routes', () => {
     })
 
     assert.strictEqual(callbackResponse.statusCode, 302)
-    const redirectUrl = new URL(callbackResponse.headers.location)
+    const callbackLocationHeader = callbackResponse.headers.location
+    assert.ok(callbackLocationHeader, 'Location header should be present')
+    const redirectUrl = new URL(callbackLocationHeader!)
     assert.strictEqual(redirectUrl.origin, 'https://client.example.com')
     assert.strictEqual(redirectUrl.pathname, '/callback')
     assert.strictEqual(redirectUrl.searchParams.get('access_token'), 'redirect-access-token')
@@ -540,7 +546,9 @@ describe('OAuth Routes Error Handling', () => {
       url: '/oauth/authorize'
     })
 
-    const location = new URL(authResponse.headers.location)
+    const authLocationHeaderError = authResponse.headers.location
+    assert.ok(authLocationHeaderError, 'Location header should be present')
+    const location = new URL(authLocationHeaderError!)
     const state = location.searchParams.get('state')
 
     // Handle callback with server error

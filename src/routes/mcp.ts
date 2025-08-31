@@ -44,10 +44,21 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     localStreams.set(sessionId, new Set())
 
     // Subscribe to messages for this session
-    await messageBroker.subscribe(`mcp/session/${sessionId}/message`, (message: JSONRPCMessage) => {
+    await messageBroker.subscribe(`mcp/session/${sessionId}/message`, async (message: JSONRPCMessage) => {
       const streams = localStreams.get(sessionId)
       if (streams && streams.size > 0) {
+        app.log.debug({ sessionId, message }, 'Received message for session via broker, sending to streams')
         sendSSEToStreams(sessionId, message, streams)
+      } else {
+        app.log.debug({ sessionId }, 'Received message for session via broker, storing in history without active streams')
+        // Store message in history even without active streams for session persistence
+        const session = await sessionStore.get(sessionId)
+        if (session) {
+          const eventId = (++session.eventId).toString()
+          session.lastEventId = eventId
+          session.lastActivity = new Date()
+          await sessionStore.addMessage(sessionId, eventId, message)
+        }
       }
     })
 
@@ -173,7 +184,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
   }, async (request: FastifyRequest, reply: FastifyReply) => {
     try {
       const message = request.body as JSONRPCMessage
-      const sessionId = request.headers['mcp-session-id'] as string
+      let sessionId = request.headers['mcp-session-id'] as string
       const useSSE = enableSSE && supportsSSE(request) && !hasActiveSSESession(sessionId)
 
       if (useSSE && reply.sse) {
@@ -185,6 +196,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         if (!session) {
           throw new Error('Session should have been created in preHandler')
         }
+        sessionId = session.id
 
         // Header already set in preHandler
 
@@ -234,7 +246,10 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
           serverInfo,
           tools,
           resources,
-          prompts
+          prompts,
+          request,
+          reply,
+          authContext: session.authorization
         })
 
         if (response) {
@@ -254,7 +269,31 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
           reply.sse.send({ data: 'heartbeat' })
         }
       } else {
-        // Regular JSON response
+        // Regular JSON response - handle sessions and auth context
+        if (enableSSE) {
+          let session: SessionMetadata | undefined
+          if (sessionId) {
+            const existingSession = await sessionStore.get(sessionId)
+            if (existingSession) {
+              session = existingSession
+            } else {
+              session = await createSSESession()
+              reply.header('Mcp-Session-Id', session.id)
+            }
+          } else {
+            session = await createSSESession()
+            reply.header('Mcp-Session-Id', session.id)
+          }
+          sessionId = session.id
+        }
+
+        // Get session for auth context
+        let authContext
+        if (sessionId) {
+          const session = await sessionStore.get(sessionId)
+          authContext = session?.authorization
+        }
+
         const response = await processMessage(message, sessionId, {
           app,
           opts,
@@ -262,12 +301,15 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
           serverInfo,
           tools,
           resources,
-          prompts
+          prompts,
+          request,
+          reply,
+          authContext
         })
         if (response) {
-          reply.send(response)
+          return response
         } else {
-          reply.code(204).send()
+          reply.code(202)
         }
       }
     } catch (error) {

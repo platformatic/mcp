@@ -318,7 +318,7 @@ describe('MCP Fastify Plugin', () => {
         payload: notification
       })
 
-      t.assert.strictEqual(response.statusCode, 204)
+      t.assert.strictEqual(response.statusCode, 202)
     })
 
     test('should handle cancelled notification', async (t: TestContext) => {
@@ -340,7 +340,7 @@ describe('MCP Fastify Plugin', () => {
         payload: notification
       })
 
-      t.assert.strictEqual(response.statusCode, 204)
+      t.assert.strictEqual(response.statusCode, 202)
     })
 
     test('should handle invalid JSON-RPC message', async (t: TestContext) => {
@@ -366,26 +366,43 @@ describe('MCP Fastify Plugin', () => {
   })
 
   describe('SSE Support', () => {
-    test('should handle POST request with SSE support', async (t: TestContext) => {
+    test('should handle GET request with SSE support', async (t: TestContext) => {
       const app = Fastify()
       t.after(() => app.close())
 
       await app.register(mcpPlugin, { enableSSE: true })
       await app.ready()
 
-      const request: JSONRPCRequest = {
+      // First create a session with POST
+      const initRequest: JSONRPCRequest = {
         jsonrpc: JSONRPC_VERSION,
         id: 1,
-        method: 'ping'
+        method: 'initialize',
+        params: {
+          protocolVersion: '2024-11-05',
+          capabilities: {},
+          clientInfo: { name: 'test', version: '1.0.0' }
+        }
       }
 
-      const response = await app.inject({
+      const initResponse = await app.inject({
         method: 'POST',
         url: '/mcp',
+        payload: initRequest
+      })
+
+      t.assert.strictEqual(initResponse.statusCode, 200)
+      const sessionId = initResponse.headers['mcp-session-id'] as string
+      t.assert.ok(sessionId)
+
+      // Now establish SSE connection with GET
+      const response = await app.inject({
+        method: 'GET',
+        url: '/mcp',
         payloadAsStream: true,
-        payload: request,
         headers: {
-          accept: 'application/json, text/event-stream'
+          accept: 'text/event-stream',
+          'mcp-session-id': sessionId
         }
       })
 

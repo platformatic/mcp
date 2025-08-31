@@ -17,6 +17,11 @@ export function createAuthPreHandler (
       return
     }
 
+    // Skip authorization for the start of the OAuth authorization flow.
+    if (request.url.startsWith('/oauth/authorize')) {
+      return
+    }
+
     // Extract Bearer token from Authorization header
     const authHeader = request.headers.authorization
     if (!authHeader) {
@@ -61,6 +66,9 @@ export function createAuthPreHandler (
 }
 
 function generateWWWAuthenticateHeader (config: AuthorizationConfig): string {
+  if (!config.enabled) {
+    throw new Error('Authorization is disabled')
+  }
   const resourceMetadataUrl = `${config.resourceUri}/.well-known/oauth-protected-resource`
   return `Bearer realm="MCP Server", resource_metadata="${resourceMetadataUrl}"`
 }
