@@ -53,7 +53,34 @@ const wellKnownRoutesPlugin = fp(async function (app: FastifyInstance, opts: Wel
     }
 
     reply.header('Content-Type', 'application/json')
-    reply.header('Cache-Control', 'public, max-age=3600') // Cache for 1 hour
+
+    return metadata
+  })
+
+  // OAuth 2.0 Protected Resource Metadata endpoint for MCP path (RFC 9728)
+  app.get('/.well-known/oauth-protected-resource/mcp', {
+    schema: {
+      response: {
+        200: {
+          type: 'object',
+          properties: {
+            resource: { type: 'string' },
+            authorization_servers: {
+              type: 'array',
+              items: { type: 'string' }
+            }
+          },
+          required: ['resource', 'authorization_servers']
+        }
+      }
+    }
+  }, async (_request: FastifyRequest, reply: FastifyReply) => {
+    const metadata: ProtectedResourceMetadata = {
+      resource: `${authConfig.resourceUri.replace(/\/+$/, '')}/mcp`,
+      authorization_servers: authConfig.authorizationServers
+    }
+
+    reply.header('Content-Type', 'application/json')
 
     return metadata
   })

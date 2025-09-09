@@ -61,7 +61,7 @@ describe('Well-known Routes', () => {
 
       t.assert.strictEqual(response.statusCode, 200)
       t.assert.strictEqual(response.headers['content-type'], 'application/json; charset=utf-8')
-      t.assert.strictEqual(response.headers['cache-control'], 'public, max-age=3600')
+      t.assert.strictEqual(response.headers['cache-control'], undefined)
 
       const body = response.json()
       t.assert.strictEqual(body.resource, 'https://mcp.test.com')
@@ -105,7 +105,7 @@ describe('Well-known Routes', () => {
 
       t.assert.strictEqual(response.statusCode, 200)
       t.assert.strictEqual(response.headers['content-type'], 'application/json; charset=utf-8')
-      t.assert.strictEqual(response.headers['cache-control'], 'public, max-age=3600')
+      t.assert.strictEqual(response.headers['cache-control'], undefined)
       t.assert.strictEqual(response.body, '')
     })
 
@@ -287,7 +287,7 @@ describe('Well-known Routes', () => {
       t.assert.ok(response.statusCode === 404 || response.statusCode === 200)
     })
 
-    test('should include cache headers for metadata endpoint', async (t: TestContext) => {
+    test('should not include cache headers for metadata endpoint', async (t: TestContext) => {
       const authConfig = createTestAuthConfig()
 
       await app.register(wellKnownRoutes, { authConfig })
@@ -299,7 +299,29 @@ describe('Well-known Routes', () => {
       })
 
       t.assert.strictEqual(response.statusCode, 200)
-      t.assert.strictEqual(response.headers['cache-control'], 'public, max-age=3600')
+      t.assert.strictEqual(response.headers['cache-control'], undefined)
+    })
+
+    test('should serve MCP-specific protected resource metadata', async (t: TestContext) => {
+      const authConfig = createTestAuthConfig()
+
+      await app.register(wellKnownRoutes, { authConfig })
+      await app.ready()
+
+      const response = await app.inject({
+        method: 'GET',
+        url: '/.well-known/oauth-protected-resource/mcp'
+      })
+
+      t.assert.strictEqual(response.statusCode, 200)
+      t.assert.strictEqual(response.headers['content-type'], 'application/json; charset=utf-8')
+      t.assert.strictEqual(response.headers['cache-control'], undefined)
+
+      const body = response.json()
+      t.assert.strictEqual(body.resource, 'https://mcp.example.com/mcp')
+      t.assert.deepStrictEqual(body.authorization_servers, [
+        'https://auth.example.com'
+      ])
     })
   })
 
