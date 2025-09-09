@@ -70,7 +70,7 @@ export class TokenValidator {
             payload
           }
         } catch (jwtError) {
-          this.fastify.log.debug({ err: jwtError }, 'JWT validation failed, trying introspection')
+          this.fastify.log.warn({ err: jwtError }, 'JWT validation failed, trying introspection')
         }
       }
 

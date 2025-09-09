@@ -155,6 +155,7 @@ const authAwareSSERoutesPlugin: FastifyPluginAsync<AuthAwareSSERoutesOptions> = 
 
   // Authorization-aware POST endpoint
   app.post('/mcp', async (request: FastifyRequest, reply: FastifyReply) => {
+    reply.log.info('Received POST /mcp request')
     try {
       const message = request.body as JSONRPCMessage
       const sessionId = request.headers['mcp-session-id'] as string

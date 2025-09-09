@@ -282,9 +282,7 @@ describe('Well-known Routes', () => {
         }
       })
 
-      // Fastify handles OPTIONS by default, should return 404 for unhandled OPTIONS
-      // or the route might handle it if CORS is configured
-      t.assert.ok(response.statusCode === 404 || response.statusCode === 200)
+      t.assert.ok(response.statusCode === 204)
     })
 
     test('should not include cache headers for metadata endpoint', async (t: TestContext) => {
@@ -322,6 +320,135 @@ describe('Well-known Routes', () => {
       t.assert.deepStrictEqual(body.authorization_servers, [
         'https://auth.example.com'
       ])
+    })
+  })
+
+  describe('OpenID Connect Discovery for MCP', () => {
+    test('should return OpenID Connect configuration for MCP', async (t: TestContext) => {
+      const authConfig = createTestAuthConfig({
+        resourceUri: 'https://mcp.test.com',
+        authorizationServers: [
+          'https://auth1.example.com',
+          'https://auth2.example.com'
+        ],
+        tokenValidation: {
+          jwksUri: 'https://auth1.example.com/.well-known/jwks.json',
+          validateAudience: true
+        }
+      })
+
+      await app.register(wellKnownRoutes, { authConfig })
+      await app.ready()
+
+      const response = await app.inject({
+        method: 'GET',
+        url: '/.well-known/openid-configuration/mcp'
+      })
+
+      t.assert.strictEqual(response.statusCode, 200)
+      t.assert.strictEqual(response.headers['content-type'], 'application/json; charset=utf-8')
+
+      const body = response.json()
+      t.assert.strictEqual(body.issuer, 'https://auth1.example.com')
+      t.assert.strictEqual(body.authorization_endpoint, 'https://auth1.example.com/oauth/authorize')
+      t.assert.strictEqual(body.token_endpoint, 'https://auth1.example.com/oauth/token')
+      t.assert.strictEqual(body.token_introspection_endpoint, 'https://auth1.example.com/oauth/introspect')
+      t.assert.strictEqual(body.jwks_uri, 'https://auth1.example.com/.well-known/jwks.json')
+      t.assert.strictEqual(body.mcp_resource_uri, 'https://mcp.test.com')
+      t.assert.deepStrictEqual(body.mcp_authorization_servers, [
+        'https://auth1.example.com',
+        'https://auth2.example.com'
+      ])
+
+      // Verify required OAuth 2.0 fields
+      t.assert.deepStrictEqual(body.token_endpoint_auth_methods_supported, [
+        'client_secret_post',
+        'client_secret_basic',
+        'none'
+      ])
+      t.assert.deepStrictEqual(body.code_challenge_methods_supported, ['S256'])
+      t.assert.deepStrictEqual(body.response_types_supported, ['code'])
+      t.assert.deepStrictEqual(body.grant_types_supported, [
+        'authorization_code',
+        'refresh_token'
+      ])
+      t.assert.deepStrictEqual(body.scopes_supported, [
+        'read',
+        'write',
+        'mcp:resources',
+        'mcp:prompts',
+        'mcp:tools'
+      ])
+    })
+
+    test('should return OpenID Connect configuration without JWKS URI when not configured', async (t: TestContext) => {
+      const authConfig = createTestAuthConfig({
+        resourceUri: 'https://mcp.simple.com',
+        authorizationServers: ['https://auth.example.com'],
+        tokenValidation: {
+          validateAudience: false
+        }
+      })
+
+      await app.register(wellKnownRoutes, { authConfig })
+      await app.ready()
+
+      const response = await app.inject({
+        method: 'GET',
+        url: '/.well-known/openid-configuration/mcp'
+      })
+
+      t.assert.strictEqual(response.statusCode, 200)
+
+      const body = response.json()
+      t.assert.strictEqual(body.issuer, 'https://auth.example.com')
+      t.assert.strictEqual(body.jwks_uri, null)
+      t.assert.strictEqual(body.mcp_resource_uri, 'https://mcp.simple.com')
+    })
+
+    test('should handle HEAD request for OpenID configuration endpoint', async (t: TestContext) => {
+      const authConfig = createTestAuthConfig()
+
+      await app.register(wellKnownRoutes, { authConfig })
+      await app.ready()
+
+      const response = await app.inject({
+        method: 'HEAD',
+        url: '/.well-known/openid-configuration/mcp'
+      })
+
+      t.assert.strictEqual(response.statusCode, 200)
+      t.assert.strictEqual(response.headers['content-type'], 'application/json; charset=utf-8')
+      t.assert.strictEqual(response.body, '')
+    })
+
+    test('should return 404 for POST request to OpenID configuration endpoint', async (t: TestContext) => {
+      const authConfig = createTestAuthConfig()
+
+      await app.register(wellKnownRoutes, { authConfig })
+      await app.ready()
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/.well-known/openid-configuration/mcp',
+        payload: { test: 'data' }
+      })
+
+      t.assert.strictEqual(response.statusCode, 404)
+    })
+
+    test('should not register OpenID configuration endpoint when authorization is disabled', async (t: TestContext) => {
+      await app.register(wellKnownRoutes, {
+        authConfig: { enabled: false }
+      })
+      await app.ready()
+
+      const response = await app.inject({
+        method: 'GET',
+        url: '/.well-known/openid-configuration/mcp'
+      })
+
+      t.assert.strictEqual(response.statusCode, 404)
     })
   })
 

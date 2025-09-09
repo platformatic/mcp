@@ -49,8 +49,7 @@ const authConfig = {
   resourceUri: getEnv('OAUTH_RESOURCE_URI')!,
   tokenValidation: {
     jwksUri: getEnv('OAUTH_JWKS_URI')!,
-    introspectionEndpoint: getEnv('OAUTH_INTROSPECTION_ENDPOINT'),
-    validateAudience: true
+    introspectionEndpoint: getEnv('OAUTH_INTROSPECTION_ENDPOINT')
   },
   oauth2Client: {
     clientId: getEnv('OAUTH_CLIENT_ID')!,
@@ -58,6 +57,7 @@ const authConfig = {
     authorizationServer: getEnv('OAUTH_AUTHORIZATION_SERVER')!,
     resourceUri: getEnv('OAUTH_RESOURCE_URI')!,
     scopes,
+    audicence: 'http://localhost:3000',
     dynamicRegistration: true
   }
 }
@@ -351,6 +351,20 @@ try {
   console.log('   1. Copy .env.example to .env and configure your OAuth settings')
   console.log('   2. Obtain an OAuth 2.0 access token from your authorization server')
   console.log('   3. Include the token in the Authorization header of your requests')
+
+  console.log('\n🔧 Auth0 Setup (if using Auth0):')
+  console.log('   If your Auth0 connections need to be upgraded to support domain connections,')
+  console.log('   use the provided upgrade script:')
+  console.log('   ')
+  console.log('   export AUTH0_TENANT=your-tenant-name')
+  console.log('   export AUTH0_TOKEN=your-management-api-token')
+  console.log('   ./examples/upgrade.sh')
+  console.log('   ')
+  console.log('   This script will automatically update all connections in your Auth0 tenant')
+  console.log('   to enable the is_domain_connection flag, which is required for some')
+  console.log('   OAuth 2.0 flows and enterprise connections.')
+  console.log('   ')
+  console.log('   Remember to configure a default Audience in your Auth0 application settings.')
 } catch (err) {
   fastify.log.error(err)
   process.exit(1)
