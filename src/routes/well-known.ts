@@ -1,5 +1,6 @@
 import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify'
 import fp from 'fastify-plugin'
+import cors from '@fastify/cors'
 import type { AuthorizationConfig, ProtectedResourceMetadata } from '../types/auth-types.ts'
 
 interface WellKnownRoutesOptions {
@@ -12,6 +13,21 @@ const wellKnownRoutesPlugin = fp(async function (app: FastifyInstance, opts: Wel
   }
 
   const { authConfig } = opts
+
+  // Register CORS for well-known endpoints to allow cross-origin requests
+  await app.register(cors, {
+    origin: true, // Allow all origins for discovery endpoints
+    methods: ['GET', 'HEAD', 'OPTIONS'],
+    allowedHeaders: [
+      'Content-Type', 
+      'Authorization',
+      'mcp-protocol-version',
+      'x-requested-with',
+      'accept',
+      'cache-control'
+    ],
+    maxAge: 3600 // Cache preflight for 1 hour
+  })
 
   // OAuth 2.0 Protected Resource Metadata endpoint (RFC 9728)
   app.get('/.well-known/oauth-protected-resource', {
