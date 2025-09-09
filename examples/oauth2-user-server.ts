@@ -58,7 +58,7 @@ const authConfig = {
     authorizationServer: getEnv('OAUTH_AUTHORIZATION_SERVER')!,
     resourceUri: getEnv('OAUTH_RESOURCE_URI')!,
     scopes,
-    dynamicRegistration: getEnv('OAUTH_DYNAMIC_REGISTRATION') === 'true'
+    dynamicRegistration: true
   }
 }
 
