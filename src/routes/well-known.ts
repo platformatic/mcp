@@ -19,7 +19,7 @@ const wellKnownRoutesPlugin = fp(async function (app: FastifyInstance, opts: Wel
     origin: true, // Allow all origins for discovery endpoints
     methods: ['GET', 'HEAD', 'OPTIONS'],
     allowedHeaders: [
-      'Content-Type', 
+      'Content-Type',
       'Authorization',
       'mcp-protocol-version',
       'x-requested-with',
