@@ -13,7 +13,7 @@ export function createAuthPreHandler (
     }
 
     // Skip authorization for well-known endpoints
-    if (request.url.startsWith('/.well-known/')) {
+    if (request.url.startsWith('/.well-known/') || request.url.startsWith('/mcp/.well-known')) {
       return
     }
 
