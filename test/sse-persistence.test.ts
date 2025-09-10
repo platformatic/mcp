@@ -170,6 +170,7 @@ test('SSE connections should persist and receive notifications', async (t) => {
   // the mcpSendToSession API which confirms the session is active and can receive messages
 
   // Test 5: Close the SSE stream and verify session cleanup
+  sseResponse.body.on('error', () => {})
   sseResponse.body.destroy()
 
   // Wait a bit for cleanup
@@ -249,5 +250,6 @@ test('Session cleanup on connection close', async (t) => {
   assert.ok(canSend, 'Should be able to send messages to active session')
 
   // Close the connection
+  response.body.on('error', () => {})
   response.body.destroy()
 })

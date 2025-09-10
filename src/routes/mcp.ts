@@ -185,6 +185,36 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         }
         streams.add(reply)
 
+        // Add comprehensive error handling for abrupt disconnections
+        if (reply.raw && typeof reply.raw.on === 'function') {
+          reply.raw.on('error', (error) => {
+            app.log.debug({ err: error, sessionId: session.id }, 'POST SSE connection error handled')
+          })
+
+          reply.raw.on('close', () => {
+            app.log.debug({ sessionId: session.id }, 'POST SSE raw connection closed')
+          })
+
+          // Override the response methods to handle errors gracefully
+          const originalWrite = reply.raw.write.bind(reply.raw)
+          reply.raw.write = function (chunk: any, encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void) {
+            try {
+              if (typeof encodingOrCallback === 'function') {
+                return originalWrite(chunk, encodingOrCallback)
+              }
+              if (encodingOrCallback !== undefined) {
+                return originalWrite(chunk, encodingOrCallback, callback)
+              }
+              return originalWrite(chunk, callback)
+            } catch (error) {
+              app.log.debug({ err: error, sessionId: session.id }, 'POST SSE write error handled gracefully')
+              const cb = typeof encodingOrCallback === 'function' ? encodingOrCallback : callback
+              if (typeof cb === 'function') cb()
+              return false
+            }
+          }
+        }
+
         app.log.info({
           sessionId: session.id,
           totalStreams: streams.size,
@@ -193,25 +223,30 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
         // Handle connection close
         reply.sse.onClose(async () => {
-          const streams = localStreams.get(session.id)
-          if (streams) {
-            streams.delete(reply)
-            app.log.info({
-              sessionId: session.id,
-              remainingStreams: streams.size
-            }, 'POST SSE connection closed')
-
-            if (streams.size === 0) {
+          try {
+            const streams = localStreams.get(session.id)
+            if (streams) {
+              streams.delete(reply)
               app.log.info({
-                sessionId: session.id
-              }, 'Last POST SSE stream closed, cleaning up session')
-              localStreams.delete(session.id)
-              try {
-                await messageBroker.unsubscribe(`mcp/session/${session.id}/message`)
-              } catch (error) {
-                app.log.warn({ err: error, sessionId: session.id }, 'Failed to unsubscribe in POST SSE close handler')
+                sessionId: session.id,
+                remainingStreams: streams.size
+              }, 'POST SSE connection closed')
+
+              if (streams.size === 0) {
+                app.log.info({
+                  sessionId: session.id
+                }, 'Last POST SSE stream closed, cleaning up session')
+                localStreams.delete(session.id)
+                try {
+                  await messageBroker.unsubscribe(`mcp/session/${session.id}/message`)
+                } catch (error) {
+                  app.log.warn({ err: error, sessionId: session.id }, 'Failed to unsubscribe in POST SSE close handler')
+                }
               }
             }
+          } catch (error) {
+            // Handle abrupt connection termination gracefully
+            app.log.debug({ err: error, sessionId: session.id }, 'Error in POST SSE close handler')
           }
         })
 
@@ -367,6 +402,36 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
       // Send initial connection event
       reply.sse.send({ data: 'connected', id: '0' })
 
+      // Add comprehensive error handling for abrupt disconnections
+      if (reply.raw && typeof reply.raw.on === 'function') {
+        reply.raw.on('error', (error) => {
+          app.log.debug({ err: error, sessionId: session.id }, 'SSE connection error handled')
+        })
+
+        reply.raw.on('close', () => {
+          app.log.debug({ sessionId: session.id }, 'SSE raw connection closed')
+        })
+
+        // Override the response methods to handle errors gracefully
+        const originalWrite = reply.raw.write.bind(reply.raw)
+        reply.raw.write = function (chunk: any, encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void) {
+          try {
+            if (typeof encodingOrCallback === 'function') {
+              return originalWrite(chunk, encodingOrCallback)
+            }
+            if (encodingOrCallback !== undefined) {
+              return originalWrite(chunk, encodingOrCallback, callback)
+            }
+            return originalWrite(chunk, callback)
+          } catch (error) {
+            app.log.debug({ err: error, sessionId: session.id }, 'SSE write error handled gracefully')
+            const cb = typeof encodingOrCallback === 'function' ? encodingOrCallback : callback
+            if (typeof cb === 'function') cb()
+            return false
+          }
+        }
+      }
+
       // Add this connection to local streams
       let streams = localStreams.get(session.id)
       if (!streams) {
@@ -390,25 +455,30 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
       // Handle connection close
       reply.sse.onClose(async () => {
-        const streams = localStreams.get(session.id)
-        if (streams) {
-          streams.delete(reply)
-          app.log.info({
-            sessionId: session.id,
-            remainingStreams: streams.size
-          }, 'SSE connection closed')
-
-          if (streams.size === 0) {
+        try {
+          const streams = localStreams.get(session.id)
+          if (streams) {
+            streams.delete(reply)
             app.log.info({
-              sessionId: session.id
-            }, 'Last SSE stream closed, cleaning up session')
-            localStreams.delete(session.id)
-            try {
-              await messageBroker.unsubscribe(`mcp/session/${session.id}/message`)
-            } catch (error) {
-              app.log.warn({ err: error, sessionId: session.id }, 'Failed to unsubscribe in GET SSE close handler')
+              sessionId: session.id,
+              remainingStreams: streams.size
+            }, 'SSE connection closed')
+
+            if (streams.size === 0) {
+              app.log.info({
+                sessionId: session.id
+              }, 'Last SSE stream closed, cleaning up session')
+              localStreams.delete(session.id)
+              try {
+                await messageBroker.unsubscribe(`mcp/session/${session.id}/message`)
+              } catch (error) {
+                app.log.warn({ err: error, sessionId: session.id }, 'Failed to unsubscribe in GET SSE close handler')
+              }
             }
           }
+        } catch (error) {
+          // Handle abrupt connection termination gracefully
+          app.log.debug({ err: error, sessionId: session.id }, 'Error in GET SSE close handler')
         }
       })
 
@@ -427,15 +497,15 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
   if (enableSSE) {
     messageBroker.subscribe('mcp/broadcast/notification', async (notification: JSONRPCMessage) => {
       app.log.info({ notification, localStreamsSize: localStreams.size }, 'Received broadcast notification')
-      
+
       try {
         // Get all session IDs and store the broadcast in each session
         const allSessionIds = await sessionStore.getAllSessionIds()
-        
+
         for (const sessionId of allSessionIds) {
           // Store message in session history
           await sessionStore.addMessageWithAutoEventId(sessionId, notification)
-          
+
           // Send to local streams if available
           const streams = localStreams.get(sessionId)
           if (streams && streams.size > 0) {
@@ -451,7 +521,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     // Subscribe to all session messages with a universal handler
     messageBroker.subscribe('mcp/session/message', async (sessionMessage: any) => {
       const { sessionId, originalMessage: message } = sessionMessage
-      
+
       if (!sessionId) {
         app.log.warn({ sessionMessage }, 'Session message missing sessionId')
         return
