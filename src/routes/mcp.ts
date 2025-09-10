@@ -6,6 +6,7 @@ import { JSONRPC_VERSION, INTERNAL_ERROR } from '../schema.ts'
 import type { MCPPluginOptions, MCPTool, MCPResource, MCPPrompt } from '../types.ts'
 import type { SessionStore, SessionMetadata } from '../stores/session-store.ts'
 import type { MessageBroker } from '../brokers/message-broker.ts'
+import type { AuthorizationContext } from '../types/auth-types.ts'
 import { processMessage } from '../handlers.ts'
 
 interface MCPPubSubRoutesOptions {
@@ -152,9 +153,26 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         sessionId = session.id
       }
 
-      // Regular JSON response - get session for auth context
-      let authContext
-      if (sessionId) {
+      // Build auth context from validated token payload
+      let authContext: AuthorizationContext | undefined
+      if ((request as any).tokenPayload) {
+        const payload = (request as any).tokenPayload
+        authContext = {
+          userId: payload.sub,
+          clientId: payload.client_id || payload.azp,
+          scopes: typeof payload.scope === 'string'
+            ? payload.scope.split(' ')
+            : payload.scopes,
+          audience: Array.isArray(payload.aud)
+            ? payload.aud
+            : payload.aud ? [payload.aud] : undefined,
+          tokenType: 'Bearer',
+          expiresAt: payload.exp ? new Date(payload.exp * 1000) : undefined,
+          issuedAt: payload.iat ? new Date(payload.iat * 1000) : undefined,
+          authorizationServer: payload.iss
+        }
+      } else if (sessionId) {
+        // Fallback to session-stored auth context
         const session = await sessionStore.get(sessionId)
         authContext = session?.authorization
       }

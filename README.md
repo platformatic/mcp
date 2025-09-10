@@ -550,9 +550,111 @@ app.mcpSendToSession('session-xyz', {
 })
 ```
 
+### Implementation Design Decisions
+
+This plugin implements certain behaviors that differ from the strict MCP specification to provide enhanced scalability and resilience in production environments:
+
+#### Multiple Connections per Session
+
+**MCP Specification Intent**: The official MCP specification (line 144-145) states that servers "**MUST** send each of its JSON-RPC messages on only one of the connected streams; that is, it **MUST NOT** broadcast the same message across multiple streams."
+
+**Our Implementation Choice**: We allow multiple SSE connections to share the same session ID and broadcast session-specific messages (`mcpSendToSession`) to all connections within that session.
+
+**Why We Made This Choice**:
+
+1. **Horizontal Scalability**: In distributed deployments with Redis, sessions can span multiple server instances. Broadcasting ensures messages reach all connections regardless of which instance they're connected to.
+
+2. **Connection Resilience**: If a client has multiple connections (e.g., main application + background tools), both can receive notifications even if one connection fails.
+
+3. **Tool Integration**: External tools can join existing sessions by providing the same `mcp-session-id` header, enabling seamless integration with ongoing workflows.
+
+4. **Message Persistence**: All connections in a session benefit from the same message history and can replay missed events using `Last-Event-ID`.
+
+**Trade-off**: This approach may deliver duplicate messages to multiple connections within the same session, but the benefits in production reliability and scalability outweigh this consideration for most use cases.
+
 ### Dual-Endpoint Architecture
 
 The plugin uses a dual-endpoint architecture that separates regular MCP protocol communication from SSE streaming:
+
+```mermaid
+sequenceDiagram
+    participant C1 as Client 1
+    participant Tool as Tool/Client 2
+    participant Server as Fastify MCP Server
+    participant Redis as Redis (Optional)
+    participant Broker as Message Broker
+
+    Note over C1,Broker: Session Creation and Multiple Connection Support
+    
+    C1->>Server: POST /mcp (initialize)
+    Server->>C1: Response + Session ID: abc123
+    
+    C1->>Server: GET /mcp (SSE stream)
+    Note right of C1: Accept: text/event-stream<br/>mcp-session-id: abc123
+    Server-->>C1: SSE connection established
+    
+    Note over Tool,Broker: Tool Joins SAME Session (Implementation Choice)
+    
+    Tool->>Server: POST /mcp (any request)
+    Note right of Tool: mcp-session-id: abc123<br/>(reuses existing session)
+    Server->>Tool: Response (no new session created)
+    
+    Tool->>Server: GET /mcp (SSE stream)
+    Note right of Tool: Accept: text/event-stream<br/>mcp-session-id: abc123
+    Server-->>Tool: SSE connection established
+    
+    rect rgb(255, 240, 240)
+        Note over Server: Implementation Detail:<br/>localStreams.get('abc123') = Set{C1, Tool}<br/>Multiple connections share same session
+    end
+    
+    Note over C1,Broker: Session-Specific Broadcasting (Implementation Choice)
+    
+    rect rgb(240, 248, 255)
+        Note over C1,Tool: Our Implementation: mcpSendToSession('abc123')<br/>broadcasts to ALL connections in session abc123<br/>(Differs from MCP spec for scalability)
+        Server->>Broker: mcpSendToSession('abc123', message)
+        alt Redis Mode (Cross-Instance)
+            Broker->>Redis: Publish to mcp/session/abc123/message
+            Redis-->>Broker: Distribute to instance with session abc123
+        else Memory Mode
+            Broker->>Broker: Route to session abc123 locally
+        end
+        Broker-->>Server: Forward to ALL streams in session abc123
+        Server-->>C1: SSE notification (shared session)
+        Server-->>Tool: SSE notification (shared session)
+    end
+    
+    Note over C1,Broker: Reconnection Resilience
+    
+    Tool->>Server: Disconnect (network issue)
+    Note over Server: Session abc123 persists with C1 still connected
+    
+    Server->>Broker: mcpSendToSession('abc123', message)
+    Broker-->>Server: Deliver to remaining connections
+    Server-->>C1: SSE notification continues
+    
+    Tool->>Server: GET /mcp (reconnect)
+    Note right of Tool: mcp-session-id: abc123<br/>Last-Event-ID: 15
+    alt Redis Mode
+        Server->>Redis: Get message history for session abc123
+        Redis-->>Server: Return events 16-20
+    else Memory Mode
+        Server->>Server: Get local history for session abc123
+    end
+    Server-->>Tool: Replay missed events
+    Server-->>Tool: Resume receiving notifications
+    
+    Note over C1,Broker: Cross-Instance Scalability
+    
+    rect rgb(240, 255, 240)
+        Note over Server,Redis: With Redis: Session abc123 can be accessed<br/>from any server instance. Messages route<br/>to the instance hosting the SSE connections.
+        Server->>Broker: mcpSendToSession('abc123', message)<br/>(from any instance)
+        Broker->>Redis: Publish to mcp/session/abc123/message
+        Redis-->>Broker: Route to correct instance
+        Broker-->>Server: Deliver to session abc123 connections
+        Server-->>C1: SSE notification
+        Server-->>Tool: SSE notification
+    end
+```
 
 #### POST `/mcp` - MCP Protocol Communication
 

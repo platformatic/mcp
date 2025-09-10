@@ -9,7 +9,7 @@ export type AuthorizationConfig =
     tokenValidation: {
       introspectionEndpoint?: string
       jwksUri?: string
-      validateAudience: boolean
+      validateAudience?: boolean
     }
     oauth2Client?: {
       clientId?: string
