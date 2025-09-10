@@ -6,11 +6,13 @@ import { JSONRPC_VERSION, INTERNAL_ERROR } from '../schema.ts'
 import type { MCPPluginOptions, MCPTool, MCPResource, MCPPrompt } from '../types.ts'
 import type { SessionStore, SessionMetadata } from '../stores/session-store.ts'
 import type { MessageBroker } from '../brokers/message-broker.ts'
+import type { AuthorizationContext } from '../types/auth-types.ts'
 import { processMessage } from '../handlers.ts'
 
 declare module 'fastify' {
   interface FastifyRequest {
     mcpSession?: SessionMetadata
+    authContext?: AuthorizationContext
   }
 }
 
@@ -30,14 +32,15 @@ interface MCPPubSubRoutesOptions {
 const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async (app, options) => {
   const { enableSSE, opts, capabilities, serverInfo, tools, resources, prompts, sessionStore, messageBroker, localStreams } = options
 
-  async function createSSESession (): Promise<SessionMetadata> {
+  async function createSSESession (authContext?: AuthorizationContext): Promise<SessionMetadata> {
     const sessionId = randomUUID()
     const session: SessionMetadata = {
       id: sessionId,
       eventId: 0,
       lastEventId: undefined,
       createdAt: new Date(),
-      lastActivity: new Date()
+      lastActivity: new Date(),
+      authorization: authContext
     }
 
     await sessionStore.create(session)
@@ -55,6 +58,22 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     if (!sessionId) return false
     const streams = localStreams.get(sessionId)
     return streams ? streams.size > 0 : false
+  }
+
+  function isAuthorizedForSession (authContext: AuthorizationContext | undefined, session: SessionMetadata): boolean {
+    // If no authorization required, allow access
+    if (!session.authorization) {
+      return true
+    }
+
+    // If no auth context provided but session requires auth, deny
+    if (!authContext) {
+      return false
+    }
+
+    // Check if the same user/token
+    return authContext.userId === session.authorization.userId &&
+           authContext.tokenHash === session.authorization.tokenHash
   }
 
   async function sendSSEToStreams (sessionId: string, message: JSONRPCMessage, streams: Set<FastifyReply>): Promise<void> {
@@ -136,26 +155,42 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     sse: enableSSE,
     preHandler: async (request: FastifyRequest, _reply: FastifyReply) => {
       if (enableSSE && supportsSSE(request)) {
+        // Extract auth context from request (set by auth prehandler if enabled)
+        const authContext = (request as any).authContext as AuthorizationContext | undefined
+
         // Create or get session and set header before SSE takes over
         const sessionId = request.headers['mcp-session-id'] as string
         let session: SessionMetadata
 
         if (sessionId) {
           const existingSession = await sessionStore.get(sessionId)
-          if (existingSession) {
+          if (existingSession && isAuthorizedForSession(authContext, existingSession)) {
             session = existingSession
+            // Update session with current auth context if needed
+            if (authContext && (!existingSession.authorization || existingSession.authorization.tokenHash !== authContext.tokenHash)) {
+              await sessionStore.updateAuthorization(sessionId, authContext)
+              session.authorization = authContext
+            }
+          } else if (existingSession && !isAuthorizedForSession(authContext, existingSession)) {
+            // Unauthorized access to existing session
+            _reply.code(403).send({
+              error: 'forbidden',
+              error_description: 'Not authorized to access this session'
+            })
+            return
           } else {
-            session = await createSSESession()
+            session = await createSSESession(authContext)
           }
         } else {
-          session = await createSSESession()
+          session = await createSSESession(authContext)
         }
 
         // Set session ID header using @fastify/sse v0.2.0 header handling
         _reply.header('Mcp-Session-Id', session.id)
 
-        // Store session for use in main handler
+        // Store session and auth context for use in main handler
         request.mcpSession = session
+        request.authContext = authContext
       }
     }
   }, async (request: FastifyRequest, reply: FastifyReply) => {
@@ -166,7 +201,12 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
       if (useSSE && reply.sse) {
         // Handle POST SSE: process message AND set up SSE stream
-        request.log.info({ sessionId, method: request.method }, 'Handling POST SSE request')
+        const authContext = request.authContext
+        request.log.info({
+          sessionId,
+          method: request.method,
+          userId: authContext?.userId
+        }, 'Handling POST SSE request')
 
         // Get session that was created in preHandler
         const session = request.mcpSession!
@@ -261,7 +301,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
           prompts,
           request,
           reply,
-          authContext: session.authorization
+          authContext: session.authorization || request.authContext
         })
 
         if (response) {
@@ -278,28 +318,33 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         }
       } else {
         // Regular JSON response - handle sessions and auth context
+        const authContext = (request as any).authContext as AuthorizationContext | undefined
+
         if (enableSSE) {
           let session: SessionMetadata | undefined
           if (sessionId) {
             const existingSession = await sessionStore.get(sessionId)
-            if (existingSession) {
+            if (existingSession && isAuthorizedForSession(authContext, existingSession)) {
               session = existingSession
+              // Update session with current auth context if needed
+              if (authContext && (!existingSession.authorization || existingSession.authorization.tokenHash !== authContext.tokenHash)) {
+                await sessionStore.updateAuthorization(sessionId, authContext)
+                session.authorization = authContext
+              }
+            } else if (existingSession && !isAuthorizedForSession(authContext, existingSession)) {
+              return reply.code(403).send({
+                error: 'forbidden',
+                error_description: 'Not authorized to access this session'
+              })
             } else {
-              session = await createSSESession()
+              session = await createSSESession(authContext)
               reply.header('Mcp-Session-Id', session.id)
             }
           } else {
-            session = await createSSESession()
+            session = await createSSESession(authContext)
             reply.header('Mcp-Session-Id', session.id)
           }
           sessionId = session.id
-        }
-
-        // Get session for auth context
-        let authContext
-        if (sessionId) {
-          const session = await sessionStore.get(sessionId)
-          authContext = session?.authorization
         }
 
         const response = await processMessage(message, sessionId, {
@@ -312,7 +357,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
           prompts,
           request,
           reply,
-          authContext
+          authContext: authContext || (sessionId ? (await sessionStore.get(sessionId))?.authorization : undefined)
         })
         if (response) {
           return response
@@ -338,6 +383,9 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     sse: enableSSE,
     preHandler: async (request: FastifyRequest, _reply: FastifyReply) => {
       if (enableSSE && supportsSSE(request)) {
+        // Extract auth context from request (set by auth prehandler if enabled)
+        const authContext = (request as any).authContext as AuthorizationContext | undefined
+
         // Create or get session and set header before SSE takes over
         const sessionId = (request.headers['mcp-session-id'] as string) ||
                          ((request.query as any)?.['mcp-session-id'])
@@ -345,20 +393,33 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
         if (sessionId) {
           const existingSession = await sessionStore.get(sessionId)
-          if (existingSession) {
+          if (existingSession && isAuthorizedForSession(authContext, existingSession)) {
             session = existingSession
+            // Update session with current auth context if needed
+            if (authContext && (!existingSession.authorization || existingSession.authorization.tokenHash !== authContext.tokenHash)) {
+              await sessionStore.updateAuthorization(sessionId, authContext)
+              session.authorization = authContext
+            }
+          } else if (existingSession && !isAuthorizedForSession(authContext, existingSession)) {
+            // Unauthorized access to existing session
+            _reply.code(403).send({
+              error: 'forbidden',
+              error_description: 'Not authorized to access this session'
+            })
+            return
           } else {
-            session = await createSSESession()
+            session = await createSSESession(authContext)
           }
         } else {
-          session = await createSSESession()
+          session = await createSSESession(authContext)
         }
 
         // Set session ID header using @fastify/sse v0.2.0 header handling
         _reply.header('Mcp-Session-Id', session.id)
 
-        // Store session for use in main handler
+        // Store session and auth context for use in main handler
         request.mcpSession = session
+        request.authContext = authContext
       }
     }
   }, async (request: FastifyRequest, reply: FastifyReply) => {
@@ -380,6 +441,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
       const sessionId = (request.headers['mcp-session-id'] as string) ||
                        ((request.query as any)?.['mcp-session-id'])
+      const authContext = request.authContext
 
       // Check if there's already an active SSE session
       if (hasActiveSSESession(sessionId)) {
@@ -389,7 +451,11 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         return
       }
 
-      request.log.info({ sessionId, method: request.method }, 'Handling SSE request')
+      request.log.info({
+        sessionId,
+        method: request.method,
+        userId: authContext?.userId
+      }, 'Handling SSE request')
 
       // Get session that was created in preHandler
       const session = request.mcpSession!
@@ -509,7 +575,12 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
           // Send to local streams if available
           const streams = localStreams.get(sessionId)
           if (streams && streams.size > 0) {
-            app.log.info({ sessionId, notification }, 'Sending broadcast to session streams')
+            const session = await sessionStore.get(sessionId)
+            app.log.info({
+              sessionId,
+              notification,
+              userId: session?.authorization?.userId
+            }, 'Sending broadcast to session streams')
             sendSSEToStreams(sessionId, notification, streams)
           }
         }
@@ -537,6 +608,25 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         const session = await sessionStore.get(sessionId)
         if (session) {
           await sessionStore.addMessageWithAutoEventId(sessionId, message)
+        }
+      }
+    })
+
+    // Subscribe to user-specific messages
+    messageBroker.subscribe('mcp/user/message', async (userMessage: any) => {
+      const { userId, originalMessage: message } = userMessage
+
+      if (!userId) {
+        app.log.warn({ userMessage }, 'User message missing userId')
+        return
+      }
+
+      // Find all sessions for this user and send message to each
+      for (const [sessionId, streams] of localStreams.entries()) {
+        const session = await sessionStore.get(sessionId)
+        if (session?.authorization?.userId === userId && streams.size > 0) {
+          app.log.debug({ sessionId, userId, message }, 'Received user message via broker, sending to user sessions')
+          sendSSEToStreams(sessionId, message, streams)
         }
       }
     })
