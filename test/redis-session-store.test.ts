@@ -11,10 +11,9 @@ describe('RedisSessionStore', () => {
 
     const metadata: SessionMetadata = {
       id: 'test-session-1',
-      eventId: 1,
-      lastEventId: '1',
       createdAt: new Date('2023-01-01T00:00:00.000Z'),
-      lastActivity: new Date('2023-01-01T00:01:00.000Z')
+      lastActivity: new Date('2023-01-01T00:01:00.000Z'),
+      streams: new Map()
     }
 
     await store.create(metadata)
@@ -22,10 +21,10 @@ describe('RedisSessionStore', () => {
 
     assert.ok(retrieved)
     assert.strictEqual(retrieved.id, metadata.id)
-    assert.strictEqual(retrieved.eventId, metadata.eventId)
-    assert.strictEqual(retrieved.lastEventId, metadata.lastEventId)
     assert.deepStrictEqual(retrieved.createdAt, metadata.createdAt)
     assert.deepStrictEqual(retrieved.lastActivity, metadata.lastActivity)
+    assert.ok(retrieved.streams instanceof Map)
+    assert.strictEqual(retrieved.streams.size, 0)
   })
 
   testWithRedis('should return null for non-existent session', async (redis) => {
@@ -40,9 +39,9 @@ describe('RedisSessionStore', () => {
 
     const metadata: SessionMetadata = {
       id: 'test-session-2',
-      eventId: 1,
       createdAt: new Date(),
-      lastActivity: new Date()
+      lastActivity: new Date(),
+      streams: new Map()
     }
 
     await store.create(metadata)
@@ -53,7 +52,7 @@ describe('RedisSessionStore', () => {
       method: 'test',
       id: 1
     }
-    await store.addMessage('test-session-2', '1', message)
+    await store.addSessionMessage('test-session-2', '1', message)
 
     // Verify session exists
     const before = await store.get('test-session-2')
@@ -67,7 +66,7 @@ describe('RedisSessionStore', () => {
     assert.strictEqual(after, null)
 
     // Verify history is deleted
-    const history = await store.getMessagesFrom('test-session-2', '0')
+    const history = await store.getSessionMessagesFrom('test-session-2', '0')
     assert.strictEqual(history.length, 0)
   })
 
@@ -76,9 +75,10 @@ describe('RedisSessionStore', () => {
 
     const metadata: SessionMetadata = {
       id: 'test-session-3',
-      eventId: 0,
+      
       createdAt: new Date(),
-      lastActivity: new Date()
+      lastActivity: new Date(),
+      streams: new Map()
     }
 
     await store.create(metadata)
@@ -117,9 +117,10 @@ describe('RedisSessionStore', () => {
 
     const metadata: SessionMetadata = {
       id: 'test-session-4',
-      eventId: 0,
+      
       createdAt: new Date(),
-      lastActivity: new Date()
+      lastActivity: new Date(),
+      streams: new Map()
     }
 
     await store.create(metadata)
@@ -148,9 +149,10 @@ describe('RedisSessionStore', () => {
 
     const metadata: SessionMetadata = {
       id: 'test-session-5',
-      eventId: 0,
+      
       createdAt: new Date(),
-      lastActivity: new Date()
+      lastActivity: new Date(),
+      streams: new Map()
     }
 
     await store.create(metadata)
@@ -178,9 +180,10 @@ describe('RedisSessionStore', () => {
 
     const metadata: SessionMetadata = {
       id: 'test-session-6',
-      eventId: 0,
+      
       createdAt: new Date(),
-      lastActivity: new Date()
+      lastActivity: new Date(),
+      streams: new Map()
     }
 
     await store.create(metadata)
@@ -209,9 +212,10 @@ describe('RedisSessionStore', () => {
 
     const metadata: SessionMetadata = {
       id: 'test-session-7',
-      eventId: 0,
+      
       createdAt: new Date(),
-      lastActivity: new Date()
+      lastActivity: new Date(),
+      streams: new Map()
     }
 
     await store.create(metadata)

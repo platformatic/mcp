@@ -1,5 +1,5 @@
 import type { JSONRPCMessage } from '../schema.ts'
-import type { SessionStore, SessionMetadata } from './session-store.ts'
+import type { SessionStore, SessionMetadata, StreamMetadata } from './session-store.ts'
 import type { AuthorizationContext, TokenRefreshInfo } from '../types/auth-types.ts'
 
 interface MessageHistoryEntry {
@@ -9,7 +9,8 @@ interface MessageHistoryEntry {
 
 export class MemorySessionStore implements SessionStore {
   private sessions = new Map<string, SessionMetadata>()
-  private messageHistory = new Map<string, MessageHistoryEntry[]>()
+  private messageHistory = new Map<string, MessageHistoryEntry[]>() // Legacy: sessionId -> messages
+  private streamMessageHistory = new Map<string, MessageHistoryEntry[]>() // streamKey -> messages
   private tokenToSession = new Map<string, string>() // tokenHash -> sessionId
   private maxMessages: number
 
@@ -17,14 +18,27 @@ export class MemorySessionStore implements SessionStore {
     this.maxMessages = maxMessages
   }
 
+  private getStreamKey(sessionId: string, streamId: string): string {
+    return `${sessionId}:${streamId}`
+  }
+
   async create (metadata: SessionMetadata): Promise<void> {
-    this.sessions.set(metadata.id, { ...metadata })
+    const sessionData = { 
+      ...metadata,
+      streams: new Map(metadata.streams || [])
+    }
+    this.sessions.set(metadata.id, sessionData)
     this.messageHistory.set(metadata.id, [])
   }
 
   async get (sessionId: string): Promise<SessionMetadata | null> {
     const session = this.sessions.get(sessionId)
-    return session ? { ...session } : null
+    if (!session) return null
+    
+    return { 
+      ...session,
+      streams: new Map(session.streams)
+    }
   }
 
   async delete (sessionId: string): Promise<void> {
@@ -32,6 +46,13 @@ export class MemorySessionStore implements SessionStore {
     const session = this.sessions.get(sessionId)
     if (session?.authorization?.tokenHash) {
       this.tokenToSession.delete(session.authorization.tokenHash)
+    }
+
+    // Clean up all stream message histories for this session
+    for (const [key] of this.streamMessageHistory.entries()) {
+      if (key.startsWith(`${sessionId}:`)) {
+        this.streamMessageHistory.delete(key)
+      }
     }
 
     this.sessions.delete(sessionId)
@@ -49,7 +70,106 @@ export class MemorySessionStore implements SessionStore {
     }
   }
 
-  async addMessage (sessionId: string, eventId: string, message: JSONRPCMessage): Promise<void> {
+  // Stream management methods
+  async createStream(sessionId: string, streamId: string): Promise<StreamMetadata | null> {
+    const session = this.sessions.get(sessionId)
+    if (!session) return null
+
+    const streamMetadata: StreamMetadata = {
+      id: streamId,
+      eventId: 0,
+      lastEventId: undefined,
+      createdAt: new Date(),
+      lastActivity: new Date()
+    }
+
+    session.streams.set(streamId, streamMetadata)
+    session.lastActivity = new Date()
+    this.sessions.set(sessionId, session)
+
+    return { ...streamMetadata }
+  }
+
+  async getStream(sessionId: string, streamId: string): Promise<StreamMetadata | null> {
+    const session = this.sessions.get(sessionId)
+    if (!session) return null
+
+    const stream = session.streams.get(streamId)
+    return stream ? { ...stream } : null
+  }
+
+  async deleteStream(sessionId: string, streamId: string): Promise<void> {
+    const session = this.sessions.get(sessionId)
+    if (!session) return
+
+    session.streams.delete(streamId)
+    session.lastActivity = new Date()
+    this.sessions.set(sessionId, session)
+
+    // Clean up stream message history
+    const streamKey = this.getStreamKey(sessionId, streamId)
+    this.streamMessageHistory.delete(streamKey)
+  }
+
+  async updateStreamActivity(sessionId: string, streamId: string): Promise<void> {
+    const session = this.sessions.get(sessionId)
+    if (!session) return
+
+    const stream = session.streams.get(streamId)
+    if (stream) {
+      stream.lastActivity = new Date()
+      session.lastActivity = new Date()
+      this.sessions.set(sessionId, session)
+    }
+  }
+
+  // Per-stream message history operations
+  async addMessage(sessionId: string, streamId: string, eventId: string, message: JSONRPCMessage): Promise<void> {
+    const streamKey = this.getStreamKey(sessionId, streamId)
+    let history = this.streamMessageHistory.get(streamKey)
+    if (!history) {
+      history = []
+      this.streamMessageHistory.set(streamKey, history)
+    }
+
+    history.push({ eventId, message })
+
+    // Auto-trim using constructor maxMessages
+    if (history.length > this.maxMessages) {
+      history.splice(0, history.length - this.maxMessages)
+    }
+
+    // Update stream metadata
+    const session = this.sessions.get(sessionId)
+    if (session) {
+      const stream = session.streams.get(streamId)
+      if (stream) {
+        stream.eventId = parseInt(eventId)
+        stream.lastEventId = eventId
+        stream.lastActivity = new Date()
+        session.lastActivity = new Date()
+        this.sessions.set(sessionId, session)
+      }
+    }
+  }
+
+  async getMessagesFrom(sessionId: string, streamId: string, fromEventId: string): Promise<Array<{ eventId: string, message: JSONRPCMessage }>> {
+    const streamKey = this.getStreamKey(sessionId, streamId)
+    const history = this.streamMessageHistory.get(streamKey) || []
+    const fromIndex = history.findIndex(entry => entry.eventId === fromEventId)
+
+    if (fromIndex === -1) {
+      return []
+    }
+
+    return history.slice(fromIndex + 1).map(entry => ({
+      eventId: entry.eventId,
+      message: entry.message
+    }))
+  }
+
+  // Legacy message operations (for backwards compatibility)
+  async addSessionMessage(sessionId: string, eventId: string, message: JSONRPCMessage): Promise<void> {
     let history = this.messageHistory.get(sessionId)
     if (!history) {
       history = []
@@ -66,12 +186,11 @@ export class MemorySessionStore implements SessionStore {
     // Update session metadata
     const session = this.sessions.get(sessionId)
     if (session) {
-      session.lastEventId = eventId
       session.lastActivity = new Date()
     }
   }
 
-  async getMessagesFrom (sessionId: string, fromEventId: string): Promise<Array<{ eventId: string, message: JSONRPCMessage }>> {
+  async getSessionMessagesFrom(sessionId: string, fromEventId: string): Promise<Array<{ eventId: string, message: JSONRPCMessage }>> {
     const history = this.messageHistory.get(sessionId) || []
     const fromIndex = history.findIndex(entry => entry.eventId === fromEventId)
 
