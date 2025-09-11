@@ -57,6 +57,21 @@ export function createError (id: string | number, code: number, message: string,
   }
 }
 
+// Helper function to check if a value is an async iterator
+function isAsyncIterator (value: any): value is AsyncGenerator<CallToolResult, CallToolResult, unknown> {
+  return value != null &&
+         typeof value === 'object' &&
+         typeof value[Symbol.asyncIterator] === 'function' &&
+         typeof value.next === 'function'
+}
+
+// Interface for streaming responses to differentiate from regular responses
+export interface StreamingToolResponse {
+  isStreaming: true
+  iterator: AsyncGenerator<CallToolResult, CallToolResult, unknown>
+  requestId: string | number
+}
+
 function handleInitialize (request: JSONRPCRequest, dependencies: HandlerDependencies): JSONRPCResponse {
   const { opts, capabilities, serverInfo } = dependencies
   const result: InitializeResult = {
@@ -114,7 +129,7 @@ async function handleToolsCall (
   request: JSONRPCRequest,
   sessionId: string | undefined,
   dependencies: HandlerDependencies
-): Promise<JSONRPCResponse | JSONRPCError> {
+): Promise<JSONRPCResponse | JSONRPCError | StreamingToolResponse> {
   const { tools } = dependencies
 
   // Validate the request parameters structure
@@ -191,6 +206,16 @@ async function handleToolsCall (
       // Use validated arguments
       try {
         const result = await tool.handler(argumentsValidation.data, { sessionId, request: dependencies.request, reply: dependencies.reply, authContext: dependencies.authContext })
+
+        // Check if result is an async iterator for streaming
+        if (isAsyncIterator(result)) {
+          return {
+            isStreaming: true,
+            iterator: result,
+            requestId: request.id
+          }
+        }
+
         return createResponse(request.id, result)
       } catch (error: any) {
         const result: CallToolResult = {
@@ -206,6 +231,16 @@ async function handleToolsCall (
       // Regular JSON Schema - basic validation or pass through
       try {
         const result = await tool.handler(toolArguments, { sessionId, request: dependencies.request, reply: dependencies.reply, authContext: dependencies.authContext })
+
+        // Check if result is an async iterator for streaming
+        if (isAsyncIterator(result)) {
+          return {
+            isStreaming: true,
+            iterator: result,
+            requestId: request.id
+          }
+        }
+
         return createResponse(request.id, result)
       } catch (error: any) {
         const result: CallToolResult = {
@@ -227,6 +262,16 @@ async function handleToolsCall (
         reply: dependencies.reply,
         authContext: dependencies.authContext
       })
+
+      // Check if result is an async iterator for streaming
+      if (isAsyncIterator(result)) {
+        return {
+          isStreaming: true,
+          iterator: result,
+          requestId: request.id
+        }
+      }
+
       return createResponse(request.id, result)
     } catch (error: any) {
       const result: CallToolResult = {
@@ -444,7 +489,7 @@ export async function handleRequest (
   request: JSONRPCRequest,
   sessionId: string | undefined,
   dependencies: HandlerDependencies
-): Promise<JSONRPCResponse | JSONRPCError> {
+): Promise<JSONRPCResponse | JSONRPCError | StreamingToolResponse> {
   const { app } = dependencies
 
   app.log.info({
@@ -496,7 +541,7 @@ export async function processMessage (
   message: JSONRPCMessage,
   sessionId: string | undefined,
   dependencies: HandlerDependencies
-): Promise<JSONRPCResponse | JSONRPCError | null> {
+): Promise<JSONRPCResponse | JSONRPCError | StreamingToolResponse | null> {
   if ('id' in message && 'method' in message) {
     return await handleRequest(message as JSONRPCRequest, sessionId, dependencies)
   } else if ('method' in message) {

@@ -7,7 +7,7 @@ import type { MCPPluginOptions, MCPTool, MCPResource, MCPPrompt } from '../types
 import type { SessionStore, SessionMetadata } from '../stores/session-store.ts'
 import type { MessageBroker } from '../brokers/message-broker.ts'
 import type { AuthorizationContext } from '../types/auth-types.ts'
-import { processMessage } from '../handlers.ts'
+import { processMessage, createResponse, createError, type StreamingToolResponse } from '../handlers.ts'
 
 interface MCPPubSubRoutesOptions {
   enableSSE: boolean
@@ -20,6 +20,11 @@ interface MCPPubSubRoutesOptions {
   sessionStore: SessionStore
   messageBroker: MessageBroker
   localStreams: Map<string, Set<any>>
+}
+
+// Helper function to check if response is streaming
+function isStreamingResponse (response: any): response is StreamingToolResponse {
+  return response && response.isStreaming === true && response.iterator && response.requestId !== undefined
 }
 
 const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async (app, options) => {
@@ -109,6 +114,108 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     }
   }
 
+  async function handleStreamingResponse (
+    streamingResponse: StreamingToolResponse,
+    sessionId: string | undefined,
+    reply: FastifyReply
+  ): Promise<void> {
+    // Hijack the response for streaming
+    reply.hijack()
+    const raw = reply.raw
+
+    // Set SSE headers
+    raw.setHeader('Content-Type', 'text/event-stream')
+    raw.setHeader('Cache-Control', 'no-cache')
+    raw.writeHead(200)
+
+    let eventId = 1
+
+    try {
+      // Manually iterate through async iterator to capture both yielded values and return value
+      const iterator = streamingResponse.iterator
+      let result = await iterator.next()
+
+      while (!result.done) {
+        // Handle yielded values
+        const response = createResponse(streamingResponse.requestId, result.value)
+        const sseEvent = `id: ${eventId}\ndata: ${JSON.stringify(response)}\n\n`
+
+        try {
+          raw.write(sseEvent)
+        } catch (error) {
+          app.log.error({ err: error }, 'Failed to write SSE chunk')
+          break
+        }
+
+        // Update session if available
+        if (enableSSE && sessionId) {
+          const session = await sessionStore.get(sessionId)
+          if (session) {
+            session.lastEventId = eventId.toString()
+            session.lastActivity = new Date()
+            await sessionStore.addMessage(sessionId, eventId.toString(), response)
+          }
+        }
+
+        eventId++
+        result = await iterator.next()
+      }
+
+      // Handle final return value if present
+      if (result.value !== undefined) {
+        const response = createResponse(streamingResponse.requestId, result.value)
+        const sseEvent = `id: ${eventId}\ndata: ${JSON.stringify(response)}\n\n`
+
+        try {
+          raw.write(sseEvent)
+        } catch (error) {
+          app.log.error({ err: error }, 'Failed to write final SSE event')
+        }
+
+        // Update session with final value if available
+        if (enableSSE && sessionId) {
+          const session = await sessionStore.get(sessionId)
+          if (session) {
+            session.lastEventId = eventId.toString()
+            session.lastActivity = new Date()
+            await sessionStore.addMessage(sessionId, eventId.toString(), response)
+          }
+        }
+      }
+    } catch (error: any) {
+      // Send error event
+      const errorResponse = createError(
+        streamingResponse.requestId,
+        INTERNAL_ERROR,
+        `Streaming error: ${error.message || error}`
+      )
+      const errorEvent = `id: ${eventId}\ndata: ${JSON.stringify(errorResponse)}\n\n`
+
+      try {
+        raw.write(errorEvent)
+      } catch (writeError) {
+        app.log.error({ err: writeError }, 'Failed to write error event')
+      }
+
+      // Update session with error if available
+      if (enableSSE && sessionId) {
+        const session = await sessionStore.get(sessionId)
+        if (session) {
+          session.lastEventId = eventId.toString()
+          session.lastActivity = new Date()
+          await sessionStore.addMessage(sessionId, eventId.toString(), errorResponse)
+        }
+      }
+    } finally {
+      // Close the stream
+      try {
+        raw.end()
+      } catch (error) {
+        app.log.error({ err: error }, 'Failed to close SSE stream')
+      }
+    }
+  }
+
   async function replayMessagesFromEventId (sessionId: string, lastEventId: string, stream: FastifyReply): Promise<void> {
     try {
       const messagesToReplay = await sessionStore.getMessagesFrom(sessionId, lastEventId)
@@ -190,6 +297,13 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         authContext
       })
       if (response) {
+        // Check if this is a streaming response
+        if (isStreamingResponse(response)) {
+          // Handle streaming response
+          await handleStreamingResponse(response, sessionId, reply)
+          return // Response already sent via streaming
+        }
+
         return response
       } else {
         reply.code(202)
