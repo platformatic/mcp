@@ -37,17 +37,30 @@ export function createAuthorizationContext (
 ): AuthorizationContext {
   const tokenHash = hashToken(token)
 
+  // Handle different scope formats: 'scope' string, 'scopes' array, or neither
+  let scopes: string[] | undefined
+  if (tokenPayload.scopes && Array.isArray(tokenPayload.scopes)) {
+    // Handle 'scopes' as array (some providers use this)
+    scopes = tokenPayload.scopes
+  } else if (tokenPayload.scope && typeof tokenPayload.scope === 'string') {
+    // Handle 'scope' as space-delimited string (OAuth 2.0 standard)
+    scopes = parseScopes(tokenPayload.scope)
+  } else {
+    // No scope information available
+    scopes = undefined
+  }
+
   return {
     userId: tokenPayload.sub,
     clientId: tokenPayload.client_id || tokenPayload.azp, // azp = authorized party
-    scopes: parseScopes(tokenPayload.scope),
+    scopes,
     audience: Array.isArray(tokenPayload.aud) ? tokenPayload.aud : tokenPayload.aud ? [tokenPayload.aud] : undefined,
     tokenType: 'Bearer',
     tokenHash,
     expiresAt: tokenPayload.exp ? new Date(tokenPayload.exp * 1000) : undefined,
     issuedAt: tokenPayload.iat ? new Date(tokenPayload.iat * 1000) : undefined,
     refreshToken: options.refreshToken,
-    authorizationServer: options.authorizationServer || tokenPayload.iss,
+    authorizationServer: tokenPayload.iss || options.authorizationServer,
     sessionBoundToken: tokenHash // Same as tokenHash for now, but could be different for session-bound tokens
   }
 }

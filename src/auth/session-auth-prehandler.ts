@@ -144,7 +144,8 @@ export function createSessionAuthPreHandler (
         sub: authContext.userId,
         client_id: authContext.clientId,
         scope: authContext.scopes?.join(' '),
-        aud: authContext.audience,
+        aud: authContext.audience?.length === 1 ? authContext.audience[0] : authContext.audience,
+        iss: authContext.authorizationServer,
         exp: authContext.expiresAt ? Math.floor(authContext.expiresAt.getTime() / 1000) : undefined,
         iat: authContext.issuedAt ? Math.floor(authContext.issuedAt.getTime() / 1000) : undefined
       }

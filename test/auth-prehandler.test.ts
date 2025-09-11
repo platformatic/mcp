@@ -1,8 +1,9 @@
 import { test, describe, beforeEach, afterEach } from 'node:test'
 import type { TestContext } from 'node:test'
 import Fastify from 'fastify'
-import { createAuthPreHandler } from '../src/auth/prehandler.ts'
+import { createSessionAuthPreHandler } from '../src/auth/session-auth-prehandler.ts'
 import { TokenValidator } from '../src/auth/token-validator.ts'
+import { MemorySessionStore } from '../src/stores/memory-session-store.ts'
 import {
   createTestAuthConfig,
   createTestJWT,
@@ -31,7 +32,8 @@ describe('Authorization PreHandler', () => {
   test('should skip authorization when disabled', async (t: TestContext) => {
     const config = createTestAuthConfig({ enabled: false })
     const validator = new TokenValidator(config, app)
-    const preHandler = createAuthPreHandler(config, validator)
+    const sessionStore = new MemorySessionStore(100)
+    const preHandler = createSessionAuthPreHandler({ config, tokenValidator: validator, sessionStore })
 
     app.addHook('preHandler', preHandler)
     app.get('/test', async () => ({ success: true }))
@@ -52,7 +54,8 @@ describe('Authorization PreHandler', () => {
   test('should skip authorization for well-known endpoints', async (t: TestContext) => {
     const config = createTestAuthConfig()
     const validator = new TokenValidator(config, app)
-    const preHandler = createAuthPreHandler(config, validator)
+    const sessionStore = new MemorySessionStore(100)
+    const preHandler = createSessionAuthPreHandler({ config, tokenValidator: validator, sessionStore })
 
     app.addHook('preHandler', preHandler)
     app.get('/.well-known/test', async () => ({ success: true }))
@@ -73,7 +76,8 @@ describe('Authorization PreHandler', () => {
   test('should skip authorization for the start of the OAuth authorization flow', async (t: TestContext) => {
     const config = createTestAuthConfig()
     const validator = new TokenValidator(config, app)
-    const preHandler = createAuthPreHandler(config, validator)
+    const sessionStore = new MemorySessionStore(100)
+    const preHandler = createSessionAuthPreHandler({ config, tokenValidator: validator, sessionStore })
 
     app.addHook('preHandler', preHandler)
     app.get('/oauth/authorize', async () => ({ success: true }))
@@ -94,7 +98,8 @@ describe('Authorization PreHandler', () => {
   test('should return 401 when no Authorization header', async (t: TestContext) => {
     const config = createTestAuthConfig()
     const validator = new TokenValidator(config, app)
-    const preHandler = createAuthPreHandler(config, validator)
+    const sessionStore = new MemorySessionStore(100)
+    const preHandler = createSessionAuthPreHandler({ config, tokenValidator: validator, sessionStore })
 
     app.addHook('preHandler', preHandler)
     app.get('/test', async () => ({ success: true }))
@@ -123,7 +128,8 @@ describe('Authorization PreHandler', () => {
   test('should return 401 when Authorization header is not Bearer', async (t: TestContext) => {
     const config = createTestAuthConfig()
     const validator = new TokenValidator(config, app)
-    const preHandler = createAuthPreHandler(config, validator)
+    const sessionStore = new MemorySessionStore(100)
+    const preHandler = createSessionAuthPreHandler({ config, tokenValidator: validator, sessionStore })
 
     app.addHook('preHandler', preHandler)
     app.get('/test', async () => ({ success: true }))
@@ -150,7 +156,8 @@ describe('Authorization PreHandler', () => {
   test('should return 401 when Bearer token is empty', async (t: TestContext) => {
     const config = createTestAuthConfig()
     const validator = new TokenValidator(config, app)
-    const preHandler = createAuthPreHandler(config, validator)
+    const sessionStore = new MemorySessionStore(100)
+    const preHandler = createSessionAuthPreHandler({ config, tokenValidator: validator, sessionStore })
 
     app.addHook('preHandler', preHandler)
     app.get('/test', async () => ({ success: true }))
@@ -181,7 +188,8 @@ describe('Authorization PreHandler', () => {
     })
 
     const validator = new TokenValidator(config, app)
-    const preHandler = createAuthPreHandler(config, validator)
+    const sessionStore = new MemorySessionStore(100)
+    const preHandler = createSessionAuthPreHandler({ config, tokenValidator: validator, sessionStore })
 
     app.addHook('preHandler', preHandler)
     app.get('/test', async (request: any) => ({
@@ -216,7 +224,8 @@ describe('Authorization PreHandler', () => {
     })
 
     const validator = new TokenValidator(config, app)
-    const preHandler = createAuthPreHandler(config, validator)
+    const sessionStore = new MemorySessionStore(100)
+    const preHandler = createSessionAuthPreHandler({ config, tokenValidator: validator, sessionStore })
 
     app.addHook('preHandler', preHandler)
     app.get('/test', async () => ({ success: true }))
@@ -247,7 +256,8 @@ describe('Authorization PreHandler', () => {
     })
 
     const validator = new TokenValidator(config, app)
-    const preHandler = createAuthPreHandler(config, validator)
+    const sessionStore = new MemorySessionStore(100)
+    const preHandler = createSessionAuthPreHandler({ config, tokenValidator: validator, sessionStore })
 
     app.addHook('preHandler', preHandler)
     app.get('/test', async () => ({ success: true }))
@@ -278,7 +288,8 @@ describe('Authorization PreHandler', () => {
     })
 
     const validator = new TokenValidator(config, app)
-    const preHandler = createAuthPreHandler(config, validator)
+    const sessionStore = new MemorySessionStore(100)
+    const preHandler = createSessionAuthPreHandler({ config, tokenValidator: validator, sessionStore })
 
     app.addHook('preHandler', preHandler)
     app.get('/test', async () => ({ success: true }))
@@ -310,7 +321,8 @@ describe('Authorization PreHandler', () => {
     })
 
     const validator = new TokenValidator(config, app)
-    const preHandler = createAuthPreHandler(config, validator)
+    const sessionStore = new MemorySessionStore(100)
+    const preHandler = createSessionAuthPreHandler({ config, tokenValidator: validator, sessionStore })
 
     app.addHook('preHandler', preHandler)
     app.get('/test', async (request: any) => {
@@ -358,7 +370,8 @@ describe('Authorization PreHandler', () => {
     })
 
     const validator = new TokenValidator(config, app)
-    const preHandler = createAuthPreHandler(config, validator)
+    const sessionStore = new MemorySessionStore(100)
+    const preHandler = createSessionAuthPreHandler({ config, tokenValidator: validator, sessionStore })
 
     app.addHook('preHandler', preHandler)
     app.get('/protected1', async () => ({ endpoint: 'protected1' }))

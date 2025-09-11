@@ -14,7 +14,7 @@ import metaDecorators from './decorators/meta.ts'
 import routes from './routes/mcp.ts'
 import wellKnownRoutes from './routes/well-known.ts'
 import { TokenValidator } from './auth/token-validator.ts'
-import { createAuthPreHandler } from './auth/prehandler.ts'
+import { createSessionAuthPreHandler } from './auth/session-auth-prehandler.ts'
 import oauthClientPlugin from './auth/oauth-client.ts'
 import authRoutesPlugin from './routes/auth-routes.ts'
 
@@ -77,7 +77,11 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     tokenValidator = new TokenValidator(opts.authorization, app)
 
     // Register authorization preHandler for all routes
-    app.addHook('preHandler', createAuthPreHandler(opts.authorization, tokenValidator))
+    app.addHook('preHandler', createSessionAuthPreHandler({
+      config: opts.authorization,
+      tokenValidator,
+      sessionStore
+    }))
 
     // Register OAuth client plugin if configured
     if (opts.authorization.oauth2Client) {
