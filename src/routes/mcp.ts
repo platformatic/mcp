@@ -238,25 +238,6 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
           reply.raw.on('close', () => {
             app.log.debug({ sessionId: session.id }, 'POST SSE raw connection closed')
           })
-
-          // Override the response methods to handle errors gracefully
-          const originalWrite = reply.raw.write.bind(reply.raw)
-          reply.raw.write = function (chunk: any, encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void) {
-            try {
-              if (typeof encodingOrCallback === 'function') {
-                return originalWrite(chunk, encodingOrCallback)
-              }
-              if (encodingOrCallback !== undefined) {
-                return originalWrite(chunk, encodingOrCallback, callback)
-              }
-              return originalWrite(chunk, callback)
-            } catch (error) {
-              app.log.debug({ err: error, sessionId: session.id }, 'POST SSE write error handled gracefully')
-              const cb = typeof encodingOrCallback === 'function' ? encodingOrCallback : callback
-              if (typeof cb === 'function') cb()
-              return false
-            }
-          }
         }
 
         app.log.info({
@@ -481,25 +462,6 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         reply.raw.on('close', () => {
           app.log.debug({ sessionId: session.id }, 'SSE raw connection closed')
         })
-
-        // Override the response methods to handle errors gracefully
-        const originalWrite = reply.raw.write.bind(reply.raw)
-        reply.raw.write = function (chunk: any, encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void) {
-          try {
-            if (typeof encodingOrCallback === 'function') {
-              return originalWrite(chunk, encodingOrCallback)
-            }
-            if (encodingOrCallback !== undefined) {
-              return originalWrite(chunk, encodingOrCallback, callback)
-            }
-            return originalWrite(chunk, callback)
-          } catch (error) {
-            app.log.debug({ err: error, sessionId: session.id }, 'SSE write error handled gracefully')
-            const cb = typeof encodingOrCallback === 'function' ? encodingOrCallback : callback
-            if (typeof cb === 'function') cb()
-            return false
-          }
-        }
       }
 
       // Add this connection to local streams
