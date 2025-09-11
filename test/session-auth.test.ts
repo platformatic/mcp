@@ -133,7 +133,8 @@ describe('Session-Based Authorization', () => {
         id: 'session-123',
         eventId: 0,
         createdAt: new Date(),
-        lastActivity: new Date()
+        lastActivity: new Date(),
+        streams: new Map()
       }
 
       await store.create(session)
@@ -155,7 +156,8 @@ describe('Session-Based Authorization', () => {
         id: 'session-123',
         eventId: 0,
         createdAt: new Date(),
-        lastActivity: new Date()
+        lastActivity: new Date(),
+        streams: new Map()
       }
 
       await store.create(session)
@@ -197,6 +199,7 @@ describe('Session-Based Authorization', () => {
         eventId: 0,
         createdAt: new Date(),
         lastActivity: new Date(),
+        streams: new Map(),
         authorization: {
           userId: 'user123',
           tokenHash
@@ -444,6 +447,7 @@ describe('Session-Based Authorization', () => {
         eventId: 0,
         createdAt: new Date(),
         lastActivity: new Date(),
+        streams: new Map(),
         authorization: authContext
       }
 
@@ -469,7 +473,8 @@ describe('Session-Based Authorization', () => {
         id: 'session-123',
         eventId: 0,
         createdAt: new Date(),
-        lastActivity: new Date()
+        lastActivity: new Date(),
+        streams: new Map()
       }
 
       await sessionStore.create(session)

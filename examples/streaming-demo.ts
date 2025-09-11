@@ -42,7 +42,7 @@ app.mcpAddTool({
   }
 }, async function * (params) {
   const delay = params.delay ?? 500
-  
+
   // Yield incremental chunks
   for (let i = 1; i <= params.count; i++) {
     yield {
@@ -51,11 +51,11 @@ app.mcpAddTool({
         text: `Streaming chunk ${i}/${params.count}: Processing...`
       }]
     }
-    
+
     // Simulate async work
     await new Promise(resolve => setTimeout(resolve, delay))
   }
-  
+
   // Final result
   return {
     content: [{
@@ -90,10 +90,10 @@ app.mcpAddTool({
         text: `📁 Processing file ${index + 1}/${params.files.length}: ${filename}`
       }]
     }
-    
+
     // Simulate processing time
     await new Promise(resolve => setTimeout(resolve, 800))
-    
+
     yield {
       content: [{
         type: 'text',
@@ -101,7 +101,7 @@ app.mcpAddTool({
       }]
     }
   }
-  
+
   // Final summary
   return {
     content: [{
@@ -123,22 +123,22 @@ app.mcpAddTool({
   }
 }, async function * (params) {
   const errorAfter = params.errorAfter ?? 3
-  
+
   for (let i = 1; i <= 5; i++) {
     if (i === errorAfter) {
       throw new Error(`Simulated error at step ${i}`)
     }
-    
+
     yield {
       content: [{
         type: 'text',
         text: `Step ${i}: Everything working fine...`
       }]
     }
-    
+
     await new Promise(resolve => setTimeout(resolve, 300))
   }
-  
+
   return {
     content: [{
       type: 'text',
@@ -154,7 +154,7 @@ const host = process.env.HOST || '127.0.0.1'
 try {
   await app.listen({ port, host })
   console.log(`🚀 MCP Streaming Demo Server running on http://${host}:${port}`)
-  console.log(`\n📖 Usage Examples:`)
+  console.log('\n📖 Usage Examples:')
   console.log(`
   # Test immediate response (returns JSON)
   curl -X POST http://${host}:${port}/mcp \\

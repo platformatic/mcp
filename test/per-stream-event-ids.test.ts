@@ -5,11 +5,11 @@ import mcpPlugin from '../src/index.ts'
 
 /**
  * Per-Stream Event ID Tests
- * 
+ *
  * According to MCP transport specification line 169:
  * "These event IDs should be assigned by servers on a per-stream basis, to
  * act as a cursor within that particular stream."
- * 
+ *
  * This test suite verifies:
  * 1. Event IDs are assigned on a per-stream basis (not per-session)
  * 2. Each SSE stream has its own event ID sequence starting from 1
@@ -36,8 +36,9 @@ test('Each SSE stream should have independent event ID sequences', async (t) => 
 
   await app.listen({ port: 0 })
   const address = app.server.address()
-  const port = typeof address === 'object' && address ? address.port : 0
-  const baseUrl = `http://localhost:${port}`
+  if (!address || typeof address !== 'object') {
+    throw new Error('Failed to start test server')
+  }
 
   // Initialize session
   const initResponse = await app.inject({
@@ -107,34 +108,34 @@ test('Each SSE stream should have independent event ID sequences', async (t) => 
   stream2Response.stream().destroy()
 })
 
-test('Last-Event-ID header should work for per-stream message replay', async (t) => {
+test('Last-Event-ID header should work for per-stream message replay', async () => {
   // This test documents the expected per-stream Last-Event-ID behavior
   // According to MCP spec, Last-Event-ID should work on a per-stream basis
   // Current implementation uses per-session event IDs which breaks proper resumability
-  
+
   assert.ok(true, 'Test placeholder - per-stream Last-Event-ID implementation needed')
 })
 
-test('Multiple streams should not interfere with each other\'s event IDs', async (t) => {
+test('Multiple streams should not interfere with each other\'s event IDs', async () => {
   // This test documents the requirement that each stream has independent event ID sequences
   // According to MCP spec line 145: server MUST send each message on only one stream
   // Current implementation broadcasts to all streams and shares event IDs
-  
+
   assert.ok(true, 'Test placeholder - independent stream event IDs needed')
 })
 
-test('Stream IDs should be unique within a session', async (t) => {
+test('Stream IDs should be unique within a session', async () => {
   // This test documents the requirement for unique stream IDs within a session
   // Stream IDs are needed to properly implement per-stream event ID sequences
   // Current implementation doesn't generate or track individual stream IDs
-  
+
   assert.ok(true, 'Test placeholder - unique stream ID generation needed')
 })
 
-test('Message storage should be organized by stream, not just session', async (t) => {
+test('Message storage should be organized by stream, not just session', async () => {
   // This test documents the requirement for per-stream message storage
   // Messages should be stored with stream context for proper Last-Event-ID replay
   // Current implementation stores messages per-session without stream differentiation
-  
+
   assert.ok(true, 'Test placeholder - per-stream message storage needed')
 })

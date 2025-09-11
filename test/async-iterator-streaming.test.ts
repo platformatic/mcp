@@ -275,6 +275,9 @@ describe('Async Iterator Streaming Tests', () => {
         }
         await new Promise(resolve => setTimeout(resolve, 5))
       }
+      return {
+        content: [{ type: 'text', text: 'Final event' }]
+      }
     })
 
     await app.ready()
@@ -301,12 +304,13 @@ describe('Async Iterator Streaming Tests', () => {
 
     const responseText = await response.body.text()
     const events = parseSSEEvents(responseText)
-    assert.strictEqual(events.length, 3)
+    assert.strictEqual(events.length, 4) // 3 yielded + 1 final return
 
     // Check that event IDs increment properly
     assert.strictEqual(events[0].id, '1')
     assert.strictEqual(events[1].id, '2')
     assert.strictEqual(events[2].id, '3')
+    assert.strictEqual(events[3].id, '4')
   })
 
   test('should handle async iterator that returns no values', async (t) => {

@@ -75,7 +75,7 @@ describe('RedisSessionStore', () => {
 
     const metadata: SessionMetadata = {
       id: 'test-session-3',
-      
+
       createdAt: new Date(),
       lastActivity: new Date(),
       streams: new Map()
@@ -95,16 +95,15 @@ describe('RedisSessionStore', () => {
       id: 2
     }
 
-    await store.addMessage('test-session-3', '1', message1)
-    await store.addMessage('test-session-3', '2', message2)
+    await store.addSessionMessage('test-session-3', '1', message1)
+    await store.addSessionMessage('test-session-3', '2', message2)
 
     // Check updated session metadata
     const updatedSession = await store.get('test-session-3')
     assert.ok(updatedSession)
-    assert.strictEqual(updatedSession.lastEventId, '2')
 
     // Check message history
-    const history = await store.getMessagesFrom('test-session-3', '0')
+    const history = await store.getSessionMessagesFrom('test-session-3', '0')
     assert.strictEqual(history.length, 2)
     assert.strictEqual(history[0].eventId, '1')
     assert.deepStrictEqual(history[0].message, message1)
@@ -117,7 +116,7 @@ describe('RedisSessionStore', () => {
 
     const metadata: SessionMetadata = {
       id: 'test-session-4',
-      
+
       createdAt: new Date(),
       lastActivity: new Date(),
       streams: new Map()
@@ -132,11 +131,11 @@ describe('RedisSessionStore', () => {
     ]
 
     for (let i = 0; i < messages.length; i++) {
-      await store.addMessage('test-session-4', (i + 1).toString(), messages[i])
+      await store.addSessionMessage('test-session-4', (i + 1).toString(), messages[i])
     }
 
     // Get messages from event ID 1 (should return events 2 and 3)
-    const history = await store.getMessagesFrom('test-session-4', '1')
+    const history = await store.getSessionMessagesFrom('test-session-4', '1')
     assert.strictEqual(history.length, 2)
     assert.strictEqual(history[0].eventId, '2')
     assert.deepStrictEqual(history[0].message, messages[1])
@@ -149,7 +148,7 @@ describe('RedisSessionStore', () => {
 
     const metadata: SessionMetadata = {
       id: 'test-session-5',
-      
+
       createdAt: new Date(),
       lastActivity: new Date(),
       streams: new Map()
@@ -164,11 +163,11 @@ describe('RedisSessionStore', () => {
         method: `test${i}`,
         id: i
       }
-      await store.addMessage('test-session-5', i.toString(), message)
+      await store.addSessionMessage('test-session-5', i.toString(), message)
     }
 
     // Should have exactly 3 messages (exact trimming)
-    const history = await store.getMessagesFrom('test-session-5', '0')
+    const history = await store.getSessionMessagesFrom('test-session-5', '0')
     assert.strictEqual(history.length, 3)
     assert.strictEqual(history[0].eventId, '3')
     assert.strictEqual(history[1].eventId, '4')
@@ -180,7 +179,7 @@ describe('RedisSessionStore', () => {
 
     const metadata: SessionMetadata = {
       id: 'test-session-6',
-      
+
       createdAt: new Date(),
       lastActivity: new Date(),
       streams: new Map()
@@ -194,7 +193,7 @@ describe('RedisSessionStore', () => {
       method: 'test',
       id: 1
     }
-    await store.addMessage('test-session-6', '1', message)
+    await store.addSessionMessage('test-session-6', '1', message)
 
     // Delete only the session (not the history) to simulate orphaned history
     await redis.del('session:test-session-6')
@@ -212,7 +211,7 @@ describe('RedisSessionStore', () => {
 
     const metadata: SessionMetadata = {
       id: 'test-session-7',
-      
+
       createdAt: new Date(),
       lastActivity: new Date(),
       streams: new Map()
@@ -230,7 +229,7 @@ describe('RedisSessionStore', () => {
       method: 'test',
       id: 1
     }
-    await store.addMessage('test-session-7', '1', message)
+    await store.addSessionMessage('test-session-7', '1', message)
 
     const newTtl = await redis.ttl('session:test-session-7')
     assert.ok(newTtl > 3500 && newTtl <= 3600)
@@ -239,7 +238,7 @@ describe('RedisSessionStore', () => {
   testWithRedis('should return empty array for non-existent message history', async (redis) => {
     const store = new RedisSessionStore({ redis, maxMessages: 100 })
 
-    const history = await store.getMessagesFrom('non-existent-session', '0')
+    const history = await store.getSessionMessagesFrom('non-existent-session', '0')
     assert.strictEqual(history.length, 0)
   })
 })

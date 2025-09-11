@@ -18,12 +18,12 @@ export class MemorySessionStore implements SessionStore {
     this.maxMessages = maxMessages
   }
 
-  private getStreamKey(sessionId: string, streamId: string): string {
+  private getStreamKey (sessionId: string, streamId: string): string {
     return `${sessionId}:${streamId}`
   }
 
   async create (metadata: SessionMetadata): Promise<void> {
-    const sessionData = { 
+    const sessionData = {
       ...metadata,
       streams: new Map(metadata.streams || [])
     }
@@ -34,8 +34,8 @@ export class MemorySessionStore implements SessionStore {
   async get (sessionId: string): Promise<SessionMetadata | null> {
     const session = this.sessions.get(sessionId)
     if (!session) return null
-    
-    return { 
+
+    return {
       ...session,
       streams: new Map(session.streams)
     }
@@ -71,7 +71,7 @@ export class MemorySessionStore implements SessionStore {
   }
 
   // Stream management methods
-  async createStream(sessionId: string, streamId: string): Promise<StreamMetadata | null> {
+  async createStream (sessionId: string, streamId: string): Promise<StreamMetadata | null> {
     const session = this.sessions.get(sessionId)
     if (!session) return null
 
@@ -90,7 +90,7 @@ export class MemorySessionStore implements SessionStore {
     return { ...streamMetadata }
   }
 
-  async getStream(sessionId: string, streamId: string): Promise<StreamMetadata | null> {
+  async getStream (sessionId: string, streamId: string): Promise<StreamMetadata | null> {
     const session = this.sessions.get(sessionId)
     if (!session) return null
 
@@ -98,7 +98,7 @@ export class MemorySessionStore implements SessionStore {
     return stream ? { ...stream } : null
   }
 
-  async deleteStream(sessionId: string, streamId: string): Promise<void> {
+  async deleteStream (sessionId: string, streamId: string): Promise<void> {
     const session = this.sessions.get(sessionId)
     if (!session) return
 
@@ -111,7 +111,7 @@ export class MemorySessionStore implements SessionStore {
     this.streamMessageHistory.delete(streamKey)
   }
 
-  async updateStreamActivity(sessionId: string, streamId: string): Promise<void> {
+  async updateStreamActivity (sessionId: string, streamId: string): Promise<void> {
     const session = this.sessions.get(sessionId)
     if (!session) return
 
@@ -124,7 +124,7 @@ export class MemorySessionStore implements SessionStore {
   }
 
   // Per-stream message history operations
-  async addMessage(sessionId: string, streamId: string, eventId: string, message: JSONRPCMessage): Promise<void> {
+  async addMessage (sessionId: string, streamId: string, eventId: string, message: JSONRPCMessage): Promise<void> {
     const streamKey = this.getStreamKey(sessionId, streamId)
     let history = this.streamMessageHistory.get(streamKey)
     if (!history) {
@@ -153,7 +153,7 @@ export class MemorySessionStore implements SessionStore {
     }
   }
 
-  async getMessagesFrom(sessionId: string, streamId: string, fromEventId: string): Promise<Array<{ eventId: string, message: JSONRPCMessage }>> {
+  async getMessagesFrom (sessionId: string, streamId: string, fromEventId: string): Promise<Array<{ eventId: string, message: JSONRPCMessage }>> {
     const streamKey = this.getStreamKey(sessionId, streamId)
     const history = this.streamMessageHistory.get(streamKey) || []
     const fromIndex = history.findIndex(entry => entry.eventId === fromEventId)
@@ -169,7 +169,7 @@ export class MemorySessionStore implements SessionStore {
   }
 
   // Legacy message operations (for backwards compatibility)
-  async addSessionMessage(sessionId: string, eventId: string, message: JSONRPCMessage): Promise<void> {
+  async addSessionMessage (sessionId: string, eventId: string, message: JSONRPCMessage): Promise<void> {
     let history = this.messageHistory.get(sessionId)
     if (!history) {
       history = []
@@ -190,7 +190,7 @@ export class MemorySessionStore implements SessionStore {
     }
   }
 
-  async getSessionMessagesFrom(sessionId: string, fromEventId: string): Promise<Array<{ eventId: string, message: JSONRPCMessage }>> {
+  async getSessionMessagesFrom (sessionId: string, fromEventId: string): Promise<Array<{ eventId: string, message: JSONRPCMessage }>> {
     const history = this.messageHistory.get(sessionId) || []
     const fromIndex = history.findIndex(entry => entry.eventId === fromEventId)
 

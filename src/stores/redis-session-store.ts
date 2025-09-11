@@ -12,11 +12,11 @@ export class RedisSessionStore implements SessionStore {
     this.maxMessages = options.maxMessages || 100
   }
 
-  private getStreamKey(sessionId: string, streamId: string): string {
+  private getStreamKey (sessionId: string, streamId: string): string {
     return `session:${sessionId}:stream:${streamId}`
   }
 
-  private getStreamHistoryKey(sessionId: string, streamId: string): string {
+  private getStreamHistoryKey (sessionId: string, streamId: string): string {
     return `session:${sessionId}:stream:${streamId}:history`
   }
 
@@ -194,7 +194,7 @@ export class RedisSessionStore implements SessionStore {
   }
 
   // Stream management methods
-  async createStream(sessionId: string, streamId: string): Promise<StreamMetadata | null> {
+  async createStream (sessionId: string, streamId: string): Promise<StreamMetadata | null> {
     const session = await this.get(sessionId)
     if (!session) return null
 
@@ -232,7 +232,7 @@ export class RedisSessionStore implements SessionStore {
     return { ...streamMetadata }
   }
 
-  async getStream(sessionId: string, streamId: string): Promise<StreamMetadata | null> {
+  async getStream (sessionId: string, streamId: string): Promise<StreamMetadata | null> {
     const streamKey = this.getStreamKey(sessionId, streamId)
     const result = await this.redis.hgetall(streamKey)
 
@@ -249,7 +249,7 @@ export class RedisSessionStore implements SessionStore {
     }
   }
 
-  async deleteStream(sessionId: string, streamId: string): Promise<void> {
+  async deleteStream (sessionId: string, streamId: string): Promise<void> {
     const session = await this.get(sessionId)
     if (!session) return
 
@@ -271,7 +271,7 @@ export class RedisSessionStore implements SessionStore {
     await this.redis.del(streamKey, streamHistoryKey)
   }
 
-  async updateStreamActivity(sessionId: string, streamId: string): Promise<void> {
+  async updateStreamActivity (sessionId: string, streamId: string): Promise<void> {
     const streamKey = this.getStreamKey(sessionId, streamId)
     const sessionKey = `session:${sessionId}`
     const now = new Date().toISOString()
@@ -285,7 +285,7 @@ export class RedisSessionStore implements SessionStore {
   }
 
   // Per-stream message history operations
-  async addMessage(sessionId: string, streamId: string, eventId: string, message: JSONRPCMessage): Promise<void> {
+  async addMessage (sessionId: string, streamId: string, eventId: string, message: JSONRPCMessage): Promise<void> {
     const historyKey = this.getStreamHistoryKey(sessionId, streamId)
     const streamKey = this.getStreamKey(sessionId, streamId)
 
@@ -316,7 +316,7 @@ export class RedisSessionStore implements SessionStore {
     await pipeline.exec()
   }
 
-  async getMessagesFrom(sessionId: string, streamId: string, fromEventId: string): Promise<Array<{ eventId: string, message: JSONRPCMessage }>> {
+  async getMessagesFrom (sessionId: string, streamId: string, fromEventId: string): Promise<Array<{ eventId: string, message: JSONRPCMessage }>> {
     const historyKey = this.getStreamHistoryKey(sessionId, streamId)
 
     try {
@@ -333,7 +333,7 @@ export class RedisSessionStore implements SessionStore {
   }
 
   // Legacy message operations (for backwards compatibility)
-  async addSessionMessage(sessionId: string, eventId: string, message: JSONRPCMessage): Promise<void> {
+  async addSessionMessage (sessionId: string, eventId: string, message: JSONRPCMessage): Promise<void> {
     const historyKey = `session:${sessionId}:history`
     const sessionKey = `session:${sessionId}`
 
@@ -357,7 +357,7 @@ export class RedisSessionStore implements SessionStore {
     await pipeline.exec()
   }
 
-  async getSessionMessagesFrom(sessionId: string, fromEventId: string): Promise<Array<{ eventId: string, message: JSONRPCMessage }>> {
+  async getSessionMessagesFrom (sessionId: string, fromEventId: string): Promise<Array<{ eventId: string, message: JSONRPCMessage }>> {
     const historyKey = `session:${sessionId}:history`
 
     try {
