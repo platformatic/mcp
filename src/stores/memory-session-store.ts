@@ -168,7 +168,7 @@ export class MemorySessionStore implements SessionStore {
     }))
   }
 
-  // Legacy message operations (for backwards compatibility)
+  // Session-level message operations (for broadcast messages and compatibility)
   async addSessionMessage (sessionId: string, eventId: string, message: JSONRPCMessage): Promise<void> {
     let history = this.messageHistory.get(sessionId)
     if (!history) {

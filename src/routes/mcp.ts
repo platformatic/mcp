@@ -65,7 +65,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
   }
 
   async function sendSSEToStreams (sessionId: string, message: JSONRPCMessage, streams: Set<FastifyReply>): Promise<void> {
-    // Check if this is a broadcast notification or elicitation (these should use legacy session-level storage)
+    // Check if this is a broadcast notification or elicitation (these should use session-level storage)
     const isBroadcast = 'method' in message && (
       message.method === 'notifications/message' ||
       message.method.startsWith('notifications/') ||
@@ -73,8 +73,8 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     )
 
     if (isBroadcast) {
-      // Use legacy broadcast method for broadcast notifications (maintains backward compatibility)
-      await sendSSEToStreamsLegacy(sessionId, message, streams)
+      // Use broadcast method for broadcast notifications and elicitation requests
+      await sendSSEToStreamsBroadcast(sessionId, message, streams)
       return
     }
 
@@ -88,9 +88,9 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     const streamId = (selectedStream as any).mcpStreamId
 
     if (!streamId) {
-      app.log.warn('Stream missing mcpStreamId, falling back to legacy broadcast')
-      // Fallback to legacy behavior if streamId is missing
-      await sendSSEToStreamsLegacy(sessionId, message, streams)
+      app.log.warn('Stream missing mcpStreamId, falling back to broadcast')
+      // Fallback to broadcast behavior if streamId is missing
+      await sendSSEToStreamsBroadcast(sessionId, message, streams)
       return
     }
 
@@ -134,11 +134,11 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     }
   }
 
-  async function sendSSEToStreamsLegacy (sessionId: string, message: JSONRPCMessage, streams: Set<FastifyReply>): Promise<void> {
-    // Legacy broadcast method for backwards compatibility - stores in session-level history
+  async function sendSSEToStreamsBroadcast (sessionId: string, message: JSONRPCMessage, streams: Set<FastifyReply>): Promise<void> {
+    // Broadcast method for notifications and elicitation - stores in session-level history
     const deadStreams = new Set<FastifyReply>()
 
-    // Use timestamp-based event ID for legacy compatibility
+    // Use timestamp-based event ID for broadcast compatibility
     const eventId = Date.now().toString()
     const sseEvent = `id: ${eventId}\ndata: ${JSON.stringify(message)}\n\n`
 
@@ -151,11 +151,11 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
       }
     }
 
-    // Store message in session-level history (for backward compatibility with tests)
+    // Store message in session-level history (broadcast messages are session-wide)
     try {
       await sessionStore.addSessionMessage(sessionId, eventId, message)
     } catch (error) {
-      app.log.error({ err: error }, 'Failed to store legacy session message')
+      app.log.error({ err: error }, 'Failed to store broadcast session message')
     }
 
     // Clean up dead streams
