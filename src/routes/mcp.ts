@@ -46,6 +46,16 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     await sessionStore.create(session)
     localStreams.set(sessionId, new Set())
 
+    // Subscribe to messages for this session
+    await messageBroker.subscribe(`mcp/session/${sessionId}/message`, async (payload: { message: JSONRPCMessage, eventId: string }) => {
+      const streams = localStreams.get(sessionId)
+      if (streams && streams.size > 0) {
+        app.log.debug({ sessionId, message: payload.message, eventId: payload.eventId }, 'Received message for session via broker, sending to streams')
+        sendSSEToStreams(sessionId, payload.message, streams, payload.eventId)
+      }
+      // Note: Message is already stored in history by mcpSendToSession before publishing
+    })
+
     return session
   }
 
@@ -76,13 +86,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
            authContext.tokenHash === session.authorization.tokenHash
   }
 
-  async function sendSSEToStreams (sessionId: string, message: JSONRPCMessage, streams: Set<FastifyReply>): Promise<void> {
-    const session = await sessionStore.get(sessionId)
-    if (!session) return
-
-    // Store message in history with auto-generated eventId (atomic operation)
-    const eventId = await sessionStore.addMessageWithAutoEventId(sessionId, message)
-
+  async function sendSSEToStreams (sessionId: string, message: JSONRPCMessage, streams: Set<FastifyReply>, eventId: string): Promise<void> {
     // Send to all connected streams in this session using @fastify/sse
     const deadStreams = new Set<FastifyReply>()
     for (const stream of streams) {
@@ -570,7 +574,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
         for (const sessionId of allSessionIds) {
           // Store message in session history
-          await sessionStore.addMessageWithAutoEventId(sessionId, notification)
+          const eventId = await sessionStore.addMessageWithAutoEventId(sessionId, notification)
 
           // Send to local streams if available
           const streams = localStreams.get(sessionId)
@@ -581,53 +585,11 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
               notification,
               userId: session?.authorization?.userId
             }, 'Sending broadcast to session streams')
-            sendSSEToStreams(sessionId, notification, streams)
+            sendSSEToStreams(sessionId, notification, streams, eventId)
           }
         }
       } catch (error) {
         app.log.error({ error }, 'Error handling broadcast notification')
-      }
-    })
-
-    // Subscribe to all session messages with a universal handler
-    messageBroker.subscribe('mcp/session/message', async (sessionMessage: any) => {
-      const { sessionId, originalMessage: message } = sessionMessage
-
-      if (!sessionId) {
-        app.log.warn({ sessionMessage }, 'Session message missing sessionId')
-        return
-      }
-
-      const streams = localStreams.get(sessionId)
-      if (streams && streams.size > 0) {
-        app.log.debug({ sessionId, message }, 'Received session message via broker, sending to streams')
-        sendSSEToStreams(sessionId, message, streams)
-      } else {
-        app.log.debug({ sessionId }, 'Received session message via broker, storing in history without active streams')
-        // Store message in history even without active streams for session persistence
-        const session = await sessionStore.get(sessionId)
-        if (session) {
-          await sessionStore.addMessageWithAutoEventId(sessionId, message)
-        }
-      }
-    })
-
-    // Subscribe to user-specific messages
-    messageBroker.subscribe('mcp/user/message', async (userMessage: any) => {
-      const { userId, originalMessage: message } = userMessage
-
-      if (!userId) {
-        app.log.warn({ userMessage }, 'User message missing userId')
-        return
-      }
-
-      // Find all sessions for this user and send message to each
-      for (const [sessionId, streams] of localStreams.entries()) {
-        const session = await sessionStore.get(sessionId)
-        if (session?.authorization?.userId === userId && streams.size > 0) {
-          app.log.debug({ sessionId, userId, message }, 'Received user message via broker, sending to user sessions')
-          sendSSEToStreams(sessionId, message, streams)
-        }
       }
     })
   }

@@ -47,12 +47,20 @@ const mcpPubSubDecoratorsPlugin: FastifyPluginAsync<MCPPubSubDecoratorsOptions> 
       return false
     }
 
+    // Store message in session history before publishing
+    let eventId: string
+    try {
+      eventId = await sessionStore.addMessageWithAutoEventId(sessionId, message)
+    } catch (error) {
+      app.log.error({ err: error }, 'Failed to store message in session history')
+      return false
+    }
+
     // Always publish to messageBroker to support cross-instance messaging in Redis deployments
     // This ensures the message reaches the correct instance where the SSE connection exists
+    // Include the event ID in the published message for SSE delivery
     try {
-      // Use a universal session topic and include sessionId in the message payload
-      const sessionMessage = { sessionId, originalMessage: message }
-      await messageBroker.publish('mcp/session/message', sessionMessage as any)
+      await messageBroker.publish(`mcp/session/${sessionId}/message`, { message, eventId })
       return true
     } catch (error) {
       app.log.error({ err: error }, 'Failed to send message to session')
