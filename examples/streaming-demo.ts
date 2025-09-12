@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import Fastify from 'fastify'
-import mcpPlugin from '../src/index.js'
+import mcpPlugin from '../dist/index.js'
 
 const app = Fastify({ logger: true })
 
