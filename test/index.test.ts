@@ -370,7 +370,7 @@ describe('MCP Fastify Plugin', () => {
 
   describe('SSE Support', () => {
     test('should handle GET request with SSE support', async (t: TestContext) => {
-      const app = Fastify()
+      const app = Fastify({ logger: true })
       t.after(() => app.close())
 
       await app.register(mcpPlugin, { enableSSE: true })
