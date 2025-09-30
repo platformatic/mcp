@@ -107,10 +107,10 @@ const authRoutesPlugin: FastifyPluginAsync<AuthRoutesOptions> = async (fastify: 
       // Create session metadata with auth session data
       const sessionMetadata = {
         id: authRequest.state,
-        eventId: 0,
         createdAt: new Date(),
         lastActivity: new Date(),
-        authSession: sessionData
+        authSession: sessionData,
+        streams: new Map()
       }
 
       await sessionStore.create(sessionMetadata)
