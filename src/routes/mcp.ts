@@ -1,9 +1,9 @@
 import { randomUUID } from 'crypto'
 import type { FastifyRequest, FastifyReply, FastifyPluginAsync } from 'fastify'
 import fp from 'fastify-plugin'
-import type { JSONRPCMessage } from '../schema.ts'
+import type { CallToolResult, JSONRPCMessage } from '../schema.ts'
 import { JSONRPC_VERSION, INTERNAL_ERROR } from '../schema.ts'
-import type { MCPPluginOptions, MCPTool, MCPResource, MCPPrompt } from '../types.ts'
+import type { MCPPluginOptions, MCPTool, MCPResource, MCPPrompt, HandlerContext } from '../types.ts'
 import type { SessionStore, SessionMetadata } from '../stores/session-store.ts'
 import type { MessageBroker } from '../brokers/message-broker.ts'
 import type { AuthorizationContext } from '../types/auth-types.ts'
@@ -20,10 +20,23 @@ interface MCPPubSubRoutesOptions {
   sessionStore: SessionStore
   messageBroker: MessageBroker
   localStreams: Map<string, Set<any>>
+  /**
+   * Optional hooks to allow for a tool to perform actions before or after handling invocation.
+   */
+  globalHooks?: {
+    /**
+     * Optional global before tool handler hook.
+     * Return nothing to signify the handler should invoke.
+     * A result indicates a failure and will result in the handler not being invoked.
+     *
+     * @param context The same context that is supplied to a handler
+     */
+    toolBeforeHandler?: (context: HandlerContext) => Promise<CallToolResult | void> | CallToolResult | void,
+  }
 }
 
 const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async (app, options) => {
-  const { enableSSE, opts, capabilities, serverInfo, tools, resources, prompts, sessionStore, messageBroker, localStreams } = options
+  const { enableSSE, opts, capabilities, serverInfo, tools, resources, prompts, sessionStore, messageBroker, localStreams, globalHooks } = options
 
   async function createSSESession (): Promise<SessionMetadata> {
     const sessionId = randomUUID()
@@ -187,7 +200,8 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         prompts,
         request,
         reply,
-        authContext
+        authContext,
+        globalHooks,
       })
       if (response) {
         return response

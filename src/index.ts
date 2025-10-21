@@ -51,6 +51,8 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
   const resources = new Map<string, MCPResource>()
   const prompts = new Map<string, MCPPrompt>()
 
+  const globalHooks = opts.hooks
+
   // Initialize stores and brokers based on configuration
   let sessionStore: SessionStore
   let messageBroker: MessageBroker
@@ -118,7 +120,8 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     prompts,
     sessionStore,
     messageBroker,
-    localStreams
+    localStreams,
+    globalHooks,
   })
 
   // Add close hook to clean up Redis connections and authorization components
