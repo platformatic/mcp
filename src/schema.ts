@@ -23,6 +23,8 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
+import type { HandlerContext } from './types.ts'
+
 /**
  * Refers to any valid JSON-RPC object that can be decoded off the wire, or encoded to be sent.
  *
@@ -943,6 +945,20 @@ export interface Tool extends BaseMetadata {
    * See [specification/2025-06-18/basic/index#general-fields] for notes on _meta usage.
    */
   _meta?: { [key: string]: unknown };
+
+  /**
+   * Optional hooks to allow for a tool to perform actions before or after handling invocation.
+   */
+  hooks?: {
+    /**
+     * Optional before handler hook.
+     * Return nothing to signify the handler should invoke.
+     * A result indicates a failure and will result in the handler not being invoked.
+     *
+     * @param context The same context that is supplied to a handler
+     */
+    beforeHandler?: (context: HandlerContext) => Promise<CallToolResult | void> | CallToolResult | void,
+  }
 }
 
 /* Logging */

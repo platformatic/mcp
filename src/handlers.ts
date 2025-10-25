@@ -23,7 +23,7 @@ import {
   INVALID_PARAMS
 } from './schema.ts'
 
-import type { MCPTool, MCPResource, MCPPrompt, MCPPluginOptions } from './types.ts'
+import type { MCPTool, MCPResource, MCPPrompt, MCPPluginOptions, HandlerContext } from './types.ts'
 import type { AuthorizationContext } from './types/auth-types.ts'
 import { validate, CallToolRequestSchema, ReadResourceRequestSchema, GetPromptRequestSchema, isTypeBoxSchema } from './validation/index.ts'
 import { sanitizeToolParams, assessToolSecurity, SECURITY_WARNINGS } from './security.ts'
@@ -39,6 +39,19 @@ type HandlerDependencies = {
   request: FastifyRequest
   reply: FastifyReply
   authContext?: AuthorizationContext
+  /**
+   * Optional hooks to allow for a tool to perform actions before or after handling invocation.
+   */
+  globalHooks?: {
+    /**
+     * Optional before handler hook.
+     * Return nothing to signify the handler should invoke.
+     * A result indicates a failure and will result in the handler not being invoked.
+     *
+     * @param context The same context that is supplied to a handler
+     */
+    toolBeforeHandler?: (context: HandlerContext) => Promise<CallToolResult | void> | CallToolResult | void,
+  }
 }
 
 export function createResponse (id: string | number, result: any): JSONRPCResponse {
@@ -188,9 +201,54 @@ async function handleToolsCall (
         return createResponse(request.id, result)
       }
 
+      // Setup context for following calls
+      const invocationContext: HandlerContext = {
+        sessionId,
+        request: dependencies.request,
+        reply: dependencies.reply,
+        authContext: dependencies.authContext
+      }
+
+      if (dependencies.globalHooks?.toolBeforeHandler) {
+        try {
+          const result = await dependencies.globalHooks.toolBeforeHandler(invocationContext)
+          if (result) {
+            return createResponse(request.id, result)
+          }
+        } catch (err: any) {
+          const result: CallToolResult = {
+            content: [{
+              type: 'text',
+              text: `Tool execution failed: ${err.message || err}`
+            }],
+            isError: true
+          }
+          return createResponse(request.id, result)
+        }
+      }
+
+      // Invoke the before hook if available
+      if (tool.definition.hooks?.beforeHandler) {
+        try {
+          const result = await tool.definition.hooks.beforeHandler(invocationContext)
+          if (result) {
+            return createResponse(request.id, result)
+          }
+        } catch (err: any) {
+          const result: CallToolResult = {
+            content: [{
+              type: 'text',
+              text: `Tool execution failed: ${err.message || err}`
+            }],
+            isError: true
+          }
+          return createResponse(request.id, result)
+        }
+      }
+
       // Use validated arguments
       try {
-        const result = await tool.handler(argumentsValidation.data, { sessionId, request: dependencies.request, reply: dependencies.reply, authContext: dependencies.authContext })
+        const result = await tool.handler(argumentsValidation.data, invocationContext)
         return createResponse(request.id, result)
       } catch (error: any) {
         const result: CallToolResult = {

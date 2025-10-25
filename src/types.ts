@@ -145,6 +145,20 @@ export interface MCPPluginOptions {
     db?: number
   }
   authorization?: AuthorizationConfig
+
+  /**
+   * Optional hooks to allow for a tool to perform actions before or after handling invocation.
+   */
+  hooks?: {
+    /**
+     * Optional global before tool handler hook.
+     * Return nothing to signify the handler should invoke.
+     * A result indicates a failure and will result in the handler not being invoked.
+     *
+     * @param context The same context that is supplied to a handler
+     */
+    toolBeforeHandler?: (context: HandlerContext) => Promise<CallToolResult | void> | CallToolResult | void,
+  }
 }
 
 export interface SSESession {
