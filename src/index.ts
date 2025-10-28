@@ -39,7 +39,7 @@ function isIoRedis (value: unknown): value is Redis {
   // can match if the same module is loaded
   if (value instanceof Redis) return true
   // otherwise treat as a duck type, which can be useful for mocking anyhow
-  return 'connect' in value && typeof (value as any).connect === 'function'
+  return typeof (value as Partial<Redis>).connect === 'function'
 }
 
 const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOptions) {
