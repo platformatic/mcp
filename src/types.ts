@@ -14,6 +14,7 @@ import type {
   RequestId
 } from './schema.ts'
 import type { Static, TSchema, TObject, TString } from '@sinclair/typebox'
+import type { Redis, RedisOptions } from 'ioredis'
 import type { AuthorizationConfig, AuthorizationContext } from './types/auth-types.ts'
 
 // Context interface for all handler types
@@ -138,12 +139,7 @@ export interface MCPPluginOptions {
   enableSSE?: boolean
   sessionStore?: 'memory' | 'redis'
   messageBroker?: 'memory' | 'redis'
-  redis?: {
-    host: string
-    port: number
-    password?: string
-    db?: number
-  }
+  redis?: Redis | RedisOptions | string
   authorization?: AuthorizationConfig
 }
 
