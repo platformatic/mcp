@@ -63,12 +63,14 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
   let sessionStore: SessionStore
   let messageBroker: MessageBroker
   let redis: Redis | null = null
+  let redisIsInternallyManaged = false
 
   if (opts.redis) {
     if (isIoRedis(opts.redis)) {
       redis = opts.redis
     } else {
       redis = new Redis(opts.redis as RedisOptions) // or string, to overcome type narrowing
+      redisIsInternallyManaged = true
     }
     sessionStore = new RedisSessionStore({ redis, maxMessages: 100 })
     messageBroker = new RedisMessageBroker(redis)
@@ -155,7 +157,7 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     // Execute all unsubscribes in parallel
     await Promise.all(unsubscribePromises)
 
-    if (redis) {
+    if (redis && redisIsInternallyManaged) {
       await redis.quit()
     }
     await messageBroker.close()

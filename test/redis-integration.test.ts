@@ -30,12 +30,16 @@ describe('Redis Integration Tests', () => {
 
   testWithRedis('should initialize plugin with a Redis client', async (redis, t) => {
     const app = fastify()
-    t.after(() => app.close())
 
     const client = new Redis({
       host: redis.options.host!,
       port: redis.options.port!,
       db: redis.options.db!
+    })
+
+    t.after(() => {
+      app.close()
+      client.quit()
     })
 
     await app.register(mcpPlugin, {
