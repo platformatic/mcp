@@ -4,6 +4,7 @@ import fastify from 'fastify'
 import mcpPlugin from '../src/index.ts'
 import { testWithRedis } from './redis-test-utils.ts'
 import type { JSONRPCMessage } from '../src/schema.ts'
+import { Redis } from 'ioredis'
 
 describe('Redis Integration Tests', () => {
   testWithRedis('should initialize plugin with Redis configuration', async (redis, t) => {
@@ -17,6 +18,52 @@ describe('Redis Integration Tests', () => {
         port: redis.options.port!,
         db: redis.options.db!
       }
+    })
+
+    // Verify plugin is registered
+    assert.ok(app.mcpAddTool)
+    assert.ok(app.mcpAddResource)
+    assert.ok(app.mcpAddPrompt)
+    assert.ok(app.mcpBroadcastNotification)
+    assert.ok(app.mcpSendToSession)
+  })
+
+  testWithRedis('should initialize plugin with a Redis client', async (redis, t) => {
+    const app = fastify()
+
+    const client = new Redis({
+      host: redis.options.host!,
+      port: redis.options.port!,
+      db: redis.options.db!
+    })
+
+    t.after(async () => {
+      await app.close()
+      await client.quit()
+    })
+
+    await app.register(mcpPlugin, {
+      enableSSE: true,
+      redis: client
+    })
+
+    // Verify plugin is registered
+    assert.ok(app.mcpAddTool)
+    assert.ok(app.mcpAddResource)
+    assert.ok(app.mcpAddPrompt)
+    assert.ok(app.mcpBroadcastNotification)
+    assert.ok(app.mcpSendToSession)
+  })
+
+  testWithRedis('should initialize plugin with a Redis url', async (redis, t) => {
+    const app = fastify()
+    t.after(() => app.close())
+
+    const url = `redis://${redis.options.host}:${redis.options.port}/${redis.options.db}`
+
+    await app.register(mcpPlugin, {
+      enableSSE: true,
+      redis: url
     })
 
     // Verify plugin is registered
