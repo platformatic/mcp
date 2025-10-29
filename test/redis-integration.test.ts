@@ -37,9 +37,9 @@ describe('Redis Integration Tests', () => {
       db: redis.options.db!
     })
 
-    t.after(() => {
-      app.close()
-      client.quit()
+    t.after(async () => {
+      await app.close()
+      await client.quit()
     })
 
     await app.register(mcpPlugin, {
