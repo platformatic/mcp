@@ -208,8 +208,32 @@ export type {
   AuthorizationConfig,
   TokenValidationResult,
   ProtectedResourceMetadata,
-  TokenIntrospectionResponse
+  TokenIntrospectionResponse,
+  AuthorizationServerMetadata,
+  ClientMetadata,
+  AuthorizationContext,
+  TokenRefreshInfo
 } from './types/auth-types.ts'
+
+// Export authorization utility functions
+export {
+  discoverAuthorizationServer,
+  fetchJWKS,
+  fetchClientMetadata
+} from './auth/discovery.ts'
+
+export {
+  generateClientMetadata,
+  validateClientMetadata
+} from './auth/client-metadata.ts'
+
+export {
+  createScopeChallenge,
+  createAuthChallenge,
+  parseTokenScopes,
+  hasRequiredScopes,
+  getMissingScopes
+} from './auth/scope-challenge.ts'
 
 export type {
   JSONRPCMessage,

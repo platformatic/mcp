@@ -2,6 +2,7 @@ import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify'
 import fp from 'fastify-plugin'
 import cors from '@fastify/cors'
 import type { AuthorizationConfig, ProtectedResourceMetadata } from '../types/auth-types.ts'
+import { generateClientMetadata } from '../auth/client-metadata.ts'
 
 interface WellKnownRoutesOptions {
   authConfig?: AuthorizationConfig
@@ -40,6 +41,14 @@ const wellKnownRoutesPlugin = fp(async function (app: FastifyInstance, opts: Wel
             authorization_servers: {
               type: 'array',
               items: { type: 'string' }
+            },
+            scopes_supported: {
+              type: 'array',
+              items: { type: 'string' }
+            },
+            bearer_methods_supported: {
+              type: 'array',
+              items: { type: 'string' }
             }
           },
           required: ['resource', 'authorization_servers']
@@ -51,6 +60,14 @@ const wellKnownRoutesPlugin = fp(async function (app: FastifyInstance, opts: Wel
       resource: authConfig.resourceUri,
       authorization_servers: authConfig.authorizationServers
     }
+
+    // Add optional scopes if configured
+    if (authConfig.defaultScopes && authConfig.defaultScopes.length > 0) {
+      metadata.scopes_supported = authConfig.defaultScopes
+    }
+
+    // Add supported bearer token methods
+    metadata.bearer_methods_supported = ['header']
 
     reply.header('Content-Type', 'application/json')
 
@@ -68,6 +85,14 @@ const wellKnownRoutesPlugin = fp(async function (app: FastifyInstance, opts: Wel
             authorization_servers: {
               type: 'array',
               items: { type: 'string' }
+            },
+            scopes_supported: {
+              type: 'array',
+              items: { type: 'string' }
+            },
+            bearer_methods_supported: {
+              type: 'array',
+              items: { type: 'string' }
             }
           },
           required: ['resource', 'authorization_servers']
@@ -79,6 +104,14 @@ const wellKnownRoutesPlugin = fp(async function (app: FastifyInstance, opts: Wel
       resource: `${authConfig.resourceUri.replace(/\/+$/, '')}/mcp`,
       authorization_servers: authConfig.authorizationServers
     }
+
+    // Add optional scopes if configured
+    if (authConfig.defaultScopes && authConfig.defaultScopes.length > 0) {
+      metadata.scopes_supported = authConfig.defaultScopes
+    }
+
+    // Add supported bearer token methods
+    metadata.bearer_methods_supported = ['header']
 
     reply.header('Content-Type', 'application/json')
 
@@ -170,6 +203,61 @@ const wellKnownRoutesPlugin = fp(async function (app: FastifyInstance, opts: Wel
       jwks_uri: authConfig.tokenValidation.jwksUri || null,
       mcp_resource_uri: authConfig.resourceUri,
       mcp_authorization_servers: authConfig.authorizationServers
+    }
+  })
+
+  // OAuth 2.0 Client ID Metadata Document endpoint
+  // Per draft MCP spec, this is the RECOMMENDED method for client registration
+  app.get('/oauth/client-metadata.json', {
+    schema: {
+      response: {
+        200: {
+          type: 'object',
+          properties: {
+            client_id: { type: 'string' },
+            client_name: { type: 'string' },
+            redirect_uris: {
+              type: 'array',
+              items: { type: 'string' }
+            },
+            grant_types: {
+              type: 'array',
+              items: { type: 'string' }
+            },
+            token_endpoint_auth_method: { type: 'string' },
+            scope: { type: 'string' },
+            jwks_uri: { type: 'string' }
+          },
+          required: [
+            'client_id',
+            'client_name',
+            'redirect_uris',
+            'grant_types',
+            'token_endpoint_auth_method'
+          ]
+        }
+      }
+    }
+  }, async (request: FastifyRequest, reply: FastifyReply) => {
+    // Construct base URL from request
+    const protocol = request.headers['x-forwarded-proto'] || 'https'
+    const host = request.headers['x-forwarded-host'] || request.hostname
+    const baseUrl = `${protocol}://${host}`
+
+    try {
+      const metadata = generateClientMetadata(authConfig, baseUrl)
+
+      reply.header('Content-Type', 'application/json')
+      reply.header('Cache-Control', 'public, max-age=3600') // Cache for 1 hour
+
+      return metadata
+    } catch (error) {
+      app.log.error({ err: error }, 'Failed to generate client metadata')
+      reply.code(500)
+      return {
+        error: 'server_error',
+        error_description: 'Failed to generate client metadata'
+      }
     }
   })
 

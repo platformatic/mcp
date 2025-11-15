@@ -1,6 +1,7 @@
 import type { FastifyRequest, FastifyReply, preHandlerHookHandler } from 'fastify'
-import type { AuthorizationConfig } from '../types/auth-types.ts'
+import type { AuthorizationConfig, AuthorizationContext } from '../types/auth-types.ts'
 import { TokenValidator } from './token-validator.ts'
+import { createAuthChallenge, parseTokenScopes } from './scope-challenge.ts'
 
 export function createAuthPreHandler (
   config: AuthorizationConfig,
@@ -57,11 +58,36 @@ export function createAuthPreHandler (
       })
     }
 
-    // Add token payload to request context for downstream handlers
+    // Build authorization context from token payload
+    const scopes = parseTokenScopes(validationResult.payload)
+    const authContext: AuthorizationContext = {
+      userId: validationResult.payload?.sub,
+      clientId: validationResult.payload?.client_id,
+      scopes,
+      audience: Array.isArray(validationResult.payload?.aud)
+        ? validationResult.payload.aud
+        : validationResult.payload?.aud
+          ? [validationResult.payload.aud]
+          : undefined,
+      tokenType: 'Bearer',
+      expiresAt: validationResult.payload?.exp
+        ? new Date(validationResult.payload.exp * 1000)
+        : undefined,
+      issuedAt: validationResult.payload?.iat
+        ? new Date(validationResult.payload.iat * 1000)
+        : undefined,
+      authorizationServer: validationResult.payload?.iss
+    }
+
+    // Add auth context to request for downstream handlers
+    // @ts-ignore - Adding custom property to request
+    request.authContext = authContext
+
+    // Keep tokenPayload for backward compatibility
     // @ts-ignore - Adding custom property to request
     request.tokenPayload = validationResult.payload
 
-    request.log.debug({ sub: validationResult.payload?.sub }, 'Token validation successful')
+    request.log.debug({ sub: authContext.userId, scopes: authContext.scopes }, 'Token validation successful')
   }
 }
 
@@ -70,12 +96,13 @@ function generateWWWAuthenticateHeader (config: AuthorizationConfig): string {
     throw new Error('Authorization is disabled')
   }
   const resourceMetadataUrl = `${config.resourceUri}/.well-known/oauth-protected-resource`
-  return `Bearer realm="MCP Server", resource_metadata="${resourceMetadataUrl}"`
+  return createAuthChallenge('invalid_token', undefined, resourceMetadataUrl, 'MCP Server')
 }
 
-// Type augmentation for FastifyRequest to include tokenPayload
+// Type augmentation for FastifyRequest to include tokenPayload and authContext
 declare module 'fastify' {
   interface FastifyRequest {
     tokenPayload?: any
+    authContext?: AuthorizationContext
   }
 }
