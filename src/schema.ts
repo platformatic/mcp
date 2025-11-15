@@ -34,8 +34,13 @@ export type JSONRPCMessage =
   | JSONRPCResponse
   | JSONRPCError
 
-/** @internal */
-export const LATEST_PROTOCOL_VERSION = 'draft'
+/**
+ * Latest supported MCP protocol version.
+ * Note: This implements draft spec features dated 2025-11-15.
+ * The official SDK currently supports: 2025-06-18, 2025-03-26, 2024-11-05, 2024-10-07
+ * @internal
+ */
+export const LATEST_PROTOCOL_VERSION = '2025-11-15'
 /** @internal */
 export const JSONRPC_VERSION = '2.0'
 

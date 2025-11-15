@@ -9,9 +9,16 @@ import {
   ListResourcesResultSchema,
   ReadResourceResultSchema,
   ListPromptsResultSchema,
-  GetPromptResultSchema
+  GetPromptResultSchema,
+  SUPPORTED_PROTOCOL_VERSIONS
 } from '@modelcontextprotocol/sdk/types.js'
 import mcpPlugin from '../src/index.ts'
+
+// Patch SDK to support draft protocol version 2025-11-15
+// This allows testing of draft spec features before official SDK release
+if (!SUPPORTED_PROTOCOL_VERSIONS.includes('2025-11-15')) {
+  SUPPORTED_PROTOCOL_VERSIONS.push('2025-11-15')
+}
 
 describe('MCP Integration Tests', () => {
   test('should handle full MCP workflow with SDK client', async (t: TestContext) => {
