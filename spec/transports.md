@@ -4,7 +4,7 @@ title: Transports
 
 <div id="enable-section-numbers" />
 
-<Info>**Protocol Revision**: 2025-06-18</Info>
+<Info>**Protocol Revision**: draft</Info>
 
 MCP uses JSON-RPC to encode messages. JSON-RPC messages **MUST** be UTF-8 encoded.
 
@@ -76,6 +76,8 @@ URL like `https://example.com/mcp`.
 When implementing Streamable HTTP transport:
 
 1. Servers **MUST** validate the `Origin` header on all incoming connections to prevent DNS rebinding attacks
+   - If the `Origin` header is present and invalid, servers **MUST** respond with HTTP 403 Forbidden. The HTTP response
+     body **MAY** comprise a JSON-RPC _error response_ that has no `id`
 2. When running locally, servers **SHOULD** bind only to localhost (127.0.0.1) rather than all network interfaces (0.0.0.0)
 3. Servers **SHOULD** implement proper authentication for all connections
 
@@ -101,16 +103,26 @@ MCP endpoint.
    `Content-Type: application/json`, to return one JSON object. The client **MUST**
    support both these cases.
 6. If the server initiates an SSE stream:
-   - The SSE stream **SHOULD** eventually include JSON-RPC _response_ for the
+   - The server **SHOULD** immediately send an SSE event consisting of an event
+     ID and an empty `data` field in order to prime the client to reconnect
+     (using that event ID as `Last-Event-ID`).
+   - After the server has sent an SSE event with an event ID to the client, the
+     server **MAY** close the _connection_ (without terminating the _SSE stream_)
+     at any time in order to avoid holding a long-lived connection. The client
+     **SHOULD** then "poll" the SSE stream by attempting to reconnect.
+   - If the server does close the _connection_ prior to terminating the _SSE stream_,
+     it **SHOULD** send an SSE event with a standard `retry` field before
+     closing the connection. The client **MUST** respect the `retry` field,
+     waiting the given number of milliseconds before attempting to reconnect.
+   - The SSE stream **SHOULD** eventually include a JSON-RPC _response_ for the
      JSON-RPC _request_ sent in the POST body.
    - The server **MAY** send JSON-RPC _requests_ and _notifications_ before sending the
      JSON-RPC _response_. These messages **SHOULD** relate to the originating client
      _request_.
-   - The server **SHOULD NOT** close the SSE stream before sending the JSON-RPC _response_
-     for the received JSON-RPC _request_, unless the [session](#session-management)
+   - The server **MAY** terminate the SSE stream if the [session](#session-management)
      expires.
-   - After the JSON-RPC _response_ has been sent, the server **SHOULD** close the SSE
-     stream.
+   - After the JSON-RPC _response_ has been sent, the server **SHOULD** terminate the
+     SSE stream.
    - Disconnection **MAY** occur at any time (e.g., due to network conditions).
      Therefore:
      - Disconnection **SHOULD NOT** be interpreted as the client cancelling its request.
@@ -172,7 +184,7 @@ act as a cursor within that particular stream.
 ### Session Management
 
 An MCP "session" consists of logically related interactions between a client and a
-server, beginning with the [initialization phase](/specification/2025-06-18/basic/lifecycle). To support
+server, beginning with the [initialization phase](/specification/draft/basic/lifecycle). To support
 servers which want to establish stateful sessions:
 
 1. A server using the Streamable HTTP transport **MAY** assign a session ID at
@@ -248,7 +260,7 @@ server, allowing the MCP server to respond based on the MCP protocol version.
 For example: `MCP-Protocol-Version: 2025-06-18`
 
 The protocol version sent by the client **SHOULD** be the one [negotiated during
-initialization](/specification/2025-06-18/basic/lifecycle#version-negotiation).
+initialization](/specification/draft/basic/lifecycle#version-negotiation).
 
 For backwards compatibility, if the server does _not_ receive an `MCP-Protocol-Version`
 header, and has no other way to identify the version - for example, by relying on the
