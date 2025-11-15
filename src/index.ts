@@ -25,13 +25,25 @@ import type {
   JSONRPCError,
   JSONRPCNotification,
   ServerCapabilities,
+  ClientCapabilities,
   Implementation,
   Tool,
   Resource,
   Prompt,
   CallToolResult,
   ReadResourceResult,
-  GetPromptResult
+  GetPromptResult,
+  IconResource,
+  FormElicitationParams,
+  URLElicitationParams,
+  SamplingTool,
+  ToolChoice,
+  ToolUseContent,
+  ToolResultContent,
+  TaskStatus,
+  TaskAugmentation,
+  CreateTaskResult,
+  TaskCapabilities
 } from './schema.ts'
 
 const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOptions) {
@@ -206,11 +218,23 @@ export type {
   JSONRPCError,
   JSONRPCNotification,
   ServerCapabilities,
+  ClientCapabilities,
   Implementation,
   Tool,
   Resource,
   Prompt,
   CallToolResult,
   ReadResourceResult,
-  GetPromptResult
+  GetPromptResult,
+  IconResource,
+  FormElicitationParams,
+  URLElicitationParams,
+  SamplingTool,
+  ToolChoice,
+  ToolUseContent,
+  ToolResultContent,
+  TaskStatus,
+  TaskAugmentation,
+  CreateTaskResult,
+  TaskCapabilities
 }

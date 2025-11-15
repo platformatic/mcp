@@ -4,7 +4,7 @@ import type {
   JSONRPCMessage,
   JSONRPCNotification,
   JSONRPCRequest,
-  ElicitRequest,
+  FormElicitationParams,
   RequestId
 } from '../schema.ts'
 import { validateElicitationRequest } from '../security.ts'
@@ -61,7 +61,7 @@ const mcpPubSubDecoratorsPlugin: FastifyPluginAsync<MCPPubSubDecoratorsOptions> 
   app.decorate('mcpElicit', async (
     sessionId: string,
     message: string,
-    requestedSchema: ElicitRequest['params']['requestedSchema'],
+    requestedSchema: FormElicitationParams['requestedSchema'],
     requestId?: RequestId
   ): Promise<boolean> => {
     if (!enableSSE) {
@@ -88,6 +88,7 @@ const mcpPubSubDecoratorsPlugin: FastifyPluginAsync<MCPPubSubDecoratorsOptions> 
       id,
       method: 'elicitation/create',
       params: {
+        mode: 'form',
         message,
         requestedSchema
       }

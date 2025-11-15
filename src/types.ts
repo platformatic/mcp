@@ -10,7 +10,7 @@ import type {
   Tool,
   Resource,
   Prompt,
-  ElicitRequest,
+  FormElicitationParams,
   RequestId
 } from './schema.ts'
 import type { Static, TSchema, TObject, TString } from '@sinclair/typebox'
@@ -104,7 +104,7 @@ declare module 'fastify' {
     mcpElicit: (
       sessionId: string,
       message: string,
-      requestedSchema: ElicitRequest['params']['requestedSchema'],
+      requestedSchema: FormElicitationParams['requestedSchema'],
       requestId?: RequestId
     ) => Promise<boolean>
   }

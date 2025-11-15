@@ -35,7 +35,7 @@ export type JSONRPCMessage =
   | JSONRPCError
 
 /** @internal */
-export const LATEST_PROTOCOL_VERSION = '2025-06-18'
+export const LATEST_PROTOCOL_VERSION = 'draft'
 /** @internal */
 export const JSONRPC_VERSION = '2.0'
 
@@ -253,11 +253,20 @@ export interface ClientCapabilities {
   /**
    * Present if the client supports sampling from an LLM.
    */
-  sampling?: object;
+  sampling?: {
+    /**
+     * Present if the client supports tool use in sampling requests.
+     */
+    tools?: {};
+  };
   /**
    * Present if the client supports elicitation from the server.
    */
-  elicitation?: object;
+  elicitation?: {};
+  /**
+   * Present if the client supports tasks (experimental).
+   */
+  tasks?: TaskCapabilities;
 }
 
 /**
@@ -271,11 +280,11 @@ export interface ServerCapabilities {
   /**
    * Present if the server supports sending log messages to the client.
    */
-  logging?: object;
+  logging?: {};
   /**
    * Present if the server supports argument autocompletion suggestions.
    */
-  completions?: object;
+  completions?: {};
   /**
    * Present if the server offers any prompt templates.
    */
@@ -306,7 +315,18 @@ export interface ServerCapabilities {
      * Whether this server supports notifications for changes to the tool list.
      */
     listChanged?: boolean;
+    /**
+     * Hint about task support for tool calls.
+     * - "never": Tool calls cannot be task-augmented
+     * - "optional": Tool calls may be task-augmented
+     * - "always": Tool calls must be task-augmented
+     */
+    taskHint?: 'never' | 'optional' | 'always';
   };
+  /**
+   * Present if the server supports tasks (experimental).
+   */
+  tasks?: TaskCapabilities;
 }
 
 /**
@@ -336,6 +356,30 @@ export interface BaseMetadata {
  */
 export interface Implementation extends BaseMetadata {
   version: string;
+  /**
+   * Optional human-readable description of the implementation.
+   */
+  description?: string;
+}
+
+/**
+ * Icon resource metadata for tools, resources, prompts, and resource templates.
+ * Allows servers to expose visual assets for UI display.
+ */
+export interface IconResource {
+  /**
+   * URL to the icon image.
+   * @format uri
+   */
+  src: string;
+  /**
+   * MIME type of the icon (e.g., "image/png", "image/svg+xml").
+   */
+  mimeType?: string;
+  /**
+   * Size of the icon in pixels (e.g., "16x16", "32x32", "16x16 32x32").
+   */
+  sizes?: string;
 }
 
 /* Ping */
@@ -548,6 +592,11 @@ export interface Resource extends BaseMetadata {
   mimeType?: string;
 
   /**
+   * Optional icon resources for UI display.
+   */
+  icons?: IconResource[];
+
+  /**
    * Optional annotations for the client.
    */
   annotations?: Annotations;
@@ -560,7 +609,7 @@ export interface Resource extends BaseMetadata {
   size?: number;
 
   /**
-   * See [specification/2025-06-18/basic/index#general-fields] for notes on _meta usage.
+   * See [specification/draft/basic/index#general-fields] for notes on _meta usage.
    */
   _meta?: { [key: string]: unknown };
 }
@@ -589,12 +638,17 @@ export interface ResourceTemplate extends BaseMetadata {
   mimeType?: string;
 
   /**
+   * Optional icon resources for UI display.
+   */
+  icons?: IconResource[];
+
+  /**
    * Optional annotations for the client.
    */
   annotations?: Annotations;
 
   /**
-   * See [specification/2025-06-18/basic/index#general-fields] for notes on _meta usage.
+   * See [specification/draft/basic/index#general-fields] for notes on _meta usage.
    */
   _meta?: { [key: string]: unknown };
 }
@@ -701,7 +755,12 @@ export interface Prompt extends BaseMetadata {
   arguments?: PromptArgument[];
 
   /**
-   * See [specification/2025-06-18/basic/index#general-fields] for notes on _meta usage.
+   * Optional icon resources for UI display.
+   */
+  icons?: IconResource[];
+
+  /**
+   * See [specification/draft/basic/index#general-fields] for notes on _meta usage.
    */
   _meta?: { [key: string]: unknown };
 }
@@ -933,6 +992,11 @@ export interface Tool extends BaseMetadata {
   };
 
   /**
+   * Optional icon resources for UI display.
+   */
+  icons?: IconResource[];
+
+  /**
    * Optional additional tool information.
    *
    * Display name precedence order is: title, annotations.title, then name.
@@ -940,7 +1004,7 @@ export interface Tool extends BaseMetadata {
   annotations?: ToolAnnotations;
 
   /**
-   * See [specification/2025-06-18/basic/index#general-fields] for notes on _meta usage.
+   * See [specification/draft/basic/index#general-fields] for notes on _meta usage.
    */
   _meta?: { [key: string]: unknown };
 }
@@ -1001,6 +1065,38 @@ export type LoggingLevel =
   | 'emergency'
 
 /* Sampling */
+
+/**
+ * Tool definition for sampling requests.
+ * Allows the model to invoke tools during sampling.
+ */
+export interface SamplingTool {
+  /**
+   * Tool name (unique identifier)
+   */
+  name: string;
+  /**
+   * Human-readable description of what the tool does
+   */
+  description: string;
+  /**
+   * JSON Schema defining the tool's input parameters
+   */
+  inputSchema: {
+    type: 'object';
+    properties?: { [key: string]: object };
+    required?: string[];
+  };
+}
+
+/**
+ * Controls how the model uses tools during sampling.
+ */
+export type ToolChoice =
+  | { mode: 'auto' }      // Model decides whether to use tools
+  | { mode: 'required' }  // Model must use at least one tool
+  | { mode: 'none' }      // Model cannot use tools
+
 /**
  * A request from the server to sample an LLM via the client. The client has full discretion over which model to select. The client should also inform the user before beginning sampling, to allow them to inspect the request (human in the loop) and decide whether to approve it.
  *
@@ -1035,6 +1131,16 @@ export interface CreateMessageRequest extends Request {
      * Optional metadata to pass through to the LLM provider. The format of this metadata is provider-specific.
      */
     metadata?: object;
+    /**
+     * Optional list of tools available to the model.
+     * Servers MUST NOT send tool-enabled sampling requests to clients that have not declared
+     * support for tool use via the sampling.tools capability.
+     */
+    tools?: SamplingTool[];
+    /**
+     * Controls how the model uses tools.
+     */
+    toolChoice?: ToolChoice;
   };
 }
 
@@ -1051,7 +1157,7 @@ export interface CreateMessageResult extends Result, SamplingMessage {
   /**
    * The reason why sampling stopped, if known.
    */
-  stopReason?: 'endTurn' | 'stopSequence' | 'maxTokens' | string;
+  stopReason?: 'endTurn' | 'stopSequence' | 'maxTokens' | 'toolUse' | string;
 }
 
 /**
@@ -1059,8 +1165,18 @@ export interface CreateMessageResult extends Result, SamplingMessage {
  */
 export interface SamplingMessage {
   role: Role;
-  content: TextContent | ImageContent | AudioContent;
+  content: SamplingContent | SamplingContent[];
 }
+
+/**
+ * Content types supported in sampling messages.
+ */
+export type SamplingContent =
+  | TextContent
+  | ImageContent
+  | AudioContent
+  | ToolUseContent
+  | ToolResultContent
 
 /**
  * Optional annotations for the client. The client can use annotations to inform how objects are used or displayed
@@ -1103,6 +1219,53 @@ export type ContentBlock =
   | AudioContent
   | ResourceLink
   | EmbeddedResource
+
+/**
+ * Tool use content - represents the model invoking a tool.
+ * Appears in assistant messages when the model decides to use a tool.
+ */
+export interface ToolUseContent {
+  type: 'tool_use';
+  /**
+   * Unique identifier for this tool invocation.
+   * Used to match with corresponding tool_result in follow-up message.
+   */
+  id: string;
+  /**
+   * Name of the tool being invoked.
+   * Must match a tool name from the sampling request.
+   */
+  name: string;
+  /**
+   * Parameters for the tool invocation.
+   * Must match the tool's inputSchema.
+   */
+  input: object;
+}
+
+/**
+ * Tool result content - represents the result of a tool invocation.
+ * Appears in user messages following assistant messages with tool_use.
+ *
+ * IMPORTANT: When a user message contains tool results, it MUST contain ONLY
+ * tool results. Mixing tool results with other content types is not allowed.
+ */
+export interface ToolResultContent {
+  type: 'tool_result';
+  /**
+   * The ID of the tool use this is a result for.
+   * Must match an id from a ToolUseContent in a previous assistant message.
+   */
+  toolUseId: string;
+  /**
+   * The result content (optional if isError is true).
+   */
+  content?: string | TextContent[];
+  /**
+   * Whether this represents an error result.
+   */
+  isError?: boolean;
+}
 
 /**
  * Text provided to or from an LLM.
@@ -1407,27 +1570,89 @@ export interface RootsListChangedNotification extends Notification {
 
 /**
  * A request from the server to elicit additional information from the user via the client.
+ * Supports two modes: form mode (structured data via JSON schema) and URL mode (out-of-band interaction).
  *
  * @category elicitation/create
  */
 export interface ElicitRequest extends Request {
   method: 'elicitation/create';
+  params: FormElicitationParams | URLElicitationParams;
+}
+
+/**
+ * Form mode elicitation: structured data collection via JSON schema.
+ * User responses are exposed to the MCP client.
+ */
+export interface FormElicitationParams {
+  /**
+   * Elicitation mode
+   */
+  mode: 'form';
+  /**
+   * The message to present to the user.
+   */
+  message: string;
+  /**
+   * A restricted subset of JSON Schema.
+   * Only top-level properties are allowed, without nesting.
+   */
+  requestedSchema: {
+    type: 'object';
+    properties: {
+      [key: string]: PrimitiveSchemaDefinition;
+    };
+    required?: string[];
+  };
+  /**
+   * Optional metadata.
+   */
+  _meta?: { [key: string]: unknown };
+  [key: string]: unknown;
+}
+
+/**
+ * URL mode elicitation: out-of-band interaction via external URL.
+ * Sensitive data remains outside the MCP client context.
+ * Used for OAuth flows, external forms, and sensitive credential collection.
+ */
+export interface URLElicitationParams {
+  /**
+   * Elicitation mode
+   */
+  mode: 'url';
+  /**
+   * Unique identifier for this elicitation request.
+   * Used to track completion and prevent CSRF attacks.
+   */
+  elicitationId: string;
+  /**
+   * HTTPS URL where the user should complete the interaction.
+   * MUST use HTTPS in production (localhost allowed for development).
+   */
+  url: string;
+  /**
+   * The message to present to the user explaining the interaction.
+   */
+  message: string;
+  /**
+   * Optional metadata.
+   */
+  _meta?: { [key: string]: unknown };
+  [key: string]: unknown;
+}
+
+/**
+ * Notification sent when a URL mode elicitation has been completed.
+ *
+ * @category notifications/elicitation/complete
+ */
+export interface ElicitationCompleteNotification extends Notification {
+  method: 'notifications/elicitation/complete';
   params: {
     /**
-     * The message to present to the user.
+     * The elicitation ID that has been completed.
      */
-    message: string;
-    /**
-     * A restricted subset of JSON Schema.
-     * Only top-level properties are allowed, without nesting.
-     */
-    requestedSchema: {
-      type: 'object';
-      properties: {
-        [key: string]: PrimitiveSchemaDefinition;
-      };
-      required?: string[];
-    };
+    elicitationId: string;
   };
 }
 
@@ -1465,12 +1690,74 @@ export interface BooleanSchema {
   default?: boolean;
 }
 
-export interface EnumSchema {
-  type: 'string';
+/**
+ * Enum schemas support both titled and untitled variants,
+ * as well as single-select and multi-select modes.
+ */
+export type EnumSchema =
+  | UntitledSingleSelectEnumSchema
+  | TitledSingleSelectEnumSchema
+  | UntitledMultiSelectEnumSchema
+  | TitledMultiSelectEnumSchema
+
+/**
+ * Untitled single-select enum (simple array of values)
+ */
+export interface UntitledSingleSelectEnumSchema {
+  type: 'string' | 'number';
   title?: string;
   description?: string;
-  enum: string[];
-  enumNames?: string[]; // Display names for enum values
+  enum: Array<string | number>;
+  default?: string | number;
+}
+
+/**
+ * Titled single-select enum (with display names for each option)
+ */
+export interface TitledSingleSelectEnumSchema {
+  type: 'string' | 'number';
+  title?: string;
+  description?: string;
+  oneOf: Array<{
+    const: string | number;
+    title: string;
+  }>;
+  default?: string | number;
+}
+
+/**
+ * Untitled multi-select enum (array of simple values)
+ */
+export interface UntitledMultiSelectEnumSchema {
+  type: 'array';
+  title?: string;
+  description?: string;
+  items: {
+    type: 'string' | 'number';
+    enum: Array<string | number>;
+  };
+  minItems?: number;
+  maxItems?: number;
+  default?: Array<string | number>;
+}
+
+/**
+ * Titled multi-select enum (array with display names)
+ */
+export interface TitledMultiSelectEnumSchema {
+  type: 'array';
+  title?: string;
+  description?: string;
+  items: {
+    type: 'string' | 'number';
+    oneOf: Array<{
+      const: string | number;
+      title: string;
+    }>;
+  };
+  minItems?: number;
+  maxItems?: number;
+  default?: Array<string | number>;
 }
 
 /**
@@ -1494,6 +1781,206 @@ export interface ElicitResult extends Result {
   content?: { [key: string]: string | number | boolean };
 }
 
+/* Tasks (Experimental) */
+
+/**
+ * Task status states.
+ */
+export type TaskStatus =
+  | 'working'          // Task is in progress
+  | 'input_required'   // Receiver needs requestor input before continuing
+  | 'completed'        // Task finished successfully
+  | 'failed'           // Task failed with error
+  | 'cancelled'        // Task was cancelled by user
+
+/**
+ * Task augmentation for requests.
+ * When included in a request, creates a task for asynchronous processing.
+ */
+export interface TaskAugmentation {
+  /**
+   * Time-to-live in milliseconds.
+   * After this time, the receiver may delete the task and its results.
+   */
+  ttl?: number;
+}
+
+/**
+ * Result when a task is created.
+ * Returned instead of the actual operation result.
+ */
+export interface CreateTaskResult extends Result {
+  task: {
+    /**
+     * Unique identifier for this task.
+     */
+    taskId: string;
+    /**
+     * Current status of the task.
+     */
+    status: TaskStatus;
+    /**
+     * Optional human-readable status message.
+     */
+    statusMessage?: string;
+    /**
+     * ISO 8601 timestamp when the task was created.
+     */
+    createdAt: string;
+    /**
+     * Time-to-live in milliseconds from creation.
+     */
+    ttl: number;
+    /**
+     * Suggested polling interval in milliseconds.
+     * Requestors SHOULD respect this value.
+     */
+    pollInterval?: number;
+  };
+  /**
+   * Optional metadata for task tracking.
+   */
+  _meta?: {
+    /**
+     * Task relationship metadata.
+     */
+    'io.modelcontextprotocol/related-task'?: {
+      taskId: string;
+    };
+    /**
+     * Immediate response for model to process while task executes.
+     */
+    'io.modelcontextprotocol/model-immediate-response'?: string;
+    [key: string]: unknown;
+  };
+}
+
+/**
+ * Get task status request.
+ *
+ * @category tasks/get
+ */
+export interface GetTaskRequest extends Request {
+  method: 'tasks/get';
+  params: {
+    /**
+     * The ID of the task to query.
+     */
+    taskId: string;
+  };
+}
+
+/**
+ * Task status result.
+ *
+ * @category tasks/get
+ */
+export interface TaskStatusResult extends Result {
+  taskId: string;
+  status: TaskStatus;
+  statusMessage?: string;
+  createdAt: string;
+  ttl: number;
+  pollInterval?: number;
+}
+
+/**
+ * Get task result request.
+ * Blocks until the task reaches a terminal status if not already terminal.
+ *
+ * @category tasks/result
+ */
+export interface GetTaskResultRequest extends Request {
+  method: 'tasks/result';
+  params: {
+    /**
+     * The ID of the task whose result to retrieve.
+     */
+    taskId: string;
+  };
+}
+
+/**
+ * List tasks request.
+ *
+ * @category tasks/list
+ */
+export interface ListTasksRequest extends Request {
+  method: 'tasks/list';
+  params?: {
+    /**
+     * Optional cursor for pagination.
+     */
+    cursor?: string;
+  };
+}
+
+/**
+ * List tasks result.
+ *
+ * @category tasks/list
+ */
+export interface ListTasksResult extends Result {
+  tasks: TaskStatusResult[];
+  /**
+   * Cursor for next page of results.
+   */
+  nextCursor?: string;
+}
+
+/**
+ * Cancel task request.
+ *
+ * @category tasks/cancel
+ */
+export interface CancelTaskRequest extends Request {
+  method: 'tasks/cancel';
+  params: {
+    /**
+     * The ID of the task to cancel.
+     */
+    taskId: string;
+  };
+}
+
+/**
+ * Optional notification sent when a task's status changes.
+ *
+ * @category notifications/tasks/status
+ */
+export interface TaskStatusNotification extends Notification {
+  method: 'notifications/tasks/status';
+  params: TaskStatusResult;
+}
+
+/**
+ * Task capability configuration.
+ */
+export interface TaskCapabilities {
+  /**
+   * Support for listing tasks.
+   */
+  list?: {};
+  /**
+   * Support for cancelling tasks.
+   */
+  cancel?: {};
+  /**
+   * Support for task-augmented requests.
+   */
+  requests?: {
+    tools?: {
+      call?: {};
+    };
+    sampling?: {
+      createMessage?: {};
+    };
+    elicitation?: {
+      create?: {};
+    };
+  };
+}
+
 /* Client messages */
 /** @internal */
 export type ClientRequest =
@@ -1510,6 +1997,10 @@ export type ClientRequest =
   | UnsubscribeRequest
   | CallToolRequest
   | ListToolsRequest
+  | GetTaskRequest
+  | GetTaskResultRequest
+  | ListTasksRequest
+  | CancelTaskRequest
 
 /** @internal */
 export type ClientNotification =
