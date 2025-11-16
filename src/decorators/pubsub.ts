@@ -5,22 +5,25 @@ import type {
   JSONRPCNotification,
   JSONRPCRequest,
   FormElicitationParams,
+  URLElicitationParams,
   RequestId
 } from '../schema.ts'
 import { validateElicitationRequest } from '../security.ts'
 import { JSONRPC_VERSION } from '../schema.ts'
 import type { SessionStore } from '../stores/session-store.ts'
 import type { MessageBroker } from '../brokers/message-broker.ts'
+import type { ElicitationStore } from '../stores/elicitation-store.ts'
 
 interface MCPPubSubDecoratorsOptions {
   enableSSE: boolean
   sessionStore: SessionStore
   messageBroker: MessageBroker
   localStreams: Map<string, Set<any>>
+  elicitationStore: ElicitationStore
 }
 
 const mcpPubSubDecoratorsPlugin: FastifyPluginAsync<MCPPubSubDecoratorsOptions> = async (app, options) => {
-  const { enableSSE, messageBroker, sessionStore } = options
+  const { enableSSE, messageBroker, sessionStore, elicitationStore } = options
 
   app.decorate('mcpBroadcastNotification', async (notification: JSONRPCNotification) => {
     if (!enableSSE) {
@@ -96,6 +99,108 @@ const mcpPubSubDecoratorsPlugin: FastifyPluginAsync<MCPPubSubDecoratorsOptions> 
 
     return await app.mcpSendToSession(sessionId, elicitRequest)
   })
+
+  app.decorate('mcpElicitURL', async (
+    sessionId: string,
+    elicitationId: string,
+    url: string,
+    message: string,
+    userId?: string,
+    requestId?: RequestId
+  ): Promise<boolean> => {
+    if (!enableSSE) {
+      app.log.warn('Cannot send URL elicitation request: SSE is disabled')
+      return false
+    }
+
+    // Store the elicitation request
+    try {
+      await elicitationStore.create({
+        elicitationId,
+        url,
+        message,
+        userId,
+        sessionId
+      })
+    } catch (error) {
+      app.log.error({ err: error, elicitationId }, 'Failed to store elicitation request')
+      return false
+    }
+
+    // Generate a request ID if not provided
+    const id = requestId ?? `elicit-url-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
+
+    const elicitRequest: JSONRPCRequest = {
+      jsonrpc: JSONRPC_VERSION,
+      id,
+      method: 'elicitation/create',
+      params: {
+        mode: 'url',
+        elicitationId,
+        url,
+        message
+      } as URLElicitationParams
+    }
+
+    return await app.mcpSendToSession(sessionId, elicitRequest)
+  })
+
+  app.decorate('mcpCompleteElicitation', async (
+    elicitationId: string
+  ): Promise<boolean> => {
+    if (!enableSSE) {
+      app.log.warn('Cannot send elicitation completion: SSE is disabled')
+      return false
+    }
+
+    // Mark elicitation as completed
+    try {
+      const elicitation = await elicitationStore.get(elicitationId)
+      if (!elicitation) {
+        app.log.warn({ elicitationId }, 'Elicitation not found for completion')
+        return false
+      }
+
+      await elicitationStore.complete(elicitationId)
+
+      // Send completion notification to the session
+      if (elicitation.sessionId) {
+        const notification: JSONRPCNotification = {
+          jsonrpc: JSONRPC_VERSION,
+          method: 'notifications/elicitation/complete',
+          params: {
+            elicitationId
+          }
+        }
+
+        return await app.mcpSendToSession(elicitation.sessionId, notification)
+      }
+
+      return true
+    } catch (error) {
+      app.log.error({ err: error, elicitationId }, 'Failed to complete elicitation')
+      return false
+    }
+  })
+
+  // Store elicitation store for use in routes
+  app.decorate('elicitationStore', elicitationStore)
+}
+
+// Type declarations for Fastify
+declare module 'fastify' {
+  interface FastifyInstance {
+    elicitationStore?: ElicitationStore
+    mcpElicitURL: (
+      sessionId: string,
+      elicitationId: string,
+      url: string,
+      message: string,
+      userId?: string,
+      requestId?: RequestId
+    ) => Promise<boolean>
+    mcpCompleteElicitation: (elicitationId: string) => Promise<boolean>
+  }
 }
 
 export default fp(mcpPubSubDecoratorsPlugin, {

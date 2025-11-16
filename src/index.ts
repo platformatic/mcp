@@ -7,10 +7,12 @@ import { MemorySessionStore } from './stores/memory-session-store.ts'
 import { MemoryMessageBroker } from './brokers/memory-message-broker.ts'
 import { RedisSessionStore } from './stores/redis-session-store.ts'
 import { RedisMessageBroker } from './brokers/redis-message-broker.ts'
+import { MemoryElicitationStore } from './stores/elicitation-store.ts'
 import type { MCPPluginOptions, MCPTool, MCPResource, MCPPrompt } from './types.ts'
 import pubsubDecorators from './decorators/pubsub.ts'
 import metaDecorators from './decorators/meta.ts'
 import loggingDecorators from './decorators/logging.ts'
+import completionDecorators from './decorators/completion.ts'
 import routes from './routes/mcp.ts'
 import wellKnownRoutes from './routes/well-known.ts'
 import { TokenValidator } from './auth/token-validator.ts'
@@ -44,7 +46,12 @@ import type {
   TaskStatus,
   TaskAugmentation,
   CreateTaskResult,
-  TaskCapabilities
+  TaskCapabilities,
+  LogLevel,
+  CompleteRequest,
+  CompleteResult,
+  PromptReference,
+  ResourceTemplateReference
 } from './schema.ts'
 
 const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOptions) {
@@ -79,6 +86,9 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     sessionStore = new MemorySessionStore(100)
     messageBroker = new MemoryMessageBroker()
   }
+
+  // Elicitation store for URL mode elicitation
+  const elicitationStore = new MemoryElicitationStore()
 
   // Local stream management per server instance
   const localStreams = new Map<string, Set<any>>()
@@ -117,11 +127,15 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     enableSSE,
     sessionStore,
     messageBroker,
-    localStreams
+    localStreams,
+    elicitationStore
   })
   app.register(loggingDecorators, {
     enableLogging: !!capabilities.logging,
     messageBroker
+  })
+  app.register(completionDecorators, {
+    enableCompletion: !!capabilities.completions
   })
 
   // Register routes
@@ -265,5 +279,15 @@ export type {
   TaskStatus,
   TaskAugmentation,
   CreateTaskResult,
-  TaskCapabilities
+  TaskCapabilities,
+  LogLevel,
+  CompleteRequest,
+  CompleteResult,
+  PromptReference,
+  ResourceTemplateReference
 }
+
+// Export completion types
+export type {
+  CompletionProvider
+} from './features/completion.ts'

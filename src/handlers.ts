@@ -13,7 +13,8 @@ import type {
   CallToolResult,
   ReadResourceResult,
   GetPromptResult,
-  LogLevel
+  LogLevel,
+  CompleteRequest
 } from './schema.ts'
 
 import {
@@ -98,6 +99,42 @@ async function handleSetLogLevel (request: JSONRPCRequest, dependencies: Handler
 
   const result: EmptyResult = {}
   return createResponse(request.id, result)
+}
+
+async function handleComplete (request: JSONRPCRequest, dependencies: HandlerDependencies): Promise<JSONRPCResponse | JSONRPCError> {
+  const { app } = dependencies
+
+  // Check if completion service is available
+  if (!app.completionService) {
+    return createError(request.id, METHOD_NOT_FOUND, 'Completion capability not enabled')
+  }
+
+  // Validate params
+  if (!request.params || typeof request.params !== 'object') {
+    return createError(request.id, INVALID_PARAMS, 'Invalid params: expected completion request parameters')
+  }
+
+  const params = request.params as CompleteRequest['params']
+
+  // Validate required fields
+  if (!params.ref || !params.argument) {
+    return createError(request.id, INVALID_PARAMS, 'Invalid params: missing ref or argument')
+  }
+
+  if (!params.ref.type || (params.ref.type !== 'ref/prompt' && params.ref.type !== 'ref/resource')) {
+    return createError(request.id, INVALID_PARAMS, 'Invalid params: ref.type must be "ref/prompt" or "ref/resource"')
+  }
+
+  if (!params.argument.name || typeof params.argument.value !== 'string') {
+    return createError(request.id, INVALID_PARAMS, 'Invalid params: argument must have name and value')
+  }
+
+  try {
+    const result = await app.completionService.complete(params)
+    return createResponse(request.id, result)
+  } catch (error) {
+    return createError(request.id, INTERNAL_ERROR, 'Completion failed', error)
+  }
 }
 
 function handleToolsList (request: JSONRPCRequest, dependencies: HandlerDependencies): JSONRPCResponse {
@@ -488,6 +525,8 @@ export async function handleRequest (
         return handlePing(request)
       case 'logging/setLevel':
         return await handleSetLogLevel(request, dependencies)
+      case 'completion/complete':
+        return await handleComplete(request, dependencies)
       case 'tools/list':
         return handleToolsList(request, dependencies)
       case 'resources/list':
