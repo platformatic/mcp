@@ -12,7 +12,8 @@ import type {
   ListPromptsResult,
   CallToolResult,
   ReadResourceResult,
-  GetPromptResult
+  GetPromptResult,
+  LogLevel
 } from './schema.ts'
 
 import {
@@ -69,6 +70,32 @@ function handleInitialize (request: JSONRPCRequest, dependencies: HandlerDepende
 }
 
 function handlePing (request: JSONRPCRequest): JSONRPCResponse {
+  const result: EmptyResult = {}
+  return createResponse(request.id, result)
+}
+
+async function handleSetLogLevel (request: JSONRPCRequest, dependencies: HandlerDependencies): Promise<JSONRPCResponse | JSONRPCError> {
+  const { app } = dependencies
+
+  // Validate params
+  if (!request.params || typeof request.params !== 'object') {
+    return createError(request.id, INVALID_PARAMS, 'Invalid params: expected object with level field')
+  }
+
+  const { level } = request.params as { level?: unknown }
+
+  if (typeof level !== 'string') {
+    return createError(request.id, INVALID_PARAMS, 'Invalid params: level must be a string')
+  }
+
+  const validLevels: LogLevel[] = ['debug', 'info', 'notice', 'warning', 'error', 'critical', 'alert', 'emergency']
+  if (!validLevels.includes(level as LogLevel)) {
+    return createError(request.id, INVALID_PARAMS, `Invalid log level: ${level}. Must be one of: ${validLevels.join(', ')}`)
+  }
+
+  // Call the decorator method
+  await app.mcpSetLogLevel(level as LogLevel)
+
   const result: EmptyResult = {}
   return createResponse(request.id, result)
 }
@@ -459,6 +486,8 @@ export async function handleRequest (
         return handleInitialize(request, dependencies)
       case 'ping':
         return handlePing(request)
+      case 'logging/setLevel':
+        return await handleSetLogLevel(request, dependencies)
       case 'tools/list':
         return handleToolsList(request, dependencies)
       case 'resources/list':

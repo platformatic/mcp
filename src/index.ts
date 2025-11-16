@@ -10,6 +10,7 @@ import { RedisMessageBroker } from './brokers/redis-message-broker.ts'
 import type { MCPPluginOptions, MCPTool, MCPResource, MCPPrompt } from './types.ts'
 import pubsubDecorators from './decorators/pubsub.ts'
 import metaDecorators from './decorators/meta.ts'
+import loggingDecorators from './decorators/logging.ts'
 import routes from './routes/mcp.ts'
 import wellKnownRoutes from './routes/well-known.ts'
 import { TokenValidator } from './auth/token-validator.ts'
@@ -117,6 +118,10 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     sessionStore,
     messageBroker,
     localStreams
+  })
+  app.register(loggingDecorators, {
+    enableLogging: !!capabilities.logging,
+    messageBroker
   })
 
   // Register routes

@@ -1662,6 +1662,60 @@ export interface ElicitationCompleteNotification extends Notification {
 }
 
 /**
+ * Logging
+ * -------
+ * Servers can send log messages to clients for debugging and monitoring.
+ */
+
+/**
+ * Log severity levels following RFC 5424 (Syslog Protocol).
+ */
+export type LogLevel =
+  | 'debug'      // Detailed debug information
+  | 'info'       // Informational messages
+  | 'notice'     // Normal but significant conditions
+  | 'warning'    // Warning conditions
+  | 'error'      // Error conditions
+  | 'critical'   // Critical conditions
+  | 'alert'      // Action must be taken immediately
+  | 'emergency'  // System is unusable
+
+/**
+ * Request to set the minimum log level.
+ * Log messages below this level will be filtered.
+ */
+export interface SetLogLevelRequest extends Request {
+  method: 'logging/setLevel';
+  params: {
+    /**
+     * Minimum log level to emit.
+     */
+    level: LogLevel;
+  };
+}
+
+/**
+ * Notification containing a log message from the server.
+ */
+export interface LogMessageNotification extends Notification {
+  method: 'notifications/message';
+  params: {
+    /**
+     * Severity level of the log message.
+     */
+    level: LogLevel;
+    /**
+     * Optional logger name or category.
+     */
+    logger?: string;
+    /**
+     * Structured log data (can be string, object, array, etc.).
+     */
+    data: unknown;
+  };
+}
+
+/**
  * Restricted schema definitions that only allow primitive types
  * without nested objects or arrays.
  */
