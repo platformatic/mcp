@@ -19,6 +19,7 @@ import { TokenValidator } from './auth/token-validator.ts'
 import { createAuthPreHandler } from './auth/prehandler.ts'
 import oauthClientPlugin from './auth/oauth-client.ts'
 import authRoutesPlugin from './routes/auth-routes.ts'
+import elicitationRoutesPlugin from './routes/elicitation-routes.ts'
 
 // Import and export MCP protocol types
 import type {
@@ -115,6 +116,11 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
   // Register OAuth client routes if OAuth client is configured
   if (opts.authorization?.enabled && opts.authorization?.oauth2Client) {
     await app.register(authRoutesPlugin, { sessionStore })
+  }
+
+  // Register elicitation routes if SSE is enabled
+  if (enableSSE) {
+    await app.register(elicitationRoutesPlugin, { elicitationStore })
   }
 
   // Register decorators first
