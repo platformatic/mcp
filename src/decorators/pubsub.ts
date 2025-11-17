@@ -6,7 +6,11 @@ import type {
   JSONRPCRequest,
   FormElicitationParams,
   URLElicitationParams,
-  RequestId
+  RequestId,
+  SamplingMessage,
+  SamplingTool,
+  ToolChoice,
+  ModelPreferences
 } from '../schema.ts'
 import { validateElicitationRequest } from '../security.ts'
 import { JSONRPC_VERSION } from '../schema.ts'
@@ -183,6 +187,73 @@ const mcpPubSubDecoratorsPlugin: FastifyPluginAsync<MCPPubSubDecoratorsOptions> 
     }
   })
 
+  app.decorate('mcpRequestSampling', async (
+    sessionId: string,
+    messages: SamplingMessage[],
+    options?: {
+      modelPreferences?: ModelPreferences
+      systemPrompt?: string
+      maxTokens: number
+      includeContext?: 'none' | 'thisServer' | 'allServers'
+      temperature?: number
+      stopSequences?: string[]
+      metadata?: Record<string, unknown>
+      tools?: SamplingTool[]
+      toolChoice?: ToolChoice
+    },
+    requestId?: RequestId
+  ): Promise<boolean> => {
+    if (!enableSSE) {
+      app.log.warn('Cannot send sampling request: SSE is disabled')
+      return false
+    }
+
+    // Generate a request ID if not provided
+    const id = requestId ?? `sampling-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
+
+    const samplingRequest: JSONRPCRequest = {
+      jsonrpc: JSONRPC_VERSION,
+      id,
+      method: 'sampling/createMessage',
+      params: {
+        messages,
+        maxTokens: options?.maxTokens ?? 1000,
+        ...(options?.modelPreferences && { modelPreferences: options.modelPreferences }),
+        ...(options?.systemPrompt && { systemPrompt: options.systemPrompt }),
+        ...(options?.includeContext && { includeContext: options.includeContext }),
+        ...(options?.temperature !== undefined && { temperature: options.temperature }),
+        ...(options?.stopSequences && { stopSequences: options.stopSequences }),
+        ...(options?.metadata && { metadata: options.metadata }),
+        ...(options?.tools && { tools: options.tools }),
+        ...(options?.toolChoice && { toolChoice: options.toolChoice })
+      }
+    }
+
+    return await app.mcpSendToSession(sessionId, samplingRequest)
+  })
+
+  app.decorate('mcpRequestRoots', async (
+    sessionId: string,
+    requestId?: RequestId
+  ): Promise<boolean> => {
+    if (!enableSSE) {
+      app.log.warn('Cannot send roots request: SSE is disabled')
+      return false
+    }
+
+    // Generate a request ID if not provided
+    const id = requestId ?? `roots-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
+
+    const rootsRequest: JSONRPCRequest = {
+      jsonrpc: JSONRPC_VERSION,
+      id,
+      method: 'roots/list',
+      params: {}
+    }
+
+    return await app.mcpSendToSession(sessionId, rootsRequest)
+  })
+
   // Store elicitation store for use in routes
   app.decorate('elicitationStore', elicitationStore)
 }
@@ -200,6 +271,26 @@ declare module 'fastify' {
       requestId?: RequestId
     ) => Promise<boolean>
     mcpCompleteElicitation: (elicitationId: string) => Promise<boolean>
+    mcpRequestSampling: (
+      sessionId: string,
+      messages: SamplingMessage[],
+      options?: {
+        modelPreferences?: ModelPreferences
+        systemPrompt?: string
+        maxTokens: number
+        includeContext?: 'none' | 'thisServer' | 'allServers'
+        temperature?: number
+        stopSequences?: string[]
+        metadata?: Record<string, unknown>
+        tools?: SamplingTool[]
+        toolChoice?: ToolChoice
+      },
+      requestId?: RequestId
+    ) => Promise<boolean>
+    mcpRequestRoots: (
+      sessionId: string,
+      requestId?: RequestId
+    ) => Promise<boolean>
   }
 }
 
