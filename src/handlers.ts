@@ -14,7 +14,9 @@ import type {
   ReadResourceResult,
   GetPromptResult,
   LogLevel,
-  CompleteRequest
+  CompleteRequest,
+  TaskStatusResult,
+  ListTasksResult
 } from './schema.ts'
 
 import {
@@ -504,6 +506,74 @@ async function handlePromptsGet (
   }
 }
 
+async function handleTasksGet (request: JSONRPCRequest, dependencies: HandlerDependencies): Promise<JSONRPCResponse | JSONRPCError> {
+  const { app, authContext } = dependencies
+
+  if (!app.taskService) {
+    return createError(request.id, METHOD_NOT_FOUND, 'Tasks capability not enabled')
+  }
+
+  if (!request.params || typeof request.params !== 'object') {
+    return createError(request.id, INVALID_PARAMS, 'Invalid params: expected object with taskId field')
+  }
+
+  const { taskId } = request.params as { taskId?: unknown }
+
+  if (typeof taskId !== 'string') {
+    return createError(request.id, INVALID_PARAMS, 'Invalid params: taskId must be a string')
+  }
+
+  try {
+    const task = await app.taskService.getTask(taskId, authContext)
+    const result: TaskStatusResult = task
+    return createResponse(request.id, result)
+  } catch (error) {
+    return createError(request.id, INVALID_PARAMS, error instanceof Error ? error.message : 'Failed to get task')
+  }
+}
+
+async function handleTasksList (request: JSONRPCRequest, dependencies: HandlerDependencies): Promise<JSONRPCResponse | JSONRPCError> {
+  const { app, authContext } = dependencies
+
+  if (!app.taskService) {
+    return createError(request.id, METHOD_NOT_FOUND, 'Tasks capability not enabled')
+  }
+
+  try {
+    const tasks = await app.taskService.listTasks(authContext)
+    const result: ListTasksResult = { tasks }
+    return createResponse(request.id, result)
+  } catch (error) {
+    return createError(request.id, INTERNAL_ERROR, error instanceof Error ? error.message : 'Failed to list tasks')
+  }
+}
+
+async function handleTasksCancel (request: JSONRPCRequest, dependencies: HandlerDependencies): Promise<JSONRPCResponse | JSONRPCError> {
+  const { app, authContext } = dependencies
+
+  if (!app.taskService) {
+    return createError(request.id, METHOD_NOT_FOUND, 'Tasks capability not enabled')
+  }
+
+  if (!request.params || typeof request.params !== 'object') {
+    return createError(request.id, INVALID_PARAMS, 'Invalid params: expected object with taskId field')
+  }
+
+  const { taskId } = request.params as { taskId?: unknown }
+
+  if (typeof taskId !== 'string') {
+    return createError(request.id, INVALID_PARAMS, 'Invalid params: taskId must be a string')
+  }
+
+  try {
+    await app.taskService.cancelTask(taskId, authContext)
+    const result: EmptyResult = {}
+    return createResponse(request.id, result)
+  } catch (error) {
+    return createError(request.id, INVALID_PARAMS, error instanceof Error ? error.message : 'Failed to cancel task')
+  }
+}
+
 export async function handleRequest (
   request: JSONRPCRequest,
   sessionId: string | undefined,
@@ -539,6 +609,12 @@ export async function handleRequest (
         return await handleResourcesRead(request, sessionId, dependencies)
       case 'prompts/get':
         return await handlePromptsGet(request, sessionId, dependencies)
+      case 'tasks/get':
+        return await handleTasksGet(request, dependencies)
+      case 'tasks/list':
+        return await handleTasksList(request, dependencies)
+      case 'tasks/cancel':
+        return await handleTasksCancel(request, dependencies)
       default:
         return createError(request.id, METHOD_NOT_FOUND, `Method ${request.method} not found`)
     }

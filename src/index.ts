@@ -8,6 +8,10 @@ import { MemoryMessageBroker } from './brokers/memory-message-broker.ts'
 import { RedisSessionStore } from './stores/redis-session-store.ts'
 import { RedisMessageBroker } from './brokers/redis-message-broker.ts'
 import { MemoryElicitationStore } from './stores/elicitation-store.ts'
+import { MemoryTaskStore } from './stores/task-store.ts'
+import { RedisTaskStore } from './stores/redis-task-store.ts'
+import { TaskService } from './features/tasks.ts'
+import type { TaskStore } from './stores/task-store.ts'
 import type { MCPPluginOptions, MCPTool, MCPResource, MCPPrompt } from './types.ts'
 import pubsubDecorators from './decorators/pubsub.ts'
 import metaDecorators from './decorators/meta.ts'
@@ -91,6 +95,39 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
   // Elicitation store for URL mode elicitation
   const elicitationStore = new MemoryElicitationStore()
 
+  // Initialize task store and service if tasks capability is enabled
+  let taskStore: TaskStore | null = null
+  let taskService: TaskService | null = null
+
+  if (capabilities.tasks) {
+    if (opts.redis && redis) {
+      // Redis implementation for horizontal scaling
+      taskStore = new RedisTaskStore({ redis })
+    } else {
+      // Memory implementation for single-instance deployment
+      taskStore = new MemoryTaskStore()
+    }
+
+    taskService = new TaskService(taskStore, messageBroker)
+
+    // Set up periodic cleanup of expired tasks (every 5 minutes)
+    const cleanupInterval = setInterval(async () => {
+      try {
+        const count = await taskService!.cleanup()
+        if (count > 0) {
+          app.log.info({ count }, 'Cleaned up expired tasks')
+        }
+      } catch (error) {
+        app.log.error({ error }, 'Failed to cleanup tasks')
+      }
+    }, 5 * 60 * 1000)
+
+    // Clear interval on close
+    app.addHook('onClose', async () => {
+      clearInterval(cleanupInterval)
+    })
+  }
+
   // Local stream management per server instance
   const localStreams = new Map<string, Set<any>>()
 
@@ -143,6 +180,11 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
   app.register(completionDecorators, {
     enableCompletion: !!capabilities.completions
   })
+
+  // Add taskService decorator if tasks capability is enabled
+  if (taskService) {
+    app.decorate('taskService', taskService)
+  }
 
   // Register routes
   await app.register(routes, {
@@ -297,3 +339,9 @@ export type {
 export type {
   CompletionProvider
 } from './features/completion.ts'
+
+declare module 'fastify' {
+  interface FastifyInstance {
+    taskService?: TaskService
+  }
+}
