@@ -15,10 +15,13 @@ import { JSONRPC_VERSION } from '../schema.ts'
  * Tasks are asynchronous operations that can be polled for completion.
  */
 export class TaskService {
-  constructor (
-    private readonly taskStore: TaskStore,
-    private readonly messageBroker: MessageBroker
-  ) {}
+  private readonly taskStore: TaskStore
+  private readonly messageBroker: MessageBroker
+
+  constructor (taskStore: TaskStore, messageBroker: MessageBroker) {
+    this.taskStore = taskStore
+    this.messageBroker = messageBroker
+  }
 
   /**
    * Creates a new task.
