@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify'
 import fp from 'fastify-plugin'
-import { Redis } from 'ioredis'
+import { Redis, type RedisOptions } from 'ioredis'
 import type { SessionStore } from './stores/session-store.ts'
 import type { MessageBroker } from './brokers/message-broker.ts'
 import { MemorySessionStore } from './stores/memory-session-store.ts'
@@ -34,6 +34,20 @@ import type {
   GetPromptResult
 } from './schema.ts'
 
+function isIoRedis (value: unknown): value is Redis {
+  if (typeof value !== 'object' || value === null) return false
+  // can match if the same module is loaded
+  if (value instanceof Redis) return true
+  // otherwise treat as a duck type, which can be useful for mocking anyhow
+  const v = value as Partial<Redis>
+  return (
+    typeof v.connect === 'function' &&
+    typeof v.quit === 'function' &&
+    typeof v.hset === 'function' &&
+    typeof v.get === 'function'
+  )
+}
+
 const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOptions) {
   const serverInfo: Implementation = opts.serverInfo ?? {
     name: '@platformatic/mcp',
@@ -55,10 +69,15 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
   let sessionStore: SessionStore
   let messageBroker: MessageBroker
   let redis: Redis | null = null
+  let redisIsInternallyManaged = false
 
   if (opts.redis) {
-    // Redis implementations for horizontal scaling
-    redis = new Redis(opts.redis)
+    if (isIoRedis(opts.redis)) {
+      redis = opts.redis
+    } else {
+      redis = new Redis(opts.redis as RedisOptions) // or string, to overcome type narrowing
+      redisIsInternallyManaged = true
+    }
     sessionStore = new RedisSessionStore({ redis, maxMessages: 100 })
     messageBroker = new RedisMessageBroker(redis)
   } else {
@@ -144,7 +163,7 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     // Execute all unsubscribes in parallel
     await Promise.all(unsubscribePromises)
 
-    if (redis) {
+    if (redis && redisIsInternallyManaged) {
       await redis.quit()
     }
     await messageBroker.close()
