@@ -34,7 +34,7 @@
   "homepage": "https://github.com/platformatic/mcp#readme",
   "devDependencies": {
     "@fastify/pre-commit": "^2.2.0",
-    "@modelcontextprotocol/inspector": "^0.17.0",
+    "@modelcontextprotocol/inspector": "^0.18.0",
     "@modelcontextprotocol/sdk": "^1.13.3",
     "@sinclair/typebox": "^0.34.37",
     "@types/node": "^24.0.10",
