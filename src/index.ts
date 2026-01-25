@@ -7,7 +7,7 @@ import { MemorySessionStore } from './stores/memory-session-store.ts'
 import { MemoryMessageBroker } from './brokers/memory-message-broker.ts'
 import { RedisSessionStore } from './stores/redis-session-store.ts'
 import { RedisMessageBroker } from './brokers/redis-message-broker.ts'
-import type { MCPPluginOptions, MCPTool, MCPResource, MCPPrompt } from './types.ts'
+import type { MCPPluginOptions, MCPTool, MCPResource, MCPPrompt, ResourceHandlers } from './types.ts'
 import pubsubDecorators from './decorators/pubsub.ts'
 import metaDecorators from './decorators/meta.ts'
 import routes from './routes/mcp.ts'
@@ -50,6 +50,7 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
   const tools = new Map<string, MCPTool>()
   const resources = new Map<string, MCPResource>()
   const prompts = new Map<string, MCPPrompt>()
+  const resourceHandlers: ResourceHandlers = {}
 
   // Initialize stores and brokers based on configuration
   let sessionStore: SessionStore
@@ -98,7 +99,8 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
   app.register(metaDecorators, {
     tools,
     resources,
-    prompts
+    prompts,
+    resourceHandlers
   })
   app.register(pubsubDecorators, {
     enableSSE,
@@ -116,6 +118,7 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     tools,
     resources,
     prompts,
+    resourceHandlers,
     sessionStore,
     messageBroker,
     localStreams
@@ -188,7 +191,10 @@ export type {
   UnsafeToolHandler,
   UnsafeResourceHandler,
   UnsafePromptHandler,
-  SSESession
+  SSESession,
+  ResourceHandlers,
+  ResourceSubscribeHandler,
+  ResourceUnsubscribeHandler
 } from './types.ts'
 
 // Export authorization types

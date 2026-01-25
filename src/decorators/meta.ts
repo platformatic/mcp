@@ -3,7 +3,10 @@ import fp from 'fastify-plugin'
 import type {
   MCPTool,
   MCPResource,
-  MCPPrompt
+  MCPPrompt,
+  ResourceHandlers,
+  ResourceSubscribeHandler,
+  ResourceUnsubscribeHandler
 } from '../types.ts'
 import { schemaToArguments, validateToolSchema } from '../validation/index.ts'
 
@@ -11,10 +14,11 @@ interface MCPDecoratorsOptions {
   tools: Map<string, MCPTool>
   resources: Map<string, MCPResource>
   prompts: Map<string, MCPPrompt>
+  resourceHandlers: ResourceHandlers
 }
 
 const mcpDecoratorsPlugin: FastifyPluginAsync<MCPDecoratorsOptions> = async (app, options) => {
-  const { tools, resources, prompts } = options
+  const { tools, resources, prompts, resourceHandlers } = options
 
   // Enhanced tool decorator with TypeBox schema support
   app.decorate('mcpAddTool', (
@@ -92,6 +96,15 @@ const mcpDecoratorsPlugin: FastifyPluginAsync<MCPDecoratorsOptions> = async (app
       },
       handler
     })
+  })
+
+  // Resource subscription handler setters
+  app.decorate('mcpSetResourceSubscribeHandler', (handler: ResourceSubscribeHandler) => {
+    resourceHandlers.subscribeHandler = handler
+  })
+
+  app.decorate('mcpSetResourceUnsubscribeHandler', (handler: ResourceUnsubscribeHandler) => {
+    resourceHandlers.unsubscribeHandler = handler
   })
 }
 
