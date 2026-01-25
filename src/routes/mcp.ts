@@ -3,7 +3,7 @@ import type { FastifyRequest, FastifyReply, FastifyPluginAsync } from 'fastify'
 import fp from 'fastify-plugin'
 import type { JSONRPCMessage } from '../schema.ts'
 import { JSONRPC_VERSION, INTERNAL_ERROR } from '../schema.ts'
-import type { MCPPluginOptions, MCPTool, MCPResource, MCPPrompt } from '../types.ts'
+import type { MCPPluginOptions, MCPTool, MCPResource, MCPPrompt, ResourceHandlers } from '../types.ts'
 import type { SessionStore, SessionMetadata } from '../stores/session-store.ts'
 import type { MessageBroker } from '../brokers/message-broker.ts'
 import type { AuthorizationContext } from '../types/auth-types.ts'
@@ -17,13 +17,14 @@ interface MCPPubSubRoutesOptions {
   tools: Map<string, MCPTool>
   resources: Map<string, MCPResource>
   prompts: Map<string, MCPPrompt>
+  resourceHandlers: ResourceHandlers
   sessionStore: SessionStore
   messageBroker: MessageBroker
   localStreams: Map<string, Set<any>>
 }
 
 const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async (app, options) => {
-  const { enableSSE, opts, capabilities, serverInfo, tools, resources, prompts, sessionStore, messageBroker, localStreams } = options
+  const { enableSSE, opts, capabilities, serverInfo, tools, resources, prompts, resourceHandlers, sessionStore, messageBroker, localStreams } = options
 
   async function createSSESession (): Promise<SessionMetadata> {
     const sessionId = randomUUID()
@@ -185,6 +186,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         tools,
         resources,
         prompts,
+        resourceHandlers,
         request,
         reply,
         authContext
