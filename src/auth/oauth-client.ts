@@ -39,7 +39,12 @@ export interface OAuthClientMethods {
   exchangeCodeForToken(code: string, pkce: PKCEChallenge, state: string, receivedState: string, redirectUri?: string): Promise<TokenResponse>
   refreshToken(refreshToken: string): Promise<TokenResponse>
   validateToken(accessToken: string): Promise<boolean>
-  dynamicClientRegistration(): Promise<{ clientId: string; clientSecret?: string }>
+  /**
+   * Register a new OAuth client dynamically (RFC 7591).
+   * @param clientMetadata Optional client metadata from the registration request.
+   *                       If provided, merges with defaults (client metadata wins).
+   */
+  dynamicClientRegistration(clientMetadata?: Record<string, unknown>): Promise<{ clientId: string; clientSecret?: string }>
 }
 
 declare module 'fastify' {
@@ -277,27 +282,33 @@ const oauthClientPlugin: FastifyPluginAsync<OAuthClientConfig> = async (fastify,
       }
     },
 
-    async dynamicClientRegistration (): Promise<{ clientId: string; clientSecret?: string }> {
+    async dynamicClientRegistration (clientMetadata?: Record<string, unknown>): Promise<{ clientId: string; clientSecret?: string }> {
       if (!opts.dynamicRegistration) {
         throw new Error('Dynamic client registration not enabled')
       }
 
       try {
+        // Default client metadata (can be overridden by clientMetadata)
+        const defaultMetadata = {
+          client_name: 'MCP Server',
+          client_uri: opts.resourceUri,
+          redirect_uris: [`${opts.resourceUri}/oauth/callback`],
+          grant_types: ['authorization_code', 'refresh_token'],
+          response_types: ['code'],
+          token_endpoint_auth_method: 'client_secret_post',
+          scope: (opts.scopes || ['read']).join(' ')
+        }
+
+        // Merge with client-provided metadata (client metadata wins)
+        const payload = { ...defaultMetadata, ...clientMetadata }
+
         const registrationResponse = await fetch(endpoints.registrationEndpoint, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
             Accept: 'application/json'
           },
-          body: JSON.stringify({
-            client_name: 'MCP Server',
-            client_uri: opts.resourceUri,
-            redirect_uris: [`${opts.resourceUri}/oauth/callback`],
-            grant_types: ['authorization_code', 'refresh_token'],
-            response_types: ['code'],
-            token_endpoint_auth_method: 'client_secret_post',
-            scope: (opts.scopes || ['read']).join(' ')
-          })
+          body: JSON.stringify(payload)
         })
 
         if (!registrationResponse.ok) {

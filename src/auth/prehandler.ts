@@ -17,8 +17,8 @@ export function createAuthPreHandler (
       return
     }
 
-    // Skip authorization for OAuth flow endpoints (authorize initiates, callback receives code)
-    if (request.url.startsWith('/oauth/authorize') || request.url.startsWith('/oauth/callback')) {
+    // Skip authorization for OAuth flow endpoints (authorize initiates, callback receives code, register is pre-auth)
+    if (request.url.startsWith('/oauth/authorize') || request.url.startsWith('/oauth/callback') || request.url.startsWith('/oauth/register')) {
       return
     }
 

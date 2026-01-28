@@ -110,12 +110,29 @@ export class TokenValidator {
     }
 
     try {
+      // Build headers with optional introspection authentication
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Accept: 'application/json'
+      }
+
+      // Apply introspection auth based on config
+      const introspectionAuth = this.config.tokenValidation.introspectionAuth
+      if (introspectionAuth) {
+        if (introspectionAuth.type === 'bearer') {
+          headers.Authorization = `Bearer ${introspectionAuth.token}`
+        } else if (introspectionAuth.type === 'basic') {
+          const credentials = Buffer.from(
+            `${introspectionAuth.clientId}:${introspectionAuth.clientSecret}`
+          ).toString('base64')
+          headers.Authorization = `Basic ${credentials}`
+        }
+        // type === 'none' - no auth header added
+      }
+
       const response = await fetch(this.config.tokenValidation.introspectionEndpoint, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          Accept: 'application/json'
-        },
+        headers,
         body: new URLSearchParams({
           token,
           token_type_hint: 'access_token'
