@@ -24,6 +24,23 @@ export interface HandlerContext {
   authContext?: AuthorizationContext
 }
 
+// Resource subscription handler types
+export type ResourceSubscribeHandler = (
+  params: { uri: string },
+  context: HandlerContext
+) => Promise<Record<string, unknown>> | Record<string, unknown>
+
+export type ResourceUnsubscribeHandler = (
+  params: { uri: string },
+  context: HandlerContext
+) => Promise<Record<string, unknown>> | Record<string, unknown>
+
+// Resource handlers container
+export interface ResourceHandlers {
+  subscribeHandler?: ResourceSubscribeHandler
+  unsubscribeHandler?: ResourceUnsubscribeHandler
+}
+
 // Generic handler types with TypeBox schema support
 export type ToolHandler<TSchema extends TObject = TObject> = (
   params: Static<TSchema>,
@@ -107,6 +124,10 @@ declare module 'fastify' {
       requestedSchema: ElicitRequest['params']['requestedSchema'],
       requestId?: RequestId
     ) => Promise<boolean>
+
+    // Resource subscription handler setters
+    mcpSetResourceSubscribeHandler: (handler: ResourceSubscribeHandler) => void
+    mcpSetResourceUnsubscribeHandler: (handler: ResourceUnsubscribeHandler) => void
   }
 }
 
