@@ -274,6 +274,82 @@ describe('TokenValidator', () => {
 
       validator.close()
     })
+
+    test('should use bearer token auth for introspection when configured', async (t: TestContext) => {
+      const config = createTestAuthConfig({
+        tokenValidation: {
+          introspectionEndpoint: 'https://auth.example.com/admin/introspect',
+          validateAudience: true,
+          introspectionAuth: {
+            type: 'bearer',
+            token: 'admin-api-key-123'
+          }
+        }
+      })
+
+      // The mock will verify the Authorization header is set correctly
+      restoreMock = setupMockAgent({
+        'https://auth.example.com/admin/introspect': createIntrospectionResponse(true)
+      })
+
+      const validator = new TokenValidator(config, app)
+      const result = await validator.validateToken('opaque-token-123')
+
+      t.assert.strictEqual(result.valid, true)
+      t.assert.ok(result.payload)
+
+      validator.close()
+    })
+
+    test('should use basic auth for introspection when configured', async (t: TestContext) => {
+      const config = createTestAuthConfig({
+        tokenValidation: {
+          introspectionEndpoint: 'https://auth.example.com/introspect',
+          validateAudience: true,
+          introspectionAuth: {
+            type: 'basic',
+            clientId: 'client-id',
+            clientSecret: 'client-secret'
+          }
+        }
+      })
+
+      restoreMock = setupMockAgent({
+        'https://auth.example.com/introspect': createIntrospectionResponse(true)
+      })
+
+      const validator = new TokenValidator(config, app)
+      const result = await validator.validateToken('opaque-token-123')
+
+      t.assert.strictEqual(result.valid, true)
+      t.assert.ok(result.payload)
+
+      validator.close()
+    })
+
+    test('should not send auth header when introspectionAuth is none', async (t: TestContext) => {
+      const config = createTestAuthConfig({
+        tokenValidation: {
+          introspectionEndpoint: 'https://auth.example.com/introspect',
+          validateAudience: true,
+          introspectionAuth: {
+            type: 'none'
+          }
+        }
+      })
+
+      restoreMock = setupMockAgent({
+        'https://auth.example.com/introspect': createIntrospectionResponse(true)
+      })
+
+      const validator = new TokenValidator(config, app)
+      const result = await validator.validateToken('opaque-token-123')
+
+      t.assert.strictEqual(result.valid, true)
+      t.assert.ok(result.payload)
+
+      validator.close()
+    })
   })
 
   describe('Fallback Logic', () => {
