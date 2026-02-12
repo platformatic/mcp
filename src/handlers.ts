@@ -9,6 +9,7 @@ import type {
   EmptyResult,
   ListToolsResult,
   ListResourcesResult,
+  ListResourceTemplatesResult,
   ListPromptsResult,
   CallToolResult,
   ReadResourceResult,
@@ -93,10 +94,32 @@ function handleToolsList (request: JSONRPCRequest, dependencies: HandlerDependen
   return createResponse(request.id, result)
 }
 
+const URI_TEMPLATE_REGEX = /\{[^}]+\}/
+
+function isTemplateUri (uri: string): boolean {
+  return URI_TEMPLATE_REGEX.test(uri)
+}
+
 function handleResourcesList (request: JSONRPCRequest, dependencies: HandlerDependencies): JSONRPCResponse {
   const { resources } = dependencies
   const result: ListResourcesResult = {
-    resources: Array.from(resources.values()).map(r => r.definition),
+    resources: Array.from(resources.values())
+      .filter(r => !isTemplateUri(r.definition.uri))
+      .map(r => r.definition),
+    nextCursor: undefined
+  }
+  return createResponse(request.id, result)
+}
+
+function handleResourceTemplatesList (request: JSONRPCRequest, dependencies: HandlerDependencies): JSONRPCResponse {
+  const { resources } = dependencies
+  const result: ListResourceTemplatesResult = {
+    resourceTemplates: Array.from(resources.values())
+      .filter(r => isTemplateUri(r.definition.uri))
+      .map(r => {
+        const { uri, ...rest } = r.definition
+        return { ...rest, uriTemplate: uri }
+      }),
     nextCursor: undefined
   }
   return createResponse(request.id, result)
@@ -534,6 +557,8 @@ export async function handleRequest (
         return handleToolsList(request, dependencies)
       case 'resources/list':
         return handleResourcesList(request, dependencies)
+      case 'resources/templates/list':
+        return handleResourceTemplatesList(request, dependencies)
       case 'prompts/list':
         return handlePromptsList(request, dependencies)
       case 'tools/call':
