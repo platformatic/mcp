@@ -7,7 +7,7 @@ import type { MCPPluginOptions, MCPTool, MCPResource, MCPPrompt } from '../types
 import type { SessionStore, SessionMetadata } from '../stores/session-store.ts'
 import type { MessageBroker } from '../brokers/message-broker.ts'
 import type { AuthorizationContext } from '../types/auth-types.ts'
-import { processMessage } from '../handlers.ts'
+import { processMessage, createResponse, createError, type StreamingToolResponse } from '../handlers.ts'
 
 interface MCPPubSubRoutesOptions {
   enableSSE: boolean
@@ -22,6 +22,11 @@ interface MCPPubSubRoutesOptions {
   localStreams: Map<string, Set<any>>
 }
 
+// Helper function to check if response is streaming
+function isStreamingResponse (response: any): response is StreamingToolResponse {
+  return response && response.isStreaming === true && response.iterator && response.requestId !== undefined
+}
+
 const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async (app, options) => {
   const { enableSSE, opts, capabilities, serverInfo, tools, resources, prompts, sessionStore, messageBroker, localStreams } = options
 
@@ -29,10 +34,9 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     const sessionId = randomUUID()
     const session: SessionMetadata = {
       id: sessionId,
-      eventId: 0,
-      lastEventId: undefined,
       createdAt: new Date(),
-      lastActivity: new Date()
+      lastActivity: new Date(),
+      streams: new Map()
     }
 
     await sessionStore.create(session)
@@ -43,17 +47,12 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
       const streams = localStreams.get(sessionId)
       if (streams && streams.size > 0) {
         app.log.debug({ sessionId, message }, 'Received message for session via broker, sending to streams')
-        sendSSEToStreams(sessionId, message, streams)
+        await sendSSEToStreams(sessionId, message, streams)
       } else {
         app.log.debug({ sessionId }, 'Received message for session via broker, storing in history without active streams')
-        // Store message in history even without active streams for session persistence
-        const session = await sessionStore.get(sessionId)
-        if (session) {
-          const eventId = (++session.eventId).toString()
-          session.lastEventId = eventId
-          session.lastActivity = new Date()
-          await sessionStore.addMessage(sessionId, eventId, message)
-        }
+        // For backward compatibility, store in session-level history if no streams are active
+        // This maintains existing behavior for legacy usage
+        await sessionStore.addSessionMessage(sessionId, '0', message)
       }
     })
 
@@ -65,33 +64,98 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     return accept ? accept.includes('text/event-stream') : false
   }
 
-  function hasActiveSSESession (sessionId?: string): boolean {
-    if (!sessionId) return false
-    const streams = localStreams.get(sessionId)
-    return streams ? streams.size > 0 : false
+  async function sendSSEToStreams (sessionId: string, message: JSONRPCMessage, streams: Set<FastifyReply>): Promise<void> {
+    // Check if this is a broadcast notification or elicitation (these should use session-level storage)
+    const isBroadcast = 'method' in message && (
+      message.method === 'notifications/message' ||
+      message.method.startsWith('notifications/') ||
+      message.method === 'elicitation/create'
+    )
+
+    if (isBroadcast) {
+      // Use broadcast method for broadcast notifications and elicitation requests
+      await sendSSEToStreamsBroadcast(sessionId, message, streams)
+      return
+    }
+
+    // According to MCP spec line 145: server MUST send each message to only one stream
+    // For now, we'll select the first available stream (round-robin could be implemented later)
+    const streamArray = Array.from(streams)
+    if (streamArray.length === 0) return
+
+    // Select the first stream for this message (simple strategy)
+    const selectedStream = streamArray[0]
+    const streamId = (selectedStream as any).mcpStreamId
+
+    if (!streamId) {
+      app.log.warn('Stream missing mcpStreamId, falling back to broadcast')
+      // Fallback to broadcast behavior if streamId is missing
+      await sendSSEToStreamsBroadcast(sessionId, message, streams)
+      return
+    }
+
+    try {
+      // Get current stream metadata to determine next event ID
+      const streamMetadata = await sessionStore.getStream(sessionId, streamId)
+      if (!streamMetadata) {
+        app.log.warn(`Stream metadata not found for stream: ${streamId}`)
+        return
+      }
+
+      // Generate next event ID for this specific stream
+      const eventId = (streamMetadata.eventId + 1).toString()
+      const sseEvent = `id: ${eventId}\ndata: ${JSON.stringify(message)}\n\n`
+
+      // Send to the selected stream
+      selectedStream.raw.write(sseEvent)
+
+      // Store message in per-stream history
+      await sessionStore.addMessage(sessionId, streamId, eventId, message)
+      await sessionStore.updateStreamActivity(sessionId, streamId)
+
+      app.log.debug({
+        sessionId,
+        streamId,
+        eventId,
+        messageType: 'method' in message ? message.method : 'response'
+      }, 'Sent message to specific stream')
+    } catch (error) {
+      app.log.error({ err: error, sessionId, streamId }, 'Failed to send SSE event to stream')
+
+      // Remove dead stream
+      streams.delete(selectedStream)
+
+      // Clean up session if no streams left
+      if (streams.size === 0) {
+        app.log.info({ sessionId }, 'Session has no active streams, cleaning up')
+        localStreams.delete(sessionId)
+        await messageBroker.unsubscribe(`mcp/session/${sessionId}/message`)
+      }
+    }
   }
 
-  async function sendSSEToStreams (sessionId: string, message: JSONRPCMessage, streams: Set<FastifyReply>): Promise<void> {
-    const session = await sessionStore.get(sessionId)
-    if (!session) return
-
-    const eventId = (++session.eventId).toString()
-    const sseEvent = `id: ${eventId}\ndata: ${JSON.stringify(message)}\n\n`
-    session.lastEventId = eventId
-    session.lastActivity = new Date()
-
-    // Store message in history
-    await sessionStore.addMessage(sessionId, eventId, message)
-
-    // Send to all connected streams in this session
+  async function sendSSEToStreamsBroadcast (sessionId: string, message: JSONRPCMessage, streams: Set<FastifyReply>): Promise<void> {
+    // Broadcast method for notifications and elicitation - stores in session-level history
     const deadStreams = new Set<FastifyReply>()
+
+    // Use timestamp-based event ID for broadcast compatibility
+    const eventId = Date.now().toString()
+    const sseEvent = `id: ${eventId}\ndata: ${JSON.stringify(message)}\n\n`
+
     for (const stream of streams) {
       try {
         stream.raw.write(sseEvent)
       } catch (error) {
-        app.log.error({ err: error }, 'Failed to write SSE event')
+        app.log.error({ err: error }, 'Failed to write legacy SSE event')
         deadStreams.add(stream)
       }
+    }
+
+    // Store message in session-level history (broadcast messages are session-wide)
+    try {
+      await sessionStore.addSessionMessage(sessionId, eventId, message)
+    } catch (error) {
+      app.log.error({ err: error }, 'Failed to store broadcast session message')
     }
 
     // Clean up dead streams
@@ -101,33 +165,118 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
     // Clean up session if no streams left
     if (streams.size === 0) {
-      app.log.info({
-        sessionId
-      }, 'Session has no active streams, cleaning up')
+      app.log.info({ sessionId }, 'Session has no active streams, cleaning up')
       localStreams.delete(sessionId)
       await messageBroker.unsubscribe(`mcp/session/${sessionId}/message`)
     }
   }
 
-  async function replayMessagesFromEventId (sessionId: string, lastEventId: string, stream: FastifyReply): Promise<void> {
+  async function handleStreamingResponse (
+    streamingResponse: StreamingToolResponse,
+    sessionId: string | undefined,
+    reply: FastifyReply
+  ): Promise<void> {
+    // Hijack the response for streaming
+    reply.hijack()
+    const raw = reply.raw
+
+    // Set SSE headers
+    raw.setHeader('Content-Type', 'text/event-stream')
+    raw.setHeader('Cache-Control', 'no-cache')
+    raw.writeHead(200)
+
+    let eventId = 1
+
     try {
-      const messagesToReplay = await sessionStore.getMessagesFrom(sessionId, lastEventId)
+      // Manually iterate through async iterator to capture both yielded values and return value
+      const iterator = streamingResponse.iterator
+      let result = await iterator.next()
+
+      while (!result.done) {
+        // Handle yielded values
+        const response = createResponse(streamingResponse.requestId, result.value)
+        const sseEvent = `id: ${eventId}\ndata: ${JSON.stringify(response)}\n\n`
+
+        try {
+          raw.write(sseEvent)
+        } catch (error) {
+          app.log.error({ err: error }, 'Failed to write SSE chunk')
+          break
+        }
+
+        // Update session if available - use legacy method for backward compatibility
+        if (enableSSE && sessionId) {
+          await sessionStore.addSessionMessage(sessionId, eventId.toString(), response)
+        }
+
+        eventId++
+        result = await iterator.next()
+      }
+
+      // Handle final return value if present
+      if (result.value !== undefined) {
+        const response = createResponse(streamingResponse.requestId, result.value)
+        const sseEvent = `id: ${eventId}\ndata: ${JSON.stringify(response)}\n\n`
+
+        try {
+          raw.write(sseEvent)
+        } catch (error) {
+          app.log.error({ err: error }, 'Failed to write final SSE event')
+        }
+
+        // Update session with final value if available - use legacy method for backward compatibility
+        if (enableSSE && sessionId) {
+          await sessionStore.addSessionMessage(sessionId, eventId.toString(), response)
+        }
+      }
+    } catch (error: any) {
+      // Send error event
+      const errorResponse = createError(
+        streamingResponse.requestId,
+        INTERNAL_ERROR,
+        `Streaming error: ${error.message || error}`
+      )
+      const errorEvent = `id: ${eventId}\ndata: ${JSON.stringify(errorResponse)}\n\n`
+
+      try {
+        raw.write(errorEvent)
+      } catch (writeError) {
+        app.log.error({ err: writeError }, 'Failed to write error event')
+      }
+
+      // Update session with error if available - use legacy method for backward compatibility
+      if (enableSSE && sessionId) {
+        await sessionStore.addSessionMessage(sessionId, eventId.toString(), errorResponse)
+      }
+    } finally {
+      // Close the stream
+      try {
+        raw.end()
+      } catch (error) {
+        app.log.error({ err: error }, 'Failed to close SSE stream')
+      }
+    }
+  }
+
+  async function replayStreamMessagesFromEventId (sessionId: string, streamId: string, lastEventId: string, stream: FastifyReply): Promise<void> {
+    try {
+      const messagesToReplay = await sessionStore.getMessagesFrom(sessionId, streamId, lastEventId)
 
       for (const entry of messagesToReplay) {
         const sseEvent = `id: ${entry.eventId}\ndata: ${JSON.stringify(entry.message)}\n\n`
         try {
           stream.raw.write(sseEvent)
         } catch (error) {
-          app.log.error({ err: error }, 'Failed to replay SSE event')
+          app.log.error({ err: error }, 'Failed to replay per-stream SSE event')
           break
         }
       }
 
       if (messagesToReplay.length > 0) {
-        app.log.info(`Replayed ${messagesToReplay.length} messages from event ID: ${lastEventId}`)
+        app.log.info(`Replayed ${messagesToReplay.length} messages from event ID: ${lastEventId} for stream: ${streamId}`)
       }
     } catch (error) {
-      app.log.warn({ err: error, lastEventId }, 'Failed to replay messages from event ID')
+      app.log.warn({ err: error, lastEventId, streamId }, 'Failed to replay per-stream messages from event ID')
     }
   }
 
@@ -190,6 +339,13 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         authContext
       })
       if (response) {
+        // Check if this is a streaming response
+        if (isStreamingResponse(response)) {
+          // Handle streaming response
+          await handleStreamingResponse(response, sessionId, reply)
+          return // Response already sent via streaming
+        }
+
         return response
       } else {
         reply.code(202)
@@ -223,13 +379,8 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
       const sessionId = (request.headers['mcp-session-id'] as string) ||
                        (request.query as any)['mcp-session-id']
 
-      // Check if there's already an active SSE session
-      if (hasActiveSSESession(sessionId)) {
-        reply.type('application/json').code(409).send({
-          error: 'Conflict: SSE session already active for this session ID'
-        })
-        return
-      }
+      // Note: According to MCP spec line 143, clients MAY remain connected to multiple SSE streams simultaneously
+      // So we allow multiple streams per session
 
       request.log.info({ sessionId }, 'Handling SSE request')
 
@@ -238,9 +389,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
       const raw = reply.raw
 
-      // Set up SSE stream
-      raw.setHeader('Content-type', 'text/event-stream')
-      raw.setHeader('Cache-Control', 'no-cache')
+      // Headers will be set later with stream ID
 
       let session: SessionMetadata
       if (sessionId) {
@@ -256,6 +405,21 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         raw.setHeader('Mcp-Session-Id', session.id)
       }
 
+      // Generate unique stream ID for this SSE connection
+      const streamId = randomUUID()
+
+      // Create stream metadata for per-stream event ID tracking
+      const streamMetadata = await sessionStore.createStream(session.id, streamId)
+      if (!streamMetadata) {
+        raw.writeHead(500)
+        raw.end('Failed to create stream')
+        return
+      }
+
+      // Set headers before writing head
+      raw.setHeader('Content-type', 'text/event-stream')
+      raw.setHeader('Cache-Control', 'no-cache')
+      raw.setHeader('Mcp-Stream-Id', streamId)
       raw.writeHead(200)
 
       let streams = localStreams.get(session.id)
@@ -265,17 +429,21 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
       }
       streams.add(reply)
 
+      // Associate the reply with the stream ID for per-stream management
+      ;(reply as any).mcpStreamId = streamId
+
       app.log.info({
         sessionId: session.id,
+        streamId,
         totalStreams: streams.size,
         method: 'GET'
       }, 'Added new stream to session')
 
-      // Handle resumability with Last-Event-ID
+      // Handle resumability with Last-Event-ID - now per-stream
       const lastEventId = request.headers['last-event-id'] as string
       if (lastEventId) {
-        app.log.info(`Resuming SSE stream from event ID: ${lastEventId}`)
-        await replayMessagesFromEventId(session.id, lastEventId, reply)
+        app.log.info(`Resuming SSE stream from event ID: ${lastEventId} for stream: ${streamId}`)
+        await replayStreamMessagesFromEventId(session.id, streamId, lastEventId, reply)
       }
 
       // Handle connection close
@@ -285,8 +453,12 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
           streams.delete(reply)
           app.log.info({
             sessionId: session.id,
+            streamId,
             remainingStreams: streams.size
           }, 'SSE connection closed')
+
+          // Clean up stream metadata
+          sessionStore.deleteStream(session.id, streamId)
 
           if (streams.size === 0) {
             app.log.info({
@@ -317,7 +489,8 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
       reply.raw.on('close', () => {
         app.log.info({
-          sessionId: session.id
+          sessionId: session.id,
+          streamId
         }, 'SSE heartbeat connection closed')
         clearInterval(heartbeatInterval)
       })
