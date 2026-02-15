@@ -160,7 +160,11 @@ describe('MCP Integration Tests', () => {
         }
       }, CallToolResultSchema)
 
-      t.assert.strictEqual(divResult.content[0].text, 'Result: 5')
+      const divContent = divResult.content[0]
+      t.assert.strictEqual(divContent.type, 'text')
+      if (divContent.type === 'text') {
+        t.assert.strictEqual(divContent.text, 'Result: 5')
+      }
 
       // Test tool execution with error
       const errorResult = await client.request({
@@ -172,7 +176,11 @@ describe('MCP Integration Tests', () => {
       }, CallToolResultSchema)
 
       t.assert.strictEqual(errorResult.isError, true)
-      t.assert.ok((errorResult.content[0].text as string).includes('Invalid operation'))
+      const errorContent = errorResult.content[0]
+      t.assert.strictEqual(errorContent.type, 'text')
+      if (errorContent.type === 'text') {
+        t.assert.ok(errorContent.text.includes('Invalid operation'))
+      }
 
       // Test resources listing
       const resourcesResult = await client.request({
@@ -189,9 +197,11 @@ describe('MCP Integration Tests', () => {
         params: { uri: 'config://settings.json' }
       }, ReadResourceResultSchema)
 
-      t.assert.strictEqual(configResult.contents[0].uri, 'config://settings.json')
-      t.assert.strictEqual(configResult.contents[0].mimeType, 'application/json')
-      const config = JSON.parse(configResult.contents[0].text as string)
+      const configContent = configResult.contents[0]
+      t.assert.strictEqual(configContent.uri, 'config://settings.json')
+      t.assert.strictEqual(configContent.mimeType, 'application/json')
+      t.assert.ok('text' in configContent, 'Expected text content')
+      const config = JSON.parse((configContent as { text: string }).text)
       t.assert.strictEqual(config.mode, 'test')
       t.assert.strictEqual(config.debug, true)
 
@@ -215,7 +225,11 @@ describe('MCP Integration Tests', () => {
 
       t.assert.strictEqual(promptResult.messages.length, 1)
       t.assert.strictEqual(promptResult.messages[0].role, 'user')
-      t.assert.ok((promptResult.messages[0].content.text as string).includes('typescript'))
+      const promptContent = promptResult.messages[0].content
+      t.assert.strictEqual(promptContent.type, 'text')
+      if (promptContent.type === 'text') {
+        t.assert.ok(promptContent.text.includes('typescript'))
+      }
     } catch (error) {
       t.assert.fail(`MCP SDK integration test failed: ${error}`)
     }
@@ -341,6 +355,10 @@ describe('MCP Integration Tests', () => {
     }, CallToolResultSchema)
 
     t.assert.strictEqual(callResult.isError, true)
-    t.assert.ok((callResult.content[0].text as string).includes('no handler implementation'))
+    const noHandlerContent = callResult.content[0]
+    t.assert.strictEqual(noHandlerContent.type, 'text')
+    if (noHandlerContent.type === 'text') {
+      t.assert.ok(noHandlerContent.text.includes('no handler implementation'))
+    }
   })
 })

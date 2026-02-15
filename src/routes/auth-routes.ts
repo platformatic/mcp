@@ -3,12 +3,14 @@ import fp from 'fastify-plugin'
 import { Type } from '@sinclair/typebox'
 import type { PKCEChallenge } from '../auth/oauth-client.ts'
 import type { SessionStore } from '../stores/session-store.ts'
+import type { DCRHooks, DCRRequest, DCRResponse } from '../types/auth-types.ts'
 
 export interface AuthSession {
   state: string
   pkce: PKCEChallenge
   resourceUri?: string
   originalUrl?: string
+  callbackUrl?: string // The redirect_uri used in authorization request (required for OIDC token exchange)
 }
 
 export interface AuthorizationCallbackQuery {
@@ -24,6 +26,8 @@ export interface TokenRefreshBody {
 
 export interface AuthRoutesOptions {
   sessionStore: SessionStore
+  /** DCR hooks for custom request/response processing */
+  dcrHooks?: DCRHooks
 }
 
 // TypeBox schemas for validation
@@ -68,11 +72,29 @@ const AuthStatusResponse = Type.Object({
   authenticated: Type.Boolean()
 })
 
+// DCR Request body schema (RFC 7591 Section 2)
+const DynamicRegistrationRequest = Type.Object({
+  client_name: Type.Optional(Type.String()),
+  client_uri: Type.Optional(Type.String({ format: 'uri' })),
+  redirect_uris: Type.Optional(Type.Array(Type.String({ format: 'uri' }))),
+  grant_types: Type.Optional(Type.Array(Type.String())),
+  response_types: Type.Optional(Type.Array(Type.String())),
+  scope: Type.Optional(Type.String()),
+  token_endpoint_auth_method: Type.Optional(Type.String()),
+  logo_uri: Type.Optional(Type.String({ format: 'uri' })),
+  tos_uri: Type.Optional(Type.String({ format: 'uri' })),
+  policy_uri: Type.Optional(Type.String({ format: 'uri' })),
+  contacts: Type.Optional(Type.Array(Type.String())),
+  jwks_uri: Type.Optional(Type.String({ format: 'uri' })),
+  software_id: Type.Optional(Type.String()),
+  software_version: Type.Optional(Type.String())
+}, { additionalProperties: true })
+
 const DynamicRegistrationResponse = Type.Object({
   client_id: Type.String(),
   client_secret: Type.Optional(Type.String()),
-  registration_status: Type.String()
-})
+  registration_status: Type.Optional(Type.String())
+}, { additionalProperties: true })
 
 const LogoutResponse = Type.Object({
   logout_status: Type.String()
@@ -90,9 +112,13 @@ const authRoutesPlugin: FastifyPluginAsync<AuthRoutesOptions> = async (fastify: 
       // eslint-disable-next-line camelcase
       const { resource, redirect_uri } = request.query as { resource?: string; redirect_uri?: string }
 
-      // Create authorization request with PKCE
+      // Build the callback URL for this server (required for OIDC compliance)
+      const callbackUrl = `${request.protocol}://${request.host}/oauth/callback`
+
+      // Create authorization request with PKCE and redirect_uri
       const authRequest = await fastify.oauthClient.createAuthorizationRequest({
-        ...(resource && { resource })
+        ...(resource && { resource }),
+        redirect_uri: callbackUrl
       })
 
       // Store session data in session store
@@ -101,7 +127,8 @@ const authRoutesPlugin: FastifyPluginAsync<AuthRoutesOptions> = async (fastify: 
         pkce: authRequest.pkce,
         resourceUri: resource,
         // eslint-disable-next-line camelcase
-        originalUrl: redirect_uri
+        originalUrl: redirect_uri,
+        callbackUrl // Store for token exchange (must match)
       }
 
       // Create session metadata with auth session data
@@ -175,12 +202,13 @@ const authRoutesPlugin: FastifyPluginAsync<AuthRoutesOptions> = async (fastify: 
       // Clean up session data
       await sessionStore.delete(state)
 
-      // Exchange authorization code for tokens
+      // Exchange authorization code for tokens (include redirect_uri for OIDC compliance)
       const tokens = await fastify.oauthClient.exchangeCodeForToken(
         code,
         sessionData.pkce,
         sessionData.state,
-        state
+        state,
+        sessionData.callbackUrl
       )
 
       // Return tokens to client or redirect with tokens
@@ -304,25 +332,100 @@ const authRoutesPlugin: FastifyPluginAsync<AuthRoutesOptions> = async (fastify: 
     }
   })
 
-  // Dynamic client registration endpoint (if enabled)
+  // Dynamic client registration endpoint (RFC 7591)
+  //
+  // When dcrHooks is configured: Acts as a proxy to upstreamEndpoint with hook interception.
+  // This is required when the authorization server advertises this MCP server as its
+  // registration_endpoint (to add custom logic like response cleaning).
+  //
+  // When dcrHooks is NOT configured: Returns 501 Not Implemented.
+  // Clients should use the authorization server's DCR endpoint directly.
+  // (Using oauth-client.dynamicClientRegistration here would cause an infinite loop
+  // if OIDC discovery points back to this server.)
   fastify.post('/oauth/register', {
     schema: {
+      body: DynamicRegistrationRequest,
       response: {
         200: DynamicRegistrationResponse,
-        400: ErrorResponse
+        400: ErrorResponse,
+        501: ErrorResponse,
+        502: ErrorResponse
       }
     }
-  }, async (_, reply) => {
-    try {
-      const registration = await fastify.oauthClient.dynamicClientRegistration()
+  }, async (request, reply) => {
+    const { dcrHooks } = opts
 
-      return reply.send({
-        client_id: registration.clientId,
-        client_secret: registration.clientSecret,
-        registration_status: 'success'
+    // DCR proxy requires hooks configuration
+    if (!dcrHooks) {
+      fastify.log.warn('DCR: request received but dcrHooks not configured')
+      return reply.status(501).send({
+        error: 'not_implemented',
+        error_description: 'Dynamic client registration proxy not configured. Use the authorization server\'s registration endpoint directly.'
       })
+    }
+
+    let clientMetadata = (request.body || {}) as DCRRequest
+
+    fastify.log.info({ dcrRequest: clientMetadata }, 'DCR: received registration request')
+
+    try {
+      // Call onRequest hook if defined
+      if (dcrHooks.onRequest) {
+        clientMetadata = await dcrHooks.onRequest(clientMetadata, fastify.log)
+      }
+
+      // Forward to upstream endpoint (explicit config avoids OIDC discovery loop)
+      const upstreamResponse = await fetch(dcrHooks.upstreamEndpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json'
+        },
+        body: JSON.stringify(clientMetadata)
+      })
+
+      if (!upstreamResponse.ok) {
+        const errorText = await upstreamResponse.text()
+        fastify.log.warn(
+          { status: upstreamResponse.status, error: errorText },
+          'DCR: upstream registration failed'
+        )
+        // Try to parse as JSON error, fallback to text
+        try {
+          const errorJson = JSON.parse(errorText)
+          return reply.status(400).send(errorJson)
+        } catch {
+          return reply.status(400).send({
+            error: 'registration_failed',
+            error_description: errorText
+          })
+        }
+      }
+
+      let dcrResponse = await upstreamResponse.json() as DCRResponse
+
+      fastify.log.info(
+        { clientId: dcrResponse.client_id },
+        'DCR: upstream registration successful'
+      )
+
+      // Call onResponse hook if defined
+      if (dcrHooks.onResponse) {
+        dcrResponse = await dcrHooks.onResponse(dcrResponse, clientMetadata, fastify.log)
+      }
+
+      return reply.status(200).send(dcrResponse)
     } catch (error) {
-      fastify.log.error({ error }, 'Dynamic client registration failed')
+      fastify.log.error({ error }, 'DCR: registration failed')
+
+      // Network error - upstream unreachable
+      if (error instanceof TypeError && error.message.includes('fetch')) {
+        return reply.status(502).send({
+          error: 'bad_gateway',
+          error_description: 'Failed to communicate with upstream authorization server'
+        })
+      }
+
       return reply.status(400).send({
         error: 'registration_failed',
         error_description: error instanceof Error ? error.message : 'Client registration failed'

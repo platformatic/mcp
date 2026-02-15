@@ -17,8 +17,15 @@ export function createAuthPreHandler (
       return
     }
 
-    // Skip authorization for the start of the OAuth authorization flow.
-    if (request.url.startsWith('/oauth/authorize')) {
+    // Skip authorization for OAuth flow endpoints (authorize initiates, callback receives code, register is pre-auth)
+    if (request.url.startsWith('/oauth/authorize') || request.url.startsWith('/oauth/callback') || request.url.startsWith('/oauth/register')) {
+      return
+    }
+
+    // Skip authorization for custom excluded paths
+    if (config.excludedPaths?.some(path =>
+      typeof path === 'string' ? request.url.startsWith(path) : path.test(request.url)
+    )) {
       return
     }
 
