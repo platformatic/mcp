@@ -6,6 +6,8 @@ export type AuthorizationConfig =
     enabled: true
     authorizationServers: string[]
     resourceUri: string
+    /** Paths to exclude from authorization (e.g., health checks). Supports string prefix or RegExp. */
+    excludedPaths?: (string | RegExp)[]
     tokenValidation: {
       introspectionEndpoint?: string
       jwksUri?: string
