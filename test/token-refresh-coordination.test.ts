@@ -430,6 +430,7 @@ describe('Token Refresh Service Coordination', () => {
         eventId: 0,
         createdAt: new Date(),
         lastActivity: new Date(),
+        streams: new Map(),
         authorization: {
           userId: 'user123',
           tokenHash: 'old-token-hash',
