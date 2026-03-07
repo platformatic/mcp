@@ -23,7 +23,7 @@ import {
   INVALID_PARAMS
 } from './schema.ts'
 
-import type { MCPTool, MCPResource, MCPPrompt, MCPPluginOptions } from './types.ts'
+import type { MCPTool, MCPResource, MCPPrompt, MCPPluginOptions, ResourceHandlers } from './types.ts'
 import type { AuthorizationContext } from './types/auth-types.ts'
 import { validate, CallToolRequestSchema, ReadResourceRequestSchema, GetPromptRequestSchema, isTypeBoxSchema } from './validation/index.ts'
 import { sanitizeToolParams, assessToolSecurity, SECURITY_WARNINGS } from './security.ts'
@@ -36,6 +36,7 @@ type HandlerDependencies = {
   tools: Map<string, MCPTool>
   resources: Map<string, MCPResource>
   prompts: Map<string, MCPPrompt>
+  resourceHandlers: ResourceHandlers
   request: FastifyRequest
   reply: FastifyReply
   authContext?: AuthorizationContext
@@ -259,7 +260,19 @@ async function handleResourcesRead (
   const params = paramsValidation.data
   const uri = params.uri
 
-  const resource = resources.get(uri)
+  // Try exact match first
+  let resource = resources.get(uri)
+
+  // If not found and URI has query params, try base URI for resources with uriSchema
+  if (!resource && uri.includes('?')) {
+    const baseUri = uri.split('?')[0]
+    const baseResource = resources.get(baseUri)
+    // Only use base resource if it has a uriSchema (expects query params)
+    if (baseResource?.definition?.uriSchema) {
+      resource = baseResource
+    }
+  }
+
   if (!resource) {
     return createError(request.id, METHOD_NOT_FOUND, `Resource '${uri}' not found`)
   }
@@ -440,6 +453,64 @@ async function handlePromptsGet (
   }
 }
 
+async function handleResourcesSubscribe (
+  request: JSONRPCRequest,
+  sessionId: string | undefined,
+  dependencies: HandlerDependencies
+): Promise<JSONRPCResponse | JSONRPCError> {
+  const { resourceHandlers } = dependencies
+
+  if (!resourceHandlers.subscribeHandler) {
+    return createError(request.id, METHOD_NOT_FOUND, 'resources/subscribe handler not configured')
+  }
+
+  const params = request.params as { uri: string }
+  if (!params?.uri) {
+    return createError(request.id, INVALID_PARAMS, 'Missing required parameter: uri')
+  }
+
+  try {
+    const result = await resourceHandlers.subscribeHandler(params, {
+      sessionId,
+      request: dependencies.request,
+      reply: dependencies.reply,
+      authContext: dependencies.authContext
+    })
+    return createResponse(request.id, result)
+  } catch (error: any) {
+    return createError(request.id, INTERNAL_ERROR, `Subscribe failed: ${error.message || error}`)
+  }
+}
+
+async function handleResourcesUnsubscribe (
+  request: JSONRPCRequest,
+  sessionId: string | undefined,
+  dependencies: HandlerDependencies
+): Promise<JSONRPCResponse | JSONRPCError> {
+  const { resourceHandlers } = dependencies
+
+  if (!resourceHandlers.unsubscribeHandler) {
+    return createError(request.id, METHOD_NOT_FOUND, 'resources/unsubscribe handler not configured')
+  }
+
+  const params = request.params as { uri: string }
+  if (!params?.uri) {
+    return createError(request.id, INVALID_PARAMS, 'Missing required parameter: uri')
+  }
+
+  try {
+    const result = await resourceHandlers.unsubscribeHandler(params, {
+      sessionId,
+      request: dependencies.request,
+      reply: dependencies.reply,
+      authContext: dependencies.authContext
+    })
+    return createResponse(request.id, result)
+  } catch (error: any) {
+    return createError(request.id, INTERNAL_ERROR, `Unsubscribe failed: ${error.message || error}`)
+  }
+}
+
 export async function handleRequest (
   request: JSONRPCRequest,
   sessionId: string | undefined,
@@ -469,6 +540,10 @@ export async function handleRequest (
         return await handleToolsCall(request, sessionId, dependencies)
       case 'resources/read':
         return await handleResourcesRead(request, sessionId, dependencies)
+      case 'resources/subscribe':
+        return await handleResourcesSubscribe(request, sessionId, dependencies)
+      case 'resources/unsubscribe':
+        return await handleResourcesUnsubscribe(request, sessionId, dependencies)
       case 'prompts/get':
         return await handlePromptsGet(request, sessionId, dependencies)
       default:
