@@ -9,6 +9,7 @@ export interface AuthSession {
   pkce: PKCEChallenge
   resourceUri?: string
   originalUrl?: string
+  callbackUrl?: string // The redirect_uri used in authorization request (required for OIDC token exchange)
 }
 
 export interface AuthorizationCallbackQuery {
@@ -90,9 +91,13 @@ const authRoutesPlugin: FastifyPluginAsync<AuthRoutesOptions> = async (fastify: 
       // eslint-disable-next-line camelcase
       const { resource, redirect_uri } = request.query as { resource?: string; redirect_uri?: string }
 
-      // Create authorization request with PKCE
+      // Build the callback URL for this server (required for OIDC compliance)
+      const callbackUrl = `${request.protocol}://${request.host}/oauth/callback`
+
+      // Create authorization request with PKCE and redirect_uri
       const authRequest = await fastify.oauthClient.createAuthorizationRequest({
-        ...(resource && { resource })
+        ...(resource && { resource }),
+        redirect_uri: callbackUrl
       })
 
       // Store session data in session store
@@ -101,7 +106,8 @@ const authRoutesPlugin: FastifyPluginAsync<AuthRoutesOptions> = async (fastify: 
         pkce: authRequest.pkce,
         resourceUri: resource,
         // eslint-disable-next-line camelcase
-        originalUrl: redirect_uri
+        originalUrl: redirect_uri,
+        callbackUrl // Store for token exchange (must match)
       }
 
       // Create session metadata with auth session data
@@ -175,12 +181,13 @@ const authRoutesPlugin: FastifyPluginAsync<AuthRoutesOptions> = async (fastify: 
       // Clean up session data
       await sessionStore.delete(state)
 
-      // Exchange authorization code for tokens
+      // Exchange authorization code for tokens (include redirect_uri for OIDC compliance)
       const tokens = await fastify.oauthClient.exchangeCodeForToken(
         code,
         sessionData.pkce,
         sessionData.state,
-        state
+        state,
+        sessionData.callbackUrl
       )
 
       // Return tokens to client or redirect with tokens
