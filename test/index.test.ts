@@ -2,6 +2,7 @@ import { test, describe } from 'node:test'
 import type { TestContext } from 'node:test'
 import Fastify from 'fastify'
 import mcpPlugin from '../src/index.ts'
+import { handleRequest } from '../src/handlers.ts'
 import type {
   JSONRPCRequest,
   JSONRPCResponse,
@@ -199,23 +200,28 @@ describe('MCP Fastify Plugin', () => {
       await app.register(mcpPlugin)
       await app.ready()
 
-      const request: JSONRPCRequest = {
-        jsonrpc: JSONRPC_VERSION,
-        id: 10,
-        method: 'tools/list'
-      }
-
-      const response = await app.inject({
-        method: 'POST',
-        url: '/mcp',
-        payload: request
+      // Call handleRequest directly to inspect the in-memory result object
+      // before JSON serialization (JSON.stringify strips undefined, fast-json-stringify converts it to null)
+      const request: JSONRPCRequest = { jsonrpc: JSONRPC_VERSION, id: 10, method: 'tools/list' }
+      const result = await handleRequest(request, undefined, {
+        app,
+        opts: {},
+        capabilities: {},
+        serverInfo: { name: 'test', version: '1.0.0' },
+        tools: new Map(),
+        resources: new Map(),
+        prompts: new Map(),
+        request: {} as Fastify.FastifyRequest,
+        reply: {} as Fastify.FastifyReply
       })
 
-      t.assert.strictEqual(response.statusCode, 200)
-      const body = response.json() as JSONRPCResponse
-      // nextCursor must not be present at all — MCP spec defines it as type "string",
-      // so a null value (from undefined serialization) violates the schema.
-      t.assert.strictEqual('nextCursor' in body.result, false, 'nextCursor should not be present in tools/list result')
+      // MCP spec defines nextCursor as type "string" — the property must not exist on the result object.
+      // Setting `nextCursor: undefined` makes it an own property that serializers may convert to null.
+      t.assert.strictEqual(
+        Object.hasOwn((result as JSONRPCResponse).result, 'nextCursor'),
+        false,
+        'nextCursor key must not exist on the tools/list result object'
+      )
     })
 
     test('should not include nextCursor in resources/list response (MCP spec compliance)', async (t: TestContext) => {
@@ -225,21 +231,24 @@ describe('MCP Fastify Plugin', () => {
       await app.register(mcpPlugin)
       await app.ready()
 
-      const request: JSONRPCRequest = {
-        jsonrpc: JSONRPC_VERSION,
-        id: 11,
-        method: 'resources/list'
-      }
-
-      const response = await app.inject({
-        method: 'POST',
-        url: '/mcp',
-        payload: request
+      const request: JSONRPCRequest = { jsonrpc: JSONRPC_VERSION, id: 11, method: 'resources/list' }
+      const result = await handleRequest(request, undefined, {
+        app,
+        opts: {},
+        capabilities: {},
+        serverInfo: { name: 'test', version: '1.0.0' },
+        tools: new Map(),
+        resources: new Map(),
+        prompts: new Map(),
+        request: {} as Fastify.FastifyRequest,
+        reply: {} as Fastify.FastifyReply
       })
 
-      t.assert.strictEqual(response.statusCode, 200)
-      const body = response.json() as JSONRPCResponse
-      t.assert.strictEqual('nextCursor' in body.result, false, 'nextCursor should not be present in resources/list result')
+      t.assert.strictEqual(
+        Object.hasOwn((result as JSONRPCResponse).result, 'nextCursor'),
+        false,
+        'nextCursor key must not exist on the resources/list result object'
+      )
     })
 
     test('should not include nextCursor in prompts/list response (MCP spec compliance)', async (t: TestContext) => {
@@ -249,21 +258,24 @@ describe('MCP Fastify Plugin', () => {
       await app.register(mcpPlugin)
       await app.ready()
 
-      const request: JSONRPCRequest = {
-        jsonrpc: JSONRPC_VERSION,
-        id: 12,
-        method: 'prompts/list'
-      }
-
-      const response = await app.inject({
-        method: 'POST',
-        url: '/mcp',
-        payload: request
+      const request: JSONRPCRequest = { jsonrpc: JSONRPC_VERSION, id: 12, method: 'prompts/list' }
+      const result = await handleRequest(request, undefined, {
+        app,
+        opts: {},
+        capabilities: {},
+        serverInfo: { name: 'test', version: '1.0.0' },
+        tools: new Map(),
+        resources: new Map(),
+        prompts: new Map(),
+        request: {} as Fastify.FastifyRequest,
+        reply: {} as Fastify.FastifyReply
       })
 
-      t.assert.strictEqual(response.statusCode, 200)
-      const body = response.json() as JSONRPCResponse
-      t.assert.strictEqual('nextCursor' in body.result, false, 'nextCursor should not be present in prompts/list result')
+      t.assert.strictEqual(
+        Object.hasOwn((result as JSONRPCResponse).result, 'nextCursor'),
+        false,
+        'nextCursor key must not exist on the prompts/list result object'
+      )
     })
 
     test('should handle tools/call request for non-existent tool', async (t: TestContext) => {
