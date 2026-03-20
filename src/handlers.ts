@@ -87,7 +87,6 @@ function handleToolsList (request: JSONRPCRequest, dependencies: HandlerDependen
       }
       return tool
     }),
-    nextCursor: undefined
   }
   return createResponse(request.id, result)
 }
@@ -96,7 +95,6 @@ function handleResourcesList (request: JSONRPCRequest, dependencies: HandlerDepe
   const { resources } = dependencies
   const result: ListResourcesResult = {
     resources: Array.from(resources.values()).map(r => r.definition),
-    nextCursor: undefined
   }
   return createResponse(request.id, result)
 }
@@ -105,7 +103,6 @@ function handlePromptsList (request: JSONRPCRequest, dependencies: HandlerDepend
   const { prompts } = dependencies
   const result: ListPromptsResult = {
     prompts: Array.from(prompts.values()).map(p => p.definition),
-    nextCursor: undefined
   }
   return createResponse(request.id, result)
 }
