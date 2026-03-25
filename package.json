@@ -11,7 +11,8 @@
     "lint": "eslint --cache",
     "lint:fix": "eslint --cache --fix",
     "typecheck": "tsc -p . --noEmit",
-    "test": "node --experimental-strip-types --no-warnings --test --test-timeout=30000 --test-concurrency=1 test/*.test.ts",
+    "test:types": "tsd",
+    "test": "npm run test:types && node --experimental-strip-types --no-warnings --test --test-timeout=30000 --test-concurrency=1 test/*.test.ts",
     "ci": "npm run build && npm run lint && npm run test",
     "start-demo": "node --watch examples/file-listing-server.ts | pino-pretty --colorize --translateTime 'SYS:standard' --ignore pid,hostname"
   },
@@ -42,6 +43,7 @@
     "fastify": "^5.4.0",
     "neostandard": "^0.13.0",
     "pino-pretty": "^13.0.0",
+    "tsd": "^0.33.0",
     "typescript": "^5.8.3",
     "undici": "^7.11.0"
   },
