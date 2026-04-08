@@ -92,7 +92,10 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
 
   // Register OAuth client routes if OAuth client is configured
   if (opts.authorization?.enabled && opts.authorization?.oauth2Client) {
-    await app.register(authRoutesPlugin, { sessionStore })
+    await app.register(authRoutesPlugin, {
+      sessionStore,
+      dcrHooks: opts.authorization.dcrHooks
+    })
   }
 
   // Register decorators first
@@ -202,7 +205,11 @@ export type {
   AuthorizationConfig,
   TokenValidationResult,
   ProtectedResourceMetadata,
-  TokenIntrospectionResponse
+  TokenIntrospectionResponse,
+  IntrospectionAuthConfig,
+  DCRRequest,
+  DCRResponse,
+  DCRHooks
 } from './types/auth-types.ts'
 
 export type {
