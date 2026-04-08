@@ -143,6 +143,7 @@ export interface MCPPluginOptions {
     port: number
     password?: string
     db?: number
+    tls?: Record<string, unknown>
   }
   authorization?: AuthorizationConfig
 }
