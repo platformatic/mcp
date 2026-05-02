@@ -175,9 +175,9 @@ describe('Authorization Compatibility Tests', () => {
       authorization: { enabled: false }
     })
 
-    // Register a test resource
+    // Register a test resource (concrete URI so it appears in resources/list)
     app.mcpAddResource({
-      uriPattern: 'test://resource/{id}',
+      uriPattern: 'test://resource/static',
       name: 'test-resource',
       description: 'A test resource'
     }, async (uri) => {
