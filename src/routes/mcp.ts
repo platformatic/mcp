@@ -329,6 +329,45 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     }
   })
 
+  // DELETE endpoint for explicit session termination (MCP spec)
+  if (enableSSE) {
+    app.delete('/mcp', async (request: FastifyRequest, reply: FastifyReply) => {
+      const sessionId = request.headers['mcp-session-id'] as string
+      if (!sessionId) {
+        reply.code(400).send({ error: 'Missing Mcp-Session-Id header' })
+        return
+      }
+
+      const session = await sessionStore.get(sessionId)
+      if (!session) {
+        reply.code(404).send({ error: 'Session not found' })
+        return
+      }
+
+      // Force-close any active SSE streams for this session
+      const streams = localStreams.get(sessionId)
+      if (streams) {
+        for (const stream of streams) {
+          try {
+            stream.raw.end()
+          } catch {
+            // stream may already be closed
+          }
+        }
+        localStreams.delete(sessionId)
+      }
+
+      // Unsubscribe from message broker
+      await messageBroker.unsubscribe(`mcp/session/${sessionId}/message`)
+
+      // Delete session from store
+      await sessionStore.delete(sessionId)
+
+      app.log.info({ sessionId }, 'Session terminated via DELETE')
+      reply.code(204).send()
+    })
+  }
+
   // Subscribe to broadcast notifications
   if (enableSSE) {
     messageBroker.subscribe('mcp/broadcast/notification', (notification: JSONRPCMessage) => {
