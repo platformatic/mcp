@@ -37,6 +37,7 @@
     "@fastify/pre-commit": "^2.2.0",
     "@modelcontextprotocol/inspector": "^0.21.0",
     "@modelcontextprotocol/sdk": "^1.13.3",
+    "@opentelemetry/api": "^1.9.0",
     "@sinclair/typebox": "^0.34.37",
     "@types/node": "^24.0.10",
     "eslint": "^9.30.0",
@@ -60,7 +61,13 @@
     "safe-stable-stringify": "^2.5.0"
   },
   "peerDependencies": {
+    "@opentelemetry/api": ">=1.0.0",
     "@sinclair/typebox": "^0.34.0"
+  },
+  "peerDependenciesMeta": {
+    "@opentelemetry/api": {
+      "optional": true
+    }
   },
   "files": [
     "dist",
