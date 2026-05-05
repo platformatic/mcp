@@ -352,6 +352,190 @@ describe('TokenValidator', () => {
     })
   })
 
+  describe('Custom Introspection Endpoint Path', () => {
+    // Some providers use non-standard introspection paths (e.g. /oauth2/introspection rather than /introspect)
+    test('should validate token via custom /oauth2/introspection path', async (t: TestContext) => {
+      const config = createTestAuthConfig({
+        tokenValidation: {
+          introspectionEndpoint: 'https://sample-instance-01.authkit.app/oauth2/introspection',
+          validateAudience: true
+        }
+      })
+
+      restoreMock = setupMockAgent({
+        'https://sample-instance-01.authkit.app/oauth2/introspection': createIntrospectionResponse(true)
+      })
+
+      const validator = new TokenValidator(config, app)
+      const result = await validator.validateToken('opaque-token-123')
+
+      t.assert.strictEqual(result.valid, true)
+      t.assert.ok(result.payload)
+      t.assert.strictEqual(result.payload.active, true)
+
+      validator.close()
+    })
+
+    test('should reject inactive token via custom /oauth2/introspection path', async (t: TestContext) => {
+      const config = createTestAuthConfig({
+        tokenValidation: {
+          introspectionEndpoint: 'https://sample-instance-01.authkit.app/oauth2/introspection',
+          validateAudience: true
+        }
+      })
+
+      restoreMock = setupMockAgent({
+        'https://sample-instance-01.authkit.app/oauth2/introspection': createIntrospectionResponse(false)
+      })
+
+      const validator = new TokenValidator(config, app)
+      const result = await validator.validateToken('opaque-token-123')
+
+      t.assert.strictEqual(result.valid, false)
+      t.assert.strictEqual(result.error, 'Token is not active')
+
+      validator.close()
+    })
+
+    test('should validate token via deeply nested custom introspection path', async (t: TestContext) => {
+      const config = createTestAuthConfig({
+        tokenValidation: {
+          introspectionEndpoint: 'https://auth.example.com/v1/tokens/validate',
+          validateAudience: true
+        }
+      })
+
+      restoreMock = setupMockAgent({
+        'https://auth.example.com/v1/tokens/validate': createIntrospectionResponse(true)
+      })
+
+      const validator = new TokenValidator(config, app)
+      const result = await validator.validateToken('opaque-token-123')
+
+      t.assert.strictEqual(result.valid, true)
+      t.assert.ok(result.payload)
+
+      validator.close()
+    })
+
+    test('should handle error from custom introspection path', async (t: TestContext) => {
+      const config = createTestAuthConfig({
+        tokenValidation: {
+          introspectionEndpoint: 'https://sample-instance-01.authkit.app/oauth2/introspection',
+          validateAudience: true
+        }
+      })
+
+      restoreMock = setupMockAgent({
+        'https://sample-instance-01.authkit.app/oauth2/introspection': {
+          status: 401,
+          body: { error: 'unauthorized' }
+        }
+      })
+
+      const validator = new TokenValidator(config, app)
+      const result = await validator.validateToken('opaque-token-123')
+
+      t.assert.strictEqual(result.valid, false)
+      t.assert.ok(result.error?.includes('Introspection failed with status 401'))
+
+      validator.close()
+    })
+  })
+
+  describe('Custom JWKS URI Path', () => {
+    // Some providers use non-standard JWKS paths (e.g. /oauth2/jwks rather than /.well-known/jwks.json)
+    test('should validate JWT using custom JSWKS path', async (t: TestContext) => {
+      const config = createTestAuthConfig({
+        tokenValidation: {
+          jwksUri: 'https://sample-instance-01.authkit.app/oauth2/jwks',
+          validateAudience: true
+        }
+      })
+      restoreMock = setupMockAgent({
+        'https://sample-instance-01.authkit.app/oauth2/jwks': generateMockJWKSResponse()
+      })
+
+      const validator = new TokenValidator(config, app)
+      const token = createTestJWT({ iss: 'https://sample-instance-01.authkit.app', aud: 'https://mcp.example.com' })
+
+      const result = await validator.validateToken(token)
+
+      t.assert.strictEqual(result.valid, true)
+      t.assert.ok(result.payload)
+      t.assert.strictEqual(result.payload.sub, 'test-user')
+
+      validator.close()
+    })
+
+    test('should validate JWT using deeply nested custom JWKS path', async (t: TestContext) => {
+      const config = createTestAuthConfig({
+        tokenValidation: {
+          jwksUri: 'https://auth.example.com/auth/realms/myrealm/protocol/openid-connect/certs',
+          validateAudience: true
+        }
+      })
+      restoreMock = setupMockAgent({
+        'https://auth.example.com/auth/realms/myrealm/protocol/openid-connect/certs': generateMockJWKSResponse()
+      })
+
+      const validator = new TokenValidator(config, app)
+      const token = createTestJWT()
+
+      const result = await validator.validateToken(token)
+
+      t.assert.strictEqual(result.valid, true)
+      t.assert.ok(result.payload)
+
+      validator.close()
+    })
+
+    test('should fail JWT validation when custom JWKS path returns 404', async (t: TestContext) => {
+      const config = createTestAuthConfig({
+        tokenValidation: {
+          jwksUri: 'https://sample-instance-01.authkit.app/oauth2/jwks',
+          validateAudience: false
+        }
+      })
+      restoreMock = setupMockAgent({
+        'https://sample-instance-01.authkit.app/oauth2/jwks': { status: 404, body: { error: 'not found' } }
+      })
+
+      const validator = new TokenValidator(config, app)
+      const token = createTestJWT({ iss: 'https://sample-instance-01.authkit.app', aud: 'https://mcp.example.com' })
+
+      const result = await validator.validateToken(token)
+
+      t.assert.strictEqual(result.valid, false)
+      t.assert.ok(result.error)
+
+      validator.close()
+    })
+
+    test('should not fetch /.well-known/jwks.json when custom path configured', async (t: TestContext) => {
+      const config = createTestAuthConfig({
+        tokenValidation: {
+          jwksUri: 'https://sample-instance-01.authkit.app/oauth2/jwks',
+          validateAudience: false
+        }
+      })
+      // Only mock the custom path — if the validator incorrectly fetches the default
+      // path, disableNetConnect will cause it to fail
+      restoreMock = setupMockAgent({
+        'https://sample-instance-01.authkit.app/oauth2/jwks': generateMockJWKSResponse()
+      })
+
+      const validator = new TokenValidator(config, app)
+      const token = createTestJWT({ iss: 'https://sample-instance-01.authkit.app', aud: 'https://mcp.example.com' })
+
+      const result = await validator.validateToken(token)
+
+      t.assert.strictEqual(result.valid, true)
+
+      validator.close()
+    })
+  })
+
   describe('Fallback Logic', () => {
     test('should fallback to introspection when JWT validation fails', async (t: TestContext) => {
       const config = createTestAuthConfig({
