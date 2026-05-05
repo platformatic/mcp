@@ -164,13 +164,10 @@ export function setupMockAgent (responses: Record<string, any>) {
       method: 'GET'
     }).reply(statusCode, JSON.stringify(responseBody), headers).persist()
 
-    // Also intercept POST for introspection endpoints
-    if (url.includes('/introspect')) {
-      mockPool.intercept({
-        path: urlObj.pathname + urlObj.search,
-        method: 'POST'
-      }).reply(statusCode, JSON.stringify(responseBody), headers).persist()
-    }
+    mockPool.intercept({
+      path: urlObj.pathname + urlObj.search,
+      method: 'POST'
+    }).reply(statusCode, JSON.stringify(responseBody), headers).persist()
   }
 
   return () => {

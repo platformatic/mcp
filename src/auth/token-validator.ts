@@ -25,7 +25,8 @@ export class TokenValidator {
 
       this.getJwks = buildGetJwks({
         max: 50,
-        ttl: 600000 // 10 minutes
+        ttl: 600000, // 10 minutes
+        jwksPath: jwksUrl.pathname
       })
 
       this.jwtVerifier = createVerifier({
