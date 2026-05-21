@@ -216,16 +216,32 @@ export class TokenRefreshService {
    * This is separated from coordination logic for clarity
    */
   private async performTokenRefresh (): Promise<void> {
-    // This is a simplified implementation placeholder
-    // In a complete implementation, you would:
-    // 1. Query session store for sessions with expiring tokens
-    // 2. Iterate through sessions and refresh tokens as needed
-    // 3. Update session store with new token information
-    // 4. Send notifications to affected sessions
+    const sessions = await this.sessionStore.list()
+    const refreshableSessions = sessions.filter(session =>
+      session.authorization &&
+      session.tokenRefresh &&
+      shouldAttemptRefresh(session.authorization, session.tokenRefresh)
+    )
+
+    for (const session of refreshableSessions) {
+      try {
+        await this.refreshSessionToken(session.id)
+      } catch (error) {
+        if (this.fastify) {
+          this.fastify.log.warn({
+            error,
+            sessionId: session.id,
+            instanceId: this.instanceId
+          }, 'Background token refresh failed for session')
+        }
+      }
+    }
 
     if (this.fastify) {
       this.fastify.log.debug({
-        instanceId: this.instanceId
+        instanceId: this.instanceId,
+        checkedSessions: sessions.length,
+        refreshedCandidates: refreshableSessions.length
       }, 'Token refresh service check completed')
     }
   }

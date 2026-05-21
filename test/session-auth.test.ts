@@ -298,6 +298,44 @@ describe('Session-Based Authorization', () => {
       assert.strictEqual(body.message, 'public')
     })
 
+    test('should skip authorization for MCP well-known endpoints', async (t) => {
+      const fastify = Fastify()
+      t.after(async () => {
+        await fastify.close()
+      })
+
+      const config = {
+        enabled: true,
+        authorizationServers: ['https://auth.example.com'],
+        resourceUri: 'https://api.example.com',
+        tokenValidation: {
+          jwksUri: 'https://auth.example.com/.well-known/jwks.json',
+          validateAudience: true
+        }
+      }
+
+      const sessionStore = new MemorySessionStore(100)
+      const tokenValidator = new TokenValidator(config, fastify)
+
+      const preHandler = createSessionAuthPreHandler({
+        config,
+        tokenValidator,
+        sessionStore
+      })
+
+      fastify.addHook('preHandler', preHandler)
+      fastify.get('/mcp/.well-known/oauth-protected-resource', async () => ({ message: 'public' }))
+
+      const response = await fastify.inject({
+        method: 'GET',
+        url: '/mcp/.well-known/oauth-protected-resource'
+      })
+
+      assert.strictEqual(response.statusCode, 200)
+      const body = JSON.parse(response.body)
+      assert.strictEqual(body.message, 'public')
+    })
+
     test('should skip authorization for the start of the OAuth authorization flow', async (t) => {
       const fastify = Fastify()
       t.after(async () => {
@@ -335,6 +373,99 @@ describe('Session-Based Authorization', () => {
       assert.strictEqual(response.statusCode, 200)
       const body = JSON.parse(response.body)
       assert.strictEqual(body.message, 'public')
+    })
+
+    test('should skip authorization for OAuth callback and registration endpoints', async (t) => {
+      const fastify = Fastify()
+      t.after(async () => {
+        await fastify.close()
+      })
+
+      const config = {
+        enabled: true,
+        authorizationServers: ['https://auth.example.com'],
+        resourceUri: 'https://api.example.com',
+        tokenValidation: {
+          jwksUri: 'https://auth.example.com/.well-known/jwks.json',
+          validateAudience: true
+        }
+      }
+
+      const sessionStore = new MemorySessionStore(100)
+      const tokenValidator = new TokenValidator(config, fastify)
+
+      const preHandler = createSessionAuthPreHandler({
+        config,
+        tokenValidator,
+        sessionStore
+      })
+
+      fastify.addHook('preHandler', preHandler)
+      fastify.get('/oauth/callback', async () => ({ message: 'callback-public' }))
+      fastify.post('/oauth/register', async () => ({ message: 'register-public' }))
+
+      const callbackResponse = await fastify.inject({
+        method: 'GET',
+        url: '/oauth/callback'
+      })
+
+      assert.strictEqual(callbackResponse.statusCode, 200)
+      assert.strictEqual(JSON.parse(callbackResponse.body).message, 'callback-public')
+
+      const registerResponse = await fastify.inject({
+        method: 'POST',
+        url: '/oauth/register'
+      })
+
+      assert.strictEqual(registerResponse.statusCode, 200)
+      assert.strictEqual(JSON.parse(registerResponse.body).message, 'register-public')
+    })
+
+    test('should skip authorization for excluded paths', async (t) => {
+      const fastify = Fastify()
+      t.after(async () => {
+        await fastify.close()
+      })
+
+      const config = {
+        enabled: true,
+        authorizationServers: ['https://auth.example.com'],
+        resourceUri: 'https://api.example.com',
+        excludedPaths: ['/health', /^\/public\//],
+        tokenValidation: {
+          jwksUri: 'https://auth.example.com/.well-known/jwks.json',
+          validateAudience: true
+        }
+      }
+
+      const sessionStore = new MemorySessionStore(100)
+      const tokenValidator = new TokenValidator(config, fastify)
+
+      const preHandler = createSessionAuthPreHandler({
+        config,
+        tokenValidator,
+        sessionStore
+      })
+
+      fastify.addHook('preHandler', preHandler)
+      fastify.get('/health/ready', async () => ({ message: 'ok' }))
+      fastify.get('/public/info', async () => ({ message: 'public' }))
+
+      const healthResponse = await fastify.inject({
+        method: 'GET',
+        url: '/health/ready'
+      })
+
+      assert.strictEqual(healthResponse.statusCode, 200)
+      assert.strictEqual(JSON.parse(healthResponse.body).message, 'ok')
+
+      const publicResponse = await fastify.inject({
+        method: 'GET',
+        url: '/public/info'
+      })
+
+      assert.strictEqual(publicResponse.statusCode, 200)
+      assert.strictEqual(JSON.parse(publicResponse.body).message, 'public')
     })
 
     test('should handle invalid bearer token format', async (t) => {
