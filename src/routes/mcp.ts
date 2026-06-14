@@ -189,7 +189,8 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         resourceHandlers,
         request,
         reply,
-        authContext
+        authContext,
+        tracer: opts.telemetry?.tracer
       })
       if (response) {
         return response

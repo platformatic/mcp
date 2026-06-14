@@ -197,8 +197,14 @@ export type {
   SSESession,
   ResourceHandlers,
   ResourceSubscribeHandler,
-  ResourceUnsubscribeHandler
+  ResourceUnsubscribeHandler,
+  TracerLike
 } from './types.ts'
+
+// Export telemetry utilities for advanced consumers
+export { MCP_ATTR, buildSpanAttributes } from './telemetry-constants.ts'
+export { withSpan } from './telemetry.ts'
+export type { HandlerDependencies } from './handlers.ts'
 
 // Export authorization types
 export type {
