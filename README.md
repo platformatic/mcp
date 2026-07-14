@@ -19,6 +19,8 @@ npm install @sinclair/typebox
 ## Features
 
 - **Complete MCP 2025-06-18 Support**: Implements the full Model Context Protocol specification with elicitation
+- **Async Iterator Streaming**: Real-time streaming of tool results via Server-Sent Events
+- **Per-Stream Event IDs**: MCP specification compliant event ID architecture for proper resumability
 - **Elicitation Support**: Server-to-client information requests with schema validation
 - **TypeBox Validation**: Type-safe schema validation with automatic TypeScript inference
 - **Security Enhancements**: Input sanitization, rate limiting, and security assessment
@@ -121,6 +123,179 @@ app.mcpAddPrompt({
 
 await app.listen({ port: 3000 })
 ```
+
+## Async Iterator Streaming
+
+The plugin supports **real-time streaming** of tool results via Server-Sent Events (SSE). Tools that return async iterators automatically stream their results as separate SSE events, enabling real-time progress updates and streaming data processing.
+
+### Basic Streaming Tool
+
+```typescript
+import Fastify from 'fastify'
+import mcpPlugin from '@platformatic/mcp'
+
+const app = Fastify({ logger: true })
+
+await app.register(mcpPlugin, {
+  enableSSE: true, // Required for streaming
+  serverInfo: { name: 'streaming-server', version: '1.0.0' },
+  capabilities: { tools: {} }
+})
+
+// Regular tool (returns JSON immediately)
+app.mcpAddTool({
+  name: 'immediate_response',
+  description: 'Returns immediate result',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      message: { type: 'string' }
+    }
+  }
+}, async (params) => {
+  return {
+    content: [{ type: 'text', text: `Echo: ${params.message}` }]
+  }
+})
+
+// Streaming tool (returns SSE stream)
+app.mcpAddTool({
+  name: 'streaming_counter',
+  description: 'Streams counting progress',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      count: { type: 'number', minimum: 1, maximum: 10 }
+    },
+    required: ['count']
+  }
+}, async function* (params) {
+  // Yield incremental progress updates
+  for (let i = 1; i <= params.count; i++) {
+    yield {
+      content: [{
+        type: 'text',
+        text: `Processing step ${i}/${params.count}...`
+      }]
+    }
+    
+    // Simulate async work
+    await new Promise(resolve => setTimeout(resolve, 500))
+  }
+  
+  // Final result
+  return {
+    content: [{
+      type: 'text',
+      text: `✅ Completed all ${params.count} steps!`
+    }]
+  }
+})
+
+await app.listen({ port: 3000 })
+```
+
+### Streaming Response Format
+
+When a tool returns an async iterator, the plugin automatically:
+
+1. **Detects the async iterator** using `Symbol.asyncIterator`
+2. **Changes response type** to `Content-Type: text/event-stream`
+3. **Streams each yielded value** as a separate SSE event
+4. **Sends the final return value** as the last event
+5. **Handles errors gracefully** during streaming
+
+### Client Usage
+
+```bash
+# Regular tool (returns JSON)
+curl -X POST http://localhost:3000/mcp \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"immediate_response","arguments":{"message":"Hello"}}}'
+
+# Streaming tool (returns text/event-stream)
+curl -X POST http://localhost:3000/mcp \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"streaming_counter","arguments":{"count":3}}}'
+```
+
+### Advanced Streaming Examples
+
+#### File Processing Stream
+```typescript
+app.mcpAddTool({
+  name: 'process_files',
+  description: 'Process multiple files with progress updates'
+}, async function* (params) {
+  for (const [index, filename] of params.files.entries()) {
+    yield {
+      content: [{
+        type: 'text',
+        text: `📁 Processing file ${index + 1}/${params.files.length}: ${filename}`
+      }]
+    }
+    
+    // Simulate file processing
+    await processFile(filename)
+    
+    yield {
+      content: [{
+        type: 'text',
+        text: `✅ Completed: ${filename}`
+      }]
+    }
+  }
+  
+  return {
+    content: [{
+      type: 'text',
+      text: `🎉 All ${params.files.length} files processed!`
+    }]
+  }
+})
+```
+
+#### Error Handling During Streaming
+```typescript
+app.mcpAddTool({
+  name: 'streaming_with_errors',
+  description: 'Demonstrates error handling in streams'
+}, async function* (params) {
+  try {
+    for (let i = 1; i <= 5; i++) {
+      if (i === 3) {
+        throw new Error('Simulated processing error')
+      }
+      
+      yield {
+        content: [{
+          type: 'text',
+          text: `Step ${i}: Working...`
+        }]
+      }
+      
+      await new Promise(resolve => setTimeout(resolve, 300))
+    }
+    
+    return {
+      content: [{ type: 'text', text: 'All steps completed' }]
+    }
+  } catch (error) {
+    // Errors during streaming are handled gracefully
+    // Client receives all yielded values before the error
+    throw error
+  }
+})
+```
+
+### Key Features
+
+- **🔄 Automatic Detection**: No configuration needed - just return an async generator
+- **📡 Real-time Updates**: Each `yield` becomes an immediate SSE event
+- **🛡️ Error Handling**: Partial results preserved, errors handled gracefully
+- **🔙 Backward Compatible**: Existing tools continue to work unchanged
+- **⚡ Performance**: Efficient streaming with proper event ID management
+- **🌊 MCP Compliant**: Per-stream event IDs for proper resumability
 
 ## Elicitation Support (MCP 2025-06-18)
 

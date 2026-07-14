@@ -45,7 +45,7 @@ export interface ResourceHandlers {
 export type ToolHandler<TSchema extends TObject = TObject> = (
   params: Static<TSchema>,
   context: HandlerContext
-) => Promise<CallToolResult> | CallToolResult
+) => Promise<CallToolResult> | CallToolResult | AsyncGenerator<CallToolResult, CallToolResult, unknown>
 
 export type ResourceHandler<TUriSchema extends TSchema = TString> = (
   uri: Static<TUriSchema>,
@@ -132,7 +132,7 @@ declare module 'fastify' {
 }
 
 // Unsafe handler types for backward compatibility
-export type UnsafeToolHandler = (params: any, context: HandlerContext) => Promise<CallToolResult> | CallToolResult
+export type UnsafeToolHandler = (params: any, context: HandlerContext) => Promise<CallToolResult> | CallToolResult | AsyncGenerator<CallToolResult, CallToolResult, unknown>
 export type UnsafeResourceHandler = (uri: string, context: HandlerContext) => Promise<ReadResourceResult> | ReadResourceResult
 export type UnsafePromptHandler = (name: string, args: any, context: HandlerContext) => Promise<GetPromptResult> | GetPromptResult
 
