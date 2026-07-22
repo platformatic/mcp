@@ -2,9 +2,11 @@ import { randomUUID } from 'crypto'
 import type { FastifyRequest, FastifyReply, FastifyPluginAsync } from 'fastify'
 import fp from 'fastify-plugin'
 import type { JSONRPCMessage } from '../schema.ts'
-import { JSONRPC_VERSION, INTERNAL_ERROR } from '../schema.ts'
+import { JSONRPC_VERSION, INTERNAL_ERROR, SUPPORTED_PROTOCOL_VERSIONS, DEFAULT_NEGOTIATED_PROTOCOL_VERSION } from '../schema.ts'
+import { isOriginAllowed } from '../security.ts'
 import type { MCPPluginOptions, MCPTool, MCPResource, MCPPrompt, ResourceHandlers } from '../types.ts'
 import type { SessionStore, SessionMetadata } from '../stores/session-store.ts'
+import type { TaskStore, TaskWaiters } from '../stores/task-store.ts'
 import type { MessageBroker } from '../brokers/message-broker.ts'
 import type { AuthorizationContext } from '../types/auth-types.ts'
 import { processMessage } from '../handlers.ts'
@@ -21,10 +23,55 @@ interface MCPPubSubRoutesOptions {
   sessionStore: SessionStore
   messageBroker: MessageBroker
   localStreams: Map<string, Set<any>>
+  taskStore?: TaskStore
+  taskWaiters?: TaskWaiters
 }
 
 const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async (app, options) => {
-  const { enableSSE, opts, capabilities, serverInfo, tools, resources, prompts, resourceHandlers, sessionStore, messageBroker, localStreams } = options
+  const { enableSSE, opts, capabilities, serverInfo, tools, resources, prompts, resourceHandlers, sessionStore, messageBroker, localStreams, taskStore, taskWaiters } = options
+
+  const allowedOrigins = opts.allowedOrigins
+
+  if (allowedOrigins === undefined) {
+    app.log.warn('MCP: no allowedOrigins configured, Origin validation is disabled. Set allowedOrigins to protect browser clients against DNS rebinding.')
+  }
+
+  // Guard against DNS rebinding: reject browser origins we do not trust.
+  // The 2025-11-25 revision requires 403 here, not 400.
+  async function validateOrigin (request: FastifyRequest, reply: FastifyReply): Promise<void> {
+    const origin = request.headers.origin as string | undefined
+    if (!isOriginAllowed(origin, allowedOrigins)) {
+      request.log.warn({ origin }, 'Rejected MCP request with disallowed Origin')
+      return reply.code(403).type('application/json').send({
+        error: 'Forbidden: Origin not allowed'
+      })
+    }
+  }
+
+  // Clients must echo the negotiated protocol version on every request after
+  // `initialize`. An absent header means 2025-03-26, which predates the header.
+  async function validateProtocolVersionHeader (request: FastifyRequest, reply: FastifyReply): Promise<void> {
+    const header = request.headers['mcp-protocol-version']
+    if (header === undefined) {
+      ;(request as any).mcpProtocolVersion = DEFAULT_NEGOTIATED_PROTOCOL_VERSION
+      return
+    }
+
+    const version = Array.isArray(header) ? header[0] : header
+    if (!(SUPPORTED_PROTOCOL_VERSIONS as readonly string[]).includes(version)) {
+      request.log.warn({ version }, 'Rejected MCP request with unsupported MCP-Protocol-Version header')
+      return reply.code(400).type('application/json').send({
+        error: `Bad Request: unsupported MCP-Protocol-Version '${version}'`,
+        supported: SUPPORTED_PROTOCOL_VERSIONS
+      })
+    }
+
+    ;(request as any).mcpProtocolVersion = version
+  }
+
+  // Scoped to the /mcp routes only: this plugin is not encapsulated, so an
+  // app-level hook would also cover the OAuth and well-known routes.
+  const mcpOnRequest = [validateOrigin, validateProtocolVersionHeader]
 
   async function createSSESession (): Promise<SessionMetadata> {
     const sessionId = randomUUID()
@@ -132,7 +179,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     }
   }
 
-  app.post('/mcp', async (request: FastifyRequest, reply: FastifyReply) => {
+  app.post('/mcp', { onRequest: mcpOnRequest }, async (request: FastifyRequest, reply: FastifyReply) => {
     try {
       const message = request.body as JSONRPCMessage
       let sessionId = request.headers['mcp-session-id'] as string
@@ -189,7 +236,11 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         resourceHandlers,
         request,
         reply,
-        authContext
+        authContext,
+        sessionStore,
+        taskStore,
+        taskWaiters,
+        sessionId
       })
       if (response) {
         return response
@@ -210,7 +261,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
   })
 
   // GET endpoint for server-initiated communication via SSE
-  app.get('/mcp', async (request: FastifyRequest, reply: FastifyReply) => {
+  app.get('/mcp', { onRequest: mcpOnRequest }, async (request: FastifyRequest, reply: FastifyReply) => {
     if (!enableSSE) {
       reply.type('application/json').code(405).send({ error: 'Method Not Allowed: SSE not enabled' })
       return
@@ -300,6 +351,27 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         }
       })
 
+      // SEP-1699: servers may end an SSE stream whenever they like, turning the
+      // stream into a polling channel. The client reconnects with Last-Event-ID
+      // on GET and we replay whatever it missed, so closing here loses nothing.
+      let maxDurationTimer: NodeJS.Timeout | undefined
+      if (opts.sseMaxConnectionMs) {
+        maxDurationTimer = setTimeout(() => {
+          app.log.info({
+            sessionId: session.id,
+            afterMs: opts.sseMaxConnectionMs
+          }, 'Closing SSE stream to let the client poll; it may resume with Last-Event-ID')
+          try {
+            reply.raw.end()
+          } catch {
+            // already gone
+          }
+        }, opts.sseMaxConnectionMs)
+        maxDurationTimer.unref()
+
+        reply.raw.on('close', () => clearTimeout(maxDurationTimer))
+      }
+
       // Send initial heartbeat
       reply.raw.write(': heartbeat\n\n')
 
@@ -331,7 +403,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
   // DELETE endpoint for explicit session termination (MCP spec)
   if (enableSSE) {
-    app.delete('/mcp', async (request: FastifyRequest, reply: FastifyReply) => {
+    app.delete('/mcp', { onRequest: mcpOnRequest }, async (request: FastifyRequest, reply: FastifyReply) => {
       const sessionId = request.headers['mcp-session-id'] as string
       if (!sessionId) {
         reply.code(400).send({ error: 'Missing Mcp-Session-Id header' })

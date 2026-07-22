@@ -22,6 +22,13 @@ export class MemorySessionStore implements SessionStore {
     this.messageHistory.set(metadata.id, [])
   }
 
+  async update (metadata: SessionMetadata): Promise<void> {
+    if (!this.sessions.has(metadata.id)) {
+      return
+    }
+    this.sessions.set(metadata.id, { ...metadata })
+  }
+
   async get (sessionId: string): Promise<SessionMetadata | null> {
     const session = this.sessions.get(sessionId)
     return session ? { ...session } : null

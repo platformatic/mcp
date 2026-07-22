@@ -168,6 +168,63 @@ export function validateElicitationRequest (message: string, schema: any): void 
 }
 
 /**
+ * Validate a URL mode elicitation request (2025-11-25).
+ *
+ * The spec forbids servers from putting anything sensitive in the URL, and
+ * forbids pre-authenticated URLs, because a malicious client could replay them
+ * to impersonate the user. We enforce what is mechanically checkable: a parseable
+ * http(s) URL carrying no embedded credentials.
+ */
+export function validateElicitationUrl (message: string, url: string): void {
+  if (message.length > MAX_STRING_LENGTH) {
+    throw new Error(`Elicitation message length exceeds maximum allowed length of ${MAX_STRING_LENGTH}`)
+  }
+
+  const sanitizedMessage = sanitizeString(message)
+  if (sanitizedMessage !== message) {
+    throw new Error('Elicitation message contains invalid characters')
+  }
+
+  let parsed: URL
+  try {
+    parsed = new URL(url)
+  } catch {
+    throw new Error('Elicitation URL is not a valid URL')
+  }
+
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+    throw new Error(`Elicitation URL must use http or https, got '${parsed.protocol}'`)
+  }
+
+  if (parsed.username || parsed.password) {
+    throw new Error('Elicitation URL must not embed credentials')
+  }
+}
+
+/**
+ * Configured value for the allowed `Origin` headers.
+ *
+ * - `undefined` disables validation (non-browser deployments)
+ * - `'*'` or `true` accepts any origin
+ * - an array accepts exact origin matches only
+ */
+export type AllowedOrigins = string[] | '*' | true | undefined
+
+/**
+ * Check a request `Origin` against the configured allow-list.
+ *
+ * Requests without an `Origin` header are accepted: the header is set by browsers,
+ * and its absence means the request did not come from one. The 2025-11-25 revision
+ * clarified that a rejected origin must be answered with 403, not 400.
+ */
+export function isOriginAllowed (origin: string | undefined, allowed: AllowedOrigins): boolean {
+  if (allowed === undefined) return true
+  if (origin === undefined) return true
+  if (allowed === true || allowed === '*') return true
+  return allowed.includes(origin)
+}
+
+/**
  * Rate limiting helper for preventing abuse
  */
 export class RateLimiter {

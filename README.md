@@ -18,8 +18,10 @@ npm install @sinclair/typebox
 
 ## Features
 
-- **Complete MCP 2025-06-18 Support**: Implements the full Model Context Protocol specification with elicitation
-- **Elicitation Support**: Server-to-client information requests with schema validation
+- **Complete MCP 2025-11-25 Support**: Implements the current Model Context Protocol revision, negotiating down to `2025-06-18`, `2025-03-26` and `2024-11-05` for older clients
+- **Tasks (experimental)**: Task-augmented tool calls with polling, deferred result retrieval and cancellation
+- **Elicitation Support**: Server-to-client information requests in both form and URL mode, with schema validation
+- **Icons**: Optional icon metadata on tools, resources, resource templates and prompts
 - **TypeBox Validation**: Type-safe schema validation with automatic TypeScript inference
 - **Security Enhancements**: Input sanitization, rate limiting, and security assessment
 - **Multiple Transport Support**: HTTP/SSE and stdio transports for flexible communication
@@ -122,9 +124,99 @@ app.mcpAddPrompt({
 await app.listen({ port: 3000 })
 ```
 
-## Elicitation Support (MCP 2025-06-18)
+## Protocol Version Negotiation
+
+The server answers `initialize` with the client's requested revision when it is one it
+supports, and otherwise offers the newest one it has:
+
+```typescript
+import { LATEST_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS } from '@platformatic/mcp'
+
+LATEST_PROTOCOL_VERSION      // '2025-11-25'
+SUPPORTED_PROTOCOL_VERSIONS  // ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05']
+```
+
+On the HTTP transport, requests after `initialize` must carry the agreed revision in the
+`MCP-Protocol-Version` header. An unsupported value is answered with `400`; an absent header
+is treated as `2025-03-26`, which predates the header.
+
+## Origin Validation
+
+Browser clients can be protected against DNS rebinding by allow-listing origins. A rejected
+origin is answered with `403`:
+
+```typescript
+await app.register(mcpPlugin, {
+  allowedOrigins: ['https://app.example.com'] // omit to disable, '*' or true to allow any
+})
+```
+
+Requests without an `Origin` header are always accepted — the header is set by browsers, so
+its absence means the request did not come from one.
+
+## Tasks (MCP 2025-11-25, experimental)
+
+Tasks let a tool call return immediately with a task handle while the work continues in the
+background. The client then polls `tasks/get` and collects the result with `tasks/result`.
+
+Enable the feature on the plugin, then opt individual tools in with `execution.taskSupport`:
+
+```typescript
+await app.register(mcpPlugin, { enableTasks: true })
+
+app.mcpAddTool({
+  name: 'generate-report',
+  description: 'Builds a large report',
+  inputSchema: Type.Object({ month: Type.String() }),
+  execution: { taskSupport: 'optional' } // 'forbidden' (default) | 'optional' | 'required'
+}, async (params) => {
+  return { content: [{ type: 'text', text: await buildReport(params.month) }] }
+})
+```
+
+A client opts in per call by adding a `task` field:
+
+```jsonc
+// -> tools/call
+{ "name": "generate-report", "arguments": { "month": "July" }, "task": { "ttl": 60000 } }
+// <- CreateTaskResult
+{ "task": { "taskId": "…", "status": "working", "ttl": 60000, "pollInterval": 1000 } }
+```
+
+Supported operations: `tasks/get`, `tasks/result` (blocks until the task is terminal),
+`tasks/list` and `tasks/cancel`, plus optional `notifications/tasks/status` pushes over SSE.
+
+Tasks are stored in memory by default and in Redis when a `redis` option is given, so any
+instance can serve a poll for a task created on another.
+
+**Security**: when authorization is enabled, tasks are bound to the token subject and a
+requestor can only reach its own. Without authorization no requestor can be identified, so
+tasks are reachable by anyone holding the (random UUID) task id and `tasks/list` is not
+advertised.
+
+## Elicitation Support (MCP 2025-11-25)
 
 The plugin supports the elicitation capability, allowing servers to request structured information from clients. This enables dynamic data collection with schema validation.
+
+Two modes are available. **Form mode** collects structured data through the client, and
+**URL mode** sends the user out of band for anything sensitive — credentials, payments,
+third-party OAuth — so it never passes through the MCP client:
+
+```typescript
+// URL mode: returns the elicitation id, or null if the request could not be sent
+const elicitationId = await app.mcpElicitUrl(
+  sessionId,
+  'Authorize access to your Example Co files',
+  'https://mcp.example.com/connect'
+)
+
+// Later, once the out-of-band interaction finishes
+await app.mcpNotifyElicitationComplete(sessionId, elicitationId)
+```
+
+Servers **MUST NOT** request passwords, API keys or payment details through form mode — use
+URL mode for those. URLs are rejected if they are malformed, use a scheme other than
+http(s), or embed credentials.
 
 ### Basic Elicitation
 
@@ -448,6 +540,9 @@ This plugin supports the MCP Streamable HTTP transport specification, enabling b
 ```typescript
 await app.register(mcpPlugin, {
   enableSSE: true, // Enable SSE support (default: false)
+  // Optionally close streams after a while so clients fall back to polling and
+  // resume with Last-Event-ID (SEP-1699). Omit to keep streams open indefinitely.
+  sseMaxConnectionMs: 300_000,
   // ... other options
 })
 ```

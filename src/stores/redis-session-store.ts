@@ -22,6 +22,10 @@ export class RedisSessionStore implements SessionStore {
       lastActivity: metadata.lastActivity.toISOString()
     }
 
+    if (metadata.protocolVersion) {
+      sessionData.protocolVersion = metadata.protocolVersion
+    }
+
     // Add authorization context if present
     if (metadata.authorization) {
       sessionData.authorization = JSON.stringify(metadata.authorization)
@@ -44,6 +48,27 @@ export class RedisSessionStore implements SessionStore {
     }
   }
 
+  async update (metadata: SessionMetadata): Promise<void> {
+    const sessionKey = `session:${metadata.id}`
+
+    // Only touch sessions that still exist; an expired session must stay expired
+    if (await this.redis.exists(sessionKey) === 0) {
+      return
+    }
+
+    const sessionData: Record<string, string> = {
+      eventId: metadata.eventId.toString(),
+      lastEventId: metadata.lastEventId || '',
+      lastActivity: metadata.lastActivity.toISOString()
+    }
+
+    if (metadata.protocolVersion) {
+      sessionData.protocolVersion = metadata.protocolVersion
+    }
+
+    await this.redis.hset(sessionKey, sessionData)
+  }
+
   async get (sessionId: string): Promise<SessionMetadata | null> {
     const sessionKey = `session:${sessionId}`
     const result = await this.redis.hgetall(sessionKey)
@@ -57,7 +82,8 @@ export class RedisSessionStore implements SessionStore {
       eventId: parseInt(result.eventId, 10),
       lastEventId: result.lastEventId || undefined,
       createdAt: new Date(result.createdAt),
-      lastActivity: new Date(result.lastActivity)
+      lastActivity: new Date(result.lastActivity),
+      protocolVersion: result.protocolVersion || undefined
     }
 
     // Parse authorization context if present

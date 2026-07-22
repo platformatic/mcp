@@ -4,7 +4,7 @@ import Fastify from 'fastify'
 import mcpPlugin from '../src/index.ts'
 import type {
   JSONRPCRequest,
-  JSONRPCResponse,
+  JSONRPCResultResponse,
   JSONRPCError,
   JSONRPCNotification,
   InitializeResult,
@@ -76,7 +76,7 @@ describe('MCP Fastify Plugin', () => {
       })
 
       t.assert.strictEqual(response.statusCode, 200)
-      const body = response.json() as JSONRPCResponse
+      const body = response.json() as JSONRPCResultResponse
       t.assert.strictEqual(body.jsonrpc, JSONRPC_VERSION)
       t.assert.strictEqual(body.id, 1)
 
@@ -108,7 +108,7 @@ describe('MCP Fastify Plugin', () => {
       })
 
       t.assert.strictEqual(response.statusCode, 200)
-      const body = response.json() as JSONRPCResponse
+      const body = response.json() as JSONRPCResultResponse
       t.assert.strictEqual(body.jsonrpc, JSONRPC_VERSION)
       t.assert.strictEqual(body.id, 2)
       t.assert.deepStrictEqual(body.result, {})
@@ -134,7 +134,7 @@ describe('MCP Fastify Plugin', () => {
       })
 
       t.assert.strictEqual(response.statusCode, 200)
-      const body = response.json() as JSONRPCResponse
+      const body = response.json() as JSONRPCResultResponse
       const result = body.result as ListToolsResult
       t.assert.ok(Array.isArray(result.tools))
       t.assert.strictEqual(result.tools.length, 0)
@@ -160,7 +160,7 @@ describe('MCP Fastify Plugin', () => {
       })
 
       t.assert.strictEqual(response.statusCode, 200)
-      const body = response.json() as JSONRPCResponse
+      const body = response.json() as JSONRPCResultResponse
       const result = body.result as ListResourcesResult
       t.assert.ok(Array.isArray(result.resources))
       t.assert.strictEqual(result.resources.length, 0)
@@ -186,7 +186,7 @@ describe('MCP Fastify Plugin', () => {
       })
 
       t.assert.strictEqual(response.statusCode, 200)
-      const body = response.json() as JSONRPCResponse
+      const body = response.json() as JSONRPCResultResponse
       const result = body.result as ListPromptsResult
       t.assert.ok(Array.isArray(result.prompts))
       t.assert.strictEqual(result.prompts.length, 0)
@@ -481,7 +481,7 @@ describe('MCP Fastify Plugin', () => {
 
       t.assert.strictEqual(response.statusCode, 200)
       t.assert.strictEqual(response.headers['content-type'], 'application/json; charset=utf-8')
-      const body = response.json() as JSONRPCResponse
+      const body = response.json() as JSONRPCResultResponse
       t.assert.strictEqual(body.jsonrpc, JSONRPC_VERSION)
       t.assert.strictEqual(body.id, 1)
     })
@@ -554,7 +554,7 @@ describe('MCP Fastify Plugin', () => {
         payload: request
       })
 
-      const body = response.json() as JSONRPCResponse
+      const body = response.json() as JSONRPCResultResponse
       const result = body.result as ListToolsResult
       t.assert.strictEqual(result.tools.length, 1)
       t.assert.strictEqual(result.tools[0].name, 'test-tool')
@@ -589,7 +589,7 @@ describe('MCP Fastify Plugin', () => {
         payload: request
       })
 
-      const body = response.json() as JSONRPCResponse
+      const body = response.json() as JSONRPCResultResponse
       const result = body.result as ListResourcesResult
       t.assert.strictEqual(result.resources.length, 1)
       t.assert.strictEqual(result.resources[0].name, 'Test Resource')
@@ -623,7 +623,7 @@ describe('MCP Fastify Plugin', () => {
         payload: request
       })
 
-      const body = response.json() as JSONRPCResponse
+      const body = response.json() as JSONRPCResultResponse
       const result = body.result as ListPromptsResult
       t.assert.strictEqual(result.prompts.length, 1)
       t.assert.strictEqual(result.prompts[0].name, 'test-prompt')

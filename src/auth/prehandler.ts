@@ -64,6 +64,24 @@ export function createAuthPreHandler (
       })
     }
 
+    // SEP-835: the token is good but may not carry everything this resource needs.
+    // Name the missing scopes so the client can run an incremental consent flow.
+    const missingScopes = findMissingScopes(config.requiredScopes, validationResult.payload)
+    if (missingScopes.length > 0) {
+      request.log.warn({ missingScopes }, 'Token is missing required scopes')
+
+      return reply
+        .code(403)
+        .header('WWW-Authenticate', generateWWWAuthenticateHeader(config, {
+          error: 'insufficient_scope',
+          scope: config.requiredScopes
+        }))
+        .send({
+          error: 'insufficient_scope',
+          error_description: `Token is missing required scope(s): ${missingScopes.join(', ')}`
+        })
+    }
+
     // Add token payload to request context for downstream handlers
     // @ts-ignore - Adding custom property to request
     request.tokenPayload = validationResult.payload
@@ -72,12 +90,47 @@ export function createAuthPreHandler (
   }
 }
 
-function generateWWWAuthenticateHeader (config: AuthorizationConfig): string {
+/**
+ * Read the scopes off a validated token, tolerating both the space-delimited
+ * `scope` string of RFC 6749 and the `scopes` array some issuers emit.
+ */
+export function extractTokenScopes (payload: any): string[] {
+  if (!payload) return []
+  if (typeof payload.scope === 'string') {
+    return payload.scope.split(' ').filter(Boolean)
+  }
+  if (Array.isArray(payload.scopes)) {
+    return payload.scopes
+  }
+  return []
+}
+
+export function findMissingScopes (required: string[] | undefined, payload: any): string[] {
+  if (!required || required.length === 0) return []
+  const granted = new Set(extractTokenScopes(payload))
+  return required.filter(scope => !granted.has(scope))
+}
+
+interface WWWAuthenticateChallenge {
+  error?: string
+  scope?: string[]
+}
+
+function generateWWWAuthenticateHeader (config: AuthorizationConfig, challenge: WWWAuthenticateChallenge = {}): string {
   if (!config.enabled) {
     throw new Error('Authorization is disabled')
   }
   const resourceMetadataUrl = `${config.resourceUri}/.well-known/oauth-protected-resource`
-  return `Bearer realm="MCP Server", resource_metadata="${resourceMetadataUrl}"`
+  const params = ['realm="MCP Server"', `resource_metadata="${resourceMetadataUrl}"`]
+
+  if (challenge.error) {
+    params.push(`error="${challenge.error}"`)
+  }
+  if (challenge.scope && challenge.scope.length > 0) {
+    params.push(`scope="${challenge.scope.join(' ')}"`)
+  }
+
+  return `Bearer ${params.join(', ')}`
 }
 
 // Type augmentation for FastifyRequest to include tokenPayload
