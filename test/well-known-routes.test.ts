@@ -381,6 +381,55 @@ describe('Well-known Routes', () => {
       ])
     })
 
+    test('should use configured introspectionEndpoint in token_introspection_endpoint field', async (t: TestContext) => {
+      // Providers like WorkOS AuthKit use non-standard paths (e.g. /oauth2/introspection)
+      const authConfig = createTestAuthConfig({
+        resourceUri: 'https://mcp.test.com',
+        authorizationServers: ['https://sample-instance-01.authkit.app'],
+        tokenValidation: {
+          introspectionEndpoint: 'https://sample-instance-01.authkit.app/oauth2/introspection',
+          validateAudience: true
+        }
+      })
+
+      await app.register(wellKnownRoutes, { authConfig })
+      await app.ready()
+
+      const response = await app.inject({
+        method: 'GET',
+        url: '/.well-known/openid-configuration/mcp'
+      })
+
+      t.assert.strictEqual(response.statusCode, 200)
+      const body = response.json()
+      t.assert.strictEqual(
+        body.token_introspection_endpoint,
+        'https://sample-instance-01.authkit.app/oauth2/introspection'
+      )
+    })
+
+    test('should fall back to default introspect path when introspectionEndpoint not configured', async (t: TestContext) => {
+      const authConfig = createTestAuthConfig({
+        resourceUri: 'https://mcp.test.com',
+        authorizationServers: ['https://auth1.example.com'],
+        tokenValidation: {
+          validateAudience: true
+        }
+      })
+
+      await app.register(wellKnownRoutes, { authConfig })
+      await app.ready()
+
+      const response = await app.inject({
+        method: 'GET',
+        url: '/.well-known/openid-configuration/mcp'
+      })
+
+      t.assert.strictEqual(response.statusCode, 200)
+      const body = response.json()
+      t.assert.strictEqual(body.token_introspection_endpoint, 'https://auth1.example.com/oauth/introspect')
+    })
+
     test('should return OpenID Connect configuration without JWKS URI when not configured', async (t: TestContext) => {
       const authConfig = createTestAuthConfig({
         resourceUri: 'https://mcp.simple.com',

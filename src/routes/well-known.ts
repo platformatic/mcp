@@ -166,7 +166,7 @@ const wellKnownRoutesPlugin = fp(async function (app: FastifyInstance, opts: Wel
         'mcp:prompts',
         'mcp:tools'
       ],
-      token_introspection_endpoint: `${primaryAuthServer}/oauth/introspect`,
+      token_introspection_endpoint: authConfig.tokenValidation.introspectionEndpoint ?? `${primaryAuthServer}/oauth/introspect`,
       jwks_uri: authConfig.tokenValidation.jwksUri || null,
       mcp_resource_uri: authConfig.resourceUri,
       mcp_authorization_servers: authConfig.authorizationServers
