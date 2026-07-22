@@ -3,7 +3,7 @@ import type { TestContext } from 'node:test'
 import Fastify from 'fastify'
 import { Type } from '@sinclair/typebox'
 import mcpPlugin from '../src/index.ts'
-import { JSONRPC_VERSION, METHOD_NOT_FOUND, INVALID_PARAMS } from '../src/schema.ts'
+import { JSONRPC_VERSION, LATEST_PROTOCOL_VERSION, METHOD_NOT_FOUND, INVALID_PARAMS } from '../src/schema.ts'
 import type { Task, CreateTaskResult, ListTasksResult, CallToolResult } from '../src/schema.ts'
 import { MemoryTaskStore } from '../src/stores/memory-task-store.ts'
 import { canTransition, isTerminal, taskHasExpired, toWireTask } from '../src/stores/task-store.ts'
@@ -23,10 +23,12 @@ function record (overrides: Partial<TaskRecord> = {}): TaskRecord {
   }
 }
 
+/** Calls as a compliant 2025-11-25 client, which must echo the negotiated revision */
 async function call (app: any, method: string, params: unknown, id = 1) {
   const response = await app.inject({
     method: 'POST',
     url: '/mcp',
+    headers: { 'mcp-protocol-version': LATEST_PROTOCOL_VERSION },
     payload: { jsonrpc: JSONRPC_VERSION, id, method, params }
   })
   return response.json()

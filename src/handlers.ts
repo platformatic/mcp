@@ -33,6 +33,12 @@ import type { SessionStore } from './stores/session-store.ts'
 import type { TaskStore, TaskRecord, TaskWaiters } from './stores/task-store.ts'
 import { isTerminal, toWireTask } from './stores/task-store.ts'
 import type { AuthorizationContext } from './types/auth-types.ts'
+import {
+  supportsTasks,
+  supportsSchemaDialect,
+  trimDefinitionToRevision,
+  capabilitiesForRevision
+} from './protocol-version.ts'
 import { validate, CallToolRequestSchema, ReadResourceRequestSchema, GetPromptRequestSchema, isTypeBoxSchema } from './validation/index.ts'
 import { sanitizeToolParams, assessToolSecurity, SECURITY_WARNINGS } from './security.ts'
 
@@ -52,6 +58,8 @@ type HandlerDependencies = {
   taskStore?: TaskStore
   taskWaiters?: TaskWaiters
   sessionId?: string
+  /** The revision this client negotiated; responses are shaped to match it */
+  protocolVersion?: string
 }
 
 export function createResponse (id: string | number, result: any): JSONRPCResponse {
@@ -114,7 +122,8 @@ async function handleInitialize (
 
   const result: InitializeResult = {
     protocolVersion,
-    capabilities,
+    // Never advertise a capability the agreed revision cannot express
+    capabilities: capabilitiesForRevision(capabilities, protocolVersion),
     serverInfo,
     instructions: opts.instructions
   }
@@ -133,24 +142,25 @@ function handlePing (request: JSONRPCRequest): JSONRPCResponse {
  */
 const JSON_SCHEMA_DIALECT = 'https://json-schema.org/draft/2020-12/schema'
 
-function withSchemaDialect<T> (schema: T): T {
+function withSchemaDialect<T> (schema: T, protocolVersion: string | undefined): T {
+  if (!supportsSchemaDialect(protocolVersion)) return schema
   if (!schema || typeof schema !== 'object') return schema
   if ('$schema' in (schema as Record<string, unknown>)) return schema
   return { $schema: JSON_SCHEMA_DIALECT, ...(schema as Record<string, unknown>) } as T
 }
 
 function handleToolsList (request: JSONRPCRequest, dependencies: HandlerDependencies): JSONRPCResponse {
-  const { tools } = dependencies
+  const { tools, protocolVersion } = dependencies
   const result: ListToolsResult = {
     tools: Array.from(tools.values()).map(t => {
-      const tool = t.definition
+      const tool = trimDefinitionToRevision(t.definition, protocolVersion)
       // TypeBox schemas are already JSON Schema compatible
       const serialized: typeof tool = {
         ...tool,
-        inputSchema: withSchemaDialect(tool.inputSchema)
+        inputSchema: withSchemaDialect(tool.inputSchema, protocolVersion)
       }
       if (serialized.outputSchema) {
-        serialized.outputSchema = withSchemaDialect(serialized.outputSchema)
+        serialized.outputSchema = withSchemaDialect(serialized.outputSchema, protocolVersion)
       }
       return serialized
     }),
@@ -166,23 +176,23 @@ function isTemplateUri (uri: string): boolean {
 }
 
 function handleResourcesList (request: JSONRPCRequest, dependencies: HandlerDependencies): JSONRPCResponse {
-  const { resources } = dependencies
+  const { resources, protocolVersion } = dependencies
   const result: ListResourcesResult = {
     resources: Array.from(resources.values())
       .filter(r => !isTemplateUri(r.definition.uri))
-      .map(r => r.definition),
+      .map(r => trimDefinitionToRevision(r.definition, protocolVersion)),
     nextCursor: undefined
   }
   return createResponse(request.id, result)
 }
 
 function handleResourceTemplatesList (request: JSONRPCRequest, dependencies: HandlerDependencies): JSONRPCResponse {
-  const { resources } = dependencies
+  const { resources, protocolVersion } = dependencies
   const result: ListResourceTemplatesResult = {
     resourceTemplates: Array.from(resources.values())
       .filter(r => isTemplateUri(r.definition.uri))
       .map(r => {
-        const { uri, ...rest } = r.definition
+        const { uri, ...rest } = trimDefinitionToRevision(r.definition, protocolVersion)
         return { ...rest, uriTemplate: uri }
       }),
     nextCursor: undefined
@@ -191,9 +201,9 @@ function handleResourceTemplatesList (request: JSONRPCRequest, dependencies: Han
 }
 
 function handlePromptsList (request: JSONRPCRequest, dependencies: HandlerDependencies): JSONRPCResponse {
-  const { prompts } = dependencies
+  const { prompts, protocolVersion } = dependencies
   const result: ListPromptsResult = {
-    prompts: Array.from(prompts.values()).map(p => p.definition),
+    prompts: Array.from(prompts.values()).map(p => trimDefinitionToRevision(p.definition, protocolVersion)),
     nextCursor: undefined
   }
   return createResponse(request.id, result)
@@ -224,7 +234,11 @@ async function handleToolsCall (
 
   // Decide up front whether this call runs as a task, so the rest of the
   // handler can stay unaware of it.
-  const taskParams = (request.params as { task?: { ttl?: number } } | undefined)?.task
+  // A client on an older revision cannot have meant `task`, because we never
+  // declared the capability to it. The spec says to ignore it in that case.
+  const taskParams = supportsTasks(dependencies.protocolVersion)
+    ? (request.params as { task?: { ttl?: number } } | undefined)?.task
+    : undefined
   const augmentation = resolveTaskAugmentation(tool, taskParams !== undefined)
   if ('error' in augmentation) {
     return createError(request.id, METHOD_NOT_FOUND, augmentation.error)
@@ -968,12 +982,17 @@ export async function handleRequest (
       case 'prompts/get':
         return await handlePromptsGet(request, sessionId, dependencies)
       case 'tasks/get':
-        return await handleTasksGet(request, dependencies)
       case 'tasks/result':
-        return await handleTasksResult(request, dependencies)
       case 'tasks/list':
-        return await handleTasksList(request, dependencies)
       case 'tasks/cancel':
+        // Tasks arrived in 2025-11-25; to an older client these methods simply
+        // do not exist, and we never advertised them.
+        if (!supportsTasks(dependencies.protocolVersion)) {
+          return createError(request.id, METHOD_NOT_FOUND, `Method ${request.method} not found`)
+        }
+        if (request.method === 'tasks/get') return await handleTasksGet(request, dependencies)
+        if (request.method === 'tasks/result') return await handleTasksResult(request, dependencies)
+        if (request.method === 'tasks/list') return await handleTasksList(request, dependencies)
         return await handleTasksCancel(request, dependencies)
       default:
         return createError(request.id, METHOD_NOT_FOUND, `Method ${request.method} not found`)

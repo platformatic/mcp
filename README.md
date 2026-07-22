@@ -140,6 +140,29 @@ On the HTTP transport, requests after `initialize` must carry the agreed revisio
 `MCP-Protocol-Version` header. An unsupported value is answered with `400`; an absent header
 is treated as `2025-03-26`, which predates the header.
 
+**Responses are shaped to the revision the client negotiated.** A client on an older revision
+never sees a field or method that revision does not define:
+
+| | `< 2025-11-25` | `2025-11-25` |
+|---|---|---|
+| `tasks` capability | not advertised | advertised |
+| `tasks/*` methods | `-32601` method not found | available |
+| `task` field on `tools/call` | ignored | honoured |
+| `icons` on listings | stripped | present |
+| `execution.taskSupport` | stripped | present |
+| `$schema` on tool schemas | omitted | JSON Schema 2020-12 |
+| URL mode elicitation | refused | available |
+
+When SSE is enabled the negotiated revision is stored on the session and is **authoritative**:
+a request whose `MCP-Protocol-Version` header contradicts what the session agreed is rejected
+with `400`, so a client cannot opt into newer behaviour after negotiating an older revision.
+When the header is omitted the session's revision is used in preference to the `2025-03-26`
+default. `initialize` is exempt, so a client may re-negotiate on an existing session.
+
+> Without SSE there is no session to remember the negotiation, so each request is judged
+> solely by its header. A client that omits it falls back to `2025-03-26` and will not see
+> `2025-11-25` features. Compliant clients always send the header.
+
 ## Origin Validation
 
 Browser clients can be protected against DNS rebinding by allow-listing origins. A rejected

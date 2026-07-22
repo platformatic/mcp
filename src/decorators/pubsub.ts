@@ -10,6 +10,7 @@ import type {
 import { validateElicitationRequest, validateElicitationUrl } from '../security.ts'
 import { JSONRPC_VERSION } from '../schema.ts'
 import { randomUUID } from 'node:crypto'
+import { supportsUrlElicitation } from '../protocol-version.ts'
 import type { SessionStore } from '../stores/session-store.ts'
 import type { MessageBroker } from '../brokers/message-broker.ts'
 
@@ -109,6 +110,17 @@ const mcpPubSubDecoratorsPlugin: FastifyPluginAsync<MCPPubSubDecoratorsOptions> 
   ): Promise<string | null> => {
     if (!enableSSE) {
       app.log.warn('Cannot send elicitation request: SSE is disabled')
+      return null
+    }
+
+    // URL mode arrived in 2025-11-25; a client on an older revision would not
+    // know what to do with it, so do not send one.
+    const session = await sessionStore.get(sessionId)
+    if (session && !supportsUrlElicitation(session.protocolVersion)) {
+      app.log.warn({
+        sessionId,
+        negotiated: session.protocolVersion
+      }, 'Cannot send URL elicitation: the session negotiated a revision without URL mode')
       return null
     }
 
