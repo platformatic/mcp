@@ -52,7 +52,7 @@
     "@fastify/jwt": "^9.1.0",
     "@fastify/type-provider-typebox": "^5.2.0",
     "fast-jwt": "^6.0.2",
-    "fastify-plugin": "^5.0.1",
+    "fastify-plugin": "^6.0.0",
     "get-jwks": "^11.0.1",
     "ioredis": "^5.0.0",
     "mqemitter": "^7.1.0",
