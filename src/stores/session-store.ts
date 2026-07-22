@@ -17,6 +17,7 @@ export interface SessionMetadata {
 export interface SessionStore {
   create(metadata: SessionMetadata): Promise<void>
   get(sessionId: string): Promise<SessionMetadata | null>
+  list(): Promise<SessionMetadata[]>
   delete(sessionId: string): Promise<void>
   cleanup(): Promise<void>
 

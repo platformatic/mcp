@@ -27,6 +27,10 @@ export class MemorySessionStore implements SessionStore {
     return session ? { ...session } : null
   }
 
+  async list (): Promise<SessionMetadata[]> {
+    return Array.from(this.sessions.values(), session => ({ ...session }))
+  }
+
   async delete (sessionId: string): Promise<void> {
     // Clean up token mappings for this session
     const session = this.sessions.get(sessionId)

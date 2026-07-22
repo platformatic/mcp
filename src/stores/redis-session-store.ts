@@ -3,6 +3,21 @@ import type { JSONRPCMessage } from '../schema.ts'
 import type { SessionStore, SessionMetadata } from './session-store.ts'
 import type { AuthorizationContext, TokenRefreshInfo } from '../types/auth-types.ts'
 
+function normalizeAuthorizationContext (authorization: AuthorizationContext): AuthorizationContext {
+  return {
+    ...authorization,
+    expiresAt: authorization.expiresAt ? new Date(authorization.expiresAt) : undefined,
+    issuedAt: authorization.issuedAt ? new Date(authorization.issuedAt) : undefined,
+  }
+}
+
+function normalizeTokenRefreshInfo (tokenRefresh: TokenRefreshInfo): TokenRefreshInfo {
+  return {
+    ...tokenRefresh,
+    lastRefreshAt: tokenRefresh.lastRefreshAt ? new Date(tokenRefresh.lastRefreshAt) : undefined,
+  }
+}
+
 export class RedisSessionStore implements SessionStore {
   private redis: Redis
   private maxMessages: number
@@ -63,7 +78,7 @@ export class RedisSessionStore implements SessionStore {
     // Parse authorization context if present
     if (result.authorization) {
       try {
-        metadata.authorization = JSON.parse(result.authorization)
+        metadata.authorization = normalizeAuthorizationContext(JSON.parse(result.authorization))
       } catch (error) {
         // Ignore parsing errors for authorization context
       }
@@ -71,7 +86,7 @@ export class RedisSessionStore implements SessionStore {
 
     if (result.tokenRefresh) {
       try {
-        metadata.tokenRefresh = JSON.parse(result.tokenRefresh)
+        metadata.tokenRefresh = normalizeTokenRefreshInfo(JSON.parse(result.tokenRefresh))
       } catch (error) {
         // Ignore parsing errors for token refresh
       }
@@ -86,6 +101,30 @@ export class RedisSessionStore implements SessionStore {
     }
 
     return metadata
+  }
+
+  async list (): Promise<SessionMetadata[]> {
+    const sessions: SessionMetadata[] = []
+    let cursor = '0'
+
+    do {
+      const [nextCursor, keys] = await this.redis.scan(cursor, 'MATCH', 'session:*', 'COUNT', 100)
+      cursor = nextCursor
+
+      for (const key of keys) {
+        if (key.endsWith(':history')) {
+          continue
+        }
+
+        const sessionId = key.slice('session:'.length)
+        const session = await this.get(sessionId)
+        if (session) {
+          sessions.push(session)
+        }
+      }
+    } while (cursor !== '0')
+
+    return sessions
   }
 
   async delete (sessionId: string): Promise<void> {

@@ -7,13 +7,17 @@ export class RedisMessageBroker implements MessageBroker {
   private emitter: any
 
   constructor (redis: Redis) {
-    this.emitter = MQEmitterRedis({
-      port: redis.options.port,
-      host: redis.options.host,
-      password: redis.options.password,
-      db: redis.options.db || 0,
-      family: redis.options.family || 4
+    const subConn = redis.duplicate({
+      enableReadyCheck: false
     })
+    const pubConn = redis.duplicate({
+      enableReadyCheck: false
+    })
+
+    this.emitter = MQEmitterRedis({
+      subConn,
+      pubConn
+    } as any)
   }
 
   async publish (topic: string, message: JSONRPCMessage): Promise<void> {
