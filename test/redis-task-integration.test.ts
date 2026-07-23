@@ -98,8 +98,8 @@ describe('Redis task integration (multi-instance)', () => {
     }
     assert.strictEqual(status, 'completed')
 
-    // ...and B can also list it
-    const list = await call(b, 'tasks/list', {})
-    assert.ok(list.result.tasks.some((x: any) => x.taskId === taskId))
+    // B can also read the full result across instances
+    const result = await call(b, 'tasks/result', { taskId })
+    assert.strictEqual(result.result.content[0].text, 'ok')
   })
 })

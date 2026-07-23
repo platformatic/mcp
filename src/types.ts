@@ -189,6 +189,17 @@ export interface MCPPluginOptions {
    */
   enableTasks?: boolean
   /**
+   * Retention for a task whose creator did not request a `ttl`, in milliseconds
+   * (default 60000). Raise it when tools can run longer than a minute, so their
+   * tasks do not expire before completing.
+   */
+  taskDefaultTtlMs?: number
+  /**
+   * Ceiling on task retention, in milliseconds (default 3600000). A requested
+   * `ttl` above this is capped, so a client cannot pin resources indefinitely.
+   */
+  taskMaxTtlMs?: number
+  /**
    * Origins accepted on the MCP endpoints, to prevent DNS rebinding attacks.
    * Omit to disable validation (non-browser deployments), pass `'*'` or `true`
    * to accept any origin, or list exact origins to allow.

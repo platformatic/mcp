@@ -87,9 +87,30 @@ export class RedisTaskStore implements TaskStore {
       updated.outcome = options.outcome
     }
 
-    // KEEPTTL: retention is measured from creation, so a status change must not
-    // extend the task's lifetime.
-    await this.redis.set(this.key(taskId), JSON.stringify(updated), 'KEEPTTL')
+    // The read above and this write are two round trips, so a concurrent write
+    // can slip between them. Re-check the stored status atomically in Lua and
+    // refuse if it has since become terminal, so a cancel and a completion
+    // racing on the same task cannot overwrite each other — the spec requires a
+    // cancelled task to stay cancelled. KEEPTTL preserves retention-from-creation.
+    const result = await this.redis.eval(
+      `local raw = redis.call('GET', KEYS[1])
+       if not raw then return false end
+       local ok, cur = pcall(cjson.decode, raw)
+       if not ok then return false end
+       local s = cur.status
+       if s == 'completed' or s == 'failed' or s == 'cancelled' then return s end
+       redis.call('SET', KEYS[1], ARGV[1], 'KEEPTTL')
+       return 'OK'`,
+      1,
+      this.key(taskId),
+      JSON.stringify(updated)
+    )
+
+    if (result === null) return null
+    if (result !== 'OK') {
+      // A terminal status was written concurrently; `result` is that status
+      throw new Error(`Task ${taskId} is already in terminal status '${result}'`)
+    }
     return updated
   }
 

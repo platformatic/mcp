@@ -607,6 +607,19 @@ const DEFAULT_TASK_TTL = 60_000
 const MAX_TASK_TTL = 3600_000
 
 /**
+ * Resolve the effective task ttl bounds from plugin options. Tasks are meant for
+ * long-running work, so a deployment whose tools outlive the 60s default can
+ * raise `taskDefaultTtlMs` / `taskMaxTtlMs` rather than have tasks expire before
+ * they finish (an expired task's `tasks/result` returns "not found").
+ */
+function taskTtlBounds (dependencies: HandlerDependencies): { defaultTtl: number, maxTtl: number } {
+  return {
+    defaultTtl: dependencies.opts.taskDefaultTtlMs ?? DEFAULT_TASK_TTL,
+    maxTtl: dependencies.opts.taskMaxTtlMs ?? MAX_TASK_TTL
+  }
+}
+
+/**
  * The authorization subject a task belongs to.
  *
  * When the deployment cannot identify requestors this is undefined, and tasks
@@ -615,6 +628,18 @@ const MAX_TASK_TTL = 3600_000
  */
 function taskSubject (dependencies: HandlerDependencies): string | undefined {
   return dependencies.authContext?.userId
+}
+
+/**
+ * Whether this deployment can tie a task to a requestor.
+ *
+ * Mirrors the gate in `index.ts` that decides whether to advertise
+ * `tasks.list`. Without authorization every task shares the undefined subject,
+ * so listing would hand every task's id to any caller — defeating the "random
+ * task id is the capability" model that protects `tasks/get|result|cancel`.
+ */
+function canIdentifyRequestors (dependencies: HandlerDependencies): boolean {
+  return dependencies.opts.authorization?.enabled === true
 }
 
 /**
@@ -653,16 +678,21 @@ export function resolveTaskAugmentation (
   return { mode: requested ? 'task' : 'direct' }
 }
 
-function newTaskRecord (method: string, ttl: number | undefined, subject: string | undefined): TaskRecord {
+function newTaskRecord (
+  method: string,
+  ttl: number | undefined,
+  subject: string | undefined,
+  bounds: { defaultTtl: number, maxTtl: number }
+): TaskRecord {
   const now = new Date().toISOString()
-  const requested = ttl ?? DEFAULT_TASK_TTL
+  const requested = ttl ?? bounds.defaultTtl
   return {
     taskId: randomUUID(),
     status: 'working',
     createdAt: now,
     lastUpdatedAt: now,
     // Receivers may override the requested ttl; we cap it
-    ttl: Math.min(requested, MAX_TASK_TTL),
+    ttl: Math.min(requested, bounds.maxTtl),
     pollInterval: DEFAULT_POLL_INTERVAL,
     method,
     authSubject: subject
@@ -833,6 +863,12 @@ async function handleTasksList (
     return createError(request.id, METHOD_NOT_FOUND, 'Tasks are not enabled on this server')
   }
 
+  // Never advertised without auth (see index.ts), so treat it as nonexistent
+  // rather than leaking every anonymous task's id to the caller.
+  if (!canIdentifyRequestors(dependencies)) {
+    return createError(request.id, METHOD_NOT_FOUND, 'Method tasks/list not found')
+  }
+
   const tasks = await taskStore.list(taskSubject(dependencies))
   const result: ListTasksResult = {
     tasks: tasks.map(toWireTask),
@@ -864,10 +900,18 @@ async function handleTasksCancel (
     return createError(request.id, INVALID_PARAMS, `Cannot cancel task: already in terminal status '${task.status}'`)
   }
 
-  const cancelled = await taskStore.updateStatus(taskId, 'cancelled', {
-    statusMessage: 'The task was cancelled by request.',
-    outcome: createError(request.id, INTERNAL_ERROR, 'Task was cancelled')
-  })
+  let cancelled: TaskRecord | null
+  try {
+    cancelled = await taskStore.updateStatus(taskId, 'cancelled', {
+      statusMessage: 'The task was cancelled by request.',
+      outcome: createError(request.id, INTERNAL_ERROR, 'Task was cancelled')
+    })
+  } catch {
+    // The task reached a terminal status between our check above and the write
+    // (it completed or was cancelled concurrently). The spec maps this to
+    // invalid params, not an internal error.
+    return createError(request.id, INVALID_PARAMS, 'Cannot cancel task: the task reached a terminal status before it could be cancelled')
+  }
 
   if (!cancelled) {
     return createError(request.id, INVALID_PARAMS, 'Failed to retrieve task: Task not found')
@@ -914,7 +958,7 @@ async function runToolCallAsTask (
     return createError(request.id, METHOD_NOT_FOUND, 'Tasks are not enabled on this server')
   }
 
-  const task = newTaskRecord('tools/call', ttl, taskSubject(dependencies))
+  const task = newTaskRecord('tools/call', ttl, taskSubject(dependencies), taskTtlBounds(dependencies))
   await taskStore.create(task)
 
   // Deliberately not awaited: the point of a task is to return control now.

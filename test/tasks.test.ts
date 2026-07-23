@@ -9,6 +9,7 @@ import { MemoryTaskStore } from '../src/stores/memory-task-store.ts'
 import { canTransition, isTerminal, taskHasExpired, toWireTask } from '../src/stores/task-store.ts'
 import type { TaskRecord } from '../src/stores/task-store.ts'
 import { resolveTaskAugmentation, RELATED_TASK_META_KEY } from '../src/handlers.ts'
+import { createTestAuthConfig, createTestJWT, setupMockAgent, generateMockJWKSResponse } from './auth-test-utils.ts'
 
 function record (overrides: Partial<TaskRecord> = {}): TaskRecord {
   const now = new Date().toISOString()
@@ -154,6 +155,39 @@ describe('task store', () => {
     t.assert.deepStrictEqual((await store.list('user-2')).map(x => x.taskId), ['b'])
     t.assert.deepStrictEqual((await store.list()).map(x => x.taskId), ['c'])
   })
+
+  test('concurrent cancel and completion cannot overwrite each other', async (t: TestContext) => {
+    // The core of the fix: a cancel racing a completion on the same working task
+    // must leave exactly one winner, and a task that reached a terminal status
+    // must not be moved out of it. updateStatus is atomic, so the second write
+    // observes the first and rejects rather than clobbering it.
+    const store = new MemoryTaskStore()
+    await store.create(record())
+
+    const results = await Promise.allSettled([
+      store.updateStatus('task-1', 'cancelled'),
+      store.updateStatus('task-1', 'completed')
+    ])
+
+    const fulfilled = results.filter(r => r.status === 'fulfilled')
+    const rejected = results.filter(r => r.status === 'rejected')
+    t.assert.strictEqual(fulfilled.length, 1, 'exactly one write should win')
+    t.assert.strictEqual(rejected.length, 1, 'the loser should be rejected, not silently clobber')
+
+    const final = await store.get('task-1')
+    t.assert.ok(isTerminal(final!.status))
+    // The stored status must equal the winner's — no lost update
+    t.assert.strictEqual(final!.status, (fulfilled[0] as PromiseFulfilledResult<TaskRecord>).value.status)
+  })
+
+  test('a terminal task rejects any further transition', async (t: TestContext) => {
+    const store = new MemoryTaskStore()
+    await store.create(record())
+    await store.updateStatus('task-1', 'cancelled')
+
+    await t.assert.rejects(() => store.updateStatus('task-1', 'completed'), /terminal status/)
+    t.assert.strictEqual((await store.get('task-1'))!.status, 'cancelled')
+  })
 })
 
 describe('task augmentation rules', () => {
@@ -298,17 +332,69 @@ describe('tasks over the wire', () => {
     t.assert.strictEqual(body.error.code, INVALID_PARAMS)
   })
 
-  test('tasks/list returns created tasks', async (t: TestContext) => {
+  test('tasks/list is refused without authorization', async (t: TestContext) => {
+    // Without auth every task shares the undefined subject, so listing would
+    // hand out every task's id — defeating the "random id is the capability"
+    // model. The method must not exist, matching the un-advertised capability.
     const app = await buildApp(t)
 
     await call(app, 'tools/call', { name: 'slow-add', arguments: { a: 1, b: 1 }, task: {} })
-    await call(app, 'tools/call', { name: 'slow-add', arguments: { a: 2, b: 2 }, task: {} })
 
     const body = await call(app, 'tasks/list', {})
-    const result = body.result as ListTasksResult
-    t.assert.strictEqual(result.tasks.length, 2)
-    // Storage-only fields must never reach the wire
-    t.assert.strictEqual('outcome' in result.tasks[0], false)
+    t.assert.strictEqual(body.error.code, METHOD_NOT_FOUND)
+
+    const init = await call(app, 'initialize', { protocolVersion: '2025-11-25', capabilities: {} })
+    t.assert.strictEqual(init.result.capabilities.tasks.list, undefined, 'list capability must not be advertised')
+  })
+
+  test('tasks/list is available and subject-scoped with authorization', async (t: TestContext) => {
+    const restoreMock = setupMockAgent({
+      'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse()
+    })
+    t.after(() => restoreMock())
+
+    const app = Fastify({ logger: false })
+    t.after(() => app.close())
+    await app.register(mcpPlugin, { enableTasks: true, authorization: createTestAuthConfig() })
+    app.mcpAddTool({
+      name: 'noop',
+      description: 'x',
+      inputSchema: Type.Object({}),
+      execution: { taskSupport: 'optional' }
+    } as any, async (): Promise<CallToolResult> => ({ content: [{ type: 'text', text: 'ok' }] }))
+    await app.ready()
+
+    const authedCall = async (token: string, method: string, params: unknown) => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/mcp',
+        headers: { authorization: `Bearer ${token}`, 'mcp-protocol-version': LATEST_PROTOCOL_VERSION },
+        payload: { jsonrpc: JSONRPC_VERSION, id: 1, method, params }
+      })
+      return res.json()
+    }
+
+    const tokenA = createTestJWT({ sub: 'user-a' })
+    const tokenB = createTestJWT({ sub: 'user-b' })
+
+    // With auth, the capability is advertised
+    const init = await authedCall(tokenA, 'initialize', { protocolVersion: LATEST_PROTOCOL_VERSION, capabilities: {} })
+    t.assert.deepStrictEqual(init.result.capabilities.tasks.list, {})
+
+    // Each subject creates a task
+    const a = await authedCall(tokenA, 'tools/call', { name: 'noop', arguments: {}, task: {} })
+    const b = await authedCall(tokenB, 'tools/call', { name: 'noop', arguments: {}, task: {} })
+    const taskA = (a.result as CreateTaskResult).task.taskId
+    const taskB = (b.result as CreateTaskResult).task.taskId
+
+    // A sees only its own task, never B's
+    const listA = (await authedCall(tokenA, 'tasks/list', {})).result as ListTasksResult
+    t.assert.deepStrictEqual(listA.tasks.map(x => x.taskId), [taskA])
+    t.assert.strictEqual(listA.tasks.some(x => x.taskId === taskB), false)
+
+    // A cannot reach B's task by id either
+    const cross = await authedCall(tokenA, 'tasks/get', { taskId: taskB })
+    t.assert.strictEqual(cross.error.code, INVALID_PARAMS)
   })
 
   test('task methods are unavailable when tasks are disabled', async (t: TestContext) => {

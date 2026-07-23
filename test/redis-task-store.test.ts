@@ -67,6 +67,33 @@ describe('RedisTaskStore', () => {
     await t.assert.rejects(() => store.updateStatus('task-1', 'working'), /terminal status/)
   })
 
+  test('a cancelled task cannot be overwritten by a concurrent completion', async (t: TestContext) => {
+    await store.create(record())
+
+    // Both start from `working`; the Lua guard must let only one win and reject
+    // the other, so the task never leaves the terminal status it first reached.
+    const results = await Promise.allSettled([
+      store.updateStatus('task-1', 'cancelled'),
+      store.updateStatus('task-1', 'completed')
+    ])
+
+    const fulfilled = results.filter(r => r.status === 'fulfilled')
+    const rejected = results.filter(r => r.status === 'rejected')
+    t.assert.strictEqual(fulfilled.length, 1, 'exactly one write should win')
+    t.assert.strictEqual(rejected.length, 1, 'the loser must be rejected, not clobber the winner')
+
+    const final = await store.get('task-1')
+    t.assert.strictEqual(final?.status, (fulfilled[0] as PromiseFulfilledResult<any>).value.status)
+  })
+
+  test('a terminal task rejects any further transition', async (t: TestContext) => {
+    await store.create(record())
+    await store.updateStatus('task-1', 'cancelled')
+
+    await t.assert.rejects(() => store.updateStatus('task-1', 'completed'), /terminal status/)
+    t.assert.strictEqual((await store.get('task-1'))?.status, 'cancelled')
+  })
+
   test('a status change does not extend the retention window', async (t: TestContext) => {
     await store.create(record({ ttl: 60_000 }))
     const before = await redis.ttl('mcp:task:task-1')

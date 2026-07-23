@@ -193,6 +193,14 @@ const oauthClientPlugin: FastifyPluginAsync<OAuthClientConfig> = async (fastify,
     const documentUrl = `${opts.resourceUri.replace(/\/$/, '')}${path}`
     const document = buildClientIdMetadataDocument(opts, documentUrl)
 
+    // The authorization server fetches this document unauthenticated to resolve
+    // the client_id. The auth preHandler only exempts /.well-known, so a custom
+    // path outside it would sit behind bearer auth and be unreachable (401).
+    if (!path.startsWith('/.well-known/')) {
+      fastify.log.warn({ path },
+        'clientIdMetadataDocument path is outside /.well-known; add it to authorization.excludedPaths or the authorization server will get 401 when fetching it')
+    }
+
     fastify.get(path, async (_request, reply) => {
       return reply.type('application/json').send(document)
     })

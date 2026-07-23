@@ -209,13 +209,26 @@ A client opts in per call by adding a `task` field:
 Supported operations: `tasks/get`, `tasks/result` (blocks until the task is terminal),
 `tasks/list` and `tasks/cancel`, plus optional `notifications/tasks/status` pushes over SSE.
 
+Retention defaults to 60 seconds when the client does not request a `ttl`. Tasks are meant
+for long-running work, so if your tools can outlive that, raise the bounds — otherwise a task
+can expire before it finishes and its `tasks/result` returns "not found":
+
+```typescript
+await app.register(mcpPlugin, {
+  enableTasks: true,
+  taskDefaultTtlMs: 15 * 60_000, // retention when the client requests no ttl
+  taskMaxTtlMs: 60 * 60_000      // ceiling on a client-requested ttl
+})
+```
+
 Tasks are stored in memory by default and in Redis when a `redis` option is given, so any
 instance can serve a poll for a task created on another.
 
 **Security**: when authorization is enabled, tasks are bound to the token subject and a
 requestor can only reach its own. Without authorization no requestor can be identified, so
-tasks are reachable by anyone holding the (random UUID) task id and `tasks/list` is not
-advertised.
+tasks are reachable by anyone holding the (random UUID) task id, and `tasks/list` is both
+unadvertised **and refused** — otherwise it would hand every anonymous task's id to any
+caller and defeat that model.
 
 ## Elicitation Support (MCP 2025-11-25)
 

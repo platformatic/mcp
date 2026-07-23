@@ -41,8 +41,15 @@ export class MemoryTaskStore implements TaskStore {
     status: TaskStatus,
     options: { statusMessage?: string, outcome?: TaskOutcome } = {}
   ): Promise<TaskRecord | null> {
-    const task = await this.get(taskId)
-    if (!task) return null
+    // Read straight from the map with no intervening await, so the terminal
+    // check and the write cannot interleave with a concurrent updateStatus.
+    // A separate `await this.get()` here would open a window in which a cancel
+    // and a completion both read `working` and each overwrite the other.
+    const task = this.tasks.get(taskId)
+    if (!task || taskHasExpired(task)) {
+      this.tasks.delete(taskId)
+      return null
+    }
 
     if (task.status !== status) {
       if (isTerminal(task.status)) {
