@@ -397,6 +397,50 @@ describe('tasks over the wire', () => {
     t.assert.strictEqual(cross.error.code, INVALID_PARAMS)
   })
 
+  test('a token without sub cannot list or reach subject-less tasks', async (t: TestContext) => {
+    const restoreMock = setupMockAgent({
+      'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse()
+    })
+    t.after(() => restoreMock())
+
+    const app = Fastify({ logger: false })
+    t.after(() => app.close())
+    await app.register(mcpPlugin, { enableTasks: true, authorization: createTestAuthConfig() })
+    app.mcpAddTool({
+      name: 'noop',
+      description: 'x',
+      inputSchema: Type.Object({}),
+      execution: { taskSupport: 'optional' }
+    } as any, async (): Promise<CallToolResult> => ({ content: [{ type: 'text', text: 'ok' }] }))
+    await app.ready()
+
+    const authedCall = async (token: string, method: string, params: unknown) => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/mcp',
+        headers: { authorization: `Bearer ${token}`, 'mcp-protocol-version': LATEST_PROTOCOL_VERSION },
+        payload: { jsonrpc: JSONRPC_VERSION, id: 1, method, params }
+      })
+      return res.json()
+    }
+
+    // Two distinct callers, both presenting tokens that carry no `sub` claim.
+    const anonA = createTestJWT({ sub: undefined })
+    const anonB = createTestJWT({ sub: undefined })
+
+    const created = await authedCall(anonA, 'tools/call', { name: 'noop', arguments: {}, task: {} })
+    const taskId = (created.result as CreateTaskResult).task.taskId
+    t.assert.ok(taskId)
+
+    // B must not enumerate A's task via list (both resolve to an undefined subject)
+    const list = await authedCall(anonB, 'tasks/list', {})
+    t.assert.deepStrictEqual((list.result as ListTasksResult).tasks, [])
+
+    // ...nor reach it by id
+    const get = await authedCall(anonB, 'tasks/get', { taskId })
+    t.assert.strictEqual(get.error.code, INVALID_PARAMS)
+  })
+
   test('task methods are unavailable when tasks are disabled', async (t: TestContext) => {
     const app = Fastify({ logger: false })
     t.after(() => app.close())

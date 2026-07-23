@@ -79,7 +79,7 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     sessionStore = new RedisSessionStore({ redis, maxMessages: 100 })
     messageBroker = new RedisMessageBroker(redis)
     if (enableTasks) {
-      taskStore = new RedisTaskStore({ redis })
+      taskStore = new RedisTaskStore({ redis, defaultTtlMs: opts.taskDefaultTtlMs })
     }
   } else {
     // Memory implementations for single-instance deployment

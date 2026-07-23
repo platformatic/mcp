@@ -48,6 +48,29 @@ describe('MCP Fastify Plugin', () => {
   })
 
   describe('MCP Protocol Handlers', () => {
+    test('rejects a JSON-RPC batch with -32600 rather than a 500', async (t: TestContext) => {
+      const app = Fastify()
+      t.after(() => app.close())
+      await app.register(mcpPlugin)
+      await app.ready()
+
+      // Batching was removed in 2025-06-18; an array body must be refused
+      // gracefully as a protocol error, not surface as an opaque HTTP 500.
+      const response = await app.inject({
+        method: 'POST',
+        url: '/mcp',
+        payload: [
+          { jsonrpc: JSONRPC_VERSION, id: 1, method: 'ping', params: {} },
+          { jsonrpc: JSONRPC_VERSION, id: 2, method: 'ping', params: {} }
+        ]
+      })
+
+      t.assert.strictEqual(response.statusCode, 200)
+      const body = response.json() as { error: { code: number }, id: unknown }
+      t.assert.strictEqual(body.error.code, -32600)
+      t.assert.strictEqual(body.id, null)
+    })
+
     test('should handle initialize request', async (t: TestContext) => {
       const app = Fastify()
       t.after(() => app.close())

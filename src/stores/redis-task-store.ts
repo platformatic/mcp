@@ -31,7 +31,14 @@ export class RedisTaskStore implements TaskStore {
 
   async create (task: TaskRecord): Promise<void> {
     const key = this.key(task.taskId)
-    await this.redis.set(key, JSON.stringify(task), 'EX', this.expirySeconds(task))
+    // A null ttl means unlimited retention (matching taskHasExpired and the
+    // memory store), so write the key without an expiry rather than falling back
+    // to the default and silently expiring it.
+    if (task.ttl === null) {
+      await this.redis.set(key, JSON.stringify(task))
+    } else {
+      await this.redis.set(key, JSON.stringify(task), 'EX', this.expirySeconds(task))
+    }
     // Index membership lets `list` enumerate without a keyspace scan; stale ids
     // are pruned on read, since the task keys expire independently.
     await this.redis.zadd(TASK_INDEX_KEY, new Date(task.createdAt).getTime(), task.taskId)

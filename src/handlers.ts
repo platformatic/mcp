@@ -25,8 +25,10 @@ import {
   SUPPORTED_PROTOCOL_VERSIONS,
   METHOD_NOT_FOUND,
   INTERNAL_ERROR,
-  INVALID_PARAMS
+  INVALID_PARAMS,
+  INVALID_REQUEST
 } from './schema.ts'
+import type { RequestId } from './schema.ts'
 
 import type { MCPTool, MCPResource, MCPPrompt, MCPPluginOptions, ResourceHandlers } from './types.ts'
 import type { SessionStore } from './stores/session-store.ts'
@@ -70,10 +72,12 @@ export function createResponse (id: string | number, result: any): JSONRPCRespon
   }
 }
 
-export function createError (id: string | number, code: number, message: string, data?: any): JSONRPCError {
+export function createError (id: string | number | null, code: number, message: string, data?: any): JSONRPCError {
   return {
     jsonrpc: JSONRPC_VERSION,
-    id,
+    // JSON-RPC requires an explicit null id when the request id is unknown
+    // (e.g. an unparseable batch); RequestId does not model null, so cast.
+    id: id as RequestId,
     error: { code, message, data }
   }
 }
@@ -644,12 +648,24 @@ function canIdentifyRequestors (dependencies: HandlerDependencies): boolean {
 
 /**
  * Enforce task isolation: a requestor may only touch its own tasks.
- * Returns an "invalid params" error rather than a distinct "forbidden" code so
- * that probing for task ids cannot distinguish existence from ownership.
+ * Returns null (surfaced as "invalid params") rather than a distinct "forbidden"
+ * code so that probing for task ids cannot distinguish existence from ownership.
  */
 function assertTaskAccess (task: TaskRecord | null, dependencies: HandlerDependencies): TaskRecord | null {
   if (!task) return null
-  if (task.authSubject !== taskSubject(dependencies)) return null
+
+  const subject = taskSubject(dependencies)
+
+  if (canIdentifyRequestors(dependencies)) {
+    // Auth on: a task is reachable only by the exact subject that owns it. A
+    // token without a `sub` claim identifies no one, so an undefined subject
+    // must never match another subject-less task via `undefined === undefined`.
+    if (subject === undefined || task.authSubject !== subject) return null
+    return task
+  }
+
+  // Auth off: no requestor can be identified, so the random task id is the
+  // capability and every (subject-less) task is reachable by whoever holds it.
   return task
 }
 
@@ -869,7 +885,15 @@ async function handleTasksList (
     return createError(request.id, METHOD_NOT_FOUND, 'Method tasks/list not found')
   }
 
-  const tasks = await taskStore.list(taskSubject(dependencies))
+  const subject = taskSubject(dependencies)
+  if (subject === undefined) {
+    // Auth is on but this token carries no `sub`, so it owns nothing we can
+    // identify. Listing the undefined-subject tasks would expose every other
+    // subject-less caller's tasks, so return an empty set instead.
+    return createResponse(request.id, { tasks: [], nextCursor: undefined } as ListTasksResult)
+  }
+
+  const tasks = await taskStore.list(subject)
   const result: ListTasksResult = {
     tasks: tasks.map(toWireTask),
     nextCursor: undefined
@@ -1140,6 +1164,12 @@ export async function processMessage (
   sessionId: string | undefined,
   dependencies: HandlerDependencies
 ): Promise<JSONRPCResponse | JSONRPCError | null> {
+  if (Array.isArray(message)) {
+    // JSON-RPC batching was removed in the 2025-06-18 revision. Refuse it with a
+    // proper protocol error rather than throwing, which the transport would
+    // otherwise surface as an opaque HTTP 500.
+    return createError(null, INVALID_REQUEST, 'Batch requests are not supported')
+  }
   if ('id' in message && 'method' in message) {
     return await handleRequest(message as JSONRPCRequest, sessionId, dependencies)
   } else if ('method' in message) {

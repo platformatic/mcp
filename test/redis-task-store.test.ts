@@ -105,6 +105,14 @@ describe('RedisTaskStore', () => {
     t.assert.ok(after > 0, 'task should still be retained')
   })
 
+  test('a null ttl means unlimited retention, not the default expiry', async (t: TestContext) => {
+    await store.create(record({ ttl: null }))
+
+    // -1 is Redis for "key exists but has no expiry"; the default must not apply
+    t.assert.strictEqual(await redis.ttl('mcp:task:task-1'), -1)
+    t.assert.strictEqual((await store.get('task-1'))?.ttl, null)
+  })
+
   test('treats a task past its ttl as absent', async (t: TestContext) => {
     await store.create(record({ createdAt: new Date(Date.now() - 10_000).toISOString(), ttl: 1_000 }))
     t.assert.strictEqual(await store.get('task-1'), null)
