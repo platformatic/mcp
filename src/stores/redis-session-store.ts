@@ -51,11 +51,6 @@ export class RedisSessionStore implements SessionStore {
   async update (metadata: SessionMetadata): Promise<void> {
     const sessionKey = `session:${metadata.id}`
 
-    // Only touch sessions that still exist; an expired session must stay expired
-    if (await this.redis.exists(sessionKey) === 0) {
-      return
-    }
-
     const sessionData: Record<string, string> = {
       eventId: metadata.eventId.toString(),
       lastEventId: metadata.lastEventId || '',
@@ -66,7 +61,18 @@ export class RedisSessionStore implements SessionStore {
       sessionData.protocolVersion = metadata.protocolVersion
     }
 
-    await this.redis.hset(sessionKey, sessionData)
+    // Check-then-write must be atomic: a separate EXISTS followed by HSET would
+    // recreate a session that expired in between, leaving it with no TTL and only
+    // the partial fields written here. The script skips the write when the key is
+    // already gone, so an expired session stays expired and keeps its existing TTL.
+    await this.redis.eval(
+      `if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+       redis.call('HSET', KEYS[1], unpack(ARGV))
+       return 1`,
+      1,
+      sessionKey,
+      ...Object.entries(sessionData).flat()
+    )
   }
 
   async get (sessionId: string): Promise<SessionMetadata | null> {

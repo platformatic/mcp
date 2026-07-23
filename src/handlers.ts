@@ -691,11 +691,82 @@ async function handleTasksGet (
   return createResponse(request.id, toWireTask(task))
 }
 
+/**
+ * Suspend for `ms`, or reject as soon as `signal` aborts.
+ */
+function delay (ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new Error('aborted'))
+      return
+    }
+    const onAbort = () => {
+      clearTimeout(timer)
+      reject(new Error('aborted'))
+    }
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    if (typeof timer.unref === 'function') timer.unref()
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+/**
+ * Block until the task reaches a terminal status, or throw when `signal` aborts.
+ *
+ * Two mechanisms run together:
+ *  - an in-process waiter that fires the instant *this* instance completes the
+ *    task, giving zero-latency wake-ups for single-instance and same-instance
+ *    cases; and
+ *  - bounded polling of the shared task store, which is what makes this correct
+ *    across instances: with a Redis-backed store the task may complete on a
+ *    different instance, whose `notify()` this process never sees, so polling is
+ *    the only mechanism guaranteed to observe the terminal state.
+ *
+ * Returns null if the task disappears (expires or is deleted) while waiting.
+ */
+async function awaitTaskTerminal (
+  taskId: string,
+  initial: TaskRecord,
+  dependencies: HandlerDependencies,
+  signal: AbortSignal
+): Promise<TaskRecord | null> {
+  const { taskStore, taskWaiters } = dependencies
+  if (!taskStore) return initial
+
+  // A single waiter for the whole call. Resolves to a terminal task when this
+  // instance completes it, or to null when aborted — caught here so that losing
+  // the race below can never surface as an unhandled rejection.
+  const accelerator: Promise<TaskRecord | null> = taskWaiters
+    ? taskWaiters.wait(taskId, signal).then(task => task).catch(() => null)
+    : new Promise<TaskRecord | null>(() => {})
+
+  let task: TaskRecord | null = initial
+  while (task && !isTerminal(task.status)) {
+    const pollDelay = task.pollInterval ?? DEFAULT_POLL_INTERVAL
+    const winner = await Promise.race([
+      accelerator,
+      delay(pollDelay, signal).then(() => null)
+    ])
+
+    if (winner && isTerminal(winner.status)) {
+      return winner
+    }
+    // The poll timer elapsed (or the accelerator aborted); the shared store is
+    // the source of truth, so re-read it before deciding whether to loop again.
+    task = await taskStore.get(taskId)
+  }
+
+  return task
+}
+
 async function handleTasksResult (
   request: JSONRPCRequest,
   dependencies: HandlerDependencies
 ): Promise<JSONRPCResponse | JSONRPCError> {
-  const { taskStore, taskWaiters } = dependencies
+  const { taskStore } = dependencies
   if (!taskStore) {
     return createError(request.id, METHOD_NOT_FOUND, 'Tasks are not enabled on this server')
   }
@@ -710,12 +781,17 @@ async function handleTasksResult (
     return createError(request.id, INVALID_PARAMS, 'Failed to retrieve task: Task not found')
   }
 
-  // `tasks/result` blocks until the task is terminal
-  if (!isTerminal(task.status) && taskWaiters) {
+  // `tasks/result` blocks until the task is terminal. Works across instances:
+  // see awaitTaskTerminal.
+  if (!isTerminal(task.status)) {
     const controller = new AbortController()
     dependencies.request.raw.on('close', () => controller.abort())
     try {
-      task = await taskWaiters.wait(taskId, controller.signal)
+      const settled = await awaitTaskTerminal(taskId, task, dependencies, controller.signal)
+      if (!settled) {
+        return createError(request.id, INVALID_PARAMS, 'Failed to retrieve task: Task not found')
+      }
+      task = settled
     } catch {
       return createError(request.id, INTERNAL_ERROR, 'Client disconnected while awaiting task result')
     }
