@@ -22,6 +22,10 @@ export class RedisSessionStore implements SessionStore {
       lastActivity: metadata.lastActivity.toISOString()
     }
 
+    if (metadata.protocolVersion) {
+      sessionData.protocolVersion = metadata.protocolVersion
+    }
+
     // Add authorization context if present
     if (metadata.authorization) {
       sessionData.authorization = JSON.stringify(metadata.authorization)
@@ -44,6 +48,33 @@ export class RedisSessionStore implements SessionStore {
     }
   }
 
+  async update (metadata: SessionMetadata): Promise<void> {
+    const sessionKey = `session:${metadata.id}`
+
+    // Persist only what the caller owns: the negotiated version and activity
+    // time. Writing eventId/lastEventId here would roll the SSE counter back to
+    // a stale value if addMessage bumped it between the caller's get() and now.
+    const sessionData: Record<string, string> = {
+      lastActivity: metadata.lastActivity.toISOString()
+    }
+    if (metadata.protocolVersion) {
+      sessionData.protocolVersion = metadata.protocolVersion
+    }
+
+    // Check-then-write must be atomic: a separate EXISTS followed by HSET would
+    // recreate a session that expired in between, leaving it with no TTL. The
+    // script skips the write when the key is gone, so an expired session stays
+    // expired; HSET does not touch the TTL, so the original expiry is preserved.
+    await this.redis.eval(
+      `if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+       redis.call('HSET', KEYS[1], unpack(ARGV))
+       return 1`,
+      1,
+      sessionKey,
+      ...Object.entries(sessionData).flat()
+    )
+  }
+
   async get (sessionId: string): Promise<SessionMetadata | null> {
     const sessionKey = `session:${sessionId}`
     const result = await this.redis.hgetall(sessionKey)
@@ -57,7 +88,8 @@ export class RedisSessionStore implements SessionStore {
       eventId: parseInt(result.eventId, 10),
       lastEventId: result.lastEventId || undefined,
       createdAt: new Date(result.createdAt),
-      lastActivity: new Date(result.lastActivity)
+      lastActivity: new Date(result.lastActivity),
+      protocolVersion: result.protocolVersion || undefined
     }
 
     // Parse authorization context if present

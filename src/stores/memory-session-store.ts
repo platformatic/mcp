@@ -22,6 +22,20 @@ export class MemorySessionStore implements SessionStore {
     this.messageHistory.set(metadata.id, [])
   }
 
+  async update (metadata: SessionMetadata): Promise<void> {
+    const existing = this.sessions.get(metadata.id)
+    if (!existing) {
+      return
+    }
+    // Only the negotiated version and activity time are the caller's to change.
+    // Writing the whole record back would roll the event counter back to a stale
+    // value if a concurrent SSE message bumped it between get() and update().
+    existing.lastActivity = metadata.lastActivity
+    if (metadata.protocolVersion !== undefined) {
+      existing.protocolVersion = metadata.protocolVersion
+    }
+  }
+
   async get (sessionId: string): Promise<SessionMetadata | null> {
     const session = this.sessions.get(sessionId)
     return session ? { ...session } : null

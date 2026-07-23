@@ -4,7 +4,7 @@ import Fastify from 'fastify'
 import mcpPlugin from '../src/index.ts'
 import type {
   JSONRPCRequest,
-  JSONRPCResponse,
+  JSONRPCResultResponse,
   ListResourcesResult,
   ListResourceTemplatesResult,
   ReadResourceResult
@@ -33,7 +33,7 @@ describe('Resource Templates', () => {
     })
 
     t.assert.strictEqual(response.statusCode, 200)
-    const body = response.json() as JSONRPCResponse
+    const body = response.json() as JSONRPCResultResponse
     const result = body.result as ListResourcesResult
     t.assert.strictEqual(result.resources.length, 1)
     t.assert.strictEqual(result.resources[0].name, 'concrete')
@@ -62,7 +62,7 @@ describe('Resource Templates', () => {
     })
 
     t.assert.strictEqual(response.statusCode, 200)
-    const body = response.json() as JSONRPCResponse
+    const body = response.json() as JSONRPCResultResponse
     const result = body.result as ListResourceTemplatesResult
     t.assert.strictEqual(result.resourceTemplates.length, 2)
 
@@ -99,7 +99,7 @@ describe('Resource Templates', () => {
     })
 
     t.assert.strictEqual(response.statusCode, 200)
-    const body = response.json() as JSONRPCResponse
+    const body = response.json() as JSONRPCResultResponse
     const result = body.result as ListResourceTemplatesResult
     t.assert.strictEqual(result.resourceTemplates.length, 0)
   })
@@ -130,7 +130,7 @@ describe('Resource Templates', () => {
     })
 
     t.assert.strictEqual(response.statusCode, 200)
-    const body = response.json() as JSONRPCResponse
+    const body = response.json() as JSONRPCResultResponse
     const result = body.result as ReadResourceResult
     t.assert.strictEqual(result.contents.length, 1)
     t.assert.ok('text' in result.contents[0] && result.contents[0].text.includes('moltnet://diary/{id}'))
@@ -161,8 +161,8 @@ describe('Resource Templates', () => {
       })
     ])
 
-    const list = (listRes.json() as JSONRPCResponse).result as ListResourcesResult
-    const templates = (templatesRes.json() as JSONRPCResponse).result as ListResourceTemplatesResult
+    const list = (listRes.json() as JSONRPCResultResponse).result as ListResourcesResult
+    const templates = (templatesRes.json() as JSONRPCResultResponse).result as ListResourceTemplatesResult
 
     t.assert.strictEqual(list.resources.length, 2)
     t.assert.strictEqual(templates.resourceTemplates.length, 2)

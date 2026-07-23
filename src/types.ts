@@ -10,11 +10,12 @@ import type {
   Tool,
   Resource,
   Prompt,
-  ElicitRequest,
+  ElicitRequestFormParams,
   RequestId
 } from './schema.ts'
 import type { Static, TSchema, TObject, TString } from '@sinclair/typebox'
 import type { AuthorizationConfig, AuthorizationContext } from './types/auth-types.ts'
+import type { AllowedOrigins } from './security.ts'
 
 // Context interface for all handler types
 export interface HandlerContext {
@@ -121,8 +122,27 @@ declare module 'fastify' {
     mcpElicit: (
       sessionId: string,
       message: string,
-      requestedSchema: ElicitRequest['params']['requestedSchema'],
+      requestedSchema: ElicitRequestFormParams['requestedSchema'],
       requestId?: RequestId
+    ) => Promise<boolean>
+
+    /**
+     * Send a URL mode elicitation request. Resolves to the elicitation id on
+     * success (use it to correlate the later completion notification), or null
+     * if the request could not be sent.
+     */
+    mcpElicitUrl: (
+      sessionId: string,
+      message: string,
+      url: string,
+      elicitationId?: string,
+      requestId?: RequestId
+    ) => Promise<string | null>
+
+    /** Signal that an out-of-band URL elicitation has completed */
+    mcpNotifyElicitationComplete: (
+      sessionId: string,
+      elicitationId: string
     ) => Promise<boolean>
 
     // Resource subscription handler setters
@@ -157,6 +177,34 @@ export interface MCPPluginOptions {
   capabilities?: ServerCapabilities
   instructions?: string
   enableSSE?: boolean
+  /**
+   * Close an SSE stream after this many milliseconds so the client falls back to
+   * polling and reconnects with `Last-Event-ID` (SEP-1699). Omit to keep streams
+   * open indefinitely, which stays valid.
+   */
+  sseMaxConnectionMs?: number
+  /**
+   * Enable task-augmented execution (2025-11-25, experimental). Tools opt in
+   * individually via `execution.taskSupport`.
+   */
+  enableTasks?: boolean
+  /**
+   * Retention for a task whose creator did not request a `ttl`, in milliseconds
+   * (default 60000). Raise it when tools can run longer than a minute, so their
+   * tasks do not expire before completing.
+   */
+  taskDefaultTtlMs?: number
+  /**
+   * Ceiling on task retention, in milliseconds (default 3600000). A requested
+   * `ttl` above this is capped, so a client cannot pin resources indefinitely.
+   */
+  taskMaxTtlMs?: number
+  /**
+   * Origins accepted on the MCP endpoints, to prevent DNS rebinding attacks.
+   * Omit to disable validation (non-browser deployments), pass `'*'` or `true`
+   * to accept any origin, or list exact origins to allow.
+   */
+  allowedOrigins?: AllowedOrigins
   sessionStore?: 'memory' | 'redis'
   messageBroker?: 'memory' | 'redis'
   redis?: {

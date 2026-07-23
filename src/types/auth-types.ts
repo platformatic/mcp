@@ -109,6 +109,13 @@ export type AuthorizationConfig =
     resourceUri: string
     /** Paths to exclude from authorization (e.g., health checks). Supports string prefix or RegExp. */
     excludedPaths?: (string | RegExp)[]
+    /**
+     * Scopes a token must carry to reach the MCP endpoints. A token that is
+     * valid but missing any of these is answered with 403 and a
+     * `WWW-Authenticate: Bearer error="insufficient_scope"` challenge naming the
+     * scopes needed, so the client can ask the user to grant them (SEP-835).
+     */
+    requiredScopes?: string[]
     tokenValidation: {
       introspectionEndpoint?: string
       jwksUri?: string
@@ -128,6 +135,11 @@ export type AuthorizationConfig =
       resourceUri?: string
       scopes?: string[]
       dynamicRegistration?: boolean
+      /**
+       * Use an OAuth Client ID Metadata Document as the client identifier
+       * (SEP-991) instead of registering with the authorization server.
+       */
+      clientIdMetadataDocument?: boolean | { path?: string }
     }
     /**
      * DCR hooks for custom request/response processing.

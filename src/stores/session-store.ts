@@ -7,6 +7,8 @@ export interface SessionMetadata {
   lastEventId?: string
   createdAt: Date
   lastActivity: Date
+  /** Protocol revision agreed during `initialize`, if the handshake has happened */
+  protocolVersion?: string
   authSession?: any // OAuth session data (legacy - for Phase 2 compatibility)
 
   // Enhanced authorization context
@@ -16,6 +18,11 @@ export interface SessionMetadata {
 
 export interface SessionStore {
   create(metadata: SessionMetadata): Promise<void>
+  /**
+   * Persist changes to an existing session without touching its message history.
+   * A no-op when the session is gone.
+   */
+  update(metadata: SessionMetadata): Promise<void>
   get(sessionId: string): Promise<SessionMetadata | null>
   delete(sessionId: string): Promise<void>
   cleanup(): Promise<void>

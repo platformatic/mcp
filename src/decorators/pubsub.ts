@@ -4,11 +4,13 @@ import type {
   JSONRPCMessage,
   JSONRPCNotification,
   JSONRPCRequest,
-  ElicitRequest,
+  ElicitRequestFormParams,
   RequestId
 } from '../schema.ts'
-import { validateElicitationRequest } from '../security.ts'
+import { validateElicitationRequest, validateElicitationUrl } from '../security.ts'
 import { JSONRPC_VERSION } from '../schema.ts'
+import { randomUUID } from 'node:crypto'
+import { supportsUrlElicitation } from '../protocol-version.ts'
 import type { SessionStore } from '../stores/session-store.ts'
 import type { MessageBroker } from '../brokers/message-broker.ts'
 
@@ -61,7 +63,7 @@ const mcpPubSubDecoratorsPlugin: FastifyPluginAsync<MCPPubSubDecoratorsOptions> 
   app.decorate('mcpElicit', async (
     sessionId: string,
     message: string,
-    requestedSchema: ElicitRequest['params']['requestedSchema'],
+    requestedSchema: ElicitRequestFormParams['requestedSchema'],
     requestId?: RequestId
   ): Promise<boolean> => {
     if (!enableSSE) {
@@ -94,6 +96,75 @@ const mcpPubSubDecoratorsPlugin: FastifyPluginAsync<MCPPubSubDecoratorsOptions> 
     }
 
     return await app.mcpSendToSession(sessionId, elicitRequest)
+  })
+
+  // URL mode elicitation (2025-11-25): sends the user out of band for anything
+  // sensitive — credentials, payments, third-party OAuth — so it never passes
+  // through the MCP client.
+  app.decorate('mcpElicitUrl', async (
+    sessionId: string,
+    message: string,
+    url: string,
+    elicitationId?: string,
+    requestId?: RequestId
+  ): Promise<string | null> => {
+    if (!enableSSE) {
+      app.log.warn('Cannot send elicitation request: SSE is disabled')
+      return null
+    }
+
+    // URL mode arrived in 2025-11-25; a client on an older revision would not
+    // know what to do with it, so do not send one.
+    const session = await sessionStore.get(sessionId)
+    if (session && !supportsUrlElicitation(session.protocolVersion)) {
+      app.log.warn({
+        sessionId,
+        negotiated: session.protocolVersion
+      }, 'Cannot send URL elicitation: the session negotiated a revision without URL mode')
+      return null
+    }
+
+    try {
+      validateElicitationUrl(message, url)
+    } catch (validationError) {
+      app.log.warn({
+        sessionId,
+        error: validationError instanceof Error ? validationError.message : 'Unknown validation error'
+      }, 'URL elicitation request validation failed')
+      return null
+    }
+
+    const id = elicitationId ?? randomUUID()
+
+    const elicitRequest: JSONRPCRequest = {
+      jsonrpc: JSONRPC_VERSION,
+      id: requestId ?? `elicit-${id}`,
+      method: 'elicitation/create',
+      params: {
+        mode: 'url',
+        message,
+        url,
+        elicitationId: id
+      }
+    }
+
+    const sent = await app.mcpSendToSession(sessionId, elicitRequest)
+    return sent ? id : null
+  })
+
+  // Tell the client an out-of-band interaction finished, so it can retry the
+  // request that triggered it. Must go only to the session that started it.
+  app.decorate('mcpNotifyElicitationComplete', async (
+    sessionId: string,
+    elicitationId: string
+  ): Promise<boolean> => {
+    const notification: JSONRPCNotification = {
+      jsonrpc: JSONRPC_VERSION,
+      method: 'notifications/elicitation/complete',
+      params: { elicitationId }
+    }
+
+    return await app.mcpSendToSession(sessionId, notification)
   })
 }
 
