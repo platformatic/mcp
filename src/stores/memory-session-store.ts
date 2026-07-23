@@ -66,6 +66,14 @@ export class MemorySessionStore implements SessionStore {
     // Update session metadata
     const session = this.sessions.get(sessionId)
     if (session) {
+      // Persist the numeric counter, not just lastEventId. get() hands callers a
+      // copy, so the `++session.eventId` a caller does on that copy is otherwise
+      // never stored — leaving every SSE event with id "1" and breaking
+      // Last-Event-ID resumption. The Redis backend already persists this.
+      const numericEventId = parseInt(eventId, 10)
+      if (!Number.isNaN(numericEventId)) {
+        session.eventId = numericEventId
+      }
       session.lastEventId = eventId
       session.lastActivity = new Date()
     }
