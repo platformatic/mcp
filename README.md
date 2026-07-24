@@ -631,6 +631,23 @@ await app.register(mcpPlugin, {
 })
 ```
 
+### Message Broker Exports
+
+`MemoryMessageBroker`, `RedisMessageBroker`, and the `MessageBroker` interface are exported from the package's public entry point, so you can use them directly without deep-importing into `dist/brokers/...`:
+
+```typescript
+import { MessageBroker, MemoryMessageBroker, RedisMessageBroker } from '@platformatic/mcp'
+
+const broker: MessageBroker = new MemoryMessageBroker()
+// or: new RedisMessageBroker(redis)
+```
+
+- **`MessageBroker`**: the pub/sub interface the plugin uses internally to deliver messages to SSE clients — `publish(topic, message)`, `subscribe(topic, handler)`, `unsubscribe(topic)`, and `close()`.
+- **`MemoryMessageBroker`**: in-process implementation backed by [MQEmitter](https://github.com/mcollina/mqemitter). Used automatically when no `redis` option is passed; messages only reach clients connected to the same server instance.
+- **`RedisMessageBroker`**: distributed implementation backed by [mqemitter-redis](https://github.com/mcollina/mqemitter-redis). Used automatically when the `redis` option is passed; publishes go through Redis so messages reach clients connected to *any* server instance.
+
+These are the same broker classes the plugin instantiates internally based on the `redis` option. Exporting them lets you construct one directly for custom pub/sub logic, tests, or scripts that need to publish/subscribe without spinning up the full plugin.
+
 ### Multi-Instance Deployment
 
 With Redis configuration, you can run multiple instances of your MCP server:

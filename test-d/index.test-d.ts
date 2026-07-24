@@ -6,6 +6,7 @@ import {
 } from 'tsd'
 import { Type } from '@sinclair/typebox'
 import type { FastifyReply } from 'fastify'
+import { RedisMessageBroker, MemoryMessageBroker } from '../dist/index.js'
 import type {
   ToolHandler,
   ResourceHandler,
@@ -22,6 +23,7 @@ import type {
   UnsafeMCPResource,
   UnsafeMCPPrompt,
   JSONRPCMessage,
+  MessageBroker,
 } from '../dist/index.js'
 
 // ─── ToolHandler ─────────────────────────────────────────────────────
@@ -260,3 +262,26 @@ expectAssignable<SSESession>({
 // Missing required fields
 expectNotAssignable<SSESession>({ id: 'sess-1' })
 expectNotAssignable<SSESession>({ id: 'sess-1', eventId: 0 })
+
+// ─── Message brokers ────────────────────────────────────────────────
+
+// Both broker implementations are importable from the package root
+expectType<typeof RedisMessageBroker>(RedisMessageBroker)
+expectType<typeof MemoryMessageBroker>(MemoryMessageBroker)
+
+// MemoryMessageBroker satisfies the MessageBroker interface
+expectAssignable<MessageBroker>(new MemoryMessageBroker())
+
+// RedisMessageBroker's methods match the MessageBroker interface shape,
+// checked via the prototype since constructing one needs a live Redis client
+expectType<(topic: string, message: JSONRPCMessage) => Promise<void>>(
+  RedisMessageBroker.prototype.publish
+)
+expectType<(topic: string, handler: (message: JSONRPCMessage) => void) => Promise<void>>(
+  RedisMessageBroker.prototype.subscribe
+)
+expectType<(topic: string) => Promise<void>>(RedisMessageBroker.prototype.unsubscribe)
+expectType<() => Promise<void>>(RedisMessageBroker.prototype.close)
+
+// Constructor still requires a real Redis instance, not an arbitrary object
+expectError(new RedisMessageBroker({}))
