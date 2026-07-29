@@ -648,6 +648,23 @@ const broker: MessageBroker = new MemoryMessageBroker()
 
 These are the same broker classes the plugin instantiates internally based on the `redis` option. Exporting them lets you construct one directly for custom pub/sub logic, tests, or scripts that need to publish/subscribe without spinning up the full plugin.
 
+### Session Store Exports
+
+`MemorySessionStore`, `RedisSessionStore`, and the `SessionStore`/`SessionMetadata` types are exported from the package's public entry point, matching the broker and task store exports:
+
+```typescript
+import { SessionStore, MemorySessionStore, RedisSessionStore } from '@platformatic/mcp'
+
+const store: SessionStore = new MemorySessionStore()
+// or: new RedisSessionStore({ redis })
+```
+
+- **`SessionStore`**: the interface the plugin uses to persist SSE session metadata, message history, and token-to-session mappings.
+- **`MemorySessionStore`**: in-process implementation used automatically when no `redis` option is passed. Takes an optional `maxMessages` history cap (default 100).
+- **`RedisSessionStore`**: distributed implementation used automatically when the `redis` option is passed; sessions and message history live in Redis so any instance can serve any client.
+
+These are the same store classes the plugin instantiates internally based on the `redis` option. Exporting them lets you construct or inspect one directly in tests and scripts.
+
 ### Multi-Instance Deployment
 
 With Redis configuration, you can run multiple instances of your MCP server:
