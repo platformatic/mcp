@@ -63,22 +63,33 @@ function single (headers: IncomingHttpHeaders, name: string): string | undefined
   return Array.isArray(value) ? value[0] : value
 }
 
+/** Methods for which `Mcp-Name` is REQUIRED, and the body field it mirrors. */
+const NAME_SOURCE: Record<string, 'name' | 'uri'> = {
+  'tools/call': 'name',
+  'prompts/get': 'name',
+  'resources/read': 'uri'
+}
+
+/** Does this method have to carry `Mcp-Name`, whatever the body looks like? */
+export function requiresName (method: string): boolean {
+  return method in NAME_SOURCE
+}
+
 /**
  * The body value that `Mcp-Name` mirrors, which differs per method:
  * `params.name` for tools and prompts, `params.uri` for resources.
- * Methods not listed here do not carry the header.
+ *
+ * Returns undefined when the method carries no name *or* when the body is
+ * missing the field — callers must distinguish those two cases via
+ * {@link requiresName}, since a missing body field does not excuse a missing
+ * header.
  */
 export function expectedNameFor (method: string, params: unknown): string | undefined {
-  const record = params as Record<string, unknown> | undefined
-  switch (method) {
-    case 'tools/call':
-    case 'prompts/get':
-      return typeof record?.name === 'string' ? record.name : undefined
-    case 'resources/read':
-      return typeof record?.uri === 'string' ? record.uri : undefined
-    default:
-      return undefined
-  }
+  const field = NAME_SOURCE[method]
+  if (!field) return undefined
+
+  const value = (params as Record<string, unknown> | undefined)?.[field]
+  return typeof value === 'string' ? value : undefined
 }
 
 /**
@@ -103,17 +114,26 @@ export function validateStandardHeaders (
     }
   }
 
-  const expectedName = expectedNameFor(method, params)
-  const rawName = single(headers, 'mcp-name')
-
-  if (expectedName === undefined) {
-    // Methods without a name source do not require the header; a stray one is
+  if (!requiresName(method)) {
+    // Methods without a name source do not carry the header; a stray one is
     // ignored rather than rejected, since it mirrors nothing.
     return { ok: true }
   }
 
+  const rawName = single(headers, 'mcp-name')
   if (rawName === undefined) {
+    // Required for this method regardless of what the body contains — a body
+    // that omits `name`/`uri` is malformed, but that is a separate failure and
+    // must not excuse the missing header.
     return { ok: false, message: 'Missing required Mcp-Name header' }
+  }
+
+  const expectedName = expectedNameFor(method, params)
+  if (expectedName === undefined) {
+    return {
+      ok: false,
+      message: `Header mismatch: Mcp-Name header was sent but the request body has no ${method === 'resources/read' ? 'uri' : 'name'}`
+    }
   }
 
   const decoded = decodeHeaderValue(rawName)

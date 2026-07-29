@@ -22,7 +22,7 @@ import {
   META_SERVER_INFO,
   TASKS_EXTENSION
 } from '../src/schema-2026.ts'
-import { InputRequired, elicitForm } from '../src/modern/input-required.ts'
+import { InputRequired, elicitForm, elicitUrl } from '../src/modern/input-required.ts'
 import { encodeHeaderValue } from '../src/modern/headers.ts'
 import type { ClientCapabilities } from '../src/schema-2026.ts'
 
@@ -143,6 +143,20 @@ describe('2026-07-28: versioning and discovery', () => {
     t.assert.strictEqual(result.cacheScope, 'private')
   })
 
+  test('a legacy revision named in _meta is refused on the modern path', async (t: TestContext) => {
+    const app = await buildServer(t)
+
+    // 2024-11-05 has no notion of resultType or caching hints, so serving it a
+    // modern envelope would be worse than refusing.
+    const response = await call(app, 'tools/list', { protocolVersion: '2024-11-05' })
+
+    t.assert.strictEqual(response.statusCode, 400)
+    const error = response.json().error
+    t.assert.strictEqual(error.code, UNSUPPORTED_PROTOCOL_VERSION)
+    // The client is still told everything we speak, so it can drop back.
+    t.assert.deepStrictEqual(error.data.supported, [...SUPPORTED_PROTOCOL_VERSIONS])
+  })
+
   test('an unsupported version is rejected with 400 and the supported list', async (t: TestContext) => {
     const app = await buildServer(t)
 
@@ -157,7 +171,7 @@ describe('2026-07-28: versioning and discovery', () => {
 })
 
 describe('2026-07-28: per-request metadata', () => {
-  test('a request without _meta is invalid params', async (t: TestContext) => {
+  test('a modern version header with no _meta is invalid params, not a legacy request', async (t: TestContext) => {
     const app = await buildServer(t)
 
     const response = await app.inject({
@@ -167,9 +181,53 @@ describe('2026-07-28: per-request metadata', () => {
         'mcp-protocol-version': LATEST_PROTOCOL_VERSION,
         'mcp-method': 'tools/list'
       },
-      // No `_meta` at all: this reads as a legacy request, which has no
-      // `tools/list`... it does, so it succeeds on the legacy path. Assert we
-      // did *not* get a modern envelope.
+      payload: { jsonrpc: JSONRPC_VERSION, id: 1, method: 'tools/list', params: {} }
+    })
+
+    t.assert.strictEqual(response.statusCode, 400)
+    t.assert.strictEqual(response.json().error.code, INVALID_PARAMS)
+  })
+
+  test('modern headers cannot be used to smuggle a body past header validation', async (t: TestContext) => {
+    const called: string[] = []
+    const app = await buildServer(t, (app) => {
+      for (const name of ['safe_tool', 'dangerous_tool']) {
+        app.mcpAddTool({ name, inputSchema: Type.Object({}) }, async () => {
+          called.push(name)
+          return { content: [{ type: 'text', text: name }] }
+        })
+      }
+    })
+
+    // A gateway routing on Mcp-Name sees `safe_tool`. Dropping `_meta` used to
+    // divert this to the legacy path, where no header validation happens, and
+    // `dangerous_tool` ran anyway.
+    const response = await app.inject({
+      method: 'POST',
+      url: '/mcp',
+      headers: {
+        'mcp-protocol-version': LATEST_PROTOCOL_VERSION,
+        'mcp-method': 'tools/call',
+        'mcp-name': 'safe_tool'
+      },
+      payload: {
+        jsonrpc: JSONRPC_VERSION,
+        id: 1,
+        method: 'tools/call',
+        params: { name: 'dangerous_tool', arguments: {} }
+      }
+    })
+
+    t.assert.strictEqual(response.statusCode, 400)
+    t.assert.deepStrictEqual(called, [])
+  })
+
+  test('a legacy request without a modern header still takes the legacy path', async (t: TestContext) => {
+    const app = await buildServer(t)
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/mcp',
       payload: { jsonrpc: JSONRPC_VERSION, id: 1, method: 'tools/list', params: {} }
     })
 
@@ -264,6 +322,17 @@ describe('2026-07-28: header validation', () => {
 
     t.assert.strictEqual(response.statusCode, 400)
     t.assert.match(response.json().error.message, /Mcp-Name/)
+  })
+
+  test('Mcp-Name is required even when the body omits the name', async (t: TestContext) => {
+    const app = await buildServer(t)
+
+    // A body with no `name` is malformed, but that does not excuse the missing
+    // header — a gateway routing on Mcp-Name must always have one to route on.
+    const response = await call(app, 'tools/call', { params: { arguments: {} } })
+
+    t.assert.strictEqual(response.statusCode, 400)
+    t.assert.strictEqual(response.json().error.code, HEADER_MISMATCH)
   })
 
   test('a Base64-encoded Mcp-Name is decoded before comparison', async (t: TestContext) => {
@@ -475,6 +544,44 @@ describe('2026-07-28: multi round-trip requests', () => {
     t.assert.match(replay.json().error.message, /different request/)
   })
 
+  test('URL mode is refused for a client that only declared form elicitation', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'verify', inputSchema: Type.Object({}) }, async () => {
+        throw new InputRequired({
+          inputRequests: { go: elicitUrl('Verify here', 'https://example.com/verify') }
+        })
+      })
+    })
+
+    const response = await call(app, 'tools/call', {
+      params: { name: 'verify', arguments: {} },
+      capabilities: { elicitation: { form: {} } }
+    })
+
+    t.assert.strictEqual(response.statusCode, 400)
+    const error = response.json().error
+    t.assert.strictEqual(error.code, MISSING_REQUIRED_CLIENT_CAPABILITY)
+    t.assert.deepStrictEqual(error.data.requiredCapabilities, { elicitation: { url: {} } })
+  })
+
+  test('URL mode is allowed once the client declares it', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'verify', inputSchema: Type.Object({}) }, async () => {
+        throw new InputRequired({
+          inputRequests: { go: elicitUrl('Verify here', 'https://example.com/verify') }
+        })
+      })
+    })
+
+    const result = (await call(app, 'tools/call', {
+      params: { name: 'verify', arguments: {} },
+      capabilities: { elicitation: { form: {}, url: {} } }
+    })).json().result
+
+    t.assert.strictEqual(result.resultType, 'input_required')
+    t.assert.strictEqual(result.inputRequests.go.params.mode, 'url')
+  })
+
   test('the server never asks for a capability the client did not declare', async (t: TestContext) => {
     const app = await buildServer(t, (app) => registerElicitingTool(app, []))
 
@@ -485,6 +592,50 @@ describe('2026-07-28: multi round-trip requests', () => {
     const error = response.json().error
     t.assert.strictEqual(error.code, MISSING_REQUIRED_CLIENT_CAPABILITY)
     t.assert.deepStrictEqual(error.data.requiredCapabilities, { elicitation: {} })
+  })
+})
+
+describe('2026-07-28: MRTR retries are not cacheable', () => {
+  test('a retry carrying requestState or inputResponses gets no caching hints', async (t: TestContext) => {
+    const uri = 'file:///doc'
+    const app = await buildServer(t, (app) => {
+      app.mcpAddResource({ uriPattern: uri }, async (_uri: string, context: any) => {
+        if (!context.requestState) {
+          throw new InputRequired({ state: { seen: true } })
+        }
+        return { contents: [{ uri, text: 'secret', mimeType: 'text/plain' }] }
+      })
+    }, { caching: { resourcesRead: { ttlMs: 600000, cacheScope: 'public' } } })
+
+    const first = (await call(app, 'resources/read', { params: { uri } })).json().result
+    t.assert.strictEqual(first.resultType, 'input_required')
+    // Interim results are not cacheable either.
+    t.assert.strictEqual(first.ttlMs, undefined)
+
+    const retry = (await call(app, 'resources/read', {
+      id: 2,
+      params: { uri, requestState: first.requestState }
+    })).json().result
+
+    t.assert.strictEqual(retry.resultType, 'complete')
+    t.assert.strictEqual(retry.contents[0].text, 'secret')
+    // The result depends on inputs outside the cache key, so it MUST NOT be
+    // cached — a `public` hint here would leak it through a shared proxy.
+    t.assert.strictEqual(retry.ttlMs, undefined)
+    t.assert.strictEqual(retry.cacheScope, undefined)
+  })
+
+  test('the same read without MRTR fields still carries its hints', async (t: TestContext) => {
+    const uri = 'file:///plain'
+    const app = await buildServer(t, (app) => {
+      app.mcpAddResource({ uriPattern: uri }, async () => ({
+        contents: [{ uri, text: 'ok', mimeType: 'text/plain' }]
+      }))
+    }, { caching: { resourcesRead: { ttlMs: 600000, cacheScope: 'public' } } })
+
+    const result = (await call(app, 'resources/read', { params: { uri } })).json().result
+    t.assert.strictEqual(result.ttlMs, 600000)
+    t.assert.strictEqual(result.cacheScope, 'public')
   })
 })
 

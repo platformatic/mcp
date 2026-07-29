@@ -103,18 +103,45 @@ export function parseRequestContext (params: unknown): RequestContextResult {
 }
 
 /**
- * Cheap check for whether a message is aimed at the modern protocol, used to
- * route between eras before doing any real parsing.
+ * Does this request body claim a modern protocol version?
  *
- * Presence of the protocol-version key is the signal. A body that merely looks
- * malformed is left to the legacy path, which is what a legacy client's traffic
- * would look like.
+ * Used only as one half of {@link isModernRequest} — on its own it is not a
+ * safe era test, because omitting the key is exactly how a caller would try to
+ * dodge modern validation.
  */
-export function looksModern (body: unknown): boolean {
+export function bodyClaimsModern (body: unknown): boolean {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return false
   const meta = (body as { params?: { _meta?: unknown } }).params?._meta
   if (!meta || typeof meta !== 'object') return false
   return META_PROTOCOL_VERSION in (meta as Record<string, unknown>)
+}
+
+/**
+ * Decide which era a request belongs to.
+ *
+ * The `MCP-Protocol-Version` header alone is enough to commit to the modern
+ * path, and it has to be: the transport mirrors body fields into headers so
+ * that gateways can route on them, and a gateway is entitled to trust those
+ * headers once the version header says the server validates them. If era
+ * detection keyed off the body alone, a caller could send modern headers with
+ * a body that omits `_meta` and slip past every header/body check into the
+ * legacy path — defeating exactly the split-brain attack that
+ * "Server Validation" exists to prevent.
+ *
+ * So: a modern version header, or a body claiming one, means modern. A request
+ * that does neither is legacy. A modern header with a body that lacks `_meta`
+ * now correctly earns `-32602` rather than silently being served.
+ */
+export function isModernRequest (
+  headers: Record<string, string | string[] | undefined>,
+  body: unknown,
+  modernVersions: readonly string[]
+): boolean {
+  const header = headers['mcp-protocol-version']
+  const version = Array.isArray(header) ? header[0] : header
+  if (version !== undefined && modernVersions.includes(version)) return true
+
+  return bodyClaimsModern(body)
 }
 
 /** Did the client declare support for elicitation in this request? */

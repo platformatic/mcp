@@ -10,7 +10,7 @@ import {
 } from '../src/modern/headers.ts'
 import { RequestStateSealer, digestRequest } from '../src/modern/request-state.ts'
 import { negotiateFilter, matchesFilter } from '../src/modern/subscriptions.ts'
-import { parseRequestContext, looksModern } from '../src/modern/request-meta.ts'
+import { parseRequestContext, bodyClaimsModern, isModernRequest } from '../src/modern/request-meta.ts'
 import { isModernRevision } from '../src/protocol-version.ts'
 import {
   META_PROTOCOL_VERSION,
@@ -274,11 +274,33 @@ describe('request metadata parsing', () => {
     t.assert.strictEqual(parsed.ok, false)
   })
 
-  test('looksModern keys off the protocol version, not the method', (t: TestContext) => {
-    t.assert.strictEqual(looksModern({ method: 'tools/list', params: meta()._meta && meta() }), true)
-    t.assert.strictEqual(looksModern({ method: 'tools/list', params: {} }), false)
-    t.assert.strictEqual(looksModern({ method: 'initialize' }), false)
-    t.assert.strictEqual(looksModern(undefined), false)
+  test('bodyClaimsModern keys off the protocol version, not the method', (t: TestContext) => {
+    t.assert.strictEqual(bodyClaimsModern({ method: 'tools/list', params: meta() }), true)
+    t.assert.strictEqual(bodyClaimsModern({ method: 'tools/list', params: {} }), false)
+    t.assert.strictEqual(bodyClaimsModern({ method: 'initialize' }), false)
+    t.assert.strictEqual(bodyClaimsModern(undefined), false)
+  })
+
+  test('a modern version header alone commits the request to the modern path', (t: TestContext) => {
+    const modern = ['2026-07-28']
+    const legacyBody = { method: 'tools/call', params: { name: 'x' } }
+
+    // This is the bypass: modern headers a gateway may route on, with a body
+    // that omits `_meta` to dodge header/body validation.
+    t.assert.strictEqual(
+      isModernRequest({ 'mcp-protocol-version': '2026-07-28' }, legacyBody, modern),
+      true
+    )
+    t.assert.strictEqual(
+      isModernRequest({ 'mcp-protocol-version': '2025-11-25' }, legacyBody, modern),
+      false
+    )
+    t.assert.strictEqual(isModernRequest({}, legacyBody, modern), false)
+    // An array-valued header must not slip past either.
+    t.assert.strictEqual(
+      isModernRequest({ 'mcp-protocol-version': ['2026-07-28'] }, legacyBody, modern),
+      true
+    )
   })
 })
 
