@@ -2749,6 +2749,26 @@ Existing deployments keep working: the handshake path is untouched, and clients 
    publishes, because `subscriptions/listen` is core to the modern protocol; legacy SSE
    delivery is still gated by the flag.
 
+**One gotcha for existing code**
+
+`LATEST_PROTOCOL_VERSION` now means `2026-07-28`, not `2025-11-25`. If you send it as the
+`MCP-Protocol-Version` header, that header alone commits the request to the modern path —
+and a body without `_meta` is then answered with `-32602`. Code that wants the newest
+*handshake* revision should use `LATEST_LEGACY_PROTOCOL_VERSION`:
+
+```diff
+-import { LATEST_PROTOCOL_VERSION } from '@platformatic/mcp'
+-headers: { 'mcp-protocol-version': LATEST_PROTOCOL_VERSION }
++import { LATEST_LEGACY_PROTOCOL_VERSION } from '@platformatic/mcp'
++headers: { 'mcp-protocol-version': LATEST_LEGACY_PROTOCOL_VERSION }
+```
+
+The header is deliberately era-determining rather than the body alone. The transport mirrors
+body fields into headers so gateways can route on them without parsing JSON; if the era were
+decided by the body, a caller could send modern headers with a body that omits `_meta` and
+slip past every header/body check onto the unvalidated legacy path — exactly the split-brain
+the spec's "Server Validation" section exists to prevent.
+
 **Deprecated upstream** (still functional, removal no earlier than twelve months): Roots,
 Sampling, Logging, the HTTP+SSE transport, and OAuth Dynamic Client Registration.
 

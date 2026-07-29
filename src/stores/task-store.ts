@@ -56,6 +56,12 @@ export interface TaskUpdateOptions {
   inputRequests?: Record<string, unknown> | null
   /** Keys to mark as answered, merged with those already recorded. */
   answeredInputKeys?: string[]
+  /**
+   * Forget which keys have been answered. Set when a new round of questions is
+   * issued, so a key reused across rounds is not mistaken for one already
+   * satisfied.
+   */
+  clearAnsweredInputKeys?: boolean
 }
 
 export interface TaskStore {
@@ -133,6 +139,10 @@ export function applyInputRequestUpdates (task: TaskRecord, options: TaskUpdateO
     delete task.inputRequests
   } else if (options.inputRequests !== undefined) {
     task.inputRequests = options.inputRequests
+  }
+
+  if (options.clearAnsweredInputKeys) {
+    delete task.answeredInputKeys
   }
 
   if (options.answeredInputKeys?.length) {

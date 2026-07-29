@@ -11,6 +11,7 @@ import {
   MISSING_REQUIRED_CLIENT_CAPABILITY,
   UNSUPPORTED_PROTOCOL_VERSION,
   SUPPORTED_PROTOCOL_VERSIONS,
+  MODERN_PROTOCOL_VERSIONS,
   DEFAULT_NEGOTIATED_PROTOCOL_VERSION
 } from '../schema.ts'
 import { isOriginAllowed } from '../security.ts'
@@ -30,7 +31,7 @@ import type { AuthorizationContext } from '../types/auth-types.ts'
 import { processMessage, createError } from '../handlers.ts'
 import type { CachingConfig } from '../modern/handlers.ts'
 import { dispatchModern } from '../modern/handlers.ts'
-import { looksModern, parseRequestContext } from '../modern/request-meta.ts'
+import { isModernRequest, parseRequestContext } from '../modern/request-meta.ts'
 import { validateStandardHeaders } from '../modern/headers.ts'
 import type { RequestStateSealer } from '../modern/request-state.ts'
 import { SubscriptionRegistry, negotiateFilter } from '../modern/subscriptions.ts'
@@ -110,6 +111,11 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     app.log.warn('MCP: no allowedOrigins configured, Origin validation is disabled. Set allowedOrigins to protect browser clients against DNS rebinding.')
   }
 
+  /** Which protocol era this request belongs to. See `isModernRequest`. */
+  function isModern (request: FastifyRequest): boolean {
+    return isModernRequest(request.headers, request.body, MODERN_PROTOCOL_VERSIONS)
+  }
+
   // Guard against DNS rebinding: reject browser origins we do not trust.
   // The 2025-11-25 revision requires 403 here, not 400.
   async function validateOrigin (request: FastifyRequest, reply: FastifyReply): Promise<void> {
@@ -170,7 +176,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
    * 400 shape and has no way to act on the JSON-RPC one.
    */
   async function enforceProtocolVersionHeader (request: FastifyRequest, reply: FastifyReply): Promise<void> {
-    if (looksModern(request.body)) return
+    if (isModern(request)) return
 
     const header = request.headers['mcp-protocol-version']
     if (header === undefined) return
@@ -195,7 +201,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
   async function reconcileProtocolVersion (request: FastifyRequest, reply: FastifyReply): Promise<void> {
     // Modern requests are stateless and carry their own version; there is no
     // session to reconcile against, and a stray `Mcp-Session-Id` is ignored.
-    if (looksModern(request.body)) return
+    if (isModern(request)) return
 
     const sessionId = request.headers['mcp-session-id'] as string | undefined
     if (!sessionId) return
@@ -491,7 +497,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
   app.post('/mcp', postRouteOptions, async (request: FastifyRequest, reply: FastifyReply) => {
     try {
-      if (looksModern(request.body)) {
+      if (isModern(request)) {
         return await handleModernPost(request, reply)
       }
 

@@ -15,7 +15,7 @@ import type { MCPPluginOptions, MCPTool, MCPResource, MCPPrompt, ResourceHandler
 import type { CacheHint, CachingConfig } from './modern/handlers.ts'
 import { RequestStateSealer } from './modern/request-state.ts'
 import { SubscriptionRegistry } from './modern/subscriptions.ts'
-import { TaskInputChannel } from './modern/task-inputs.ts'
+import { TaskInputChannel, TASK_INPUT_TOPIC } from './modern/task-inputs.ts'
 import pubsubDecorators from './decorators/pubsub.ts'
 import metaDecorators from './decorators/meta.ts'
 import routes from './routes/mcp.ts'
@@ -33,6 +33,7 @@ import {
 } from './client.ts'
 
 // Import and export MCP protocol types
+import { JSONRPC_VERSION } from './schema.ts'
 import type {
   JSONRPCMessage,
   JSONRPCRequest,
@@ -155,7 +156,12 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
 
   const sealer = new RequestStateSealer({
     secret: opts.requestStateSecret,
-    ttlMs: opts.requestStateTtlMs
+    ttlMs: opts.requestStateTtlMs,
+    // With authorization on, a token carrying no `sub` identifies nobody, and
+    // two such callers would share the same (undefined) principal — so state
+    // sealed for one would verify for the other. Refuse rather than bind to
+    // nobody.
+    requirePrincipal: opts.authorization?.enabled === true
   })
 
   if (!opts.requestStateSecret) {
@@ -163,6 +169,25 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
   }
 
   const subscriptions = new SubscriptionRegistry(app.log)
+
+  // A `tasks/update` can land on any instance, but the execution waiting for
+  // those answers lives on exactly one. Route the wake-up through the broker so
+  // it reaches that instance; `deliver` is a no-op everywhere else.
+  taskInputs.setPublisher(async (taskId, inputResponses) => {
+    await messageBroker.publish(TASK_INPUT_TOPIC, {
+      jsonrpc: JSONRPC_VERSION,
+      method: 'notifications/tasks/input',
+      params: { taskId, inputResponses }
+    })
+  })
+
+  if (enableTasks) {
+    await messageBroker.subscribe(TASK_INPUT_TOPIC, (message) => {
+      const params = (message as { params?: { taskId?: unknown, inputResponses?: unknown } }).params
+      if (typeof params?.taskId !== 'string' || !params.inputResponses) return
+      taskInputs.deliver(params.taskId, params.inputResponses as Record<string, unknown>)
+    })
+  }
 
   // Local stream management per server instance
   const localStreams = new Map<string, Set<any>>()
@@ -238,12 +263,30 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     enableTasks
   })
 
-  // Add close hook to clean up Redis connections and authorization components
-  app.addHook('onClose', async () => {
+  // Streams must be closed in `preClose`: Fastify shuts the HTTP server down
+  // before `onClose` runs, and an open SSE response is an in-flight request, so
+  // waiting until `onClose` would deadlock the close on the very streams it is
+  // trying to end.
+  app.addHook('preClose', async () => {
     // End modern subscription streams with the graceful-closure response, so
     // clients can tell a shutdown from a dropped connection.
     subscriptions.closeAll()
 
+    for (const streams of localStreams.values()) {
+      for (const stream of streams) {
+        try {
+          if (stream.raw && !stream.raw.destroyed) {
+            stream.raw.end()
+          }
+        } catch (error) {
+          app.log.debug({ error }, 'Error ending SSE stream during shutdown')
+        }
+      }
+    }
+  })
+
+  // Add close hook to clean up Redis connections and authorization components
+  app.addHook('onClose', async () => {
     // Clean up all SSE streams and sessions
     const unsubscribePromises: Promise<void>[] = []
     for (const [sessionId, streams] of localStreams.entries()) {

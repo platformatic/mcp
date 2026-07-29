@@ -23,7 +23,8 @@ import {
   HEADER_MISMATCH,
   MISSING_REQUIRED_CLIENT_CAPABILITY,
   UNSUPPORTED_PROTOCOL_VERSION,
-  SUPPORTED_PROTOCOL_VERSIONS
+  SUPPORTED_PROTOCOL_VERSIONS,
+  MODERN_PROTOCOL_VERSIONS
 } from '../schema.ts'
 import type {
   CacheableResult,
@@ -183,8 +184,24 @@ function inputRequired (
     // Never ask for something the client did not declare it can do.
     const missing: Record<string, unknown> = {}
     for (const entry of Object.values(thrown.inputRequests)) {
-      const needed = requiredCapabilityFor(entry as { method?: string })
-      if (needed && context.clientCapabilities[needed] === undefined) {
+      const needed = requiredCapabilityFor(entry as { method?: string, params?: { mode?: string } })
+      if (!needed) continue
+
+      if (needed === 'elicitation') {
+        // Form and URL mode are declared separately, and URL mode sends the
+        // user out of band — a client that only declared `form` must never be
+        // handed one.
+        const declared = context.clientCapabilities.elicitation
+        const mode = (entry as { params?: { mode?: string } }).params?.mode
+        if (declared === undefined) {
+          missing.elicitation = {}
+        } else if (mode === 'url' && declared.url === undefined) {
+          missing.elicitation = { url: {} }
+        }
+        continue
+      }
+
+      if (context.clientCapabilities[needed] === undefined) {
         missing[needed] = {}
       }
     }
@@ -393,7 +410,9 @@ async function handleTasksUpdate (
       answeredInputKeys: Object.keys(accepted)
     })
 
-    dependencies.taskInputs?.deliver(params.taskId, accepted)
+    // Over the broker, not in-process: the execution waiting for these answers
+    // may well be on another instance.
+    await dependencies.taskInputs?.publish(params.taskId, accepted)
   }
 
   return createResponse(request.id, complete({}, dependencies.serverInfo))
@@ -487,7 +506,12 @@ async function runAsTask (
           try {
             const parked = await taskStore!.updateStatus(record.taskId, 'input_required', {
               statusMessage: error.message,
-              inputRequests: error.inputRequests as Record<string, unknown>
+              inputRequests: error.inputRequests as Record<string, unknown>,
+              // Start the round with a clean slate. Keys answered in an earlier
+              // round must not suppress a fresh question that happens to reuse
+              // one — otherwise `tasks/update` acks it and drops it, and the
+              // task hangs until its ttl.
+              clearAnsweredInputKeys: true
             })
             if (parked) taskWaiters?.notify(parked)
 
@@ -518,6 +542,8 @@ async function runAsTask (
       if (updated) taskWaiters?.notify(updated)
     } catch (error) {
       app.log.debug({ err: error, taskId: record.taskId }, 'Could not record task outcome')
+    } finally {
+      taskInputs?.forget(record.taskId)
     }
   })()
 
@@ -621,6 +647,12 @@ export function buildServerCapabilities (
   return capabilities
 }
 
+/** Is this the client coming back with answers to an `InputRequiredResult`? */
+function isMrtrRetry (request: JSONRPCRequest): boolean {
+  const params = request.params as { inputResponses?: unknown, requestState?: unknown } | undefined
+  return params?.inputResponses !== undefined || params?.requestState !== undefined
+}
+
 function handleDiscover (
   request: JSONRPCRequest,
   dependencies: ModernDependencies
@@ -657,7 +689,11 @@ export async function dispatchModern (
     client: context.clientInfo?.name
   }, `MCP request: ${request.method}`)
 
-  if (!supportedVersions.includes(context.protocolVersion)) {
+  // A legacy revision named in `_meta` is still unsupported *here*: 2024-11-05
+  // has no notion of `resultType` or caching hints, so serving it a modern
+  // envelope would be worse than refusing. The error still advertises every
+  // version we speak, so the client can drop back to the handshake.
+  if (!MODERN_PROTOCOL_VERSIONS.includes(context.protocolVersion as never)) {
     return unsupportedVersion(request.id, context.protocolVersion, supportedVersions)
   }
 
@@ -673,24 +709,32 @@ export async function dispatchModern (
   if (!opened.ok) return opened.error
   const scoped = withMrtrContext(request, dependencies, opened.payload)
 
+  // A result produced from `inputResponses`/`requestState` depends on inputs
+  // that are not part of the cache key, so it must not carry freshness hints
+  // at all — a `public` hint here would let a shared proxy serve one user's
+  // answer to another.
+  const cacheable = !isMrtrRetry(request)
+  const hint = (which: keyof CachingConfig): CacheHint | undefined =>
+    cacheable ? scoped.caching[which] : undefined
+
   try {
     switch (request.method) {
       case 'server/discover':
         return handleDiscover(request, scoped)
 
       case 'tools/list':
-        return adapt(await handleToolsList(request, scoped), scoped.serverInfo, scoped.caching.toolsList)
+        return adapt(await handleToolsList(request, scoped), scoped.serverInfo, hint('toolsList'))
       case 'resources/list':
-        return adapt(handleResourcesList(request, scoped), scoped.serverInfo, scoped.caching.resourcesList)
+        return adapt(handleResourcesList(request, scoped), scoped.serverInfo, hint('resourcesList'))
       case 'resources/templates/list':
-        return adapt(handleResourceTemplatesList(request, scoped), scoped.serverInfo, scoped.caching.resourceTemplatesList)
+        return adapt(handleResourceTemplatesList(request, scoped), scoped.serverInfo, hint('resourceTemplatesList'))
       case 'prompts/list':
-        return adapt(handlePromptsList(request, scoped), scoped.serverInfo, scoped.caching.promptsList)
+        return adapt(handlePromptsList(request, scoped), scoped.serverInfo, hint('promptsList'))
 
       case 'tools/call':
         return await modernToolsCall(request, scoped)
       case 'resources/read':
-        return adapt(await handleResourcesRead(request, undefined, scoped), scoped.serverInfo, scoped.caching.resourcesRead)
+        return adapt(await handleResourcesRead(request, undefined, scoped), scoped.serverInfo, hint('resourcesRead'))
       case 'prompts/get':
         return adapt(await handlePromptsGet(request, undefined, scoped), scoped.serverInfo)
 
