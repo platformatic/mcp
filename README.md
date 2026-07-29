@@ -663,6 +663,15 @@ PORT=3001 REDIS_HOST=redis.example.com node server.js
 PORT=3002 REDIS_HOST=redis.example.com node server.js
 ```
 
+### Graceful Shutdown
+
+`RedisMessageBroker.close()` is bounded: it waits up to `closeTimeoutMs` (default 2000ms) for
+mqemitter-redis to close its Redis connections gracefully, then falls back to forcibly
+disconnecting them so Fastify's `onClose` hooks - and the process shutdown deadline enforced by
+most orchestrators - are never blocked by a Redis outage or a stuck reconnect. Pass
+`closeTimeoutMs` and `onCloseTimeout` as a second argument to `RedisMessageBroker` to customize
+this behavior, e.g. to log when a shutdown had to fall back to the forced path.
+
 ### Session Persistence Features
 
 **Automatic Session Management:**

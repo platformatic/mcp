@@ -20,6 +20,7 @@ import { TokenValidator } from './auth/token-validator.ts'
 import { createAuthPreHandler } from './auth/prehandler.ts'
 import oauthClientPlugin from './auth/oauth-client.ts'
 import authRoutesPlugin from './routes/auth-routes.ts'
+import { quitWithTimeout } from './redis-quit-with-timeout.ts'
 
 // Import and export MCP protocol types
 import type {
@@ -46,6 +47,8 @@ import type {
   ElicitRequestFormParams,
   ElicitRequestURLParams
 } from './schema.ts'
+
+const REDIS_QUIT_TIMEOUT_MS = 2000
 
 const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOptions) {
   const serverInfo: Implementation = opts.serverInfo ?? {
@@ -77,7 +80,11 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     // Redis implementations for horizontal scaling
     redis = new Redis(opts.redis)
     sessionStore = new RedisSessionStore({ redis, maxMessages: 100 })
-    messageBroker = new RedisMessageBroker(redis)
+    messageBroker = new RedisMessageBroker(redis, {
+      onCloseTimeout: (closeTimeoutMs) => {
+        app.log.warn({ closeTimeoutMs }, 'Redis message broker close timed out; forcing disconnect')
+      }
+    })
     if (enableTasks) {
       taskStore = new RedisTaskStore({ redis, defaultTtlMs: opts.taskDefaultTtlMs })
     }
@@ -192,10 +199,15 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     // Execute all unsubscribes in parallel
     await Promise.all(unsubscribePromises)
 
-    if (redis) {
-      await redis.quit()
+    try {
+      await messageBroker.close()
+    } finally {
+      if (redis) {
+        await quitWithTimeout(redis, REDIS_QUIT_TIMEOUT_MS, () => {
+          app.log.warn({ timeoutMs: REDIS_QUIT_TIMEOUT_MS }, 'Redis client quit timed out; forcing disconnect')
+        })
+      }
     }
-    await messageBroker.close()
 
     // Clean up token validator
     if (tokenValidator) {
