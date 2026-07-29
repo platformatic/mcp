@@ -42,6 +42,11 @@ export class RedisMessageBroker implements MessageBroker {
   private readonly onCloseTimeout?: (closeTimeoutMs: number) => void
   private closePromise: Promise<void> | null = null
 
+  /**
+   * @param redis Redis connection whose options are reused for the MQEmitter pub/sub connections.
+   * @param options.closeTimeoutMs Bound on how long close() waits for a graceful shutdown, in ms (default 2000).
+   * @param options.onCloseTimeout Called with closeTimeoutMs when close() falls back to a forced disconnect after it elapses.
+   */
   constructor (redis: Redis, options: RedisMessageBrokerOptions = {}) {
     this.emitter = MQEmitterRedis({
       port: redis.options.port,

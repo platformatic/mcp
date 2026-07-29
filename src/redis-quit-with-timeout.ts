@@ -2,50 +2,39 @@ import type { Redis } from 'ioredis'
 
 // Mirrors RedisMessageBroker's own bounded close: races a graceful quit()
 // against a timer, falling back to a forced disconnect so a Redis outage
-// can't block onClose. Never rejects, and the timer stays refed since it's
-// the only thing driving resolution once quit() hangs. Also force-disconnects
-// on a rejected quit() (e.g. the connection dropped mid-command), since
-// ioredis can otherwise be left reconnecting with an active socket/timer.
+// can't block onClose. Never rejects: quit()'s rejection is mapped to an
+// outcome before the race (a rejected loser would otherwise reject the race
+// later), and it also force-disconnects on that path (e.g. the connection
+// dropped mid-command), since ioredis can otherwise be left reconnecting
+// with an active socket/timer. The timer is cleared in finally so a fast
+// quit() doesn't keep the event loop alive for the full timeout.
 export async function quitWithTimeout (client: Redis, timeoutMs: number, onTimeout: () => void): Promise<void> {
-  await new Promise<void>((resolve) => {
-    let timedOut = false
+  let timer: NodeJS.Timeout | undefined
+  const timeout = new Promise<'timeout'>((resolve) => {
+    timer = setTimeout(() => resolve('timeout'), timeoutMs)
+  })
 
-    // Both fallback paths are best-effort: a throwing onTimeout() or
-    // disconnect() must neither crash the process (this runs in a timer
-    // callback) nor leave this promise pending, so each step is isolated
-    // and resolution is guaranteed by the finally.
-    const forceDisconnect = (notifyTimeout: boolean): void => {
+  try {
+    const outcome = await Promise.race([
+      client.quit().then(() => 'ok' as const, () => 'error' as const),
+      timeout
+    ])
+    if (outcome === 'ok') {
+      return
+    }
+    if (outcome === 'timeout') {
       try {
-        if (notifyTimeout) {
-          try {
-            onTimeout()
-          } catch {
-            // caller-supplied hook must not break shutdown
-          }
-        }
-        try {
-          client.disconnect()
-        } catch {
-          // connection may already be in a broken state
-        }
-      } finally {
-        resolve()
+        onTimeout()
+      } catch {
+        // caller-supplied hook must not break shutdown
       }
     }
-
-    const timer = setTimeout(() => {
-      timedOut = true
-      forceDisconnect(true)
-    }, timeoutMs)
-
-    client.quit().then(() => {
-      if (timedOut) return
-      clearTimeout(timer)
-      resolve()
-    }).catch(() => {
-      if (timedOut) return
-      clearTimeout(timer)
-      forceDisconnect(false)
-    })
-  })
+    try {
+      client.disconnect()
+    } catch {
+      // connection may already be in a broken state
+    }
+  } finally {
+    clearTimeout(timer)
+  }
 }
