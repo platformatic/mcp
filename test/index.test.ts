@@ -17,7 +17,7 @@ import {
 } from 'node:events'
 import {
   JSONRPC_VERSION,
-  LATEST_PROTOCOL_VERSION,
+  LATEST_LEGACY_PROTOCOL_VERSION,
   METHOD_NOT_FOUND,
   INTERNAL_ERROR
 } from '../src/schema.ts'
@@ -86,7 +86,7 @@ describe('MCP Fastify Plugin', () => {
         id: 1,
         method: 'initialize',
         params: {
-          protocolVersion: LATEST_PROTOCOL_VERSION,
+          protocolVersion: LATEST_LEGACY_PROTOCOL_VERSION,
           capabilities: { roots: {} },
           clientInfo: { name: 'test-client', version: '1.0.0' }
         }
@@ -104,7 +104,7 @@ describe('MCP Fastify Plugin', () => {
       t.assert.strictEqual(body.id, 1)
 
       const result = body.result as InitializeResult
-      t.assert.strictEqual(result.protocolVersion, LATEST_PROTOCOL_VERSION)
+      t.assert.strictEqual(result.protocolVersion, LATEST_LEGACY_PROTOCOL_VERSION)
       t.assert.strictEqual(result.serverInfo.name, 'test-server')
       t.assert.strictEqual(result.serverInfo.version, '1.0.0')
       t.assert.strictEqual(result.instructions, 'Test server for MCP')

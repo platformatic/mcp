@@ -24,12 +24,10 @@ interface MCPPubSubDecoratorsOptions {
 const mcpPubSubDecoratorsPlugin: FastifyPluginAsync<MCPPubSubDecoratorsOptions> = async (app, options) => {
   const { enableSSE, messageBroker, sessionStore } = options
 
+  // Broadcasts are published regardless of `enableSSE`: that flag governs the
+  // legacy standing-stream transport, whereas 2026-07-28 delivers the same
+  // notifications on `subscriptions/listen` streams, which are always available.
   app.decorate('mcpBroadcastNotification', async (notification: JSONRPCNotification) => {
-    if (!enableSSE) {
-      app.log.warn('Cannot broadcast notification: SSE is disabled')
-      return
-    }
-
     try {
       await messageBroker.publish('mcp/broadcast/notification', notification)
     } catch (error) {

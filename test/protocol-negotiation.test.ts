@@ -6,6 +6,8 @@ import type { JSONRPCRequest, InitializeResult } from '../src/schema.ts'
 import {
   JSONRPC_VERSION,
   LATEST_PROTOCOL_VERSION,
+  LATEST_LEGACY_PROTOCOL_VERSION,
+  LEGACY_PROTOCOL_VERSIONS,
   SUPPORTED_PROTOCOL_VERSIONS,
   DEFAULT_NEGOTIATED_PROTOCOL_VERSION
 } from '../src/schema.ts'
@@ -25,17 +27,23 @@ function initializeRequest (protocolVersion?: string): JSONRPCRequest {
 }
 
 describe('protocol version negotiation', () => {
-  test('negotiateProtocolVersion echoes any supported version', (t: TestContext) => {
-    for (const version of SUPPORTED_PROTOCOL_VERSIONS) {
+  test('negotiateProtocolVersion echoes any supported handshake version', (t: TestContext) => {
+    for (const version of LEGACY_PROTOCOL_VERSIONS) {
       t.assert.strictEqual(negotiateProtocolVersion(version), version)
     }
   })
 
-  test('negotiateProtocolVersion falls back to latest for unknown input', (t: TestContext) => {
-    t.assert.strictEqual(negotiateProtocolVersion('1999-01-01'), LATEST_PROTOCOL_VERSION)
-    t.assert.strictEqual(negotiateProtocolVersion(undefined), LATEST_PROTOCOL_VERSION)
-    t.assert.strictEqual(negotiateProtocolVersion(42), LATEST_PROTOCOL_VERSION)
-    t.assert.strictEqual(negotiateProtocolVersion(null), LATEST_PROTOCOL_VERSION)
+  test('negotiateProtocolVersion never answers initialize with a handshake-free revision', (t: TestContext) => {
+    // 2026-07-28 removed `initialize` entirely, so a client that got here
+    // cannot speak it however it asked.
+    t.assert.strictEqual(negotiateProtocolVersion(LATEST_PROTOCOL_VERSION), LATEST_LEGACY_PROTOCOL_VERSION)
+  })
+
+  test('negotiateProtocolVersion falls back to the latest handshake version for unknown input', (t: TestContext) => {
+    t.assert.strictEqual(negotiateProtocolVersion('1999-01-01'), LATEST_LEGACY_PROTOCOL_VERSION)
+    t.assert.strictEqual(negotiateProtocolVersion(undefined), LATEST_LEGACY_PROTOCOL_VERSION)
+    t.assert.strictEqual(negotiateProtocolVersion(42), LATEST_LEGACY_PROTOCOL_VERSION)
+    t.assert.strictEqual(negotiateProtocolVersion(null), LATEST_LEGACY_PROTOCOL_VERSION)
   })
 
   test('initialize echoes a supported version requested by the client', async (t: TestContext) => {
@@ -55,7 +63,7 @@ describe('protocol version negotiation', () => {
     t.assert.strictEqual(result.protocolVersion, '2025-03-26')
   })
 
-  test('initialize offers the latest version when the client asks for an unsupported one', async (t: TestContext) => {
+  test('initialize offers the latest handshake version when the client asks for an unsupported one', async (t: TestContext) => {
     const app = Fastify()
     t.after(() => app.close())
     await app.register(mcpPlugin)
@@ -69,10 +77,10 @@ describe('protocol version negotiation', () => {
 
     t.assert.strictEqual(response.statusCode, 200)
     const result = response.json().result as InitializeResult
-    t.assert.strictEqual(result.protocolVersion, LATEST_PROTOCOL_VERSION)
+    t.assert.strictEqual(result.protocolVersion, LATEST_LEGACY_PROTOCOL_VERSION)
   })
 
-  test('initialize offers the latest version when the client sends none', async (t: TestContext) => {
+  test('initialize offers the latest handshake version when the client sends none', async (t: TestContext) => {
     const app = Fastify()
     t.after(() => app.close())
     await app.register(mcpPlugin)
@@ -86,7 +94,7 @@ describe('protocol version negotiation', () => {
 
     t.assert.strictEqual(response.statusCode, 200)
     const result = response.json().result as InitializeResult
-    t.assert.strictEqual(result.protocolVersion, LATEST_PROTOCOL_VERSION)
+    t.assert.strictEqual(result.protocolVersion, LATEST_LEGACY_PROTOCOL_VERSION)
   })
 
   test('the negotiated version is persisted on the session', async (t: TestContext) => {
@@ -125,7 +133,7 @@ describe('MCP-Protocol-Version header validation', () => {
     const response = await app.inject({
       method: 'POST',
       url: '/mcp',
-      headers: { 'mcp-protocol-version': LATEST_PROTOCOL_VERSION },
+      headers: { 'mcp-protocol-version': LATEST_LEGACY_PROTOCOL_VERSION },
       payload: { jsonrpc: JSONRPC_VERSION, id: 1, method: 'ping', params: {} }
     })
 
