@@ -221,6 +221,19 @@ export type {
   StdioTransportOptions
 } from './stdio.ts'
 
+// Export message broker implementations and interface
+export {
+  RedisMessageBroker
+} from './brokers/redis-message-broker.ts'
+
+export {
+  MemoryMessageBroker
+} from './brokers/memory-message-broker.ts'
+
+export type {
+  MessageBroker
+} from './brokers/message-broker.ts'
+
 // Export plugin types
 export type {
   MCPPluginOptions,
