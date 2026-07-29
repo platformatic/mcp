@@ -17,6 +17,9 @@ import type {
 import type { Static, TSchema, TObject, TString } from '@sinclair/typebox'
 import type { AuthorizationConfig, AuthorizationContext } from './types/auth-types.ts'
 import type { AllowedOrigins } from './security.ts'
+import type { CacheHint } from './modern/handlers.ts'
+
+export type { CacheHint }
 
 // Context interface for all handler types
 export interface HandlerContext {
@@ -24,6 +27,17 @@ export interface HandlerContext {
   request: FastifyRequest
   reply: FastifyReply
   authContext?: AuthorizationContext
+  /**
+   * Answers to a previous `InputRequiredResult`, keyed the way the handler
+   * keyed its `inputRequests` (2026-07-28 multi round-trip requests). Absent on
+   * a first attempt, and always absent on the legacy path.
+   */
+  inputResponses?: Record<string, unknown>
+  /**
+   * The value the handler passed as `state` when it threw `InputRequired`,
+   * verified and unsealed. Absent unless the client is retrying.
+   */
+  requestState?: unknown
 }
 
 // Resource subscription handler types
@@ -292,6 +306,35 @@ export interface MCPPluginOptions {
    * `ttl` above this is capped, so a client cannot pin resources indefinitely.
    */
   taskMaxTtlMs?: number
+  /**
+   * Freshness hints for the operations 2026-07-28 makes cacheable. Every
+   * cacheable result must carry `ttlMs` and `cacheScope`, so anything omitted
+   * here falls back to `{ ttlMs: 0, cacheScope: 'private' }` — immediately
+   * stale and never shared between callers, which is always safe.
+   *
+   * Raise `ttlMs` for lists that rarely change; combined with `listChanged`
+   * notifications the client gets both a cheap steady state and prompt
+   * invalidation. Only mark something `public` when the result genuinely does
+   * not vary per user, since a shared cache may serve it across access tokens.
+   */
+  caching?: {
+    discover?: CacheHint
+    toolsList?: CacheHint
+    promptsList?: CacheHint
+    resourcesList?: CacheHint
+    resourceTemplatesList?: CacheHint
+    resourcesRead?: CacheHint
+  }
+  /**
+   * Secret used to seal the `requestState` blob that carries multi round-trip
+   * context through the client. It must be shared by every instance that can
+   * serve a retry, otherwise a retry landing on another replica is rejected.
+   * Defaults to a per-process random key, which is correct for a single
+   * instance only.
+   */
+  requestStateSecret?: string
+  /** How long a sealed `requestState` stays valid. Defaults to 5 minutes. */
+  requestStateTtlMs?: number
   /**
    * Origins accepted on the MCP endpoints, to prevent DNS rebinding attacks.
    * Omit to disable validation (non-browser deployments), pass `'*'` or `true`
