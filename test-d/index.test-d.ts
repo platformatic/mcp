@@ -288,6 +288,7 @@ expectType<() => Promise<void>>(RedisMessageBroker.prototype.close)
 // Constructor still requires a real Redis instance, not an arbitrary object
 expectError(new RedisMessageBroker({}))
 
+<<<<<<< Updated upstream
 // ─── Session stores ─────────────────────────────────────────────────
 
 // Both session store implementations are importable from the package root
@@ -306,3 +307,23 @@ expectType<(sessionId: string) => Promise<void>>(RedisSessionStore.prototype.del
 // Constructor still requires a real Redis instance, not an arbitrary object
 expectError(new RedisSessionStore({}))
 expectError(new RedisSessionStore())
+=======
+// ─── canAccessTool hook ─────────────────────────────────────────────
+
+// Hook parameters are fully typed: definition plus per-request context
+const accessHook: NonNullable<MCPPluginOptions['canAccessTool']> = (tool, context) => {
+  expectType<string>(tool.name)
+  expectAssignable<string[] | undefined>(context.authContext?.scopes)
+  expectAssignable<string | undefined>(context.sessionId)
+  return context.request !== undefined
+}
+expectAssignable<MCPPluginOptions>({ canAccessTool: accessHook })
+
+// Sync and async hooks are both accepted
+expectAssignable<MCPPluginOptions>({ canAccessTool: () => true })
+expectAssignable<MCPPluginOptions>({ canAccessTool: async () => false })
+
+// Non-boolean returns and non-function values are rejected
+expectNotAssignable<MCPPluginOptions>({ canAccessTool: () => 'yes' })
+expectNotAssignable<MCPPluginOptions>({ canAccessTool: true })
+>>>>>>> Stashed changes

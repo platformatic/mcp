@@ -205,6 +205,17 @@ export interface MCPPluginOptions {
    * to accept any origin, or list exact origins to allow.
    */
   allowedOrigins?: AllowedOrigins
+  /**
+   * Per-request tool authorization. Consulted by both `tools/list` (a denied
+   * tool is omitted) and `tools/call` (a denied tool answers with the same
+   * "not found" error as an unknown tool, so callers cannot probe for tools
+   * they are not allowed to see). A hook that throws denies access.
+   * Omit to keep every registered tool visible and callable.
+   */
+  canAccessTool?: (
+    tool: Tool,
+    context: { authContext?: AuthorizationContext, request?: FastifyRequest, sessionId?: string }
+  ) => boolean | Promise<boolean>
   sessionStore?: 'memory' | 'redis'
   messageBroker?: 'memory' | 'redis'
   redis?: {
