@@ -226,6 +226,12 @@ export interface MCPPluginOptions {
     toolName: string,
     context: ToolAccessContext
   ) => boolean | Promise<boolean>
+  /**
+   * Validate plain-JSON-Schema tool inputs with AJV before invoking the handler
+   * (TypeBox schemas are always validated). Off by default: without it, plain
+   * JSON Schema tool arguments are passed through to handlers unvalidated.
+   */
+  validateJsonSchemaInputs?: boolean
   sessionStore?: 'memory' | 'redis'
   messageBroker?: 'memory' | 'redis'
   redis?: {

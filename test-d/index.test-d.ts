@@ -330,3 +330,11 @@ expectAssignable<MCPPluginOptions>({ canAccessTool: async () => false })
 // Non-boolean returns and non-function values are rejected
 expectNotAssignable<MCPPluginOptions>({ canAccessTool: () => 'yes' })
 expectNotAssignable<MCPPluginOptions>({ canAccessTool: true })
+
+// ─── Plugin options ─────────────────────────────────────────────────
+
+// validateJsonSchemaInputs is an optional boolean
+expectAssignable<MCPPluginOptions>({ validateJsonSchemaInputs: true })
+expectAssignable<MCPPluginOptions>({ validateJsonSchemaInputs: false })
+expectAssignable<MCPPluginOptions>({})
+expectNotAssignable<MCPPluginOptions>({ validateJsonSchemaInputs: 'yes' })

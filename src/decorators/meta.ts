@@ -8,17 +8,19 @@ import type {
   ResourceSubscribeHandler,
   ResourceUnsubscribeHandler
 } from '../types.ts'
-import { schemaToArguments, validateToolSchema } from '../validation/index.ts'
+import { schemaToArguments, validateToolSchema, isTypeBoxSchema } from '../validation/index.ts'
+import type { JsonSchemaValidator } from '../validation/json-schema-validator.ts'
 
 interface MCPDecoratorsOptions {
   tools: Map<string, MCPTool>
   resources: Map<string, MCPResource>
   prompts: Map<string, MCPPrompt>
   resourceHandlers: ResourceHandlers
+  jsonSchemaValidator?: JsonSchemaValidator
 }
 
 const mcpDecoratorsPlugin: FastifyPluginAsync<MCPDecoratorsOptions> = async (app, options) => {
-  const { tools, resources, prompts, resourceHandlers } = options
+  const { tools, resources, prompts, resourceHandlers, jsonSchemaValidator } = options
 
   // Enhanced tool decorator with TypeBox schema support
   app.decorate('mcpAddTool', (
@@ -35,6 +37,16 @@ const mcpDecoratorsPlugin: FastifyPluginAsync<MCPDecoratorsOptions> = async (app
       const schemaErrors = validateToolSchema(definition.inputSchema)
       if (schemaErrors.length > 0) {
         throw new Error(`Invalid tool schema for '${name}': ${schemaErrors.join(', ')}`)
+      }
+
+      // When AJV validation is on, an uncompilable plain JSON Schema must fail
+      // registration rather than register a tool whose inputs can't be checked
+      if (jsonSchemaValidator && !isTypeBoxSchema(definition.inputSchema)) {
+        try {
+          jsonSchemaValidator.compileAndCache(definition.inputSchema)
+        } catch (error) {
+          throw new Error(`Invalid tool schema for '${name}': ${error instanceof Error ? error.message : String(error)}`)
+        }
       }
     }
 
