@@ -249,6 +249,7 @@ export type {
 // Export plugin types
 export type {
   MCPPluginOptions,
+  ToolAccessContext,
   MCPTool,
   MCPResource,
   MCPPrompt,

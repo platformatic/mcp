@@ -5,7 +5,7 @@ import {
   expectNotAssignable,
 } from 'tsd'
 import { Type } from '@sinclair/typebox'
-import type { FastifyReply } from 'fastify'
+import type { FastifyReply, FastifyRequest } from 'fastify'
 import { RedisMessageBroker, MemoryMessageBroker, RedisSessionStore, MemorySessionStore } from '../dist/index.js'
 import type {
   ToolHandler,
@@ -26,6 +26,7 @@ import type {
   MessageBroker,
   SessionStore,
   SessionMetadata,
+  ToolAccessContext,
 } from '../dist/index.js'
 
 // ─── ToolHandler ─────────────────────────────────────────────────────
@@ -288,7 +289,6 @@ expectType<() => Promise<void>>(RedisMessageBroker.prototype.close)
 // Constructor still requires a real Redis instance, not an arbitrary object
 expectError(new RedisMessageBroker({}))
 
-<<<<<<< Updated upstream
 // ─── Session stores ─────────────────────────────────────────────────
 
 // Both session store implementations are importable from the package root
@@ -307,17 +307,21 @@ expectType<(sessionId: string) => Promise<void>>(RedisSessionStore.prototype.del
 // Constructor still requires a real Redis instance, not an arbitrary object
 expectError(new RedisSessionStore({}))
 expectError(new RedisSessionStore())
-=======
+
 // ─── canAccessTool hook ─────────────────────────────────────────────
 
-// Hook parameters are fully typed: definition plus per-request context
-const accessHook: NonNullable<MCPPluginOptions['canAccessTool']> = (tool, context) => {
-  expectType<string>(tool.name)
+// Hook parameters are fully typed: tool name plus per-request context
+const accessHook: NonNullable<MCPPluginOptions['canAccessTool']> = (toolName, context) => {
+  expectType<string>(toolName)
   expectAssignable<string[] | undefined>(context.authContext?.scopes)
   expectAssignable<string | undefined>(context.sessionId)
   return context.request !== undefined
 }
 expectAssignable<MCPPluginOptions>({ canAccessTool: accessHook })
+
+// The context type is exported and carries a required request
+expectAssignable<ToolAccessContext>({ request: {} as FastifyRequest })
+expectNotAssignable<ToolAccessContext>({})
 
 // Sync and async hooks are both accepted
 expectAssignable<MCPPluginOptions>({ canAccessTool: () => true })
@@ -326,4 +330,3 @@ expectAssignable<MCPPluginOptions>({ canAccessTool: async () => false })
 // Non-boolean returns and non-function values are rejected
 expectNotAssignable<MCPPluginOptions>({ canAccessTool: () => 'yes' })
 expectNotAssignable<MCPPluginOptions>({ canAccessTool: true })
->>>>>>> Stashed changes

@@ -159,19 +159,19 @@ function withSchemaDialect<T> (schema: T, protocolVersion: string | undefined): 
  * exposing a tool the deployment meant to gate; the error is logged so a
  * misbehaving hook is visible to the operator.
  */
-async function checkToolAccess (tool: MCPTool, dependencies: HandlerDependencies): Promise<boolean> {
+async function checkToolAccess (toolName: string, dependencies: HandlerDependencies): Promise<boolean> {
   const hook = dependencies.opts.canAccessTool
   if (!hook) return true
   try {
-    return await hook(tool.definition, {
+    return await hook(toolName, {
       authContext: dependencies.authContext,
       request: dependencies.request,
       sessionId: dependencies.sessionId
     }) === true
   } catch (error) {
-    dependencies.app.log.warn({
+    dependencies.request.log.warn({
       err: error,
-      tool: tool.definition.name
+      tool: toolName
     }, 'canAccessTool hook threw; denying access')
     return false
   }
@@ -179,12 +179,12 @@ async function checkToolAccess (tool: MCPTool, dependencies: HandlerDependencies
 
 async function handleToolsList (request: JSONRPCRequest, dependencies: HandlerDependencies): Promise<JSONRPCResponse> {
   const { tools, protocolVersion } = dependencies
-  const accessibleTools: MCPTool[] = []
-  for (const tool of tools.values()) {
-    if (await checkToolAccess(tool, dependencies)) {
-      accessibleTools.push(tool)
-    }
-  }
+  // Independent per-tool checks run concurrently; order stays registration order
+  const registeredTools = Array.from(tools.values())
+  const accessResults = await Promise.all(
+    registeredTools.map(tool => checkToolAccess(tool.definition.name, dependencies))
+  )
+  const accessibleTools = registeredTools.filter((_tool, index) => accessResults[index])
   const result: ListToolsResult = {
     tools: accessibleTools.map(t => {
       const tool = trimDefinitionToRevision(t.definition, protocolVersion)
@@ -261,12 +261,15 @@ async function handleToolsCall (
   const params = paramsValidation.data
   const toolName = params.name
 
-  const tool = tools.get(toolName)
   // A denied tool answers exactly like an unknown one, so a caller cannot
   // distinguish "does not exist" from "exists but not for you" (mirrors the
-  // tools/list filtering). Authorization is a protocol-level rejection, not a
-  // SEP-1303 tool error: the model cannot correct itself out of missing access.
-  if (!tool || !(await checkToolAccess(tool, dependencies))) {
+  // tools/list filtering). The hook runs even for unknown names, so both paths
+  // share the same timing and a caller cannot probe existence by latency.
+  // Authorization is a protocol-level rejection, not a SEP-1303 tool error:
+  // the model cannot correct itself out of missing access.
+  const isAllowed = await checkToolAccess(toolName, dependencies)
+  const tool = tools.get(toolName)
+  if (!isAllowed || !tool) {
     return createError(request.id, METHOD_NOT_FOUND, `Tool '${toolName}' not found`)
   }
 

@@ -61,9 +61,9 @@ describe('Tool Authorization (canAccessTool)', () => {
 
   test('tools/list omits tools the hook denies, per request', async (t: TestContext) => {
     const app = await buildApp(t, {
-      canAccessTool: (tool, context) => {
-        if (tool.name !== 'restricted-tool') return true
-        return context.request?.headers['x-role'] === 'admin'
+      canAccessTool: (toolName, context) => {
+        if (toolName !== 'restricted-tool') return true
+        return context.request.headers['x-role'] === 'admin'
       }
     })
 
@@ -83,7 +83,7 @@ describe('Tool Authorization (canAccessTool)', () => {
     let handlerInvoked = false
     const app = Fastify({ logger: false })
     t.after(() => app.close())
-    await app.register(mcpPlugin, { canAccessTool: (tool) => tool.name !== 'restricted-tool' })
+    await app.register(mcpPlugin, { canAccessTool: (toolName) => toolName !== 'restricted-tool' })
     app.mcpAddTool({
       name: 'restricted-tool',
       description: 'Tool behind authorization',
@@ -107,11 +107,49 @@ describe('Tool Authorization (canAccessTool)', () => {
     t.assert.strictEqual(unknownBody.error.message, "Tool 'no-such-tool' not found")
   })
 
+  test('the hook is invoked for unknown tool names too', async (t: TestContext) => {
+    // Same code path for unknown and denied names: no timing-based existence leak
+    const checkedNames: string[] = []
+    const app = await buildApp(t, {
+      canAccessTool: async (toolName) => {
+        checkedNames.push(toolName)
+        await new Promise(resolve => setImmediate(resolve))
+        return toolName !== 'restricted-tool'
+      }
+    })
+
+    await app.inject({ method: 'POST', url: '/mcp', payload: callRequest('restricted-tool') })
+    await app.inject({ method: 'POST', url: '/mcp', payload: callRequest('no-such-tool') })
+
+    t.assert.ok(checkedNames.includes('restricted-tool'), 'denied registered name must be checked')
+    t.assert.ok(checkedNames.includes('no-such-tool'), 'unknown name must be checked')
+  })
+
+  test('tools/list evaluates independent checks concurrently', async (t: TestContext) => {
+    let activeChecks = 0
+    let maxConcurrentChecks = 0
+    const app = await buildApp(t, {
+      canAccessTool: async () => {
+        activeChecks++
+        maxConcurrentChecks = Math.max(maxConcurrentChecks, activeChecks)
+        await new Promise(resolve => setImmediate(resolve))
+        activeChecks--
+        return true
+      }
+    })
+
+    const listResponse = await app.inject({ method: 'POST', url: '/mcp', payload: listRequest() })
+    // buildApp registers two tools; serial evaluation would report 1
+    t.assert.strictEqual(maxConcurrentChecks, 2)
+    // Concurrency must not reorder: registration order is preserved
+    t.assert.deepStrictEqual(listedToolNames(listResponse), ['public-tool', 'restricted-tool'])
+  })
+
   test('async hooks are awaited', async (t: TestContext) => {
     const app = await buildApp(t, {
-      canAccessTool: async (tool) => {
+      canAccessTool: async (toolName) => {
         await new Promise(resolve => setImmediate(resolve))
-        return tool.name === 'public-tool'
+        return toolName === 'public-tool'
       }
     })
 
@@ -155,7 +193,7 @@ describe('Tool Authorization (canAccessTool)', () => {
     t.after(() => app.close())
     await app.register(mcpPlugin, {
       enableTasks: true,
-      canAccessTool: (tool) => tool.name !== 'restricted-task-tool'
+      canAccessTool: (toolName) => toolName !== 'restricted-task-tool'
     })
     app.mcpAddTool({
       name: 'restricted-task-tool',
@@ -189,8 +227,8 @@ describe('Tool Authorization (canAccessTool)', () => {
 
     const app = await buildApp(t, {
       authorization: createTestAuthConfig({ resourceUri: 'http://localhost:3000' }),
-      canAccessTool: (tool, context) => {
-        if (tool.name !== 'restricted-tool') return true
+      canAccessTool: (toolName, context) => {
+        if (toolName !== 'restricted-tool') return true
         return context.authContext?.scopes?.includes('tools:admin') === true
       }
     })

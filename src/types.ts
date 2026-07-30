@@ -172,6 +172,13 @@ export interface UnsafeMCPPrompt {
   handler?: UnsafePromptHandler
 }
 
+/** Per-request context handed to the `canAccessTool` hook. */
+export interface ToolAccessContext {
+  authContext?: AuthorizationContext
+  request: FastifyRequest
+  sessionId?: string
+}
+
 export interface MCPPluginOptions {
   serverInfo?: Implementation
   capabilities?: ServerCapabilities
@@ -206,15 +213,17 @@ export interface MCPPluginOptions {
    */
   allowedOrigins?: AllowedOrigins
   /**
-   * Per-request tool authorization. Consulted by both `tools/list` (a denied
-   * tool is omitted) and `tools/call` (a denied tool answers with the same
-   * "not found" error as an unknown tool, so callers cannot probe for tools
-   * they are not allowed to see). A hook that throws denies access.
+   * Per-request tool authorization, keyed by tool name. Consulted by both
+   * `tools/list` (a denied tool is omitted) and `tools/call` (a denied tool
+   * answers with the same "not found" error as an unknown tool, so callers
+   * cannot probe for tools they are not allowed to see). `tools/call` runs the
+   * hook even for unknown names, so denied and unknown calls share one code
+   * path and timing. A hook that throws denies access.
    * Omit to keep every registered tool visible and callable.
    */
   canAccessTool?: (
-    tool: Tool,
-    context: { authContext?: AuthorizationContext, request?: FastifyRequest, sessionId?: string }
+    toolName: string,
+    context: ToolAccessContext
   ) => boolean | Promise<boolean>
   sessionStore?: 'memory' | 'redis'
   messageBroker?: 'memory' | 'redis'

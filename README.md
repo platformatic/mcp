@@ -1446,8 +1446,8 @@ Tool-level checks like the one above keep the tool visible to every client and o
 ```typescript
 await app.register(mcpPlugin, {
   authorization: { /* ... */ },
-  canAccessTool: (tool, { authContext }) => {
-    if (tool.name === 'admin-tool') {
+  canAccessTool: (toolName, { authContext }) => {
+    if (toolName === 'admin-tool') {
       return authContext?.scopes?.includes('tools:admin') === true
     }
     return true
@@ -1455,10 +1455,10 @@ await app.register(mcpPlugin, {
 })
 ```
 
-The hook receives the tool definition and a per-request context (`authContext`, `request`, `sessionId`), and may be sync or async. It is consulted at both dispatch points, so list and call can never disagree:
+The hook receives the tool name and a per-request context (`authContext`, `request`, `sessionId`), and may be sync or async. It is consulted at both dispatch points, so list and call can never disagree:
 
-- `tools/list` omits every tool the hook denies for that request.
-- `tools/call` on a denied tool returns the same `-32601` "Tool 'name' not found" protocol error as an unknown tool, so callers cannot probe for tools they are not allowed to see. Task-augmented calls (`task` field) go through the same gate.
+- `tools/list` omits every tool the hook denies for that request. Independent per-tool checks run concurrently; the listing keeps registration order.
+- `tools/call` on a denied tool returns the same `-32601` "Tool 'name' not found" protocol error as an unknown tool, and the hook runs even for unknown names, so callers cannot probe for tools they are not allowed to see — by response shape or by timing. Task-augmented calls (`task` field) go through the same gate.
 
 A hook that throws denies access (fail closed) and logs a warning. Only an explicit `true` grants access. Without the hook, every registered tool stays visible and callable.
 
