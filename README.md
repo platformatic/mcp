@@ -1439,6 +1439,29 @@ app.mcpAddTool({
 })
 ```
 
+### Per-Tool Authorization
+
+Tool-level checks like the one above keep the tool visible to every client and only fail at call time. To gate tools per request — hiding them from `tools/list` and rejecting `tools/call` in one place — provide a `canAccessTool` hook:
+
+```typescript
+await app.register(mcpPlugin, {
+  authorization: { /* ... */ },
+  canAccessTool: (toolName, { authContext }) => {
+    if (toolName === 'admin-tool') {
+      return authContext?.scopes?.includes('tools:admin') === true
+    }
+    return true
+  }
+})
+```
+
+The hook receives the tool name and a per-request context (`authContext`, `request`, `sessionId`), and may be sync or async. It is consulted at both dispatch points, so list and call can never disagree:
+
+- `tools/list` omits every tool the hook denies for that request. Per-tool checks run concurrently with a fixed cap (8 at a time), so an async hook backed by a database or HTTP service is not flooded with one lookup per registered tool; the listing keeps registration order.
+- `tools/call` on a denied tool returns the same `-32601` "Tool 'name' not found" protocol error as an unknown tool, and the hook runs even for unknown names, so callers cannot probe for tools they are not allowed to see by response shape. Response timing is not guaranteed to be indistinguishable — it depends on what the hook itself does per name. Task-augmented calls (`task` field) go through the same gate.
+
+A hook that throws denies access (fail closed) and logs a warning. Only an explicit `true` grants access. Without the hook, every registered tool stays visible and callable.
+
 ### OAuth Routes
 
 The plugin automatically registers OAuth management routes:
@@ -1658,6 +1681,7 @@ await app.register(import('@fastify/bearer-auth'), {
 - `capabilities`: MCP capabilities configuration
 - `instructions`: Optional server instructions
 - `enableSSE`: Enable Server-Sent Events support (default: false)
+- `canAccessTool`: Per-request tool authorization hook consulted by `tools/list` and `tools/call` (optional)
 - `authorization`: OAuth 2.1 authorization configuration (optional)
   - `enabled`: Enable OAuth 2.1 authorization (default: false)
   - `authorizationServers`: Authorization server URIs
