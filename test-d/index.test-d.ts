@@ -6,7 +6,7 @@ import {
 } from 'tsd'
 import { Type } from '@sinclair/typebox'
 import type { FastifyReply } from 'fastify'
-import { RedisMessageBroker, MemoryMessageBroker } from '../dist/index.js'
+import { RedisMessageBroker, MemoryMessageBroker, RedisSessionStore, MemorySessionStore } from '../dist/index.js'
 import type {
   ToolHandler,
   ResourceHandler,
@@ -24,6 +24,8 @@ import type {
   UnsafeMCPPrompt,
   JSONRPCMessage,
   MessageBroker,
+  SessionStore,
+  SessionMetadata,
 } from '../dist/index.js'
 
 // ─── ToolHandler ─────────────────────────────────────────────────────
@@ -285,3 +287,22 @@ expectType<() => Promise<void>>(RedisMessageBroker.prototype.close)
 
 // Constructor still requires a real Redis instance, not an arbitrary object
 expectError(new RedisMessageBroker({}))
+
+// ─── Session stores ─────────────────────────────────────────────────
+
+// Both session store implementations are importable from the package root
+expectType<typeof RedisSessionStore>(RedisSessionStore)
+expectType<typeof MemorySessionStore>(MemorySessionStore)
+
+// MemorySessionStore satisfies the SessionStore interface
+expectAssignable<SessionStore>(new MemorySessionStore())
+
+// RedisSessionStore's methods match the SessionStore interface shape,
+// checked via the prototype since constructing one needs a live Redis client
+expectType<(metadata: SessionMetadata) => Promise<void>>(RedisSessionStore.prototype.create)
+expectType<(sessionId: string) => Promise<SessionMetadata | null>>(RedisSessionStore.prototype.get)
+expectType<(sessionId: string) => Promise<void>>(RedisSessionStore.prototype.delete)
+
+// Constructor still requires a real Redis instance, not an arbitrary object
+expectError(new RedisSessionStore({}))
+expectError(new RedisSessionStore())

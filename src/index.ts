@@ -317,3 +317,8 @@ export {
 export type { TaskStore, TaskRecord, TaskOutcome } from './stores/task-store.ts'
 export { MemoryTaskStore } from './stores/memory-task-store.ts'
 export { RedisTaskStore } from './stores/redis-task-store.ts'
+
+// Session storage, for callers that want to supply or inspect a backend
+export type { SessionStore, SessionMetadata } from './stores/session-store.ts'
+export { MemorySessionStore } from './stores/memory-session-store.ts'
+export { RedisSessionStore } from './stores/redis-session-store.ts'
