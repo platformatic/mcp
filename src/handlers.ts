@@ -177,12 +177,29 @@ async function checkToolAccess (toolName: string, dependencies: HandlerDependenc
   }
 }
 
+const TOOL_ACCESS_CONCURRENCY = 8
+
+async function mapWithConcurrency<T, R> (items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length)
+  let next = 0
+  async function worker (): Promise<void> {
+    while (next < items.length) {
+      const index = next++
+      results[index] = await fn(items[index])
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker))
+  return results
+}
+
 async function handleToolsList (request: JSONRPCRequest, dependencies: HandlerDependencies): Promise<JSONRPCResponse> {
   const { tools, protocolVersion } = dependencies
-  // Independent per-tool checks run concurrently; order stays registration order
+  // Per-tool checks run concurrently (bounded); order stays registration order
   const registeredTools = Array.from(tools.values())
-  const accessResults = await Promise.all(
-    registeredTools.map(tool => checkToolAccess(tool.definition.name, dependencies))
+  const accessResults = await mapWithConcurrency(
+    registeredTools,
+    TOOL_ACCESS_CONCURRENCY,
+    tool => checkToolAccess(tool.definition.name, dependencies)
   )
   const accessibleTools = registeredTools.filter((_tool, index) => accessResults[index])
   const result: ListToolsResult = {
@@ -262,9 +279,10 @@ async function handleToolsCall (
   const toolName = params.name
 
   // A denied tool answers exactly like an unknown one, so a caller cannot
-  // distinguish "does not exist" from "exists but not for you" (mirrors the
-  // tools/list filtering). The hook runs even for unknown names, so both paths
-  // share the same timing and a caller cannot probe existence by latency.
+  // distinguish "does not exist" from "exists but not for you" by the protocol
+  // response (mirrors the tools/list filtering). The hook runs even for
+  // unknown names. No timing guarantee: latency depends on what the hook
+  // itself does per name.
   // Authorization is a protocol-level rejection, not a SEP-1303 tool error:
   // the model cannot correct itself out of missing access.
   const isAllowed = await checkToolAccess(toolName, dependencies)

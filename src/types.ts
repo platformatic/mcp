@@ -216,9 +216,10 @@ export interface MCPPluginOptions {
    * Per-request tool authorization, keyed by tool name. Consulted by both
    * `tools/list` (a denied tool is omitted) and `tools/call` (a denied tool
    * answers with the same "not found" error as an unknown tool, so callers
-   * cannot probe for tools they are not allowed to see). `tools/call` runs the
-   * hook even for unknown names, so denied and unknown calls share one code
-   * path and timing. A hook that throws denies access.
+   * cannot probe for tools they are not allowed to see by response shape).
+   * `tools/call` runs the hook even for unknown names. Response timing is not
+   * guaranteed to be indistinguishable: it depends on what the hook itself
+   * does per name. A hook that throws denies access.
    * Omit to keep every registered tool visible and callable.
    */
   canAccessTool?: (

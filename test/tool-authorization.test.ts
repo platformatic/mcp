@@ -108,7 +108,7 @@ describe('Tool Authorization (canAccessTool)', () => {
   })
 
   test('the hook is invoked for unknown tool names too', async (t: TestContext) => {
-    // Same code path for unknown and denied names: no timing-based existence leak
+    // Same code path for unknown and denied names: identical protocol response
     const checkedNames: string[] = []
     const app = await buildApp(t, {
       canAccessTool: async (toolName) => {
@@ -143,6 +143,48 @@ describe('Tool Authorization (canAccessTool)', () => {
     t.assert.strictEqual(maxConcurrentChecks, 2)
     // Concurrency must not reorder: registration order is preserved
     t.assert.deepStrictEqual(listedToolNames(listResponse), ['public-tool', 'restricted-tool'])
+  })
+
+  test('tools/list caps concurrent hook evaluations with many tools', async (t: TestContext) => {
+    const TOOL_COUNT = 50
+    const CONCURRENCY_CAP = 8
+    let activeChecks = 0
+    let maxConcurrentChecks = 0
+    let totalChecks = 0
+    const app = Fastify({ logger: false })
+    t.after(() => app.close())
+    await app.register(mcpPlugin, {
+      canAccessTool: async () => {
+        activeChecks++
+        totalChecks++
+        maxConcurrentChecks = Math.max(maxConcurrentChecks, activeChecks)
+        await new Promise(resolve => setImmediate(resolve))
+        activeChecks--
+        return true
+      }
+    })
+    for (let i = 0; i < TOOL_COUNT; i++) {
+      app.mcpAddTool({
+        name: `tool-${i}`,
+        description: `Tool number ${i}`,
+        inputSchema: { type: 'object', properties: {} }
+      }, async () => ({ content: [{ type: 'text', text: 'ok' }] }))
+    }
+    await app.ready()
+
+    const listResponse = await app.inject({ method: 'POST', url: '/mcp', payload: listRequest() })
+
+    t.assert.strictEqual(totalChecks, TOOL_COUNT, 'every tool must be checked')
+    t.assert.ok(maxConcurrentChecks > 1, 'checks must overlap')
+    t.assert.ok(
+      maxConcurrentChecks <= CONCURRENCY_CAP,
+      `at most ${CONCURRENCY_CAP} concurrent checks, saw ${maxConcurrentChecks}`
+    )
+    // Registration order preserved despite the bounded pool
+    t.assert.deepStrictEqual(
+      listedToolNames(listResponse),
+      Array.from({ length: TOOL_COUNT }, (_, i) => `tool-${i}`)
+    )
   })
 
   test('async hooks are awaited', async (t: TestContext) => {
