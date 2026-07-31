@@ -1,3 +1,4 @@
+import type { Options } from 'ajv'
 import { Ajv2020 } from 'ajv/dist/2020.js'
 import type { ErrorObject } from 'ajv/dist/2020.js'
 import stringify from 'safe-stable-stringify'
@@ -14,7 +15,7 @@ export type JsonSchemaValidator = ReturnType<typeof createJsonSchemaValidator>
  * Create a per-plugin-instance AJV validator with a compiled-schema cache,
  * so registering the plugin twice never shares compilation state.
  */
-export function createJsonSchemaValidator () {
+export function createJsonSchemaValidator (customOptions: Options = {}) {
   // Deliberately non-mutating: tool arguments must reach handlers exactly as the
   // client sent them, so no coercion, no defaults injection, no property removal.
   // `strict: false` tolerates MCP-style schemas carrying extra annotation keywords;
@@ -27,7 +28,8 @@ export function createJsonSchemaValidator () {
     addUsedSchema: false,
     allErrors: false,
     strict: false,
-    validateFormats: false
+    validateFormats: false,
+    ...customOptions
   })
 
   // Compiled validator cache, mirroring the TypeBox cache in validator.ts

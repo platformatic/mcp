@@ -562,11 +562,14 @@ app.mcpAddTool({
 
 ### Validating plain JSON Schema inputs with AJV
 
-Set `validateJsonSchemaInputs: true` to validate plain-JSON-Schema tool inputs with [AJV](https://ajv.js.org/) (draft 2020-12, matching the plugin's published schema dialect) before the handler runs. TypeBox tools are unaffected — they keep their existing TypeBox validation.
+Set `validateJsonSchemaInputs: {}` to validate plain-JSON-Schema tool inputs with [AJV](https://ajv.js.org/) (draft 2020-12, matching the plugin's published schema dialect) before the handler runs. TypeBox tools are unaffected — they keep their existing TypeBox validation.
 
 ```typescript
 await app.register(mcpPlugin, {
-  validateJsonSchemaInputs: true
+  validateJsonSchemaInputs: {
+    allErrors: true,
+    useDefaults: false
+  }
 })
 ```
 

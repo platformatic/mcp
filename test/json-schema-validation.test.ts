@@ -42,8 +42,12 @@ async function callTool (app: FastifyInstance, name: string, args: unknown, extr
 }
 
 describe('JSON Schema Validation (validateJsonSchemaInputs)', () => {
-  test('valid arguments reach the handler unmutated (no coercion, no defaults)', async (t) => {
-    const app = await buildApp(t, { validateJsonSchemaInputs: true })
+  test('custom AJV options are applied', async (t) => {
+    const app = await buildApp(t, {
+      validateJsonSchemaInputs: {
+        useDefaults: false
+      }
+    })
 
     let receivedParams: unknown
     app.mcpAddTool({
@@ -59,11 +63,11 @@ describe('JSON Schema Validation (validateJsonSchemaInputs)', () => {
     const body = await callTool(app, 'search', { query: 'test' })
     assert.strictEqual(body.result.isError, undefined)
     // The `limit` default from the schema must NOT be injected
-    assert.deepStrictEqual(receivedParams, { limit: 10, query: 'test' })
+    assert.deepStrictEqual(receivedParams, { query: 'test' })
   })
 
   test('invalid arguments return an isError result before the handler runs', async (t) => {
-    const app = await buildApp(t, { validateJsonSchemaInputs: true })
+    const app = await buildApp(t, { validateJsonSchemaInputs: {} })
 
     let handlerCalled = false
     app.mcpAddTool({
@@ -85,7 +89,7 @@ describe('JSON Schema Validation (validateJsonSchemaInputs)', () => {
   })
 
   test('missing arguments are validated as an empty object', async (t) => {
-    const app = await buildApp(t, { validateJsonSchemaInputs: true })
+    const app = await buildApp(t, { validateJsonSchemaInputs: {} })
 
     app.mcpAddTool({
       name: 'search',
@@ -101,7 +105,7 @@ describe('JSON Schema Validation (validateJsonSchemaInputs)', () => {
   })
 
   test('long error lists are capped in the message', async (t) => {
-    const app = await buildApp(t, { validateJsonSchemaInputs: true })
+    const app = await buildApp(t, { validateJsonSchemaInputs: {} })
 
     const manyProps = Object.fromEntries(
       Array.from({ length: 8 }, (_, i) => [`p${i}`, { type: 'string' }])
@@ -123,7 +127,7 @@ describe('JSON Schema Validation (validateJsonSchemaInputs)', () => {
   })
 
   test('an uncompilable schema fails tool registration', async (t) => {
-    const app = await buildApp(t, { validateJsonSchemaInputs: true })
+    const app = await buildApp(t, { validateJsonSchemaInputs: {} })
     await app.ready()
 
     assert.throws(() => {
@@ -155,7 +159,7 @@ describe('JSON Schema Validation (validateJsonSchemaInputs)', () => {
   })
 
   test('TypeBox tools keep their own validation regardless of the flag', async (t) => {
-    const app = await buildApp(t, { validateJsonSchemaInputs: true })
+    const app = await buildApp(t, { validateJsonSchemaInputs: {} })
 
     app.mcpAddTool({
       name: 'typed',
@@ -171,7 +175,7 @@ describe('JSON Schema Validation (validateJsonSchemaInputs)', () => {
   })
 
   test('task-mode calls are validated too', async (t) => {
-    const app = await buildApp(t, { validateJsonSchemaInputs: true, enableTasks: true })
+    const app = await buildApp(t, { validateJsonSchemaInputs: {}, enableTasks: true })
 
     app.mcpAddTool({
       name: 'search',

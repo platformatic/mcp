@@ -333,8 +333,26 @@ expectNotAssignable<MCPPluginOptions>({ canAccessTool: true })
 
 // ─── Plugin options ─────────────────────────────────────────────────
 
-// validateJsonSchemaInputs is an optional boolean
-expectAssignable<MCPPluginOptions>({ validateJsonSchemaInputs: true })
-expectAssignable<MCPPluginOptions>({ validateJsonSchemaInputs: false })
+// validateJsonSchemaInputs is an optional object
+expectAssignable<MCPPluginOptions>({ validateJsonSchemaInputs: {} })
+
+expectAssignable<MCPPluginOptions>({
+  validateJsonSchemaInputs: {
+    allErrors: true,
+    useDefaults: false
+  }
+})
+
 expectAssignable<MCPPluginOptions>({})
-expectNotAssignable<MCPPluginOptions>({ validateJsonSchemaInputs: 'yes' })
+
+expectNotAssignable<MCPPluginOptions>({
+  validateJsonSchemaInputs: true
+})
+
+expectNotAssignable<MCPPluginOptions>({
+  validateJsonSchemaInputs: false
+})
+
+expectNotAssignable<MCPPluginOptions>({
+  validateJsonSchemaInputs: 'yes'
+})

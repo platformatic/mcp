@@ -147,8 +147,8 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
   }
 
   // AJV instance and compiled-schema cache scoped to this plugin registration
-  const jsonSchemaValidator = opts.validateJsonSchemaInputs === true
-    ? createJsonSchemaValidator()
+  const jsonSchemaValidator = opts.validateJsonSchemaInputs
+    ? createJsonSchemaValidator(opts.validateJsonSchemaInputs)
     : undefined
 
   // Register decorators first
