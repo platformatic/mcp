@@ -42,6 +42,7 @@ import {
   capabilitiesForRevision
 } from './protocol-version.ts'
 import { validate, CallToolRequestSchema, ReadResourceRequestSchema, GetPromptRequestSchema, isTypeBoxSchema } from './validation/index.ts'
+import type { JsonSchemaValidator } from './validation/json-schema-validator.ts'
 import { sanitizeToolParams, assessToolSecurity, SECURITY_WARNINGS } from './security.ts'
 
 type HandlerDependencies = {
@@ -59,6 +60,7 @@ type HandlerDependencies = {
   sessionStore?: SessionStore
   taskStore?: TaskStore
   taskWaiters?: TaskWaiters
+  jsonSchemaValidator?: JsonSchemaValidator
   sessionId?: string
   /** The revision this client negotiated; responses are shaped to match it */
   protocolVersion?: string
@@ -402,7 +404,22 @@ async function executeToolCall (
         return createResponse(request.id, result)
       }
     } else {
-      // Regular JSON Schema - basic validation or pass through
+      // Regular JSON Schema - validated with AJV when opted in, pass through otherwise
+      if (dependencies.jsonSchemaValidator) {
+        const validationError = dependencies.jsonSchemaValidator.validate(schema, toolArguments)
+        if (validationError !== null) {
+          // SEP-1303: a tool execution error, not a protocol error (same as the
+          // TypeBox branch above)
+          const result: CallToolResult = {
+            content: [{
+              type: 'text',
+              text: `Invalid tool arguments: ${validationError}`
+            }],
+            isError: true
+          }
+          return createResponse(request.id, result)
+        }
+      }
       try {
         const result = await tool.handler(toolArguments, { sessionId, request: dependencies.request, reply: dependencies.reply, authContext: dependencies.authContext })
         return createResponse(request.id, result)

@@ -1,4 +1,5 @@
 import type { FastifyReply, FastifyRequest } from 'fastify'
+import type { Options } from 'ajv'
 import type {
   JSONRPCMessage,
   JSONRPCNotification,
@@ -226,6 +227,12 @@ export interface MCPPluginOptions {
     toolName: string,
     context: ToolAccessContext
   ) => boolean | Promise<boolean>
+  /**
+   * Validate plain JSON Schema tool inputs using AJV.
+   * Omit this option to disable validation, or provide an object to enable it.
+   * Options override the default Fastify-compatible AJV configuration.
+   */
+  validateJsonSchemaInputs?: Options
   sessionStore?: 'memory' | 'redis'
   messageBroker?: 'memory' | 'redis'
   redis?: {

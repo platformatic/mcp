@@ -2,6 +2,7 @@
 export * from './schemas.ts'
 export * from './validator.ts'
 export * from './converter.ts'
+export * from './json-schema-validator.ts'
 
 // Re-export commonly used TypeBox types
 export { Type } from '@sinclair/typebox'

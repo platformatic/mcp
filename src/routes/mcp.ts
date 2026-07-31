@@ -9,6 +9,7 @@ import type { SessionStore, SessionMetadata } from '../stores/session-store.ts'
 import type { TaskStore, TaskWaiters } from '../stores/task-store.ts'
 import type { MessageBroker } from '../brokers/message-broker.ts'
 import type { AuthorizationContext } from '../types/auth-types.ts'
+import type { JsonSchemaValidator } from '../validation/json-schema-validator.ts'
 import { processMessage } from '../handlers.ts'
 
 interface MCPPubSubRoutesOptions {
@@ -25,10 +26,11 @@ interface MCPPubSubRoutesOptions {
   localStreams: Map<string, Set<any>>
   taskStore?: TaskStore
   taskWaiters?: TaskWaiters
+  jsonSchemaValidator?: JsonSchemaValidator
 }
 
 const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async (app, options) => {
-  const { enableSSE, opts, capabilities, serverInfo, tools, resources, prompts, resourceHandlers, sessionStore, messageBroker, localStreams, taskStore, taskWaiters } = options
+  const { enableSSE, opts, capabilities, serverInfo, tools, resources, prompts, resourceHandlers, sessionStore, messageBroker, localStreams, taskStore, taskWaiters, jsonSchemaValidator } = options
 
   const allowedOrigins = opts.allowedOrigins
 
@@ -285,6 +287,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         sessionStore,
         taskStore,
         taskWaiters,
+        jsonSchemaValidator,
         sessionId,
         protocolVersion: (request as any).mcpProtocolVersion ?? DEFAULT_NEGOTIATED_PROTOCOL_VERSION
       })

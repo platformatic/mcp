@@ -21,6 +21,7 @@ import { createAuthPreHandler } from './auth/prehandler.ts'
 import oauthClientPlugin from './auth/oauth-client.ts'
 import authRoutesPlugin from './routes/auth-routes.ts'
 import { quitWithTimeout } from './redis-quit-with-timeout.ts'
+import { createJsonSchemaValidator } from './validation/json-schema-validator.ts'
 
 // Import and export MCP protocol types
 import type {
@@ -145,12 +146,18 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     })
   }
 
+  // AJV instance and compiled-schema cache scoped to this plugin registration
+  const jsonSchemaValidator = opts.validateJsonSchemaInputs
+    ? createJsonSchemaValidator(opts.validateJsonSchemaInputs)
+    : undefined
+
   // Register decorators first
   app.register(metaDecorators, {
     tools,
     resources,
     prompts,
-    resourceHandlers
+    resourceHandlers,
+    jsonSchemaValidator
   })
   app.register(pubsubDecorators, {
     enableSSE,
@@ -173,7 +180,8 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     messageBroker,
     localStreams,
     taskStore,
-    taskWaiters
+    taskWaiters,
+    jsonSchemaValidator
   })
 
   // Add close hook to clean up Redis connections and authorization components

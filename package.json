@@ -49,6 +49,7 @@
   },
   "dependencies": {
     "@fastify/cors": "^11.1.0",
+    "ajv": "^8.17.1",
     "@fastify/jwt": "^10.0.0",
     "@fastify/type-provider-typebox": "^6.0.0",
     "fast-jwt": "^6.0.2",
