@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify'
+import createFastifyError from 'fastify-error'
 import type {
   JSONRPCMessage,
   JSONRPCRequest,
@@ -30,7 +31,7 @@ import {
 } from './schema.ts'
 import type { RequestId } from './schema.ts'
 
-import type { MCPTool, MCPResource, MCPPrompt, MCPPluginOptions, ResourceHandlers } from './types.ts'
+import type { MCPTool, MCPResource, MCPPrompt, MCPPluginOptions, ResourceHandlers, McpCallToolOutcome } from './types.ts'
 import type { SessionStore } from './stores/session-store.ts'
 import type { TaskStore, TaskRecord, TaskWaiters } from './stores/task-store.ts'
 import { isTerminal, toWireTask } from './stores/task-store.ts'
@@ -65,6 +66,17 @@ type HandlerDependencies = {
   /** The revision this client negotiated; responses are shaped to match it */
   protocolVersion?: string
 }
+
+type ToolCallDependencies = Pick<HandlerDependencies,
+  'app' |
+  'opts' |
+  'tools' |
+  'request' |
+  'reply' |
+  'authContext' |
+  'jsonSchemaValidator' |
+  'sessionId'
+>
 
 export function createResponse (id: string | number, result: any): JSONRPCResponse {
   return {
@@ -161,7 +173,7 @@ function withSchemaDialect<T> (schema: T, protocolVersion: string | undefined): 
  * exposing a tool the deployment meant to gate; the error is logged so a
  * misbehaving hook is visible to the operator.
  */
-async function checkToolAccess (toolName: string, dependencies: HandlerDependencies): Promise<boolean> {
+async function checkToolAccess (toolName: string, dependencies: ToolCallDependencies): Promise<boolean> {
   const hook = dependencies.opts.canAccessTool
   if (!hook) return true
   try {
@@ -180,6 +192,11 @@ async function checkToolAccess (toolName: string, dependencies: HandlerDependenc
 }
 
 const TOOL_ACCESS_CONCURRENCY = 8
+
+const UnhandledToolCallOutcomeError = createFastifyError(
+  'MCP_ERR_UNHANDLED_TOOL_CALL_OUTCOME',
+  'Unhandled tool call outcome: %s'
+)
 
 async function mapWithConcurrency<T, R> (items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
   const results = new Array<R>(items.length)
@@ -267,8 +284,6 @@ async function handleToolsCall (
   sessionId: string | undefined,
   dependencies: HandlerDependencies
 ): Promise<JSONRPCResponse | JSONRPCError> {
-  const { tools } = dependencies
-
   // Validate the request parameters structure
   const paramsValidation = validate(CallToolRequestSchema, request.params)
   if (!paramsValidation.success) {
@@ -287,10 +302,9 @@ async function handleToolsCall (
   // itself does per name.
   // Authorization is a protocol-level rejection, not a SEP-1303 tool error:
   // the model cannot correct itself out of missing access.
-  const isAllowed = await checkToolAccess(toolName, dependencies)
-  const tool = tools.get(toolName)
-  if (!isAllowed || !tool) {
-    return createError(request.id, METHOD_NOT_FOUND, `Tool '${toolName}' not found`)
+  const resolved = await resolveRegisteredTool(toolName, dependencies)
+  if (!resolved.ok) {
+    return toolCallOutcomeToJsonRpc(request.id, toolName, resolved)
   }
 
   // Decide up front whether this call runs as a task, so the rest of the
@@ -300,7 +314,7 @@ async function handleToolsCall (
   const taskParams = supportsTasks(dependencies.protocolVersion)
     ? (request.params as { task?: { ttl?: number } } | undefined)?.task
     : undefined
-  const augmentation = resolveTaskAugmentation(tool, taskParams !== undefined)
+  const augmentation = resolveTaskAugmentation(resolved.tool, taskParams !== undefined)
   if ('error' in augmentation) {
     return createError(request.id, METHOD_NOT_FOUND, augmentation.error)
   }
@@ -308,12 +322,81 @@ async function handleToolsCall (
     return await runToolCallAsTask(
       request,
       taskParams?.ttl,
-      () => executeToolCall(request, tool, params, sessionId, dependencies),
+      () => executeToolCall(request, resolved.tool, params, sessionId, dependencies),
       dependencies
     )
   }
 
-  return await executeToolCall(request, tool, params, sessionId, dependencies)
+  return await executeToolCall(request, resolved.tool, params, sessionId, dependencies)
+}
+
+async function resolveRegisteredTool (
+  toolName: string,
+  dependencies: ToolCallDependencies
+): Promise<{ ok: true, tool: MCPTool } | { ok: false, reason: 'not-found' }> {
+  const isAllowed = await checkToolAccess(toolName, dependencies)
+  if (!isAllowed) {
+    return { ok: false, reason: 'not-found' }
+  }
+
+  const tool = dependencies.tools.get(toolName)
+  if (!tool) {
+    return { ok: false, reason: 'not-found' }
+  }
+
+  return { ok: true, tool }
+}
+
+function toolCallOutcomeToJsonRpc (
+  id: RequestId,
+  toolName: string,
+  outcome: McpCallToolOutcome
+): JSONRPCResponse | JSONRPCError {
+  if (outcome.ok) {
+    return createResponse(id, outcome.result)
+  }
+
+  switch (outcome.reason) {
+    case 'invalid-arguments': {
+      const result: CallToolResult = {
+        content: [{
+          type: 'text',
+          text: `Invalid tool arguments: ${outcome.detail}`
+        }],
+        isError: true
+      }
+      return createResponse(id, result)
+    }
+    case 'not-found':
+      return createError(id, METHOD_NOT_FOUND, `Tool '${toolName}' not found`)
+    // Unreachable from the JSON-RPC path today (handleToolsCall resolves task
+    // augmentation itself), but kept in the mapping so the two paths stay
+    // consistent if they ever converge. Mirrors resolveTaskAugmentation's error.
+    case 'task-required':
+      return createError(id, METHOD_NOT_FOUND, `Tool '${toolName}' requires task-augmented execution`)
+    default: {
+      const unhandled: never = outcome
+      throw new UnhandledToolCallOutcomeError(JSON.stringify(unhandled))
+    }
+  }
+}
+
+export async function callRegisteredTool (
+  name: string,
+  args: Record<string, unknown>,
+  dependencies: ToolCallDependencies
+): Promise<McpCallToolOutcome> {
+  const resolved = await resolveRegisteredTool(name, dependencies)
+  if (!resolved.ok) {
+    return resolved
+  }
+
+  const augmentation = resolveTaskAugmentation(resolved.tool, false)
+  if ('error' in augmentation) {
+    return { ok: false, reason: 'task-required' }
+  }
+
+  return await executeRegisteredTool(resolved.tool, name, args, dependencies)
 }
 
 async function executeToolCall (
@@ -325,6 +408,18 @@ async function executeToolCall (
 ): Promise<JSONRPCResponse | JSONRPCError> {
   const toolName = params.name
 
+  const outcome = await executeRegisteredTool(tool, toolName, params.arguments || {}, { ...dependencies, sessionId })
+  return toolCallOutcomeToJsonRpc(request.id, toolName, outcome)
+}
+
+async function executeRegisteredTool (
+  tool: MCPTool,
+  toolName: string,
+  args: Record<string, unknown>,
+  dependencies: ToolCallDependencies
+): Promise<McpCallToolOutcome> {
+  const sessionId = dependencies.sessionId
+
   if (!tool.handler) {
     const result: CallToolResult = {
       content: [{
@@ -333,7 +428,7 @@ async function executeToolCall (
       }],
       isError: true
     }
-    return createResponse(request.id, result)
+    return { ok: true, result }
   }
 
   // Assess security risks from tool annotations
@@ -349,7 +444,7 @@ async function executeToolCall (
   }
 
   // Validate and sanitize tool arguments against the tool's input schema
-  let toolArguments = params.arguments || {}
+  let toolArguments = args
 
   try {
     // Sanitize arguments to prevent injection attacks
@@ -370,7 +465,7 @@ async function executeToolCall (
       }],
       isError: true
     }
-    return createResponse(request.id, result)
+    return { ok: true, result }
   }
   if ('inputSchema' in tool.definition) {
     // Check if it's a TypeBox schema
@@ -379,20 +474,13 @@ async function executeToolCall (
       // TypeBox schema - use our validation
       const argumentsValidation = validate(schema, toolArguments)
       if (!argumentsValidation.success) {
-        const result: CallToolResult = {
-          content: [{
-            type: 'text',
-            text: `Invalid tool arguments: ${argumentsValidation.error.message}`
-          }],
-          isError: true
-        }
-        return createResponse(request.id, result)
+        return { ok: false, reason: 'invalid-arguments', detail: argumentsValidation.error.message }
       }
 
       // Use validated arguments
       try {
         const result = await tool.handler(argumentsValidation.data, { sessionId, request: dependencies.request, reply: dependencies.reply, authContext: dependencies.authContext })
-        return createResponse(request.id, result)
+        return { ok: true, result }
       } catch (error: any) {
         const result: CallToolResult = {
           content: [{
@@ -401,7 +489,7 @@ async function executeToolCall (
           }],
           isError: true
         }
-        return createResponse(request.id, result)
+        return { ok: true, result }
       }
     } else {
       // Regular JSON Schema - validated with AJV when opted in, pass through otherwise
@@ -410,19 +498,12 @@ async function executeToolCall (
         if (validationError !== null) {
           // SEP-1303: a tool execution error, not a protocol error (same as the
           // TypeBox branch above)
-          const result: CallToolResult = {
-            content: [{
-              type: 'text',
-              text: `Invalid tool arguments: ${validationError}`
-            }],
-            isError: true
-          }
-          return createResponse(request.id, result)
+          return { ok: false, reason: 'invalid-arguments', detail: validationError }
         }
       }
       try {
         const result = await tool.handler(toolArguments, { sessionId, request: dependencies.request, reply: dependencies.reply, authContext: dependencies.authContext })
-        return createResponse(request.id, result)
+        return { ok: true, result }
       } catch (error: any) {
         const result: CallToolResult = {
           content: [{
@@ -431,7 +512,7 @@ async function executeToolCall (
           }],
           isError: true
         }
-        return createResponse(request.id, result)
+        return { ok: true, result }
       }
     }
   } else {
@@ -443,7 +524,7 @@ async function executeToolCall (
         reply: dependencies.reply,
         authContext: dependencies.authContext
       })
-      return createResponse(request.id, result)
+      return { ok: true, result }
     } catch (error: any) {
       const result: CallToolResult = {
         content: [{
@@ -452,7 +533,7 @@ async function executeToolCall (
         }],
         isError: true
       }
-      return createResponse(request.id, result)
+      return { ok: true, result }
     }
   }
 }

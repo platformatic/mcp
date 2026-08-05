@@ -1796,6 +1796,32 @@ app.mcpAddTool(
 )
 ```
 
+#### Server-Side Tool Invocation
+
+Use `app.mcpCallTool()` when application code needs to run a registered tool without making a loopback `POST /mcp` request or building a JSON-RPC envelope. The call uses the same tool registry, input validation, `canAccessTool` hook, argument sanitization, required task execution check and handler error conversion as `tools/call`, but it does not create or use an MCP session, SSE stream, message broker or Redis connection. `mcpCallTool()` executes the tool access, validation, sanitization, and handler pipeline. It does not run Fastify lifecycle hooks and is only available in the Fastify encapsulation scope where the MCP plugin was registered and its descendants.
+
+```typescript
+const outcome = await app.mcpCallTool('search', { query: 'fastify' }, { request, reply })
+
+if (outcome.ok) {
+  return outcome.result
+}
+
+switch (outcome.reason) {
+  case 'not-found':
+    reply.code(404)
+    return { error: 'Tool not found' }
+  case 'invalid-arguments':
+    reply.code(400)
+    return { error: outcome.detail }
+  case 'task-required':
+    reply.code(409)
+    return { error: 'Tool must be invoked through task-augmented tools/call' }
+}
+```
+
+The `canAccessTool` hook still runs before validation and before the handler, and receives the same `request` object passed to `mcpCallTool()`. Denied tools and unknown tools both return `{ ok: false, reason: 'not-found' }`, matching the JSON-RPC `tools/call` path's public behavior. Pass the route's real `reply` so tool handlers can use the full Fastify reply API. Pass `authContext` when the in-process caller has one so access hooks and handlers see the same authorization context they would receive over HTTP. If the tool handler throws, the outcome is `{ ok: true, result }` with `result.isError: true`, matching the JSON-RPC `tools/call` path.
+
 #### Type-Safe Resource Registration
 
 ```typescript
