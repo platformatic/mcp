@@ -79,6 +79,14 @@ const mcpDecoratorsPlugin: FastifyPluginAsync<MCPDecoratorsOptions> = async (app
     })
   })
 
+  app.decorate('mcpHasTool', (name: string): boolean => {
+    return tools.has(name)
+  })
+
+  app.decorate('mcpListToolNames', (): readonly string[] => {
+    return [...tools.keys()]
+  })
+
   // Enhanced resource decorator with URI schema support
   app.decorate('mcpAddResource', (
     definition: any,

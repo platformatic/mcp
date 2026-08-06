@@ -424,3 +424,11 @@ expectNotAssignable<MCPPluginOptions>({
 expectNotAssignable<MCPPluginOptions>({
   validateJsonSchemaInputs: 'yes'
 })
+
+// ─── Fastify decorators ─────────────────────────────────────────────
+
+const app = {} as FastifyInstance
+
+expectType<boolean>(app.mcpHasTool('search'))
+expectType<readonly string[]>(app.mcpListToolNames())
+expectError(app.mcpListToolNames().push('search'))

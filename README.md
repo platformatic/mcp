@@ -1854,6 +1854,51 @@ app.mcpAddPrompt(
 )
 ```
 
+#### Server-Side Tool Registry Introspection
+
+Use these decorators to introspect tool registration state from server-side code:
+
+- `app.mcpHasTool(name: string): boolean`
+- `app.mcpListToolNames(): readonly string[]`
+
+Important behavior:
+
+- Available only within the MCP plugin Fastify encapsulation scope (the registration scope and descendants)
+- Reports registration state, not request-specific visibility
+- Does not evaluate `canAccessTool`
+- Returns a read-only snapshot of names in registration order
+
+Because this API is authorization-agnostic by design, avoid exposing it directly to untrusted clients unless you enforce your own authorization.
+
+```typescript
+await app.register(mcpPlugin)
+
+app.mcpAddTool({
+  name: 'search',
+  description: 'Search documents',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      query: { type: 'string' }
+    },
+    required: ['query']
+  }
+}, async ({ query }) => {
+  return {
+    content: [{ type: 'text', text: `Searching for ${query}` }]
+  }
+})
+
+app.get('/internal/tool-status', async () => {
+  return {
+    searchRegistered: app.mcpHasTool('search'),
+    registeredTools: app.mcpListToolNames()
+  }
+})
+```
+
+This route is illustrative only and should be protected in real deployments.
+
 #### HTTP Context Access in Tool Handlers
 
 Tool handlers can access the Fastify request and reply objects through the context parameter, enabling tools to interact with HTTP-specific features like headers, query parameters, and custom response headers. 

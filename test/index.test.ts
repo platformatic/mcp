@@ -651,6 +651,92 @@ describe('MCP Fastify Plugin', () => {
       t.assert.strictEqual(result.prompts.length, 1)
       t.assert.strictEqual(result.prompts[0].name, 'test-prompt')
     })
+
+    test('should provide mcpHasTool and mcpListToolNames decorators', async (t: TestContext) => {
+      const app = Fastify()
+      t.after(() => app.close())
+
+      await app.register(mcpPlugin)
+      await app.ready()
+
+      t.assert.ok(typeof app.mcpHasTool === 'function')
+      t.assert.ok(typeof app.mcpListToolNames === 'function')
+    })
+
+    test('mcpHasTool should report registered and unknown tools', async (t: TestContext) => {
+      const app = Fastify()
+      t.after(() => app.close())
+
+      await app.register(mcpPlugin)
+      await app.ready()
+
+      app.mcpAddTool({
+        name: 'search',
+        description: 'Search tool',
+        inputSchema: { type: 'object', properties: {} }
+      })
+
+      t.assert.strictEqual(app.mcpHasTool('search'), true)
+      t.assert.strictEqual(app.mcpHasTool('unknown'), false)
+    })
+
+    test('mcpListToolNames should return all names in registration order', async (t: TestContext) => {
+      const app = Fastify()
+      t.after(() => app.close())
+
+      await app.register(mcpPlugin)
+      await app.ready()
+
+      app.mcpAddTool({ name: 'search', description: 'Search', inputSchema: { type: 'object', properties: {} } })
+      app.mcpAddTool({ name: 'summarize', description: 'Summarize', inputSchema: { type: 'object', properties: {} } })
+      app.mcpAddTool({ name: 'translate', description: 'Translate', inputSchema: { type: 'object', properties: {} } })
+
+      t.assert.deepStrictEqual(app.mcpListToolNames(), ['search', 'summarize', 'translate'])
+    })
+
+    test('mcpListToolNames should reflect tools added after an earlier call', async (t: TestContext) => {
+      const app = Fastify()
+      t.after(() => app.close())
+
+      await app.register(mcpPlugin)
+      await app.ready()
+
+      app.mcpAddTool({ name: 'search', description: 'Search', inputSchema: { type: 'object', properties: {} } })
+      t.assert.deepStrictEqual(app.mcpListToolNames(), ['search'])
+
+      app.mcpAddTool({ name: 'summarize', description: 'Summarize', inputSchema: { type: 'object', properties: {} } })
+      t.assert.deepStrictEqual(app.mcpListToolNames(), ['search', 'summarize'])
+    })
+
+    test('tool registry introspection should not invoke handlers or canAccessTool', async (t: TestContext) => {
+      let handlerCallCount = 0
+      let canAccessCallCount = 0
+
+      const app = Fastify()
+      t.after(() => app.close())
+
+      await app.register(mcpPlugin, {
+        canAccessTool: async () => {
+          canAccessCallCount++
+          return false
+        }
+      })
+      await app.ready()
+
+      app.mcpAddTool({
+        name: 'denied-tool',
+        description: 'Denied tool',
+        inputSchema: { type: 'object', properties: {} }
+      }, async () => {
+        handlerCallCount++
+        return { content: [{ type: 'text', text: 'ok' }] }
+      })
+
+      t.assert.strictEqual(app.mcpHasTool('denied-tool'), true)
+      t.assert.deepStrictEqual(app.mcpListToolNames(), ['denied-tool'])
+      t.assert.strictEqual(handlerCallCount, 0)
+      t.assert.strictEqual(canAccessCallCount, 0)
+    })
   })
 
   describe('Top-Level Exports', () => {
