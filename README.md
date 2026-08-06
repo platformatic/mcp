@@ -124,6 +124,76 @@ app.mcpAddPrompt({
 await app.listen({ port: 3000 })
 ```
 
+## Testing MCP Servers
+
+Use the testing subpath to exercise MCP endpoints through Fastify injection without opening a real network port:
+
+```typescript
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import Fastify from 'fastify'
+import type { FastifyInstance } from 'fastify'
+import mcpPlugin from '@platformatic/mcp'
+import mcpTesting from '@platformatic/mcp/testing'
+
+test('calls an MCP tool', async (t) => {
+  const app: FastifyInstance = Fastify()
+  t.after(() => app.close())
+
+  await app.register(mcpPlugin, { enableSSE: true })
+  await app.register(mcpTesting)
+
+  app.mcpAddTool({
+    name: 'echo',
+    description: 'Echo a message',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        message: { type: 'string' }
+      },
+      required: ['message'],
+      additionalProperties: false
+    }
+  }, async ({ message }) => {
+    return {
+      content: [{ type: 'text', text: message }]
+    }
+  })
+
+  await app.ready()
+
+  const client = app.mcpTestClient()
+
+  await client.initialize()
+
+  const response = await client.callTool('echo', {
+    message: 'hello'
+  })
+
+  assert.equal(response.statusCode, 200)
+  app.assertMcpResult(response.body)
+  assert.deepEqual(response.body.result, {
+    content: [{ type: 'text', text: 'hello' }]
+  })
+})
+```
+
+The testing client:
+
+- Uses `app.inject()` only (no port binding).
+- Manages sequential JSON-RPC request IDs per client instance.
+- `initialize()` performs the complete MCP lifecycle handshake (`initialize` plus `notifications/initialized`).
+- `initialize()` rejects when `notifications/initialized` is not accepted with an empty `202` or `204` response.
+- Commits `mcp-session-id` and negotiated protocol version only after the full initialization handshake succeeds.
+- Forwards headers passed to `initialize()` to both lifecycle requests, except MCP-managed `mcp-session-id` and `mcp-protocol-version` on `notifications/initialized`.
+- Captures committed `mcp-session-id` from successful initialization and sends it automatically on later requests.
+- Lets you pass custom headers (including authorization) globally or per request.
+
+Notes:
+
+- No OAuth/JWT credentials are generated for you.
+- Assertion helpers (`assertMcpResult`, `assertMcpError`) are framework-independent and throw plain `Error` values.
+
 ## Protocol Version Negotiation
 
 The server answers `initialize` with the client's requested revision when it is one it
