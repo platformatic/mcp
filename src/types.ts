@@ -1,4 +1,4 @@
-import type { FastifyReply, FastifyRequest } from 'fastify'
+import type { FastifyReply, FastifyRequest, FastifySchema, HTTPMethods } from 'fastify'
 import type { Options } from 'ajv'
 import type {
   JSONRPCMessage,
@@ -180,6 +180,22 @@ export interface ToolAccessContext {
   sessionId?: string
 }
 
+export type MCPRouteId =
+  | 'mcp.post'
+  | 'mcp.get'
+  | 'mcp.delete'
+
+export interface MCPRouteSchemaContext {
+  routeId: MCPRouteId
+  method: HTTPMethods
+  url: string
+}
+
+export type MCPRouteSchemaTransformer = (
+  schema: FastifySchema,
+  context: MCPRouteSchemaContext
+) => FastifySchema
+
 export interface MCPPluginOptions {
   serverInfo?: Implementation
   capabilities?: ServerCapabilities
@@ -227,6 +243,11 @@ export interface MCPPluginOptions {
     toolName: string,
     context: ToolAccessContext
   ) => boolean | Promise<boolean>
+  /**
+   * Customize Fastify/OpenAPI schema metadata for MCP transport routes.
+   * This callback runs once per registered route during startup.
+   */
+  transformRouteSchema?: MCPRouteSchemaTransformer
   /**
    * Validate plain JSON Schema tool inputs using AJV.
    * Omit this option to disable validation, or provide an object to enable it.

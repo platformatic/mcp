@@ -5,7 +5,7 @@ import {
   expectNotAssignable,
 } from 'tsd'
 import { Type } from '@sinclair/typebox'
-import type { FastifyReply, FastifyRequest } from 'fastify'
+import type { FastifyReply, FastifyRequest, FastifySchema, HTTPMethods } from 'fastify'
 import { RedisMessageBroker, MemoryMessageBroker, RedisSessionStore, MemorySessionStore } from '../dist/index.js'
 import type {
   ToolHandler,
@@ -27,6 +27,9 @@ import type {
   SessionStore,
   SessionMetadata,
   ToolAccessContext,
+  MCPRouteId,
+  MCPRouteSchemaContext,
+  MCPRouteSchemaTransformer,
 } from '../dist/index.js'
 
 // ─── ToolHandler ─────────────────────────────────────────────────────
@@ -209,6 +212,45 @@ expectAssignable<UnsafeMCPPrompt>({ definition: { name: 'anything' } })
 
 // Empty options are valid
 expectAssignable<MCPPluginOptions>({})
+
+const routeSchemaContext: MCPRouteSchemaContext = {
+  routeId: 'mcp.post',
+  method: 'POST',
+  url: '/mcp'
+}
+expectType<MCPRouteId>(routeSchemaContext.routeId)
+expectType<HTTPMethods>(routeSchemaContext.method)
+
+const routeSchemaTransformer: MCPRouteSchemaTransformer = (schema, context) => {
+  const routeId: MCPRouteId = context.routeId
+  expectType<MCPRouteSchemaContext>(context)
+
+  return {
+    ...schema,
+    tags: [routeId]
+  }
+}
+
+expectAssignable<MCPPluginOptions>({
+  transformRouteSchema: routeSchemaTransformer
+})
+
+expectError<MCPRouteSchemaContext>({
+  routeId: 'invalid.route',
+  method: 'POST',
+  url: '/mcp'
+})
+
+expectNotAssignable<MCPRouteSchemaTransformer>(async (schema: FastifySchema) => {
+  return {
+    ...schema,
+    tags: ['async-not-allowed']
+  }
+})
+
+expectNotAssignable<MCPRouteSchemaTransformer>((_schema: FastifySchema) => {
+  return undefined
+})
 
 // Full options
 expectAssignable<MCPPluginOptions>({

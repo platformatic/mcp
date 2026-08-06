@@ -1484,6 +1484,52 @@ The hook receives the tool name and a per-request context (`authContext`, `reque
 
 A hook that throws denies access (fail closed) and logs a warning. Only an explicit `true` grants access. Without the hook, every registered tool stays visible and callable.
 
+## Customizing MCP Route Schemas
+
+Use `transformRouteSchema` to customize Fastify/OpenAPI schema metadata on MCP transport routes without replacing handlers or route definitions.
+
+```typescript
+import Fastify from 'fastify'
+import mcpPlugin from '@platformatic/mcp'
+
+const app = Fastify()
+
+await app.register(mcpPlugin, {
+  transformRouteSchema (schema, { routeId }) {
+    return {
+      ...schema,
+      tags: ['MCP'],
+      security: [{ oauth2: ['tools:read'] }],
+      operationId: routeId.replace('.', '-'),
+      'x-roles': ['admin']
+    }
+  }
+})
+```
+
+Route IDs are stable and map to MCP transport routes:
+
+| Route ID | Method | Purpose |
+|---|---|---|
+| `mcp.post` | `POST` | MCP JSON-RPC messages |
+| `mcp.get` | `GET` | MCP streaming/SSE connection |
+| `mcp.delete` | `DELETE` | MCP session termination |
+
+Behavior notes:
+
+- The callback runs once per registered MCP transport route during startup.
+- The plugin passes the original route schema object to the callback.
+- Spread the incoming schema when you want to preserve existing fields.
+- The callback is synchronous and must return a schema object.
+- Returned metadata applies only to Fastify/OpenAPI schema fields.
+- OAuth and well-known routes are not customized by this option in this version.
+
+Security notes:
+
+- OpenAPI schema metadata does not enforce authentication or authorization.
+- For example, `security: [{ oauth2: ['tools:read'] }]` documents expectations but does not install auth checks.
+- Enforcement still depends on your configured auth hooks, token validation, and tool access controls.
+
 ### OAuth Routes
 
 The plugin automatically registers OAuth management routes:
