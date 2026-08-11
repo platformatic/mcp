@@ -257,6 +257,9 @@ export type {
 // Export plugin types
 export type {
   MCPPluginOptions,
+  MCPRouteId,
+  MCPRouteSchemaContext,
+  MCPRouteSchemaTransformer,
   ToolAccessContext,
   MCPTool,
   MCPResource,

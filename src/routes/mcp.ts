@@ -1,10 +1,18 @@
 import { randomUUID } from 'crypto'
-import type { FastifyRequest, FastifyReply, FastifyPluginAsync } from 'fastify'
+import type { FastifyRequest, FastifyReply, FastifyPluginAsync, FastifySchema } from 'fastify'
 import fp from 'fastify-plugin'
 import type { JSONRPCMessage } from '../schema.ts'
 import { JSONRPC_VERSION, INTERNAL_ERROR, SUPPORTED_PROTOCOL_VERSIONS, DEFAULT_NEGOTIATED_PROTOCOL_VERSION } from '../schema.ts'
 import { isOriginAllowed } from '../security.ts'
-import type { MCPPluginOptions, MCPTool, MCPResource, MCPPrompt, ResourceHandlers } from '../types.ts'
+import type {
+  MCPPluginOptions,
+  MCPTool,
+  MCPResource,
+  MCPPrompt,
+  ResourceHandlers,
+  MCPRouteSchemaContext,
+  MCPRouteSchemaTransformer
+} from '../types.ts'
 import type { SessionStore, SessionMetadata } from '../stores/session-store.ts'
 import type { TaskStore, TaskWaiters } from '../stores/task-store.ts'
 import type { MessageBroker } from '../brokers/message-broker.ts'
@@ -29,8 +37,46 @@ interface MCPPubSubRoutesOptions {
   jsonSchemaValidator?: JsonSchemaValidator
 }
 
+function resolveRouteUrl (prefix: string | undefined, url: string): string {
+  if (!prefix || prefix === '/') {
+    return url
+  }
+
+  const normalizedPrefix = prefix.endsWith('/') ? prefix.slice(0, -1) : prefix
+  return `${normalizedPrefix}${url}`
+}
+
+function isThenable (value: unknown): value is PromiseLike<unknown> {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    'then' in value &&
+    typeof value.then === 'function'
+  )
+}
+
+function resolveMcpRouteSchema (
+  defaultSchema: FastifySchema | undefined,
+  context: MCPRouteSchemaContext,
+  transform?: MCPRouteSchemaTransformer
+): FastifySchema | undefined {
+  if (!transform) {
+    return defaultSchema
+  }
+
+  const schema = defaultSchema ?? {}
+  const transformed = transform(schema, context)
+
+  if (typeof transformed !== 'object' || transformed === null || Array.isArray(transformed) || isThenable(transformed)) {
+    throw new TypeError(`transformRouteSchema must return a synchronous Fastify schema object for ${context.routeId}`)
+  }
+
+  return transformed
+}
+
 const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async (app, options) => {
   const { enableSSE, opts, capabilities, serverInfo, tools, resources, prompts, resourceHandlers, sessionStore, messageBroker, localStreams, taskStore, taskWaiters, jsonSchemaValidator } = options
+  const mcpUrl = resolveRouteUrl(app.prefix, '/mcp')
 
   const allowedOrigins = opts.allowedOrigins
 
@@ -226,12 +272,146 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     }
   }
 
-  app.post('/mcp', { onRequest: mcpOnRequest, preHandler: mcpPreHandler }, async (request: FastifyRequest, reply: FastifyReply) => {
-    try {
-      const message = request.body as JSONRPCMessage
-      let sessionId = request.headers['mcp-session-id'] as string
+  {
+    const schema = resolveMcpRouteSchema(undefined, {
+      routeId: 'mcp.post',
+      method: 'POST',
+      url: mcpUrl
+    }, opts.transformRouteSchema)
+    const routeOptions = schema === undefined
+      ? { onRequest: mcpOnRequest, preHandler: mcpPreHandler }
+      : { onRequest: mcpOnRequest, preHandler: mcpPreHandler, schema }
 
-      if (enableSSE) {
+    app.post('/mcp', routeOptions, async (request: FastifyRequest, reply: FastifyReply) => {
+      try {
+        const message = request.body as JSONRPCMessage
+        let sessionId = request.headers['mcp-session-id'] as string
+
+        if (enableSSE) {
+          let session: SessionMetadata
+          if (sessionId) {
+            const existingSession = await sessionStore.get(sessionId)
+            if (existingSession) {
+              session = existingSession
+            } else {
+              session = await createSSESession()
+              reply.header('Mcp-Session-Id', session.id)
+            }
+          } else {
+            session = await createSSESession()
+            reply.header('Mcp-Session-Id', session.id)
+          }
+          sessionId = session.id
+        }
+
+        // Build auth context from validated token payload
+        let authContext: AuthorizationContext | undefined
+        if ((request as any).tokenPayload) {
+          const payload = (request as any).tokenPayload
+          authContext = {
+            userId: payload.sub,
+            clientId: payload.client_id || payload.azp,
+            scopes: typeof payload.scope === 'string'
+              ? payload.scope.split(' ')
+              : payload.scopes,
+            audience: Array.isArray(payload.aud)
+              ? payload.aud
+              : payload.aud ? [payload.aud] : undefined,
+            tokenType: 'Bearer',
+            expiresAt: payload.exp ? new Date(payload.exp * 1000) : undefined,
+            issuedAt: payload.iat ? new Date(payload.iat * 1000) : undefined,
+            authorizationServer: payload.iss
+          }
+        } else if (sessionId) {
+        // Fallback to session-stored auth context
+          const session = await sessionStore.get(sessionId)
+          authContext = session?.authorization
+        }
+
+        const response = await processMessage(message, sessionId, {
+          app,
+          opts,
+          capabilities,
+          serverInfo,
+          tools,
+          resources,
+          prompts,
+          resourceHandlers,
+          request,
+          reply,
+          authContext,
+          sessionStore,
+          taskStore,
+          taskWaiters,
+          jsonSchemaValidator,
+          sessionId,
+          protocolVersion: (request as any).mcpProtocolVersion ?? DEFAULT_NEGOTIATED_PROTOCOL_VERSION
+        })
+        if (response) {
+          return response
+        } else {
+          reply.code(202)
+        }
+      } catch (error) {
+        app.log.error({ err: error }, 'Error processing MCP message')
+        reply.type('application/json').code(500).send({
+          jsonrpc: JSONRPC_VERSION,
+          id: null,
+          error: {
+            code: INTERNAL_ERROR,
+            message: 'Internal server error'
+          }
+        })
+      }
+    })
+  }
+
+  // GET endpoint for server-initiated communication via SSE
+  if (!enableSSE) {
+    app.get('/mcp', { onRequest: mcpOnRequest, preHandler: mcpPreHandler }, async (_request: FastifyRequest, reply: FastifyReply) => {
+      reply.type('application/json').code(405).send({ error: 'Method Not Allowed: SSE not enabled' })
+    })
+  }
+
+  if (enableSSE) {
+    const schema = resolveMcpRouteSchema(undefined, {
+      routeId: 'mcp.get',
+      method: 'GET',
+      url: mcpUrl
+    }, opts.transformRouteSchema)
+    const routeOptions = schema === undefined
+      ? { onRequest: mcpOnRequest, preHandler: mcpPreHandler }
+      : { onRequest: mcpOnRequest, preHandler: mcpPreHandler, schema }
+
+    app.get('/mcp', routeOptions, async (request: FastifyRequest, reply: FastifyReply) => {
+      if (!supportsSSE(request)) {
+        reply.type('application/json').code(405).send({ error: 'Method Not Allowed: SSE not supported' })
+        return
+      }
+
+      try {
+        const sessionId = (request.headers['mcp-session-id'] as string) ||
+                       (request.query as any)['mcp-session-id']
+
+        // Check if there's already an active SSE session
+        if (hasActiveSSESession(sessionId)) {
+          reply.type('application/json').code(409).send({
+            error: 'Conflict: SSE session already active for this session ID'
+          })
+          return
+        }
+
+        request.log.info({ sessionId }, 'Handling SSE request')
+
+        // We are opting out of Fastify proper
+        reply.hijack()
+
+        const raw = reply.raw
+
+        // Set up SSE stream
+        raw.setHeader('Content-type', 'text/event-stream')
+        raw.setHeader('Cache-Control', 'no-cache')
+
         let session: SessionMetadata
         if (sessionId) {
           const existingSession = await sessionStore.get(sessionId)
@@ -239,220 +419,118 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
             session = existingSession
           } else {
             session = await createSSESession()
-            reply.header('Mcp-Session-Id', session.id)
+            raw.setHeader('Mcp-Session-Id', session.id)
           }
-        } else {
-          session = await createSSESession()
-          reply.header('Mcp-Session-Id', session.id)
-        }
-        sessionId = session.id
-      }
-
-      // Build auth context from validated token payload
-      let authContext: AuthorizationContext | undefined
-      if ((request as any).tokenPayload) {
-        const payload = (request as any).tokenPayload
-        authContext = {
-          userId: payload.sub,
-          clientId: payload.client_id || payload.azp,
-          scopes: typeof payload.scope === 'string'
-            ? payload.scope.split(' ')
-            : payload.scopes,
-          audience: Array.isArray(payload.aud)
-            ? payload.aud
-            : payload.aud ? [payload.aud] : undefined,
-          tokenType: 'Bearer',
-          expiresAt: payload.exp ? new Date(payload.exp * 1000) : undefined,
-          issuedAt: payload.iat ? new Date(payload.iat * 1000) : undefined,
-          authorizationServer: payload.iss
-        }
-      } else if (sessionId) {
-        // Fallback to session-stored auth context
-        const session = await sessionStore.get(sessionId)
-        authContext = session?.authorization
-      }
-
-      const response = await processMessage(message, sessionId, {
-        app,
-        opts,
-        capabilities,
-        serverInfo,
-        tools,
-        resources,
-        prompts,
-        resourceHandlers,
-        request,
-        reply,
-        authContext,
-        sessionStore,
-        taskStore,
-        taskWaiters,
-        jsonSchemaValidator,
-        sessionId,
-        protocolVersion: (request as any).mcpProtocolVersion ?? DEFAULT_NEGOTIATED_PROTOCOL_VERSION
-      })
-      if (response) {
-        return response
-      } else {
-        reply.code(202)
-      }
-    } catch (error) {
-      app.log.error({ err: error }, 'Error processing MCP message')
-      reply.type('application/json').code(500).send({
-        jsonrpc: JSONRPC_VERSION,
-        id: null,
-        error: {
-          code: INTERNAL_ERROR,
-          message: 'Internal server error'
-        }
-      })
-    }
-  })
-
-  // GET endpoint for server-initiated communication via SSE
-  app.get('/mcp', { onRequest: mcpOnRequest, preHandler: mcpPreHandler }, async (request: FastifyRequest, reply: FastifyReply) => {
-    if (!enableSSE) {
-      reply.type('application/json').code(405).send({ error: 'Method Not Allowed: SSE not enabled' })
-      return
-    }
-
-    if (!supportsSSE(request)) {
-      reply.type('application/json').code(405).send({ error: 'Method Not Allowed: SSE not supported' })
-      return
-    }
-
-    try {
-      const sessionId = (request.headers['mcp-session-id'] as string) ||
-                       (request.query as any)['mcp-session-id']
-
-      // Check if there's already an active SSE session
-      if (hasActiveSSESession(sessionId)) {
-        reply.type('application/json').code(409).send({
-          error: 'Conflict: SSE session already active for this session ID'
-        })
-        return
-      }
-
-      request.log.info({ sessionId }, 'Handling SSE request')
-
-      // We are opting out of Fastify proper
-      reply.hijack()
-
-      const raw = reply.raw
-
-      // Set up SSE stream
-      raw.setHeader('Content-type', 'text/event-stream')
-      raw.setHeader('Cache-Control', 'no-cache')
-
-      let session: SessionMetadata
-      if (sessionId) {
-        const existingSession = await sessionStore.get(sessionId)
-        if (existingSession) {
-          session = existingSession
         } else {
           session = await createSSESession()
           raw.setHeader('Mcp-Session-Id', session.id)
         }
-      } else {
-        session = await createSSESession()
-        raw.setHeader('Mcp-Session-Id', session.id)
-      }
 
-      raw.writeHead(200)
+        raw.writeHead(200)
 
-      let streams = localStreams.get(session.id)
-      if (!streams) {
-        streams = new Set()
-        localStreams.set(session.id, streams)
-      }
-      streams.add(reply)
-
-      app.log.info({
-        sessionId: session.id,
-        totalStreams: streams.size,
-        method: 'GET'
-      }, 'Added new stream to session')
-
-      // Handle resumability with Last-Event-ID
-      const lastEventId = request.headers['last-event-id'] as string
-      if (lastEventId) {
-        app.log.info(`Resuming SSE stream from event ID: ${lastEventId}`)
-        await replayMessagesFromEventId(session.id, lastEventId, reply)
-      }
-
-      // Handle connection close
-      reply.raw.on('close', () => {
-        const streams = localStreams.get(session.id)
-        if (streams) {
-          streams.delete(reply)
-          app.log.info({
-            sessionId: session.id,
-            remainingStreams: streams.size
-          }, 'SSE connection closed')
-
-          if (streams.size === 0) {
-            app.log.info({
-              sessionId: session.id
-            }, 'Last SSE stream closed, cleaning up session')
-            localStreams.delete(session.id)
-            messageBroker.unsubscribe(`mcp/session/${session.id}/message`)
-          }
+        let streams = localStreams.get(session.id)
+        if (!streams) {
+          streams = new Set()
+          localStreams.set(session.id, streams)
         }
-      })
+        streams.add(reply)
 
-      // SEP-1699: servers may end an SSE stream whenever they like, turning the
-      // stream into a polling channel. The client reconnects with Last-Event-ID
-      // on GET and we replay whatever it missed, so closing here loses nothing.
-      let maxDurationTimer: NodeJS.Timeout | undefined
-      if (opts.sseMaxConnectionMs) {
-        maxDurationTimer = setTimeout(() => {
-          app.log.info({
-            sessionId: session.id,
-            afterMs: opts.sseMaxConnectionMs
-          }, 'Closing SSE stream to let the client poll; it may resume with Last-Event-ID')
-          try {
-            reply.raw.end()
-          } catch {
-            // already gone
-          }
-        }, opts.sseMaxConnectionMs)
-        maxDurationTimer.unref()
+        app.log.info({
+          sessionId: session.id,
+          totalStreams: streams.size,
+          method: 'GET'
+        }, 'Added new stream to session')
 
-        reply.raw.on('close', () => clearTimeout(maxDurationTimer))
-      }
+        // Handle resumability with Last-Event-ID
+        const lastEventId = request.headers['last-event-id'] as string
+        if (lastEventId) {
+          app.log.info(`Resuming SSE stream from event ID: ${lastEventId}`)
+          await replayMessagesFromEventId(session.id, lastEventId, reply)
+        }
 
-      // Send initial heartbeat
-      reply.raw.write(': heartbeat\n\n')
-
-      // Keep connection alive with periodic heartbeats
-      const heartbeatInterval = setInterval(() => {
-        try {
-          reply.raw.write(': heartbeat\n\n')
-        } catch (error) {
-          clearInterval(heartbeatInterval)
+        // Handle connection close
+        reply.raw.on('close', () => {
           const streams = localStreams.get(session.id)
           if (streams) {
             streams.delete(reply)
-          }
-        }
-      }, 30000) // 30 second heartbeat
-      heartbeatInterval.unref()
+            app.log.info({
+              sessionId: session.id,
+              remainingStreams: streams.size
+            }, 'SSE connection closed')
 
-      reply.raw.on('close', () => {
-        app.log.info({
-          sessionId: session.id
-        }, 'SSE heartbeat connection closed')
-        clearInterval(heartbeatInterval)
-      })
-    } catch (error) {
-      app.log.error({ err: error }, 'Error setting up SSE stream')
-      reply.type('application/json').code(500).send({ error: 'Internal server error' })
-    }
-  })
+            if (streams.size === 0) {
+              app.log.info({
+                sessionId: session.id
+              }, 'Last SSE stream closed, cleaning up session')
+              localStreams.delete(session.id)
+              messageBroker.unsubscribe(`mcp/session/${session.id}/message`)
+            }
+          }
+        })
+
+        // SEP-1699: servers may end an SSE stream whenever they like, turning the
+        // stream into a polling channel. The client reconnects with Last-Event-ID
+        // on GET and we replay whatever it missed, so closing here loses nothing.
+        let maxDurationTimer: NodeJS.Timeout | undefined
+        if (opts.sseMaxConnectionMs) {
+          maxDurationTimer = setTimeout(() => {
+            app.log.info({
+              sessionId: session.id,
+              afterMs: opts.sseMaxConnectionMs
+            }, 'Closing SSE stream to let the client poll; it may resume with Last-Event-ID')
+            try {
+              reply.raw.end()
+            } catch {
+            // already gone
+            }
+          }, opts.sseMaxConnectionMs)
+          maxDurationTimer.unref()
+
+          reply.raw.on('close', () => clearTimeout(maxDurationTimer))
+        }
+
+        // Send initial heartbeat
+        reply.raw.write(': heartbeat\n\n')
+
+        // Keep connection alive with periodic heartbeats
+        const heartbeatInterval = setInterval(() => {
+          try {
+            reply.raw.write(': heartbeat\n\n')
+          } catch (error) {
+            clearInterval(heartbeatInterval)
+            const streams = localStreams.get(session.id)
+            if (streams) {
+              streams.delete(reply)
+            }
+          }
+        }, 30000) // 30 second heartbeat
+        heartbeatInterval.unref()
+
+        reply.raw.on('close', () => {
+          app.log.info({
+            sessionId: session.id
+          }, 'SSE heartbeat connection closed')
+          clearInterval(heartbeatInterval)
+        })
+      } catch (error) {
+        app.log.error({ err: error }, 'Error setting up SSE stream')
+        reply.type('application/json').code(500).send({ error: 'Internal server error' })
+      }
+    })
+  }
 
   // DELETE endpoint for explicit session termination (MCP spec)
   if (enableSSE) {
-    app.delete('/mcp', { onRequest: mcpOnRequest, preHandler: mcpPreHandler }, async (request: FastifyRequest, reply: FastifyReply) => {
+    const schema = resolveMcpRouteSchema(undefined, {
+      routeId: 'mcp.delete',
+      method: 'DELETE',
+      url: mcpUrl
+    }, opts.transformRouteSchema)
+    const routeOptions = schema === undefined
+      ? { onRequest: mcpOnRequest, preHandler: mcpPreHandler }
+      : { onRequest: mcpOnRequest, preHandler: mcpPreHandler, schema }
+
+    app.delete('/mcp', routeOptions, async (request: FastifyRequest, reply: FastifyReply) => {
       const sessionId = request.headers['mcp-session-id'] as string
       if (!sessionId) {
         reply.code(400).send({ error: 'Missing Mcp-Session-Id header' })
