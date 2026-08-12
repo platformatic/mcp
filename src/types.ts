@@ -95,6 +95,12 @@ declare module 'fastify' {
       handler?: UnsafeToolHandler
     ): void
 
+    mcpCallTool(
+      name: string,
+      args: Record<string, unknown>,
+      context: McpCallToolContext
+    ): Promise<McpCallToolOutcome>
+
     mcpAddResource<TUriSchema extends TSchema = TString>(
       definition: Omit<Resource, 'uri'> & {
         uriPattern: string,
@@ -195,6 +201,18 @@ export type MCPRouteSchemaTransformer = (
   schema: FastifySchema,
   context: MCPRouteSchemaContext
 ) => FastifySchema
+
+export interface McpCallToolContext {
+  request: FastifyRequest
+  reply: FastifyReply
+  authContext?: AuthorizationContext
+}
+
+export type McpCallToolOutcome =
+  | { ok: true, result: CallToolResult }
+  | { ok: false, reason: 'not-found' }
+  | { ok: false, reason: 'invalid-arguments', detail: string }
+  | { ok: false, reason: 'task-required' }
 
 export interface MCPPluginOptions {
   serverInfo?: Implementation

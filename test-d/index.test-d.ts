@@ -5,7 +5,7 @@ import {
   expectNotAssignable,
 } from 'tsd'
 import { Type } from '@sinclair/typebox'
-import type { FastifyReply, FastifyRequest, FastifySchema, HTTPMethods } from 'fastify'
+import type { FastifyInstance, FastifyReply, FastifyRequest, FastifySchema, HTTPMethods } from 'fastify'
 import { RedisMessageBroker, MemoryMessageBroker, RedisSessionStore, MemorySessionStore } from '../dist/index.js'
 import type {
   ToolHandler,
@@ -30,6 +30,8 @@ import type {
   MCPRouteId,
   MCPRouteSchemaContext,
   MCPRouteSchemaTransformer,
+  McpCallToolContext,
+  McpCallToolOutcome,
 } from '../dist/index.js'
 
 // ─── ToolHandler ─────────────────────────────────────────────────────
@@ -364,6 +366,30 @@ expectAssignable<MCPPluginOptions>({ canAccessTool: accessHook })
 // The context type is exported and carries a required request
 expectAssignable<ToolAccessContext>({ request: {} as FastifyRequest })
 expectNotAssignable<ToolAccessContext>({})
+
+// mcpCallTool is decorated on Fastify and returns the exported outcome union
+const fastifyApp = {} as FastifyInstance
+expectType<Promise<McpCallToolOutcome>>(
+  fastifyApp.mcpCallTool('echo', {}, { request: {} as FastifyRequest, reply: {} as FastifyReply })
+)
+expectAssignable<McpCallToolContext>({
+  request: {} as FastifyRequest,
+  reply: {} as FastifyReply
+})
+expectAssignable<McpCallToolContext>({
+  request: {} as FastifyRequest,
+  reply: {} as FastifyReply,
+  authContext: { userId: 'user-123', tokenType: 'Bearer' }
+})
+expectNotAssignable<McpCallToolContext>({ request: {} as FastifyRequest })
+expectNotAssignable<McpCallToolContext>({})
+expectAssignable<McpCallToolOutcome>({ ok: true, result: { content: [{ type: 'text', text: 'ok' }] } })
+expectAssignable<McpCallToolOutcome>({ ok: false, reason: 'not-found' })
+expectNotAssignable<McpCallToolOutcome>({ ok: false, reason: 'unknown-tool' })
+expectNotAssignable<McpCallToolOutcome>({ ok: false, reason: 'access-denied' })
+expectAssignable<McpCallToolOutcome>({ ok: false, reason: 'invalid-arguments', detail: 'missing input' })
+expectAssignable<McpCallToolOutcome>({ ok: false, reason: 'task-required' })
+expectNotAssignable<McpCallToolOutcome>({ ok: false, reason: 'nope' })
 
 // Sync and async hooks are both accepted
 expectAssignable<MCPPluginOptions>({ canAccessTool: () => true })

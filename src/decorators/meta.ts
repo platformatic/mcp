@@ -4,10 +4,13 @@ import type {
   MCPTool,
   MCPResource,
   MCPPrompt,
+  MCPPluginOptions,
+  McpCallToolContext,
   ResourceHandlers,
   ResourceSubscribeHandler,
   ResourceUnsubscribeHandler
 } from '../types.ts'
+import { callRegisteredTool } from '../handlers.ts'
 import { schemaToArguments, validateToolSchema, isTypeBoxSchema } from '../validation/index.ts'
 import type { JsonSchemaValidator } from '../validation/json-schema-validator.ts'
 
@@ -16,11 +19,12 @@ interface MCPDecoratorsOptions {
   resources: Map<string, MCPResource>
   prompts: Map<string, MCPPrompt>
   resourceHandlers: ResourceHandlers
+  opts: MCPPluginOptions
   jsonSchemaValidator?: JsonSchemaValidator
 }
 
 const mcpDecoratorsPlugin: FastifyPluginAsync<MCPDecoratorsOptions> = async (app, options) => {
-  const { tools, resources, prompts, resourceHandlers, jsonSchemaValidator } = options
+  const { tools, resources, prompts, resourceHandlers, opts, jsonSchemaValidator } = options
 
   // Enhanced tool decorator with TypeBox schema support
   app.decorate('mcpAddTool', (
@@ -60,6 +64,18 @@ const mcpDecoratorsPlugin: FastifyPluginAsync<MCPDecoratorsOptions> = async (app
         inputSchema: definition.inputSchema || toolDefinition.inputSchema
       },
       handler
+    })
+  })
+
+  app.decorate('mcpCallTool', (name: string, args: Record<string, unknown>, context: McpCallToolContext) => {
+    return callRegisteredTool(name, args, {
+      app,
+      opts,
+      tools,
+      jsonSchemaValidator,
+      request: context.request,
+      reply: context.reply,
+      authContext: context.authContext
     })
   })
 

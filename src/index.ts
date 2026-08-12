@@ -157,6 +157,7 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     resources,
     prompts,
     resourceHandlers,
+    opts,
     jsonSchemaValidator
   })
   app.register(pubsubDecorators, {
@@ -261,6 +262,8 @@ export type {
   MCPRouteSchemaContext,
   MCPRouteSchemaTransformer,
   ToolAccessContext,
+  McpCallToolContext,
+  McpCallToolOutcome,
   MCPTool,
   MCPResource,
   MCPPrompt,
