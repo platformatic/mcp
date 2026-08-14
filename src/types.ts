@@ -100,6 +100,8 @@ declare module 'fastify' {
       args: Record<string, unknown>,
       context: McpCallToolContext
     ): Promise<McpCallToolOutcome>
+    mcpHasTool(name: string): boolean
+    mcpListToolNames(): readonly string[]
 
     mcpAddResource<TUriSchema extends TSchema = TString>(
       definition: Omit<Resource, 'uri'> & {
