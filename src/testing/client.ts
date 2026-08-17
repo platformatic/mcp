@@ -22,6 +22,10 @@ const InvalidJsonResponseError = createFastifyError(
   'MCP_ERR_INVALID_JSON_RESPONSE',
   'Failed to parse JSON response from MCP test request (status %s): %s; payload=%s'
 )
+const InvalidNotificationAcceptanceError = createFastifyError(
+  'MCP_ERR_INVALID_NOTIFICATION_ACCEPTANCE',
+  'MCP %s notification failed: expected an empty 202 or 204 response, received status %s; payload=%s'
+)
 
 export interface McpTestClientOptions {
   endpoint?: string
@@ -158,10 +162,10 @@ function assertNotificationAccepted (
     response.statusCode === 204
 
   if (!acceptedStatus || response.payload.trim() !== '') {
-    throw new Error(
-      `MCP ${method} notification failed: expected an empty 202 or 204 response, ` +
-      `received status ${response.statusCode}; ` +
-      `payload=${truncateForError(response.payload)}`
+    throw new InvalidNotificationAcceptanceError(
+      method,
+      response.statusCode,
+      truncateForError(response.payload)
     )
   }
 }
