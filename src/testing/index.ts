@@ -8,8 +8,7 @@ export {
 } from './client.ts'
 
 export {
-  assertMcpResult,
-  assertMcpError
+  assertMcpResult
 } from './assertions.ts'
 
 export { default, default as mcpTesting } from './plugin.ts'

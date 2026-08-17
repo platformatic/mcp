@@ -3,12 +3,14 @@ import createFastifyError from 'fastify-error'
 import type {
   Implementation,
   JSONRPCNotification,
-  JSONRPCRequest
+  JSONRPCRequest,
+  JSONRPCResponse
 } from '../schema.ts'
 import {
   JSONRPC_VERSION,
   LATEST_PROTOCOL_VERSION
 } from '../schema.ts'
+import { assertMcpResponse } from './assertions.ts'
 
 const DEFAULT_ENDPOINT = '/mcp'
 const DEFAULT_STARTING_REQUEST_ID = 1
@@ -40,7 +42,7 @@ export interface McpTestRequestOptions {
   id?: string | number
 }
 
-export interface McpTestResponse<TBody = unknown> {
+export interface McpTestResponse<TBody = JSONRPCResponse> {
   statusCode: number
   headers: Record<string, string | string[] | undefined>
   body: TBody
@@ -154,7 +156,7 @@ function omitManagedMcpHeaders (
 }
 
 function assertNotificationAccepted (
-  response: McpTestResponse,
+  response: McpTestResponse<unknown>,
   method: string
 ): void {
   const acceptedStatus =
@@ -233,10 +235,18 @@ export function createMcpTestClient (
     return generatedId
   }
 
+  function send (
+    request: JSONRPCRequest | JSONRPCNotification,
+    requestOptions?: SendOptions & { expectJsonResponse?: true }
+  ): Promise<McpTestResponse>
+  function send (
+    request: JSONRPCRequest | JSONRPCNotification,
+    requestOptions: SendOptions & { expectJsonResponse: false }
+  ): Promise<McpTestResponse<undefined>>
   async function send (
     request: JSONRPCRequest | JSONRPCNotification,
     requestOptions?: SendOptions
-  ): Promise<McpTestResponse> {
+  ): Promise<McpTestResponse<JSONRPCResponse | undefined>> {
     const expectJsonResponse = requestOptions?.expectJsonResponse ?? true
     const effectiveProtocolVersion =
       requestOptions?.protocolVersion === undefined
@@ -271,9 +281,12 @@ export function createMcpTestClient (
     })
 
     const payload = response.body
-    const body = expectJsonResponse
-      ? parseJsonBody(payload, response.statusCode)
-      : undefined
+    let body: JSONRPCResponse | undefined
+    if (expectJsonResponse) {
+      const parsedBody = parseJsonBody(payload, response.statusCode)
+      assertMcpResponse(parsedBody)
+      body = parsedBody
+    }
 
     return {
       statusCode: response.statusCode,

@@ -1,4 +1,4 @@
-import type { JSONRPCErrorResponse, JSONRPCResultResponse } from '../schema.ts'
+import type { JSONRPCResponse, JSONRPCResultResponse } from '../schema.ts'
 import { JSONRPC_VERSION } from '../schema.ts'
 import createFastifyError from 'fastify-error'
 
@@ -26,14 +26,6 @@ const InvalidMcpErrorResponseObjectError = createFastifyError(
   'MCP_ERR_INVALID_ERROR_RESPONSE_OBJECT',
   'Expected JSON-RPC error response object, got %s'
 )
-const MissingMcpErrorFieldError = createFastifyError(
-  'MCP_ERR_MISSING_ERROR',
-  'Expected JSON-RPC error response to include error'
-)
-const UnexpectedMcpErrorResultError = createFastifyError(
-  'MCP_ERR_UNEXPECTED_ERROR_RESULT',
-  'Expected JSON-RPC error response not to include result'
-)
 const InvalidMcpErrorObjectError = createFastifyError(
   'MCP_ERR_INVALID_ERROR_OBJECT',
   'Expected error to be an object'
@@ -60,26 +52,16 @@ function describeValue (value: unknown): string {
 export function assertMcpResult (
   body: unknown
 ): asserts body is JSONRPCResultResponse {
-  if (!isRecord(body)) {
-    throw new InvalidMcpResultResponseObjectError(describeValue(body))
-  }
+  assertMcpResponse(body)
 
-  if (body.jsonrpc !== JSONRPC_VERSION) {
-    throw new InvalidMcpJsonrpcVersionError()
-  }
-
-  if (!hasOwn(body, 'result')) {
-    throw new MissingMcpResultError()
-  }
-
-  if (hasOwn(body, 'error')) {
-    throw new UnexpectedMcpResultErrorFieldError()
+  if ('error' in body) {
+    throw new InvalidMcpResultResponseObjectError('error response')
   }
 }
 
-export function assertMcpError (
+export function assertMcpResponse (
   body: unknown
-): asserts body is JSONRPCErrorResponse {
+): asserts body is JSONRPCResponse {
   if (!isRecord(body)) {
     throw new InvalidMcpErrorResponseObjectError(describeValue(body))
   }
@@ -88,12 +70,16 @@ export function assertMcpError (
     throw new InvalidMcpJsonrpcVersionError()
   }
 
-  if (!hasOwn(body, 'error')) {
-    throw new MissingMcpErrorFieldError()
+  if (hasOwn(body, 'result') && hasOwn(body, 'error')) {
+    throw new UnexpectedMcpResultErrorFieldError()
   }
 
   if (hasOwn(body, 'result')) {
-    throw new UnexpectedMcpErrorResultError()
+    return
+  }
+
+  if (!hasOwn(body, 'error')) {
+    throw new MissingMcpResultError()
   }
 
   const errorValue = body.error

@@ -10,7 +10,6 @@ import {
   METHOD_NOT_FOUND
 } from '../src/schema.ts'
 import {
-  assertMcpError,
   assertMcpResult,
   createMcpTestClient
 } from '../src/testing/index.ts'
@@ -385,7 +384,7 @@ describe('MCP testing client', () => {
     assert.equal(typeof testingModule.default, 'function')
     assert.equal(typeof testingModule.mcpTesting, 'function')
     assert.equal(typeof testingModule.assertMcpResult, 'function')
-    assert.equal(typeof testingModule.assertMcpError, 'function')
+    assert.equal('assertMcpError' in testingModule, false)
   })
 
   test('testing plugin decorates the Fastify instance', async (t) => {
@@ -449,7 +448,7 @@ describe('MCP testing client', () => {
     const client = createMcpTestClient(app)
 
     const response = await client.initialize()
-    assertMcpError(response.body)
+    assert.ok('error' in response.body)
     assert.equal(client.sessionId, undefined)
 
     await client.callTool('echo', { message: 'hello' })
@@ -656,7 +655,7 @@ describe('MCP testing client', () => {
     await client.initialize()
     const response = await client.callTool('does-not-exist', {})
 
-    assertMcpError(response.body)
+    assert.ok('error' in response.body)
     assert.equal(response.body.error.code, METHOD_NOT_FOUND)
   })
 
@@ -778,7 +777,10 @@ describe('MCP testing client', () => {
     })
 
     await client.initialize()
-    await client.listTools({ protocolVersion: '2025-03-26' })
+    await assert.rejects(
+      () => client.listTools({ protocolVersion: '2025-03-26' }),
+      /jsonrpc/
+    )
 
     assert.equal(capturedRequests[2].headers['mcp-protocol-version'], '2025-03-26')
   })
@@ -806,30 +808,16 @@ describe('MCP testing client', () => {
     assert.throws(() => assertMcpResult(response.body), /success response/)
   })
 
-  test('assertMcpError narrows and accepts error responses', async (t) => {
+  test('client returns validated error responses', async (t) => {
     const { app } = await createTestApp(t)
     const client = createMcpTestClient(app)
 
     await client.initialize()
     const response = await client.callTool('missing', {})
 
-    assertMcpError(response.body)
+    assert.ok('error' in response.body)
     assert.equal(typeof response.body.error.code, 'number')
     assert.equal(typeof response.body.error.message, 'string')
-  })
-
-  test('assertMcpError throws for success and malformed responses', async (t) => {
-    const { app } = await createTestApp(t)
-    const client = createMcpTestClient(app)
-
-    await client.initialize()
-    const success = await client.callTool('echo', { message: 'hello' })
-
-    assert.throws(() => assertMcpError(success.body), /error response/)
-    assert.throws(
-      () => assertMcpError({ jsonrpc: JSONRPC_VERSION, error: { code: 'oops', message: 1 } }),
-      /error\.code/
-    )
   })
 
   test('invalid JSON responses throw descriptive bounded errors', async (t) => {
@@ -855,6 +843,29 @@ describe('MCP testing client', () => {
         assert.ok(error.message.length < 1_800)
         return true
       }
+    )
+  })
+
+  test('malformed JSON-RPC responses are rejected', async (t) => {
+    const app = Fastify()
+    t.after(() => app.close())
+
+    app.post('/malformed-json-rpc', async () => {
+      return {
+        jsonrpc: JSONRPC_VERSION,
+        error: { code: 'oops', message: 1 }
+      }
+    })
+
+    await app.ready()
+
+    const client = createMcpTestClient(app, {
+      endpoint: '/malformed-json-rpc'
+    })
+
+    await assert.rejects(
+      () => client.listTools(),
+      /error\.code/
     )
   })
 })
