@@ -5,51 +5,78 @@ import type {
   JSONRPCNotification,
   JSONRPCRequest,
   JSONRPCResponse
-} from '../schema.ts'
+} from './schema.ts'
 import {
   JSONRPC_VERSION,
   LATEST_PROTOCOL_VERSION
-} from '../schema.ts'
-import { assertMcpResponse } from './assertions.ts'
+} from './schema.ts'
 
 const DEFAULT_ENDPOINT = '/mcp'
 const DEFAULT_STARTING_REQUEST_ID = 1
 const DEFAULT_ACCEPT_HEADER = 'application/json, text/event-stream'
 const DEFAULT_CLIENT_INFO: Implementation = {
-  name: '@platformatic/mcp-test-client',
+  name: '@platformatic/mcp-client',
   version: '1.0.0'
 }
 const JSON_PARSE_ERROR_PAYLOAD_LIMIT = 600
 const InvalidJsonResponseError = createFastifyError(
   'MCP_ERR_INVALID_JSON_RESPONSE',
-  'Failed to parse JSON response from MCP test request (status %s): %s; payload=%s'
+  'Failed to parse JSON response from MCP client request (status %s): %s; payload=%s'
 )
 const InvalidNotificationAcceptanceError = createFastifyError(
   'MCP_ERR_INVALID_NOTIFICATION_ACCEPTANCE',
   'MCP %s notification failed: expected an empty 202 or 204 response, received status %s; payload=%s'
 )
+const InvalidMcpErrorMessageError = createFastifyError(
+  'MCP_ERR_INVALID_ERROR_MESSAGE',
+  'Expected error.message to be a string'
+)
+const InvalidMcpJsonrpcVersionError = createFastifyError(
+  'MCP_ERR_INVALID_JSONRPC_VERSION',
+  `Expected jsonrpc to be '${JSONRPC_VERSION}'`
+)
+const MissingMcpResultError = createFastifyError(
+  'MCP_ERR_MISSING_RESULT',
+  'Expected JSON-RPC success response to include result'
+)
+const UnexpectedMcpResultErrorFieldError = createFastifyError(
+  'MCP_ERR_UNEXPECTED_RESULT_ERROR',
+  'Expected JSON-RPC success response not to include error'
+)
+const InvalidMcpErrorResponseObjectError = createFastifyError(
+  'MCP_ERR_INVALID_ERROR_RESPONSE_OBJECT',
+  'Expected JSON-RPC error response object, got %s'
+)
+const InvalidMcpErrorObjectError = createFastifyError(
+  'MCP_ERR_INVALID_ERROR_OBJECT',
+  'Expected error to be an object'
+)
+const InvalidMcpErrorCodeError = createFastifyError(
+  'MCP_ERR_INVALID_ERROR_CODE',
+  'Expected error.code to be a number'
+)
 
-export interface McpTestClientOptions {
+export interface McpClientOptions {
   endpoint?: string
   headers?: Record<string, string>
   protocolVersion?: string | null
   startingRequestId?: number
 }
 
-export interface McpTestRequestOptions {
+export interface McpClientRequestOptions {
   headers?: Record<string, string>
   protocolVersion?: string | null
   id?: string | number
 }
 
-export interface McpTestResponse<TBody = JSONRPCResponse> {
+export interface McpClientResponse<TBody = JSONRPCResponse> {
   statusCode: number
   headers: Record<string, string | string[] | undefined>
   body: TBody
   payload: string
 }
 
-export interface McpTestInitializeOptions {
+export interface McpClientInitializeOptions {
   clientInfo?: {
     name: string
     version: string
@@ -60,23 +87,23 @@ export interface McpTestInitializeOptions {
   id?: string | number
 }
 
-export interface McpTestClient {
+export interface McpClient {
   readonly sessionId: string | undefined
 
-  initialize(options?: McpTestInitializeOptions): Promise<McpTestResponse>
+  initialize(options?: McpClientInitializeOptions): Promise<McpClientResponse>
 
-  listTools(options?: McpTestRequestOptions & {
+  listTools(options?: McpClientRequestOptions & {
     cursor?: string
-  }): Promise<McpTestResponse>
+  }): Promise<McpClientResponse>
 
   callTool(
     name: string,
     args?: Record<string, unknown>,
-    options?: McpTestRequestOptions
-  ): Promise<McpTestResponse>
+    options?: McpClientRequestOptions
+  ): Promise<McpClientResponse>
 }
 
-interface SendOptions extends McpTestRequestOptions {
+interface SendOptions extends McpClientRequestOptions {
   expectJsonResponse?: boolean
   sessionId?: string | null
 }
@@ -108,6 +135,47 @@ function isRecord (value: unknown): value is Record<string, unknown> {
 
 function hasOwn (value: Record<string, unknown>, key: string): boolean {
   return Object.prototype.hasOwnProperty.call(value, key)
+}
+
+function describeValue (value: unknown): string {
+  if (value === null) return 'null'
+  if (Array.isArray(value)) return 'array'
+  return typeof value
+}
+
+function assertMcpResponse (body: unknown): asserts body is JSONRPCResponse {
+  if (!isRecord(body)) {
+    throw new InvalidMcpErrorResponseObjectError(describeValue(body))
+  }
+
+  if (body.jsonrpc !== JSONRPC_VERSION) {
+    throw new InvalidMcpJsonrpcVersionError()
+  }
+
+  if (hasOwn(body, 'result') && hasOwn(body, 'error')) {
+    throw new UnexpectedMcpResultErrorFieldError()
+  }
+
+  if (hasOwn(body, 'result')) {
+    return
+  }
+
+  if (!hasOwn(body, 'error')) {
+    throw new MissingMcpResultError()
+  }
+
+  const errorValue = body.error
+  if (!isRecord(errorValue)) {
+    throw new InvalidMcpErrorObjectError()
+  }
+
+  if (typeof errorValue.code !== 'number') {
+    throw new InvalidMcpErrorCodeError()
+  }
+
+  if (typeof errorValue.message !== 'string') {
+    throw new InvalidMcpErrorMessageError()
+  }
 }
 
 function isInitializeSuccessResponse (body: unknown): body is {
@@ -156,7 +224,7 @@ function omitManagedMcpHeaders (
 }
 
 function assertNotificationAccepted (
-  response: McpTestResponse<unknown>,
+  response: McpClientResponse<unknown>,
   method: string
 ): void {
   const acceptedStatus =
@@ -211,10 +279,10 @@ function getPayloadProtocolVersion (
   return requestProtocolVersion
 }
 
-export function createMcpTestClient (
+export function createMcpClient (
   app: FastifyInstance,
-  options: McpTestClientOptions = {}
-): McpTestClient {
+  options: McpClientOptions = {}
+): McpClient {
   const endpoint = options.endpoint ?? DEFAULT_ENDPOINT
   const clientHeaders = options.headers ?? {}
   const configuredProtocolVersion =
@@ -238,15 +306,15 @@ export function createMcpTestClient (
   function send (
     request: JSONRPCRequest | JSONRPCNotification,
     requestOptions?: SendOptions & { expectJsonResponse?: true }
-  ): Promise<McpTestResponse>
+  ): Promise<McpClientResponse>
   function send (
     request: JSONRPCRequest | JSONRPCNotification,
     requestOptions: SendOptions & { expectJsonResponse: false }
-  ): Promise<McpTestResponse<undefined>>
+  ): Promise<McpClientResponse<undefined>>
   async function send (
     request: JSONRPCRequest | JSONRPCNotification,
     requestOptions?: SendOptions
-  ): Promise<McpTestResponse<JSONRPCResponse | undefined>> {
+  ): Promise<McpClientResponse<JSONRPCResponse | undefined>> {
     const expectJsonResponse = requestOptions?.expectJsonResponse ?? true
     const effectiveProtocolVersion =
       requestOptions?.protocolVersion === undefined
@@ -301,7 +369,7 @@ export function createMcpTestClient (
       return storedSessionId
     },
 
-    async initialize (initOptions?: McpTestInitializeOptions): Promise<McpTestResponse> {
+    async initialize (initOptions?: McpClientInitializeOptions): Promise<McpClientResponse> {
       const id = getRequestId(initOptions?.id)
       const payloadProtocolVersion = getPayloadProtocolVersion(
         configuredProtocolVersion,
@@ -362,7 +430,7 @@ export function createMcpTestClient (
       return response
     },
 
-    async listTools (requestOptions?: McpTestRequestOptions & { cursor?: string }): Promise<McpTestResponse> {
+    async listTools (requestOptions?: McpClientRequestOptions & { cursor?: string }): Promise<McpClientResponse> {
       const id = getRequestId(requestOptions?.id)
 
       const request: JSONRPCRequest = {
@@ -378,8 +446,8 @@ export function createMcpTestClient (
     async callTool (
       name: string,
       args: Record<string, unknown> = {},
-      requestOptions?: McpTestRequestOptions
-    ): Promise<McpTestResponse> {
+      requestOptions?: McpClientRequestOptions
+    ): Promise<McpClientResponse> {
       const id = getRequestId(requestOptions?.id)
 
       const request: JSONRPCRequest = {

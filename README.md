@@ -124,9 +124,11 @@ app.mcpAddPrompt({
 await app.listen({ port: 3000 })
 ```
 
-## Testing MCP Servers
+## In-process MCP Client
 
-Use the testing subpath to exercise MCP endpoints through Fastify injection without opening a real network port:
+The plugin decorates the Fastify instance with `mcpClient()`, a client that talks to the
+server through `app.inject()` — no port binding, so it's equally useful for tests or for
+driving the server from other in-process code:
 
 ```typescript
 import { test } from 'node:test'
@@ -134,14 +136,12 @@ import assert from 'node:assert/strict'
 import Fastify from 'fastify'
 import type { FastifyInstance } from 'fastify'
 import mcpPlugin from '@platformatic/mcp'
-import mcpTesting from '@platformatic/mcp/testing'
 
 test('calls an MCP tool', async (t) => {
   const app: FastifyInstance = Fastify()
   t.after(() => app.close())
 
   await app.register(mcpPlugin, { enableSSE: true })
-  await app.register(mcpTesting)
 
   app.mcpAddTool({
     name: 'echo',
@@ -162,7 +162,7 @@ test('calls an MCP tool', async (t) => {
 
   await app.ready()
 
-  const client = app.mcpTestClient()
+  const client = app.mcpClient()
 
   await client.initialize()
 
@@ -171,14 +171,14 @@ test('calls an MCP tool', async (t) => {
   })
 
   assert.equal(response.statusCode, 200)
-  app.assertMcpResult(response.body)
+  assert.ok('result' in response.body)
   assert.deepEqual(response.body.result, {
     content: [{ type: 'text', text: 'hello' }]
   })
 })
 ```
 
-The testing client:
+The client:
 
 - Uses `app.inject()` only (no port binding).
 - Manages sequential JSON-RPC request IDs per client instance.
@@ -189,10 +189,11 @@ The testing client:
 - Captures committed `mcp-session-id` from successful initialization and sends it automatically on later requests.
 - Lets you pass custom headers (including authorization) globally or per request.
 
-Notes:
+Responses are a discriminated union — narrow with `'result' in response.body` or
+`'error' in response.body`. Malformed or non-JSON-RPC responses throw a coded Fastify error
+instead of returning.
 
-- No OAuth/JWT credentials are generated for you.
-- Assertion helpers (`assertMcpResult`, `assertMcpError`) are framework-independent and throw plain `Error` values.
+Note: no OAuth/JWT credentials are generated for you.
 
 ## Protocol Version Negotiation
 

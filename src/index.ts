@@ -22,6 +22,11 @@ import oauthClientPlugin from './auth/oauth-client.ts'
 import authRoutesPlugin from './routes/auth-routes.ts'
 import { quitWithTimeout } from './redis-quit-with-timeout.ts'
 import { createJsonSchemaValidator } from './validation/json-schema-validator.ts'
+import {
+  createMcpClient,
+  type McpClient,
+  type McpClientOptions
+} from './client.ts'
 
 // Import and export MCP protocol types
 import type {
@@ -51,6 +56,12 @@ import type {
 
 const REDIS_QUIT_TIMEOUT_MS = 2000
 
+declare module 'fastify' {
+  interface FastifyInstance {
+    mcpClient (options?: McpClientOptions): McpClient
+  }
+}
+
 const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOptions) {
   const serverInfo: Implementation = opts.serverInfo ?? {
     name: '@platformatic/mcp',
@@ -62,6 +73,10 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     resources: {},
     prompts: {}
   }
+
+  app.decorate('mcpClient', (clientOptions?: McpClientOptions) => {
+    return createMcpClient(app, clientOptions)
+  })
 
   const enableSSE = opts.enableSSE ?? false
   const enableTasks = opts.enableTasks ?? false
@@ -337,3 +352,13 @@ export { RedisTaskStore } from './stores/redis-task-store.ts'
 export type { SessionStore, SessionMetadata } from './stores/session-store.ts'
 export { MemorySessionStore } from './stores/memory-session-store.ts'
 export { RedisSessionStore } from './stores/redis-session-store.ts'
+
+// In-process MCP client, for exercising a registered server via app.inject()
+export { createMcpClient } from './client.ts'
+export type {
+  McpClient,
+  McpClientOptions,
+  McpClientRequestOptions,
+  McpClientInitializeOptions,
+  McpClientResponse
+} from './client.ts'

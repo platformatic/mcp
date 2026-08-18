@@ -3,17 +3,12 @@ import type { TestContext } from 'node:test'
 import assert from 'node:assert/strict'
 import Fastify, { type FastifyInstance } from 'fastify'
 import { Type } from '@sinclair/typebox'
-import mcpPlugin from '../src/index.ts'
+import mcpPlugin, { createMcpClient } from '../src/index.ts'
 import {
   JSONRPC_VERSION,
   LATEST_PROTOCOL_VERSION,
   METHOD_NOT_FOUND
 } from '../src/schema.ts'
-import {
-  assertMcpResult,
-  createMcpTestClient
-} from '../src/testing/index.ts'
-import mcpTesting from '../src/testing/index.ts'
 
 interface CapturedRequest {
   headers: Record<string, string | string[] | undefined>
@@ -377,34 +372,23 @@ function getPayload (capturedRequest: CapturedRequest): Record<string, unknown> 
   return capturedRequest.payload as Record<string, unknown>
 }
 
-describe('MCP testing client', () => {
-  test('testing module exports are importable', async () => {
-    const testingModule = await import('../src/testing/index.ts')
-    assert.equal(typeof testingModule.createMcpTestClient, 'function')
-    assert.equal(typeof testingModule.default, 'function')
-    assert.equal(typeof testingModule.mcpTesting, 'function')
-    assert.equal(typeof testingModule.assertMcpResult, 'function')
-    assert.equal('assertMcpError' in testingModule, false)
-  })
-
-  test('testing plugin decorates the Fastify instance', async (t) => {
+describe('MCP client', () => {
+  test('registering the main plugin decorates the Fastify instance with mcpClient', async (t) => {
     const app: FastifyInstance = Fastify()
     t.after(() => app.close())
 
     await app.register(mcpPlugin)
-    await app.register(mcpTesting)
     await app.ready()
 
-    const client = app.mcpTestClient({ startingRequestId: 42 })
+    const client = app.mcpClient({ startingRequestId: 42 })
     const response = await client.initialize()
     assert.equal(response.statusCode, 200)
-
-    app.assertMcpResult(response.body)
+    assert.ok('result' in response.body)
   })
 
   test('initialize builds a valid MCP initialize request', async (t) => {
     const { app, capturedRequests } = await createTestApp(t)
-    const client = createMcpTestClient(app)
+    const client = createMcpClient(app)
 
     await client.initialize()
 
@@ -417,7 +401,7 @@ describe('MCP testing client', () => {
       protocolVersion: LATEST_PROTOCOL_VERSION,
       capabilities: {},
       clientInfo: {
-        name: '@platformatic/mcp-test-client',
+        name: '@platformatic/mcp-client',
         version: '1.0.0'
       }
     })
@@ -435,7 +419,7 @@ describe('MCP testing client', () => {
 
   test('initialize captures returned session id', async (t) => {
     const { app } = await createTestApp(t)
-    const client = createMcpTestClient(app)
+    const client = createMcpClient(app)
 
     const response = await client.initialize()
     assert.equal(response.statusCode, 200)
@@ -445,7 +429,7 @@ describe('MCP testing client', () => {
 
   test('failed initialize response does not store session id or reuse it later', async (t) => {
     const { app, capturedRequests } = await createInitializeErrorApp(t)
-    const client = createMcpTestClient(app)
+    const client = createMcpClient(app)
 
     const response = await client.initialize()
     assert.ok('error' in response.body)
@@ -460,7 +444,7 @@ describe('MCP testing client', () => {
 
   test('subsequent requests send captured session id automatically', async (t) => {
     const { app, capturedRequests } = await createTestApp(t)
-    const client = createMcpTestClient(app)
+    const client = createMcpClient(app)
 
     await client.initialize()
     const expectedSessionId = client.sessionId
@@ -472,7 +456,7 @@ describe('MCP testing client', () => {
 
   test('sends notifications/initialized before first tool request', async (t) => {
     const { app, capturedRequests } = await createTestApp(t)
-    const client = createMcpTestClient(app)
+    const client = createMcpClient(app)
 
     await client.initialize()
     await client.listTools()
@@ -485,7 +469,7 @@ describe('MCP testing client', () => {
 
   test('initialize forwards application headers to both lifecycle requests', async (t) => {
     const { app, capturedRequests } = await createTestApp(t)
-    const client = createMcpTestClient(app)
+    const client = createMcpClient(app)
 
     await client.initialize({
       headers: {
@@ -503,7 +487,7 @@ describe('MCP testing client', () => {
 
   test('initialize ignores stale managed MCP headers and uses negotiated values', async (t) => {
     const { app, capturedRequests } = await createTestApp(t)
-    const client = createMcpTestClient(app)
+    const client = createMcpClient(app)
 
     const initResponse = await client.initialize({
       headers: {
@@ -513,7 +497,7 @@ describe('MCP testing client', () => {
       }
     })
 
-    assertMcpResult(initResponse.body)
+    assert.ok('result' in initResponse.body)
     const negotiatedProtocolVersion = initResponse.body.result.protocolVersion
     assert.equal(typeof negotiatedProtocolVersion, 'string')
 
@@ -528,7 +512,7 @@ describe('MCP testing client', () => {
 
   test('initialize rejects when notifications/initialized is rejected and does not commit state', async (t) => {
     const { app } = await createInitializedRejectingApp(t, 'status-401-json')
-    const client = createMcpTestClient(app)
+    const client = createMcpClient(app)
 
     await assert.rejects(
       () => client.initialize(),
@@ -540,7 +524,7 @@ describe('MCP testing client', () => {
 
   test('initialize keeps state unset when notifications/initialized returns plain-text server error', async (t) => {
     const { app } = await createInitializedRejectingApp(t, 'status-500-text')
-    const client = createMcpTestClient(app)
+    const client = createMcpClient(app)
 
     await assert.rejects(
       () => client.initialize(),
@@ -558,7 +542,7 @@ describe('MCP testing client', () => {
 
   test('initialize rejects non-empty 202 response for notifications/initialized', async (t) => {
     const { app } = await createInitializedRejectingApp(t, 'status-202-non-empty')
-    const client = createMcpTestClient(app)
+    const client = createMcpClient(app)
 
     await assert.rejects(
       () => client.initialize(),
@@ -570,7 +554,7 @@ describe('MCP testing client', () => {
 
   test('initialize accepts empty 202 response for notifications/initialized', async (t) => {
     const { app } = await createInitializedAcceptedApp(t, 202)
-    const client = createMcpTestClient(app)
+    const client = createMcpClient(app)
 
     await client.initialize()
 
@@ -579,7 +563,7 @@ describe('MCP testing client', () => {
 
   test('initialize accepts empty 204 response for notifications/initialized', async (t) => {
     const { app } = await createInitializedAcceptedApp(t, 204)
-    const client = createMcpTestClient(app)
+    const client = createMcpClient(app)
 
     await client.initialize()
 
@@ -588,13 +572,13 @@ describe('MCP testing client', () => {
 
   test('listTools returns registered tools', async (t) => {
     const { app } = await createTestApp(t)
-    const client = createMcpTestClient(app)
+    const client = createMcpClient(app)
 
     await client.initialize()
     const response = await client.listTools()
 
     assert.equal(response.statusCode, 200)
-    assertMcpResult(response.body)
+    assert.ok('result' in response.body)
     const toolsResult = response.body.result as { tools: Array<{ name: string }> }
     const names = toolsResult.tools.map(tool => tool.name).sort()
     assert.deepEqual(names, ['echo', 'validated'])
@@ -602,7 +586,7 @@ describe('MCP testing client', () => {
 
   test('listTools supports cursor parameter', async (t) => {
     const { app, capturedRequests } = await createTestApp(t)
-    const client = createMcpTestClient(app)
+    const client = createMcpClient(app)
 
     await client.initialize()
     await client.listTools({ cursor: 'cursor-1' })
@@ -613,13 +597,13 @@ describe('MCP testing client', () => {
 
   test('callTool invokes a registered tool', async (t) => {
     const { app } = await createTestApp(t)
-    const client = createMcpTestClient(app)
+    const client = createMcpClient(app)
 
     await client.initialize()
     const response = await client.callTool('echo', { message: 'hello' })
 
     assert.equal(response.statusCode, 200)
-    assertMcpResult(response.body)
+    assert.ok('result' in response.body)
     assert.deepEqual(response.body.result, {
       content: [{ type: 'text', text: 'hello' }]
     })
@@ -627,7 +611,7 @@ describe('MCP testing client', () => {
 
   test('callTool passes arguments unchanged to the server', async (t) => {
     const { app, getObservedEchoArgs } = await createTestApp(t)
-    const client = createMcpTestClient(app)
+    const client = createMcpClient(app)
 
     await client.initialize()
     await client.callTool('echo', { message: 'hello' })
@@ -637,20 +621,20 @@ describe('MCP testing client', () => {
 
   test('invalid arguments exercise server validation path', async (t) => {
     const { app } = await createTestApp(t)
-    const client = createMcpTestClient(app)
+    const client = createMcpClient(app)
 
     await client.initialize()
     const response = await client.callTool('validated', { count: 'nope' as unknown as number })
 
     assert.equal(response.statusCode, 200)
-    assertMcpResult(response.body)
+    assert.ok('result' in response.body)
     const result = response.body.result as { isError?: boolean }
     assert.equal(result.isError, true)
   })
 
   test('unknown tools return MCP JSON-RPC error', async (t) => {
     const { app } = await createTestApp(t)
-    const client = createMcpTestClient(app)
+    const client = createMcpClient(app)
 
     await client.initialize()
     const response = await client.callTool('does-not-exist', {})
@@ -661,15 +645,15 @@ describe('MCP testing client', () => {
 
   test('request ids increment sequentially when not explicitly set', async (t) => {
     const { app } = await createTestApp(t)
-    const client = createMcpTestClient(app)
+    const client = createMcpClient(app)
 
     const initResponse = await client.initialize()
     const listResponse = await client.listTools()
     const callResponse = await client.callTool('echo', { message: 'hello' })
 
-    assertMcpResult(initResponse.body)
-    assertMcpResult(listResponse.body)
-    assertMcpResult(callResponse.body)
+    assert.ok('result' in initResponse.body)
+    assert.ok('result' in listResponse.body)
+    assert.ok('result' in callResponse.body)
     assert.equal(initResponse.body.id, 1)
     assert.equal(listResponse.body.id, 2)
     assert.equal(callResponse.body.id, 3)
@@ -677,31 +661,31 @@ describe('MCP testing client', () => {
 
   test('explicit request ids are preserved and do not consume generated ids', async (t) => {
     const { app } = await createTestApp(t)
-    const client = createMcpTestClient(app)
+    const client = createMcpClient(app)
 
     const initResponse = await client.initialize({ id: 'init-id' })
     const listResponse = await client.listTools()
 
-    assertMcpResult(initResponse.body)
-    assertMcpResult(listResponse.body)
+    assert.ok('result' in initResponse.body)
+    assert.ok('result' in listResponse.body)
     assert.equal(initResponse.body.id, 'init-id')
     assert.equal(listResponse.body.id, 1)
   })
 
   test('two clients keep independent request ids and sessions', async (t) => {
     const { app } = await createTestApp(t)
-    const a = createMcpTestClient(app)
-    const b = createMcpTestClient(app)
+    const a = createMcpClient(app)
+    const b = createMcpClient(app)
 
     const initA = await a.initialize()
     const initB = await b.initialize()
     const listA = await a.listTools()
     const listB = await b.listTools()
 
-    assertMcpResult(initA.body)
-    assertMcpResult(initB.body)
-    assertMcpResult(listA.body)
-    assertMcpResult(listB.body)
+    assert.ok('result' in initA.body)
+    assert.ok('result' in initB.body)
+    assert.ok('result' in listA.body)
+    assert.ok('result' in listB.body)
 
     assert.equal(initA.body.id, 1)
     assert.equal(initB.body.id, 1)
@@ -715,7 +699,7 @@ describe('MCP testing client', () => {
 
   test('client-level headers are sent', async (t) => {
     const { app, capturedRequests } = await createTestApp(t)
-    const client = createMcpTestClient(app, {
+    const client = createMcpClient(app, {
       headers: {
         'x-test-client': 'from-client'
       }
@@ -728,7 +712,7 @@ describe('MCP testing client', () => {
 
   test('per-request headers override client and generated headers', async (t) => {
     const { app, capturedRequests } = await createTestApp(t)
-    const client = createMcpTestClient(app, {
+    const client = createMcpClient(app, {
       headers: {
         'x-test-header': 'client-value',
         'mcp-protocol-version': LATEST_PROTOCOL_VERSION
@@ -752,7 +736,7 @@ describe('MCP testing client', () => {
 
   test('protocolVersion null omits protocol version header', async (t) => {
     const { app, capturedRequests } = await createTestApp(t)
-    const client = createMcpTestClient(app, {
+    const client = createMcpClient(app, {
       protocolVersion: null
     })
 
@@ -764,7 +748,7 @@ describe('MCP testing client', () => {
       protocolVersion: LATEST_PROTOCOL_VERSION,
       capabilities: {},
       clientInfo: {
-        name: '@platformatic/mcp-test-client',
+        name: '@platformatic/mcp-client',
         version: '1.0.0'
       }
     })
@@ -772,7 +756,7 @@ describe('MCP testing client', () => {
 
   test('per-request protocol version overrides client default', async (t) => {
     const { app, capturedRequests } = await createTestApp(t)
-    const client = createMcpTestClient(app, {
+    const client = createMcpClient(app, {
       protocolVersion: LATEST_PROTOCOL_VERSION
     })
 
@@ -785,32 +769,26 @@ describe('MCP testing client', () => {
     assert.equal(capturedRequests[2].headers['mcp-protocol-version'], '2025-03-26')
   })
 
-  test('assertMcpResult narrows and accepts success responses', async (t) => {
+  test('result/error narrowing works using the response union', async (t) => {
     const { app } = await createTestApp(t)
-    const client = createMcpTestClient(app)
+    const client = createMcpClient(app)
 
     await client.initialize()
-    const response = await client.callTool('echo', { message: 'hello' })
 
-    assertMcpResult(response.body)
-    assert.deepEqual(response.body.result, {
+    const resultResponse = await client.callTool('echo', { message: 'hello' })
+    assert.ok('result' in resultResponse.body)
+    assert.deepEqual(resultResponse.body.result, {
       content: [{ type: 'text', text: 'hello' }]
     })
-  })
 
-  test('assertMcpResult throws for error responses', async (t) => {
-    const { app } = await createTestApp(t)
-    const client = createMcpTestClient(app)
-
-    await client.initialize()
-    const response = await client.callTool('missing', {})
-
-    assert.throws(() => assertMcpResult(response.body), /success response/)
+    const errorResponse = await client.callTool('missing', {})
+    assert.ok('error' in errorResponse.body)
+    assert.equal(typeof errorResponse.body.error.code, 'number')
   })
 
   test('client returns validated error responses', async (t) => {
     const { app } = await createTestApp(t)
-    const client = createMcpTestClient(app)
+    const client = createMcpClient(app)
 
     await client.initialize()
     const response = await client.callTool('missing', {})
@@ -830,7 +808,7 @@ describe('MCP testing client', () => {
 
     await app.ready()
 
-    const client = createMcpTestClient(app, {
+    const client = createMcpClient(app, {
       endpoint: '/invalid-json'
     })
 
@@ -859,7 +837,7 @@ describe('MCP testing client', () => {
 
     await app.ready()
 
-    const client = createMcpTestClient(app, {
+    const client = createMcpClient(app, {
       endpoint: '/malformed-json-rpc'
     })
 
