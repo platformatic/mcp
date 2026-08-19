@@ -124,6 +124,77 @@ app.mcpAddPrompt({
 await app.listen({ port: 3000 })
 ```
 
+## In-process MCP Client
+
+The plugin decorates the Fastify instance with `mcpClient()`, a client that talks to the
+server through `app.inject()` — no port binding, so it's equally useful for tests or for
+driving the server from other in-process code:
+
+```typescript
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import Fastify from 'fastify'
+import type { FastifyInstance } from 'fastify'
+import mcpPlugin from '@platformatic/mcp'
+
+test('calls an MCP tool', async (t) => {
+  const app: FastifyInstance = Fastify()
+  t.after(() => app.close())
+
+  await app.register(mcpPlugin, { enableSSE: true })
+
+  app.mcpAddTool({
+    name: 'echo',
+    description: 'Echo a message',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        message: { type: 'string' }
+      },
+      required: ['message'],
+      additionalProperties: false
+    }
+  }, async ({ message }) => {
+    return {
+      content: [{ type: 'text', text: message }]
+    }
+  })
+
+  await app.ready()
+
+  const client = app.mcpClient()
+
+  await client.initialize()
+
+  const response = await client.callTool('echo', {
+    message: 'hello'
+  })
+
+  assert.equal(response.statusCode, 200)
+  assert.ok('result' in response.body)
+  assert.deepEqual(response.body.result, {
+    content: [{ type: 'text', text: 'hello' }]
+  })
+})
+```
+
+The client:
+
+- Uses `app.inject()` only (no port binding).
+- Manages sequential JSON-RPC request IDs per client instance.
+- `initialize()` performs the complete MCP lifecycle handshake (`initialize` plus `notifications/initialized`).
+- `initialize()` rejects when `notifications/initialized` is not accepted with an empty `202` or `204` response.
+- Commits `mcp-session-id` and negotiated protocol version only after the full initialization handshake succeeds.
+- Forwards headers passed to `initialize()` to both lifecycle requests, except MCP-managed `mcp-session-id` and `mcp-protocol-version` on `notifications/initialized`.
+- Captures committed `mcp-session-id` from successful initialization and sends it automatically on later requests.
+- Lets you pass custom headers (including authorization) globally or per request.
+
+Responses are a discriminated union — narrow with `'result' in response.body` or
+`'error' in response.body`. Malformed or non-JSON-RPC responses throw a coded Fastify error
+instead of returning.
+
+Note: no OAuth/JWT credentials are generated for you.
+
 ## Protocol Version Negotiation
 
 The server answers `initialize` with the client's requested revision when it is one it
