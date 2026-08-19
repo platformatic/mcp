@@ -42,6 +42,7 @@ import {
   createError,
   createResponse,
   executeToolCall,
+  resolveRegisteredTool,
   handleToolsList,
   handleResourcesList,
   handleResourceTemplatesList,
@@ -575,10 +576,13 @@ async function modernToolsCall (
     return createError(request.id, INVALID_PARAMS, 'Invalid tool call parameters: "name" is required')
   }
 
-  const tool = dependencies.tools.get(params.name)
-  if (!tool) {
+  // Resolve through the shared authorization gate. Denied and unknown tools
+  // are deliberately indistinguishable so authorization cannot leak names.
+  const resolved = await resolveRegisteredTool(params.name, dependencies)
+  if (!resolved.ok) {
     return createError(request.id, INVALID_PARAMS, `Unknown tool: ${params.name}`)
   }
+  const tool = resolved.tool
 
   // Any parameter the tool mirrors into a header must agree with the body.
   if ('inputSchema' in tool.definition) {

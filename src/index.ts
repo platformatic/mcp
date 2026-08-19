@@ -499,6 +499,7 @@ export type {
   McpClient,
   McpClientOptions,
   McpClientRequestOptions,
+  McpClientCallToolOptions,
   McpClientInitializeOptions,
   McpClientResponse
 } from './client.ts'

@@ -180,15 +180,52 @@ test('calls an MCP tool', async (t) => {
 })
 ```
 
+The client defaults to `LATEST_LEGACY_PROTOCOL_VERSION`, so existing code keeps the
+handshake and session lifecycle shown above. To use the stateless revision, select it
+explicitly and call methods without `initialize()`:
+
+```typescript
+import { LATEST_PROTOCOL_VERSION } from '@platformatic/mcp'
+
+const modern = app.mcpClient({
+  protocolVersion: LATEST_PROTOCOL_VERSION,
+  clientInfo: { name: 'my-client', version: '1.0.0' },
+  clientCapabilities: {}
+})
+
+const discovery = await modern.discover()
+const tools = await modern.listTools()
+const result = await modern.callTool('echo', { message: 'hello' })
+```
+
+In modern mode the client adds the required per-request `_meta`, `Mcp-Method`, encoded
+`Mcp-Name`, and protocol-version headers. Calling `listTools()` also caches tool schemas so a
+later `callTool()` can mirror `x-mcp-header` arguments into encoded `Mcp-Param-*` headers.
+For a direct call before listing, pass those headers through `callTool(..., { headers })`.
+It does not create or send a session; `initialize()` rejects because that method was removed
+in `2026-07-28`.
+
+When a call returns `resultType: 'input_required'`, retry it with the returned state and the
+client's answers:
+
+```typescript
+await modern.callTool('interactive-tool', args, {
+  requestState: response.body.result.requestState,
+  inputResponses: {
+    confirmation: { action: 'accept', content: { confirmed: true } }
+  }
+})
+```
+
 The client:
 
 - Uses `app.inject()` only (no port binding).
 - Manages sequential JSON-RPC request IDs per client instance.
-- `initialize()` performs the complete MCP lifecycle handshake (`initialize` plus `notifications/initialized`).
-- `initialize()` rejects when `notifications/initialized` is not accepted with an empty `202` or `204` response.
-- Commits `mcp-session-id` and negotiated protocol version only after the full initialization handshake succeeds.
+- In legacy mode, `initialize()` performs the complete lifecycle handshake (`initialize` plus `notifications/initialized`).
+- Rejects a legacy initialization when `notifications/initialized` is not accepted with an empty `202` or `204` response.
+- Commits `mcp-session-id` and negotiated protocol version only after the full legacy handshake succeeds.
 - Forwards headers passed to `initialize()` to both lifecycle requests, except MCP-managed `mcp-session-id` and `mcp-protocol-version` on `notifications/initialized`.
-- Captures committed `mcp-session-id` from successful initialization and sends it automatically on later requests.
+- Captures committed `mcp-session-id` from successful legacy initialization and sends it automatically on later requests.
 - Lets you pass custom headers (including authorization) globally or per request.
 
 Responses are a discriminated union — narrow with `'result' in response.body` or
@@ -216,8 +253,10 @@ SUPPORTED_PROTOCOL_VERSIONS     // ['2026-07-28', '2025-11-25', '2025-06-18', '2
 ```
 
 A request is served as **modern** when its `params._meta` carries
-`io.modelcontextprotocol/protocolVersion`; anything else takes the legacy path. Nothing else
-about the request decides it, so the two can interleave freely on one server.
+`io.modelcontextprotocol/protocolVersion` or its `MCP-Protocol-Version` header names a modern
+revision. A request with neither takes the legacy path, so the two eras can interleave freely
+on one server. Header-based detection ensures modern routing headers can never bypass their
+required header/body validation.
 
 ### Modern requests (2026-07-28)
 

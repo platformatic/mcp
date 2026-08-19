@@ -82,7 +82,7 @@ export type HandlerDependencies = {
   taskInputs?: TaskInputChannel
 }
 
-type ToolCallDependencies = Pick<HandlerDependencies,
+export type ToolCallDependencies = Pick<HandlerDependencies,
   'app' |
   'opts' |
   'tools' |
@@ -377,7 +377,7 @@ async function handleToolsCall (
   return await executeToolCall(request, resolved.tool, params, sessionId, dependencies)
 }
 
-async function resolveRegisteredTool (
+export async function resolveRegisteredTool (
   toolName: string,
   dependencies: ToolCallDependencies
 ): Promise<{ ok: true, tool: MCPTool } | { ok: false, reason: 'not-found' }> {
