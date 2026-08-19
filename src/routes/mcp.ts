@@ -586,133 +586,133 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
     app.get('/mcp', getRouteOptions, async (request: FastifyRequest, reply: FastifyReply) => {
       if (!supportsSSE(request)) {
-      reply.type('application/json').code(405).send({ error: 'Method Not Allowed: SSE not supported' })
-      return
-    }
-
-    try {
-      const sessionId = (request.headers['mcp-session-id'] as string) ||
-                       (request.query as any)['mcp-session-id']
-
-      // Check if there's already an active SSE session
-      if (hasActiveSSESession(sessionId)) {
-        reply.type('application/json').code(409).send({
-          error: 'Conflict: SSE session already active for this session ID'
-        })
+        reply.type('application/json').code(405).send({ error: 'Method Not Allowed: SSE not supported' })
         return
       }
 
-      request.log.info({ sessionId }, 'Handling SSE request')
+      try {
+        const sessionId = (request.headers['mcp-session-id'] as string) ||
+                       (request.query as any)['mcp-session-id']
 
-      // We are opting out of Fastify proper
-      reply.hijack()
+        // Check if there's already an active SSE session
+        if (hasActiveSSESession(sessionId)) {
+          reply.type('application/json').code(409).send({
+            error: 'Conflict: SSE session already active for this session ID'
+          })
+          return
+        }
 
-      const raw = reply.raw
+        request.log.info({ sessionId }, 'Handling SSE request')
 
-      // Set up SSE stream
-      raw.setHeader('Content-type', 'text/event-stream')
-      raw.setHeader('Cache-Control', 'no-cache')
+        // We are opting out of Fastify proper
+        reply.hijack()
 
-      let session: SessionMetadata
-      if (sessionId) {
-        const existingSession = await sessionStore.get(sessionId)
-        if (existingSession) {
-          session = existingSession
+        const raw = reply.raw
+
+        // Set up SSE stream
+        raw.setHeader('Content-type', 'text/event-stream')
+        raw.setHeader('Cache-Control', 'no-cache')
+
+        let session: SessionMetadata
+        if (sessionId) {
+          const existingSession = await sessionStore.get(sessionId)
+          if (existingSession) {
+            session = existingSession
+          } else {
+            session = await createSSESession()
+            raw.setHeader('Mcp-Session-Id', session.id)
+          }
         } else {
           session = await createSSESession()
           raw.setHeader('Mcp-Session-Id', session.id)
         }
-      } else {
-        session = await createSSESession()
-        raw.setHeader('Mcp-Session-Id', session.id)
-      }
 
-      raw.writeHead(200)
+        raw.writeHead(200)
 
-      let streams = localStreams.get(session.id)
-      if (!streams) {
-        streams = new Set()
-        localStreams.set(session.id, streams)
-      }
-      streams.add(reply)
-
-      app.log.info({
-        sessionId: session.id,
-        totalStreams: streams.size,
-        method: 'GET'
-      }, 'Added new stream to session')
-
-      // Handle resumability with Last-Event-ID
-      const lastEventId = request.headers['last-event-id'] as string
-      if (lastEventId) {
-        app.log.info(`Resuming SSE stream from event ID: ${lastEventId}`)
-        await replayMessagesFromEventId(session.id, lastEventId, reply)
-      }
-
-      // Handle connection close
-      reply.raw.on('close', () => {
-        const streams = localStreams.get(session.id)
-        if (streams) {
-          streams.delete(reply)
-          app.log.info({
-            sessionId: session.id,
-            remainingStreams: streams.size
-          }, 'SSE connection closed')
-
-          if (streams.size === 0) {
-            app.log.info({
-              sessionId: session.id
-            }, 'Last SSE stream closed, cleaning up session')
-            localStreams.delete(session.id)
-            messageBroker.unsubscribe(`mcp/session/${session.id}/message`)
-          }
+        let streams = localStreams.get(session.id)
+        if (!streams) {
+          streams = new Set()
+          localStreams.set(session.id, streams)
         }
-      })
+        streams.add(reply)
 
-      // SEP-1699: servers may end an SSE stream whenever they like, turning the
-      // stream into a polling channel. The client reconnects with Last-Event-ID
-      // on GET and we replay whatever it missed, so closing here loses nothing.
-      let maxDurationTimer: NodeJS.Timeout | undefined
-      if (opts.sseMaxConnectionMs) {
-        maxDurationTimer = setTimeout(() => {
-          app.log.info({
-            sessionId: session.id,
-            afterMs: opts.sseMaxConnectionMs
-          }, 'Closing SSE stream to let the client poll; it may resume with Last-Event-ID')
-          try {
-            reply.raw.end()
-          } catch {
-            // already gone
-          }
-        }, opts.sseMaxConnectionMs)
-        maxDurationTimer.unref()
+        app.log.info({
+          sessionId: session.id,
+          totalStreams: streams.size,
+          method: 'GET'
+        }, 'Added new stream to session')
 
-        reply.raw.on('close', () => clearTimeout(maxDurationTimer))
-      }
+        // Handle resumability with Last-Event-ID
+        const lastEventId = request.headers['last-event-id'] as string
+        if (lastEventId) {
+          app.log.info(`Resuming SSE stream from event ID: ${lastEventId}`)
+          await replayMessagesFromEventId(session.id, lastEventId, reply)
+        }
 
-      // Send initial heartbeat
-      reply.raw.write(': heartbeat\n\n')
-
-      // Keep connection alive with periodic heartbeats
-      const heartbeatInterval = setInterval(() => {
-        try {
-          reply.raw.write(': heartbeat\n\n')
-        } catch (error) {
-          clearInterval(heartbeatInterval)
+        // Handle connection close
+        reply.raw.on('close', () => {
           const streams = localStreams.get(session.id)
           if (streams) {
             streams.delete(reply)
-          }
-        }
-      }, 30000) // 30 second heartbeat
-      heartbeatInterval.unref()
+            app.log.info({
+              sessionId: session.id,
+              remainingStreams: streams.size
+            }, 'SSE connection closed')
 
-      reply.raw.on('close', () => {
-        app.log.info({
-          sessionId: session.id
-        }, 'SSE heartbeat connection closed')
-        clearInterval(heartbeatInterval)
-      })
+            if (streams.size === 0) {
+              app.log.info({
+                sessionId: session.id
+              }, 'Last SSE stream closed, cleaning up session')
+              localStreams.delete(session.id)
+              messageBroker.unsubscribe(`mcp/session/${session.id}/message`)
+            }
+          }
+        })
+
+        // SEP-1699: servers may end an SSE stream whenever they like, turning the
+        // stream into a polling channel. The client reconnects with Last-Event-ID
+        // on GET and we replay whatever it missed, so closing here loses nothing.
+        let maxDurationTimer: NodeJS.Timeout | undefined
+        if (opts.sseMaxConnectionMs) {
+          maxDurationTimer = setTimeout(() => {
+            app.log.info({
+              sessionId: session.id,
+              afterMs: opts.sseMaxConnectionMs
+            }, 'Closing SSE stream to let the client poll; it may resume with Last-Event-ID')
+            try {
+              reply.raw.end()
+            } catch {
+            // already gone
+            }
+          }, opts.sseMaxConnectionMs)
+          maxDurationTimer.unref()
+
+          reply.raw.on('close', () => clearTimeout(maxDurationTimer))
+        }
+
+        // Send initial heartbeat
+        reply.raw.write(': heartbeat\n\n')
+
+        // Keep connection alive with periodic heartbeats
+        const heartbeatInterval = setInterval(() => {
+          try {
+            reply.raw.write(': heartbeat\n\n')
+          } catch (error) {
+            clearInterval(heartbeatInterval)
+            const streams = localStreams.get(session.id)
+            if (streams) {
+              streams.delete(reply)
+            }
+          }
+        }, 30000) // 30 second heartbeat
+        heartbeatInterval.unref()
+
+        reply.raw.on('close', () => {
+          app.log.info({
+            sessionId: session.id
+          }, 'SSE heartbeat connection closed')
+          clearInterval(heartbeatInterval)
+        })
       } catch (error) {
         app.log.error({ err: error }, 'Error setting up SSE stream')
         reply.type('application/json').code(500).send({ error: 'Internal server error' })

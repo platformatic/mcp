@@ -102,7 +102,7 @@ export type HandlerDependencies = {
   taskInputs?: TaskInputChannel
 }
 
-type ToolCallDependencies = Pick<HandlerDependencies,
+export type ToolCallDependencies = Pick<HandlerDependencies,
   'app' |
   'opts' |
   'tools' |
@@ -461,7 +461,7 @@ type RegisteredToolResolution =
   | { ok: false, reason: 'not-found' }
   | { ok: false, reason: 'access-denied' }
 
-async function resolveRegisteredTool (
+export async function resolveRegisteredTool (
   toolName: string,
   dependencies: ToolCallDependencies
 ): Promise<RegisteredToolResolution> {
