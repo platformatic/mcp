@@ -1,8 +1,19 @@
 import { randomUUID } from 'crypto'
 import type { FastifyRequest, FastifyReply, FastifyPluginAsync, FastifySchema } from 'fastify'
 import fp from 'fastify-plugin'
-import type { JSONRPCMessage } from '../schema.ts'
-import { JSONRPC_VERSION, INTERNAL_ERROR, SUPPORTED_PROTOCOL_VERSIONS, DEFAULT_NEGOTIATED_PROTOCOL_VERSION } from '../schema.ts'
+import type { JSONRPCMessage, JSONRPCNotification, JSONRPCRequest, JSONRPCResponse, JSONRPCError } from '../schema.ts'
+import {
+  JSONRPC_VERSION,
+  INTERNAL_ERROR,
+  INVALID_PARAMS,
+  METHOD_NOT_FOUND,
+  HEADER_MISMATCH,
+  MISSING_REQUIRED_CLIENT_CAPABILITY,
+  UNSUPPORTED_PROTOCOL_VERSION,
+  SUPPORTED_PROTOCOL_VERSIONS,
+  MODERN_PROTOCOL_VERSIONS,
+  DEFAULT_NEGOTIATED_PROTOCOL_VERSION
+} from '../schema.ts'
 import { isOriginAllowed } from '../security.ts'
 import type {
   MCPPluginOptions,
@@ -17,8 +28,15 @@ import type { SessionStore, SessionMetadata } from '../stores/session-store.ts'
 import type { TaskStore, TaskWaiters } from '../stores/task-store.ts'
 import type { MessageBroker } from '../brokers/message-broker.ts'
 import type { AuthorizationContext } from '../types/auth-types.ts'
+import { processMessage, createError } from '../handlers.ts'
+import type { CachingConfig } from '../modern/handlers.ts'
+import { dispatchModern } from '../modern/handlers.ts'
+import { isModernRequest, parseRequestContext } from '../modern/request-meta.ts'
+import { validateStandardHeaders } from '../modern/headers.ts'
+import type { RequestStateSealer } from '../modern/request-state.ts'
+import { SubscriptionRegistry, negotiateFilter } from '../modern/subscriptions.ts'
+import type { TaskInputChannel } from '../modern/task-inputs.ts'
 import type { JsonSchemaValidator } from '../validation/json-schema-validator.ts'
-import { processMessage } from '../handlers.ts'
 
 interface MCPPubSubRoutesOptions {
   enableSSE: boolean
@@ -35,6 +53,11 @@ interface MCPPubSubRoutesOptions {
   taskStore?: TaskStore
   taskWaiters?: TaskWaiters
   jsonSchemaValidator?: JsonSchemaValidator
+  taskInputs: TaskInputChannel
+  sealer: RequestStateSealer
+  caching: CachingConfig
+  subscriptions: SubscriptionRegistry
+  enableTasks: boolean
 }
 
 function resolveRouteUrl (prefix: string | undefined, url: string): string {
@@ -75,13 +98,22 @@ function resolveMcpRouteSchema (
 }
 
 const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async (app, options) => {
-  const { enableSSE, opts, capabilities, serverInfo, tools, resources, prompts, resourceHandlers, sessionStore, messageBroker, localStreams, taskStore, taskWaiters, jsonSchemaValidator } = options
+  const {
+    enableSSE, opts, capabilities, serverInfo, tools, resources, prompts, resourceHandlers,
+    sessionStore, messageBroker, localStreams, taskStore, taskWaiters, jsonSchemaValidator,
+    taskInputs, sealer, caching, subscriptions, enableTasks
+  } = options
   const mcpUrl = resolveRouteUrl(app.prefix, '/mcp')
 
   const allowedOrigins = opts.allowedOrigins
 
   if (allowedOrigins === undefined) {
     app.log.warn('MCP: no allowedOrigins configured, Origin validation is disabled. Set allowedOrigins to protect browser clients against DNS rebinding.')
+  }
+
+  /** Which protocol era this request belongs to. See `isModernRequest`. */
+  function isModern (request: FastifyRequest): boolean {
+    return isModernRequest(request.headers, request.body, MODERN_PROTOCOL_VERSIONS)
   }
 
   // Guard against DNS rebinding: reject browser origins we do not trust.
@@ -98,6 +130,11 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
   // Clients must echo the negotiated protocol version on every request after
   // `initialize`. An absent header means 2025-03-26, which predates the header.
+  //
+  // POSTs are exempt from the rejection below: only the body tells us whether
+  // the caller is modern, and a modern client must be answered with a JSON-RPC
+  // `UnsupportedProtocolVersionError` rather than this legacy shape. The POST
+  // handler makes that call once it has parsed the body.
   async function validateProtocolVersionHeader (request: FastifyRequest, reply: FastifyReply): Promise<void> {
     const header = request.headers['mcp-protocol-version']
     if (header === undefined) {
@@ -106,6 +143,10 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     }
 
     const version = Array.isArray(header) ? header[0] : header
+    ;(request as any).mcpProtocolVersion = version
+
+    if (request.method === 'POST') return
+
     if (!(SUPPORTED_PROTOCOL_VERSIONS as readonly string[]).includes(version)) {
       request.log.warn({ version }, 'Rejected MCP request with unsupported MCP-Protocol-Version header')
       return reply.code(400).type('application/json').send({
@@ -113,8 +154,6 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         supported: SUPPORTED_PROTOCOL_VERSIONS
       })
     }
-
-    ;(request as any).mcpProtocolVersion = version
   }
 
   /**
@@ -129,6 +168,30 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
   }
 
   /**
+   * Reject an unsupported version header on a legacy POST.
+   *
+   * Runs as a preHandler because only the body distinguishes the eras: a modern
+   * request must be answered with a JSON-RPC `UnsupportedProtocolVersionError`,
+   * which `handleModernPost` does, whereas a legacy client expects this plain
+   * 400 shape and has no way to act on the JSON-RPC one.
+   */
+  async function enforceProtocolVersionHeader (request: FastifyRequest, reply: FastifyReply): Promise<void> {
+    if (isModern(request)) return
+
+    const header = request.headers['mcp-protocol-version']
+    if (header === undefined) return
+
+    const version = Array.isArray(header) ? header[0] : header
+    if ((SUPPORTED_PROTOCOL_VERSIONS as readonly string[]).includes(version)) return
+
+    request.log.warn({ version }, 'Rejected MCP request with unsupported MCP-Protocol-Version header')
+    return reply.code(400).type('application/json').send({
+      error: `Bad Request: unsupported MCP-Protocol-Version '${version}'`,
+      supported: SUPPORTED_PROTOCOL_VERSIONS
+    })
+  }
+
+  /**
    * Reconcile the header against what the session actually negotiated.
    *
    * The session is authoritative: a client that agreed on 2025-03-26 must not be
@@ -136,6 +199,10 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
    * preHandler because deciding whether this is an `initialize` needs the body.
    */
   async function reconcileProtocolVersion (request: FastifyRequest, reply: FastifyReply): Promise<void> {
+    // Modern requests are stateless and carry their own version; there is no
+    // session to reconcile against, and a stray `Mcp-Session-Id` is ignored.
+    if (isModern(request)) return
+
     const sessionId = request.headers['mcp-session-id'] as string | undefined
     if (!sessionId) return
 
@@ -164,7 +231,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
   // Scoped to the /mcp routes only: this plugin is not encapsulated, so an
   // app-level hook would also cover the OAuth and well-known routes.
   const mcpOnRequest = [validateOrigin, validateProtocolVersionHeader]
-  const mcpPreHandler = [reconcileProtocolVersion]
+  const mcpPreHandler = [enforceProtocolVersionHeader, reconcileProtocolVersion]
 
   async function createSSESession (): Promise<SessionMetadata> {
     const sessionId = randomUUID()
@@ -272,99 +339,232 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     }
   }
 
-  {
-    const schema = resolveMcpRouteSchema(undefined, {
-      routeId: 'mcp.post',
-      method: 'POST',
-      url: mcpUrl
-    }, opts.transformRouteSchema)
-    const routeOptions = schema === undefined
-      ? { onRequest: mcpOnRequest, preHandler: mcpPreHandler }
-      : { onRequest: mcpOnRequest, preHandler: mcpPreHandler, schema }
+  /**
+   * The HTTP status a modern response carries.
+   *
+   * The revision pins specific statuses to specific JSON-RPC errors, and
+   * clients rely on them: a dual-era client uses `400` plus a recognised
+   * modern error body to tell a modern server from a legacy one, and `404`
+   * with `-32601` to tell an unimplemented method from a legacy HTTP+SSE
+   * server that does not host this endpoint at all.
+   */
+  function statusForResponse (response: JSONRPCResponse | JSONRPCError): number {
+    if (!('error' in response)) return 200
 
-    app.post('/mcp', routeOptions, async (request: FastifyRequest, reply: FastifyReply) => {
-      try {
-        const message = request.body as JSONRPCMessage
-        let sessionId = request.headers['mcp-session-id'] as string
+    switch (response.error.code) {
+      case HEADER_MISMATCH:
+      case UNSUPPORTED_PROTOCOL_VERSION:
+      case MISSING_REQUIRED_CLIENT_CAPABILITY:
+        return 400
+      case METHOD_NOT_FOUND:
+        return 404
+      default:
+        // Application-level failures — an unknown tool, a missing resource —
+        // stay on 200 with a JSON-RPC error. Only the three errors above are
+        // the ones a dual-era client reads a 400 body for, so widening this
+        // would make an unknown tool look like a legacy server.
+        return 200
+    }
+  }
 
-        if (enableSSE) {
-          let session: SessionMetadata
-          if (sessionId) {
-            const existingSession = await sessionStore.get(sessionId)
-            if (existingSession) {
-              session = existingSession
-            } else {
-              session = await createSSESession()
-              reply.header('Mcp-Session-Id', session.id)
-            }
+  /** Build the authorization context from a validated token, if there is one. */
+  function authContextFrom (request: FastifyRequest): AuthorizationContext | undefined {
+    const payload = (request as any).tokenPayload
+    if (!payload) return undefined
+
+    return {
+      userId: payload.sub,
+      clientId: payload.client_id || payload.azp,
+      scopes: typeof payload.scope === 'string' ? payload.scope.split(' ') : payload.scopes,
+      audience: Array.isArray(payload.aud) ? payload.aud : payload.aud ? [payload.aud] : undefined,
+      tokenType: 'Bearer',
+      expiresAt: payload.exp ? new Date(payload.exp * 1000) : undefined,
+      issuedAt: payload.iat ? new Date(payload.iat * 1000) : undefined,
+      authorizationServer: payload.iss
+    }
+  }
+
+  /**
+   * Serve a request that speaks 2026-07-28.
+   *
+   * Nothing here consults or creates a session: the request's `_meta` carries
+   * everything needed to serve it, which is what lets an instance behind a
+   * plain round-robin balancer handle any request.
+   */
+  async function handleModernPost (request: FastifyRequest, reply: FastifyReply): Promise<unknown> {
+    const body = request.body as JSONRPCRequest | JSONRPCNotification
+
+    // A notification has no id and gets no body back.
+    if (!('id' in body)) {
+      request.log.debug({ method: body.method }, 'Accepted modern notification')
+      reply.code(202)
+      return undefined
+    }
+
+    const message = body as JSONRPCRequest
+
+    const parsed = parseRequestContext(message.params)
+    if (!parsed.ok) {
+      reply.code(400).type('application/json')
+      return createError(message.id, INVALID_PARAMS, parsed.message)
+    }
+    const context = parsed.context
+
+    // The mirrored header and the body must agree, or a gateway routing on one
+    // and this server acting on the other could be made to disagree.
+    const headerVersion = request.headers['mcp-protocol-version']
+    const sentVersion = Array.isArray(headerVersion) ? headerVersion[0] : headerVersion
+    if (sentVersion === undefined) {
+      reply.code(400).type('application/json')
+      return createError(message.id, HEADER_MISMATCH, 'Missing required MCP-Protocol-Version header')
+    }
+    if (sentVersion !== context.protocolVersion) {
+      reply.code(400).type('application/json')
+      return createError(
+        message.id,
+        HEADER_MISMATCH,
+        `Header mismatch: MCP-Protocol-Version header value '${sentVersion}' does not match body value '${context.protocolVersion}'`
+      )
+    }
+
+    if (!(SUPPORTED_PROTOCOL_VERSIONS as readonly string[]).includes(context.protocolVersion)) {
+      reply.code(400).type('application/json')
+      return createError(message.id, UNSUPPORTED_PROTOCOL_VERSION, 'Unsupported protocol version', {
+        supported: [...SUPPORTED_PROTOCOL_VERSIONS],
+        requested: context.protocolVersion
+      })
+    }
+
+    const headerCheck = validateStandardHeaders(request.headers, message.method, message.params)
+    if (!headerCheck.ok) {
+      reply.code(400).type('application/json')
+      return createError(message.id, HEADER_MISMATCH, headerCheck.message)
+    }
+
+    const authContext = authContextFrom(request)
+
+    // `subscriptions/listen` answers with a stream rather than a value, so it
+    // never reaches the dispatcher.
+    if (message.method === 'subscriptions/listen') {
+      const requested = (message.params as { notifications?: unknown } | undefined)?.notifications
+      if (!requested || typeof requested !== 'object' || Array.isArray(requested)) {
+        reply.code(400).type('application/json')
+        return createError(message.id, INVALID_PARAMS, 'Invalid "notifications": expected a subscription filter')
+      }
+
+      const filter = negotiateFilter(requested, capabilities)
+      request.log.info({ subscriptionId: message.id, filter }, 'Opening subscription stream')
+      subscriptions.open(reply, message.id, filter)
+      return reply
+    }
+
+    const response = await dispatchModern(message, {
+      app,
+      opts,
+      capabilities,
+      serverInfo,
+      tools,
+      resources,
+      prompts,
+      resourceHandlers,
+      request,
+      reply,
+      authContext,
+      taskStore,
+      taskWaiters,
+      jsonSchemaValidator,
+      taskInputs,
+      protocolVersion: context.protocolVersion,
+      context,
+      sealer,
+      caching,
+      supportedVersions: SUPPORTED_PROTOCOL_VERSIONS,
+      enableTasks
+    })
+
+    reply.type('application/json').code(statusForResponse(response))
+    return response
+  }
+
+  const postSchema = resolveMcpRouteSchema(undefined, {
+    routeId: 'mcp.post',
+    method: 'POST',
+    url: mcpUrl
+  }, opts.transformRouteSchema)
+  const postRouteOptions = postSchema === undefined
+    ? { onRequest: mcpOnRequest, preHandler: mcpPreHandler }
+    : { onRequest: mcpOnRequest, preHandler: mcpPreHandler, schema: postSchema }
+
+  app.post('/mcp', postRouteOptions, async (request: FastifyRequest, reply: FastifyReply) => {
+    try {
+      if (isModern(request)) {
+        return await handleModernPost(request, reply)
+      }
+
+      const message = request.body as JSONRPCMessage
+      let sessionId = request.headers['mcp-session-id'] as string
+
+      if (enableSSE) {
+        let session: SessionMetadata
+        if (sessionId) {
+          const existingSession = await sessionStore.get(sessionId)
+          if (existingSession) {
+            session = existingSession
           } else {
             session = await createSSESession()
             reply.header('Mcp-Session-Id', session.id)
           }
-          sessionId = session.id
-        }
-
-        // Build auth context from validated token payload
-        let authContext: AuthorizationContext | undefined
-        if ((request as any).tokenPayload) {
-          const payload = (request as any).tokenPayload
-          authContext = {
-            userId: payload.sub,
-            clientId: payload.client_id || payload.azp,
-            scopes: typeof payload.scope === 'string'
-              ? payload.scope.split(' ')
-              : payload.scopes,
-            audience: Array.isArray(payload.aud)
-              ? payload.aud
-              : payload.aud ? [payload.aud] : undefined,
-            tokenType: 'Bearer',
-            expiresAt: payload.exp ? new Date(payload.exp * 1000) : undefined,
-            issuedAt: payload.iat ? new Date(payload.iat * 1000) : undefined,
-            authorizationServer: payload.iss
-          }
-        } else if (sessionId) {
-        // Fallback to session-stored auth context
-          const session = await sessionStore.get(sessionId)
-          authContext = session?.authorization
-        }
-
-        const response = await processMessage(message, sessionId, {
-          app,
-          opts,
-          capabilities,
-          serverInfo,
-          tools,
-          resources,
-          prompts,
-          resourceHandlers,
-          request,
-          reply,
-          authContext,
-          sessionStore,
-          taskStore,
-          taskWaiters,
-          jsonSchemaValidator,
-          sessionId,
-          protocolVersion: (request as any).mcpProtocolVersion ?? DEFAULT_NEGOTIATED_PROTOCOL_VERSION
-        })
-        if (response) {
-          return response
         } else {
-          reply.code(202)
+          session = await createSSESession()
+          reply.header('Mcp-Session-Id', session.id)
         }
-      } catch (error) {
-        app.log.error({ err: error }, 'Error processing MCP message')
-        reply.type('application/json').code(500).send({
-          jsonrpc: JSONRPC_VERSION,
-          id: null,
-          error: {
-            code: INTERNAL_ERROR,
-            message: 'Internal server error'
-          }
-        })
+        sessionId = session.id
       }
-    })
-  }
+
+      // Build auth context from validated token payload
+      let authContext = authContextFrom(request)
+      if (!authContext && sessionId) {
+        // Fallback to session-stored auth context
+        const session = await sessionStore.get(sessionId)
+        authContext = session?.authorization
+      }
+
+      const response = await processMessage(message, sessionId, {
+        app,
+        opts,
+        capabilities,
+        serverInfo,
+        tools,
+        resources,
+        prompts,
+        resourceHandlers,
+        request,
+        reply,
+        authContext,
+        sessionStore,
+        taskStore,
+        taskWaiters,
+        jsonSchemaValidator,
+        sessionId,
+        protocolVersion: (request as any).mcpProtocolVersion ?? DEFAULT_NEGOTIATED_PROTOCOL_VERSION
+      })
+      if (response) {
+        return response
+      } else {
+        reply.code(202)
+      }
+    } catch (error) {
+      app.log.error({ err: error }, 'Error processing MCP message')
+      reply.type('application/json').code(500).send({
+        jsonrpc: JSONRPC_VERSION,
+        id: null,
+        error: {
+          code: INTERNAL_ERROR,
+          message: 'Internal server error'
+        }
+      })
+    }
+  })
 
   // GET endpoint for server-initiated communication via SSE
   if (!enableSSE) {
@@ -374,16 +574,16 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
   }
 
   if (enableSSE) {
-    const schema = resolveMcpRouteSchema(undefined, {
+    const getSchema = resolveMcpRouteSchema(undefined, {
       routeId: 'mcp.get',
       method: 'GET',
       url: mcpUrl
     }, opts.transformRouteSchema)
-    const routeOptions = schema === undefined
+    const getRouteOptions = getSchema === undefined
       ? { onRequest: mcpOnRequest, preHandler: mcpPreHandler }
-      : { onRequest: mcpOnRequest, preHandler: mcpPreHandler, schema }
+      : { onRequest: mcpOnRequest, preHandler: mcpPreHandler, schema: getSchema }
 
-    app.get('/mcp', routeOptions, async (request: FastifyRequest, reply: FastifyReply) => {
+    app.get('/mcp', getRouteOptions, async (request: FastifyRequest, reply: FastifyReply) => {
       if (!supportsSSE(request)) {
         reply.type('application/json').code(405).send({ error: 'Method Not Allowed: SSE not supported' })
         return
@@ -521,16 +721,16 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
   // DELETE endpoint for explicit session termination (MCP spec)
   if (enableSSE) {
-    const schema = resolveMcpRouteSchema(undefined, {
+    const deleteSchema = resolveMcpRouteSchema(undefined, {
       routeId: 'mcp.delete',
       method: 'DELETE',
       url: mcpUrl
     }, opts.transformRouteSchema)
-    const routeOptions = schema === undefined
+    const deleteRouteOptions = deleteSchema === undefined
       ? { onRequest: mcpOnRequest, preHandler: mcpPreHandler }
-      : { onRequest: mcpOnRequest, preHandler: mcpPreHandler, schema }
+      : { onRequest: mcpOnRequest, preHandler: mcpPreHandler, schema: deleteSchema }
 
-    app.delete('/mcp', routeOptions, async (request: FastifyRequest, reply: FastifyReply) => {
+    app.delete('/mcp', deleteRouteOptions, async (request: FastifyRequest, reply: FastifyReply) => {
       const sessionId = request.headers['mcp-session-id'] as string
       if (!sessionId) {
         reply.code(400).send({ error: 'Missing Mcp-Session-Id header' })
@@ -567,17 +767,22 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     })
   }
 
-  // Subscribe to broadcast notifications
-  if (enableSSE) {
-    messageBroker.subscribe('mcp/broadcast/notification', (notification: JSONRPCMessage) => {
-      // Send to all local streams
-      for (const [sessionId, streams] of localStreams.entries()) {
-        if (streams.size > 0) {
-          sendSSEToStreams(sessionId, notification, streams)
-        }
+  // Subscribe to broadcast notifications.
+  //
+  // The same broadcast feeds both eras: legacy SSE sessions get it on their
+  // standing stream, and modern `subscriptions/listen` streams get whichever
+  // notification types they opted in to. Registering unconditionally means
+  // modern subscriptions work without `enableSSE`, which is a legacy concept.
+  await messageBroker.subscribe('mcp/broadcast/notification', (notification: JSONRPCMessage) => {
+    subscriptions.deliver(notification as JSONRPCNotification)
+
+    if (!enableSSE) return
+    for (const [sessionId, streams] of localStreams.entries()) {
+      if (streams.size > 0) {
+        sendSSEToStreams(sessionId, notification, streams)
       }
-    })
-  }
+    }
+  })
 }
 
 export default fp(mcpPubSubRoutesPlugin, {

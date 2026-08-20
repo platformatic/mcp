@@ -12,6 +12,10 @@ import { TaskWaiters } from './stores/task-store.ts'
 import { MemoryTaskStore } from './stores/memory-task-store.ts'
 import { RedisTaskStore } from './stores/redis-task-store.ts'
 import type { MCPPluginOptions, MCPTool, MCPResource, MCPPrompt, ResourceHandlers } from './types.ts'
+import type { CacheHint, CachingConfig } from './modern/handlers.ts'
+import { RequestStateSealer } from './modern/request-state.ts'
+import { SubscriptionRegistry } from './modern/subscriptions.ts'
+import { TaskInputChannel, TASK_INPUT_TOPIC } from './modern/task-inputs.ts'
 import pubsubDecorators from './decorators/pubsub.ts'
 import metaDecorators from './decorators/meta.ts'
 import routes from './routes/mcp.ts'
@@ -29,6 +33,7 @@ import {
 } from './client.ts'
 
 // Import and export MCP protocol types
+import { JSONRPC_VERSION } from './schema.ts'
 import type {
   JSONRPCMessage,
   JSONRPCRequest,
@@ -116,11 +121,16 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
   // Waiters are process-local by design: only the instance serving a given
   // tasks/result request needs to be woken when that task finishes.
   const taskWaiters = new TaskWaiters()
+  const taskInputs = new TaskInputChannel()
 
   if (enableTasks) {
     // Advertise which task operations we support. `tasks/list` is only offered
     // when authorization is on, because without an identifiable requestor it
     // would expose every task's metadata to anyone who can reach the server.
+    //
+    // This is the 2025-11-25 core shape, used only on the legacy path. Modern
+    // clients see the `io.modelcontextprotocol/tasks` extension instead, which
+    // `buildServerCapabilities` adds to the `server/discover` result.
     const canIdentifyRequestors = opts.authorization?.enabled === true
     capabilities.tasks = {
       ...(canIdentifyRequestors ? { list: {} } : {}),
@@ -129,6 +139,54 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
         tools: { call: {} }
       }
     }
+  }
+
+  // Cacheable results must always carry hints, so anything unconfigured
+  // defaults to "immediately stale, never shared" — correct for every server,
+  // and something deployments opt out of knowingly.
+  const noCache: CacheHint = { ttlMs: 0, cacheScope: 'private' }
+  const caching: CachingConfig = {
+    discover: opts.caching?.discover ?? noCache,
+    toolsList: opts.caching?.toolsList ?? noCache,
+    promptsList: opts.caching?.promptsList ?? noCache,
+    resourcesList: opts.caching?.resourcesList ?? noCache,
+    resourceTemplatesList: opts.caching?.resourceTemplatesList ?? noCache,
+    resourcesRead: opts.caching?.resourcesRead ?? noCache
+  }
+
+  const sealer = new RequestStateSealer({
+    secret: opts.requestStateSecret,
+    ttlMs: opts.requestStateTtlMs,
+    // With authorization on, a token carrying no `sub` identifies nobody, and
+    // two such callers would share the same (undefined) principal — so state
+    // sealed for one would verify for the other. Refuse rather than bind to
+    // nobody.
+    requirePrincipal: opts.authorization?.enabled === true
+  })
+
+  if (!opts.requestStateSecret) {
+    app.log.debug('MCP: no requestStateSecret configured; multi round-trip retries will only verify on the instance that issued them')
+  }
+
+  const subscriptions = new SubscriptionRegistry(app.log)
+
+  // A `tasks/update` can land on any instance, but the execution waiting for
+  // those answers lives on exactly one. Route the wake-up through the broker so
+  // it reaches that instance; `deliver` is a no-op everywhere else.
+  taskInputs.setPublisher(async (taskId, inputResponses) => {
+    await messageBroker.publish(TASK_INPUT_TOPIC, {
+      jsonrpc: JSONRPC_VERSION,
+      method: 'notifications/tasks/input',
+      params: { taskId, inputResponses }
+    })
+  })
+
+  if (enableTasks) {
+    await messageBroker.subscribe(TASK_INPUT_TOPIC, (message) => {
+      const params = (message as { params?: { taskId?: unknown, inputResponses?: unknown } }).params
+      if (typeof params?.taskId !== 'string' || !params.inputResponses) return
+      taskInputs.deliver(params.taskId, params.inputResponses as Record<string, unknown>)
+    })
   }
 
   // Local stream management per server instance
@@ -197,7 +255,34 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     localStreams,
     taskStore,
     taskWaiters,
-    jsonSchemaValidator
+    jsonSchemaValidator,
+    taskInputs,
+    sealer,
+    caching,
+    subscriptions,
+    enableTasks
+  })
+
+  // Streams must be closed in `preClose`: Fastify shuts the HTTP server down
+  // before `onClose` runs, and an open SSE response is an in-flight request, so
+  // waiting until `onClose` would deadlock the close on the very streams it is
+  // trying to end.
+  app.addHook('preClose', async () => {
+    // End modern subscription streams with the graceful-closure response, so
+    // clients can tell a shutdown from a dropped connection.
+    subscriptions.closeAll()
+
+    for (const streams of localStreams.values()) {
+      for (const stream of streams) {
+        try {
+          if (stream.raw && !stream.raw.destroyed) {
+            stream.raw.end()
+          }
+        } catch (error) {
+          app.log.debug({ error }, 'Error ending SSE stream during shutdown')
+        }
+      }
+    }
   })
 
   // Add close hook to clean up Redis connections and authorization components
@@ -337,11 +422,66 @@ export type {
 // Protocol constants, so consumers can negotiate and branch on the revision
 export {
   LATEST_PROTOCOL_VERSION,
+  LATEST_LEGACY_PROTOCOL_VERSION,
   SUPPORTED_PROTOCOL_VERSIONS,
+  MODERN_PROTOCOL_VERSIONS,
+  LEGACY_PROTOCOL_VERSIONS,
   DEFAULT_NEGOTIATED_PROTOCOL_VERSION,
   JSONRPC_VERSION,
-  URL_ELICITATION_REQUIRED
+  URL_ELICITATION_REQUIRED,
+  HEADER_MISMATCH,
+  MISSING_REQUIRED_CLIENT_CAPABILITY,
+  UNSUPPORTED_PROTOCOL_VERSION
 } from './schema.ts'
+
+/* ---------------------------------------------------------------- */
+/* 2026-07-28                                                        */
+/* ---------------------------------------------------------------- */
+
+// Multi round-trip requests: how a handler asks the client for something.
+export {
+  InputRequired,
+  elicitForm,
+  elicitUrl,
+  requestSampling,
+  requestRoots
+} from './modern/input-required.ts'
+
+// Reserved `_meta` keys and the tasks extension identifier.
+export {
+  META_PROTOCOL_VERSION,
+  META_CLIENT_INFO,
+  META_CLIENT_CAPABILITIES,
+  META_LOG_LEVEL,
+  META_SUBSCRIPTION_ID,
+  META_SERVER_INFO,
+  TASKS_EXTENSION
+} from './schema-2026.ts'
+
+// Header mirroring, for clients and for tests.
+export { encodeHeaderValue, decodeHeaderValue } from './modern/headers.ts'
+
+export { RequestStateSealer } from './modern/request-state.ts'
+export { SubscriptionRegistry } from './modern/subscriptions.ts'
+
+export type {
+  ClientCapabilities as ModernClientCapabilities,
+  ServerCapabilities as ModernServerCapabilities,
+  DiscoverResult,
+  CacheableResult,
+  InputRequests,
+  InputResponses,
+  InputRequiredResult,
+  RequestMetaObject,
+  ResultType,
+  SubscriptionFilter,
+  Task as ExtensionTask,
+  TaskStatus as ExtensionTaskStatus,
+  CreateTaskResult as ExtensionCreateTaskResult,
+  DetailedTask
+} from './schema-2026.ts'
+
+export type { CacheHint, CachingConfig } from './modern/handlers.ts'
 
 // Task storage, for callers that want to supply or inspect a backend
 export type { TaskStore, TaskRecord, TaskOutcome } from './stores/task-store.ts'
@@ -359,6 +499,7 @@ export type {
   McpClient,
   McpClientOptions,
   McpClientRequestOptions,
+  McpClientCallToolOptions,
   McpClientInitializeOptions,
   McpClientResponse
 } from './client.ts'

@@ -5,7 +5,7 @@ import type { FastifyRequest } from 'fastify'
 import { Type } from '@sinclair/typebox'
 import mcpPlugin from '../src/index.ts'
 import type { JSONRPCErrorResponse, JSONRPCRequest, JSONRPCResultResponse, CallToolResult } from '../src/index.ts'
-import { JSONRPC_VERSION, LATEST_PROTOCOL_VERSION, METHOD_NOT_FOUND } from '../src/schema.ts'
+import { JSONRPC_VERSION, LATEST_LEGACY_PROTOCOL_VERSION, METHOD_NOT_FOUND } from '../src/schema.ts'
 
 type DirectBody = {
   name: string
@@ -196,7 +196,7 @@ function initializeRequest (id = 100): JSONRPCRequest {
     id,
     method: 'initialize',
     params: {
-      protocolVersion: LATEST_PROTOCOL_VERSION,
+      protocolVersion: LATEST_LEGACY_PROTOCOL_VERSION,
       capabilities: {},
       clientInfo: { name: 'test-client', version: '1.0.0' }
     }

@@ -18,6 +18,15 @@ export interface TaskRecord extends Task {
   method: string
   /** Terminal outcome, present once the task reaches completed/failed/cancelled */
   outcome?: TaskOutcome
+  /**
+   * Outstanding server-to-client requests while the task sits in
+   * `input_required` (2026-07-28 tasks extension). Keys are unique for the
+   * lifetime of the task, so a client can deduplicate across polls and the
+   * server can ignore responses to keys it has already satisfied.
+   */
+  inputRequests?: Record<string, unknown>
+  /** Keys that have already been answered, so replays can be ignored. */
+  answeredInputKeys?: string[]
 }
 
 /**
@@ -39,6 +48,22 @@ export function canTransition (from: TaskStatus, to: TaskStatus): boolean {
   return ALLOWED_TRANSITIONS[from]?.includes(to) ?? false
 }
 
+/** Fields a status transition may set alongside the new status. */
+export interface TaskUpdateOptions {
+  statusMessage?: string
+  outcome?: TaskOutcome
+  /** Replaces the outstanding input requests; `null` clears them. */
+  inputRequests?: Record<string, unknown> | null
+  /** Keys to mark as answered, merged with those already recorded. */
+  answeredInputKeys?: string[]
+  /**
+   * Forget which keys have been answered. Set when a new round of questions is
+   * issued, so a key reused across rounds is not mistaken for one already
+   * satisfied.
+   */
+  clearAnsweredInputKeys?: boolean
+}
+
 export interface TaskStore {
   create(task: TaskRecord): Promise<void>
   get(taskId: string): Promise<TaskRecord | null>
@@ -47,7 +72,7 @@ export interface TaskStore {
    * Returns the updated record, or null if the task is gone.
    * @throws if the transition is not allowed
    */
-  updateStatus(taskId: string, status: TaskStatus, options?: { statusMessage?: string, outcome?: TaskOutcome }): Promise<TaskRecord | null>
+  updateStatus(taskId: string, status: TaskStatus, options?: TaskUpdateOptions): Promise<TaskRecord | null>
   /** Tasks visible to the given authorization subject, newest first */
   list(authSubject?: string): Promise<TaskRecord[]>
   delete(taskId: string): Promise<void>
@@ -100,6 +125,28 @@ export class TaskWaiters {
     if (set.size === 0) {
       this.waiters.delete(taskId)
     }
+  }
+}
+
+/**
+ * Fold the input-request fields of an update into a record, in place.
+ *
+ * Shared by both backends so `input_required` bookkeeping cannot drift between
+ * them: answered keys accumulate (never shrink) and clearing is explicit.
+ */
+export function applyInputRequestUpdates (task: TaskRecord, options: TaskUpdateOptions): void {
+  if (options.inputRequests === null) {
+    delete task.inputRequests
+  } else if (options.inputRequests !== undefined) {
+    task.inputRequests = options.inputRequests
+  }
+
+  if (options.clearAnsweredInputKeys) {
+    delete task.answeredInputKeys
+  }
+
+  if (options.answeredInputKeys?.length) {
+    task.answeredInputKeys = [...new Set([...(task.answeredInputKeys ?? []), ...options.answeredInputKeys])]
   }
 }
 

@@ -1,6 +1,6 @@
 # Fastify MCP Server
 
-A Fastify plugin that implements the Model Context Protocol (MCP) server using JSON-RPC 2.0. This plugin enables Fastify applications to expose tools, resources, and prompts following the MCP 2025-06-18 specification with full elicitation support.
+A Fastify plugin that implements the Model Context Protocol (MCP) server using JSON-RPC 2.0. This plugin enables Fastify applications to expose tools, resources, and prompts following the MCP **2026-07-28** specification, while continuing to serve clients that speak the earlier handshake-based revisions on the same endpoint.
 
 ## Installation
 
@@ -18,8 +18,10 @@ npm install @sinclair/typebox
 
 ## Features
 
-- **Complete MCP 2025-11-25 Support**: Implements the current Model Context Protocol revision, negotiating down to `2025-06-18`, `2025-03-26` and `2024-11-05` for older clients
-- **Tasks (experimental)**: Task-augmented tool calls with polling, deferred result retrieval and cancellation
+- **MCP 2026-07-28 Support**: Stateless per-request protocol with `server/discover`, multi round-trip requests, `subscriptions/listen`, cacheable results and header-based routing
+- **Dual-era**: The same endpoint serves 2026-07-28 statelessly *and* answers `initialize` for `2025-11-25`, `2025-06-18`, `2025-03-26` and `2024-11-05` clients
+- **Multi Round-Trip Requests**: Handlers ask for elicitation, sampling or roots by throwing `InputRequired`; state travels through the client, integrity-protected
+- **Tasks Extension**: `io.modelcontextprotocol/tasks` with `tasks/get` polling, `tasks/update` and `tasks/cancel`
 - **Elicitation Support**: Server-to-client information requests in both form and URL mode, with schema validation
 - **Icons**: Optional icon metadata on tools, resources, resource templates and prompts
 - **TypeBox Validation**: Type-safe schema validation with automatic TypeScript inference
@@ -178,15 +180,52 @@ test('calls an MCP tool', async (t) => {
 })
 ```
 
+The client defaults to `LATEST_LEGACY_PROTOCOL_VERSION`, so existing code keeps the
+handshake and session lifecycle shown above. To use the stateless revision, select it
+explicitly and call methods without `initialize()`:
+
+```typescript
+import { LATEST_PROTOCOL_VERSION } from '@platformatic/mcp'
+
+const modern = app.mcpClient({
+  protocolVersion: LATEST_PROTOCOL_VERSION,
+  clientInfo: { name: 'my-client', version: '1.0.0' },
+  clientCapabilities: {}
+})
+
+const discovery = await modern.discover()
+const tools = await modern.listTools()
+const result = await modern.callTool('echo', { message: 'hello' })
+```
+
+In modern mode the client adds the required per-request `_meta`, `Mcp-Method`, encoded
+`Mcp-Name`, and protocol-version headers. Calling `listTools()` also caches tool schemas so a
+later `callTool()` can mirror `x-mcp-header` arguments into encoded `Mcp-Param-*` headers.
+For a direct call before listing, pass those headers through `callTool(..., { headers })`.
+It does not create or send a session; `initialize()` rejects because that method was removed
+in `2026-07-28`.
+
+When a call returns `resultType: 'input_required'`, retry it with the returned state and the
+client's answers:
+
+```typescript
+await modern.callTool('interactive-tool', args, {
+  requestState: response.body.result.requestState,
+  inputResponses: {
+    confirmation: { action: 'accept', content: { confirmed: true } }
+  }
+})
+```
+
 The client:
 
 - Uses `app.inject()` only (no port binding).
 - Manages sequential JSON-RPC request IDs per client instance.
-- `initialize()` performs the complete MCP lifecycle handshake (`initialize` plus `notifications/initialized`).
-- `initialize()` rejects when `notifications/initialized` is not accepted with an empty `202` or `204` response.
-- Commits `mcp-session-id` and negotiated protocol version only after the full initialization handshake succeeds.
+- In legacy mode, `initialize()` performs the complete lifecycle handshake (`initialize` plus `notifications/initialized`).
+- Rejects a legacy initialization when `notifications/initialized` is not accepted with an empty `202` or `204` response.
+- Commits `mcp-session-id` and negotiated protocol version only after the full legacy handshake succeeds.
 - Forwards headers passed to `initialize()` to both lifecycle requests, except MCP-managed `mcp-session-id` and `mcp-protocol-version` on `notifications/initialized`.
-- Captures committed `mcp-session-id` from successful initialization and sends it automatically on later requests.
+- Captures committed `mcp-session-id` from successful legacy initialization and sends it automatically on later requests.
 - Lets you pass custom headers (including authorization) globally or per request.
 
 Responses are a discriminated union — narrow with `'result' in response.body` or
@@ -195,21 +234,107 @@ instead of returning.
 
 Note: no OAuth/JWT credentials are generated for you.
 
-## Protocol Version Negotiation
+## Protocol Versions
 
-The server answers `initialize` with the client's requested revision when it is one it
-supports, and otherwise offers the newest one it has:
+This plugin is a **dual-era** server, in the spec's terminology. The `2026-07-28` revision
+removed the `initialize` handshake, protocol-level sessions, and SSE resumability; rather
+than drop the clients that still need them, the same `/mcp` endpoint serves both:
 
 ```typescript
-import { LATEST_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS } from '@platformatic/mcp'
+import {
+  LATEST_PROTOCOL_VERSION,
+  LATEST_LEGACY_PROTOCOL_VERSION,
+  SUPPORTED_PROTOCOL_VERSIONS
+} from '@platformatic/mcp'
 
-LATEST_PROTOCOL_VERSION      // '2025-11-25'
-SUPPORTED_PROTOCOL_VERSIONS  // ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05']
+LATEST_PROTOCOL_VERSION         // '2026-07-28'
+LATEST_LEGACY_PROTOCOL_VERSION  // '2025-11-25' — newest revision reachable via initialize
+SUPPORTED_PROTOCOL_VERSIONS     // ['2026-07-28', '2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05']
 ```
 
-On the HTTP transport, requests after `initialize` must carry the agreed revision in the
-`MCP-Protocol-Version` header. An unsupported value is answered with `400`; an absent header
-is treated as `2025-03-26`, which predates the header.
+A request is served as **modern** when its `params._meta` carries
+`io.modelcontextprotocol/protocolVersion` or its `MCP-Protocol-Version` header names a modern
+revision. A request with neither takes the legacy path, so the two eras can interleave freely
+on one server. Header-based detection ensures modern routing headers can never bypass their
+required header/body validation.
+
+### Modern requests (2026-07-28)
+
+There is no negotiation step. Every request states what it speaks and what the client can do:
+
+```jsonc
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "get_weather",
+    "arguments": { "location": "Seattle" },
+    "_meta": {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientInfo": { "name": "ExampleClient", "version": "1.0.0" },
+      "io.modelcontextprotocol/clientCapabilities": {}
+    }
+  }
+}
+```
+
+sent with these headers, which the server checks against the body:
+
+```http
+MCP-Protocol-Version: 2026-07-28
+Mcp-Method: tools/call
+Mcp-Name: get_weather
+```
+
+`protocolVersion` and `clientCapabilities` are required — a request missing either is
+answered with `-32602` and HTTP 400. Every result comes back with `resultType`, the server's
+identity in `_meta`, and caching hints where the revision defines them.
+
+The status codes matter, because a dual-era *client* uses them to work out which kind of
+server it reached:
+
+| Condition | HTTP | JSON-RPC error |
+|---|---|---|
+| Headers disagree with the body, or a required one is missing | `400` | `-32020` `HeaderMismatch` |
+| Client did not declare a capability the request needs | `400` | `-32021` `MissingRequiredClientCapability` |
+| Version unknown or unsupported | `400` | `-32022` `UnsupportedProtocolVersion` |
+| Method not implemented, or removed in this revision | `404` | `-32601` `Method not found` |
+| Unknown tool, missing resource, failed handler | `200` | `-32602` / `-32603` |
+
+`server/discover` reports everything a client might want up front, and is the probe a
+dual-era client uses on stdio:
+
+```bash
+curl -X POST http://localhost:3000/mcp \
+  -H 'MCP-Protocol-Version: 2026-07-28' \
+  -H 'Mcp-Method: server/discover' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{
+        "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities":{}}}}'
+```
+
+### What 2026-07-28 removed
+
+These are answered with `404` and `-32601` on the modern path, and continue to work
+unchanged for legacy clients:
+
+| Removed | Replacement |
+|---|---|
+| `initialize` / `notifications/initialized` | per-request `_meta` |
+| `Mcp-Session-Id`, HTTP `GET` and `DELETE` | nothing — the protocol is stateless |
+| `ping` | none; use transport-level health checks |
+| `logging/setLevel` | `io.modelcontextprotocol/logLevel` in a request's `_meta` |
+| `resources/subscribe` / `resources/unsubscribe` | `subscriptions/listen` |
+| Server-initiated requests on SSE streams | [multi round-trip requests](#multi-round-trip-requests-2026-07-28) |
+| `Last-Event-ID` resumability | re-issue the request with a new id |
+| `tasks/result`, `tasks/list` | `tasks/get` polling |
+
+### Legacy requests (2025-11-25 and earlier)
+
+The handshake path is unchanged. The server answers `initialize` with the client's requested
+revision when it supports it, and otherwise with `2025-11-25` — never with `2026-07-28`,
+which a client sending `initialize` by definition cannot speak.
 
 **Responses are shaped to the revision the client negotiated.** A client on an older revision
 never sees a field or method that revision does not define:
@@ -234,6 +359,112 @@ default. `initialize` is exempt, so a client may re-negotiate on an existing ses
 > solely by its header. A client that omits it falls back to `2025-03-26` and will not see
 > `2025-11-25` features. Compliant clients always send the header.
 
+## Multi Round-Trip Requests (2026-07-28)
+
+A stateless server cannot hold a request open while it asks the user something. Instead it
+ends the request with an interim result, and the client comes back with the answers on a new
+one. Handlers express this by throwing `InputRequired`:
+
+```typescript
+import mcpPlugin, { InputRequired, elicitForm } from '@platformatic/mcp'
+
+app.mcpAddTool({
+  name: 'create-issue',
+  inputSchema: Type.Object({ title: Type.String() })
+}, async (args, context) => {
+  const answer = context.inputResponses?.repo
+
+  if (!answer) {
+    throw new InputRequired({
+      inputRequests: {
+        repo: elicitForm('Which repository?', {
+          type: 'object',
+          properties: { name: { type: 'string' } },
+          required: ['name']
+        })
+      },
+      // Anything the handler needs to resume. Sealed before it reaches the client.
+      state: { title: args.title }
+    })
+  }
+
+  // On the retry, `requestState` is the value above, verified and unsealed.
+  const { title } = context.requestState as { title: string }
+  return { content: [{ type: 'text', text: `Created "${title}" in ${answer.content.name}` }] }
+})
+```
+
+`elicitForm`, `elicitUrl`, `requestSampling` and `requestRoots` build the entries. The
+dispatcher refuses to send a request the client did not declare support for, answering
+`-32021` instead — so a handler cannot accidentally elicit from a client that cannot elicit.
+
+### requestState security
+
+`requestState` passes through the client, so it is attacker-controlled by definition. The
+plugin seals it with HMAC-SHA256 and binds it to the authenticated principal, an expiry, and
+a digest of the originating request. State that is tampered with, expired, presented by
+another principal, or replayed onto a different call is refused with `-32602`.
+
+```typescript
+await app.register(mcpPlugin, {
+  // Required when more than one instance can serve a retry — the default is a
+  // per-process random key, so a retry landing on another replica would be refused.
+  requestStateSecret: process.env.MCP_REQUEST_STATE_SECRET,
+  requestStateTtlMs: 5 * 60 * 1000 // default
+})
+```
+
+> Replay is *bounded*, not eliminated. If a given `requestState` must be consumed at most
+> once, enforce that in your own handler.
+
+## Subscriptions (2026-07-28)
+
+`subscriptions/listen` replaces both the standalone `GET` stream and `resources/subscribe`.
+The client names what it wants and the response *is* the stream:
+
+```jsonc
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "subscriptions/listen",
+  "params": {
+    "notifications": {
+      "toolsListChanged": true,
+      "resourceSubscriptions": ["file:///project/config.json"]
+    },
+    "_meta": { /* ... */ }
+  }
+}
+```
+
+The server acknowledges with `notifications/subscriptions/acknowledged`, reporting the subset
+it agreed to honour — an opt-in for something the server has no capability for is dropped.
+Every message on the stream carries `io.modelcontextprotocol/subscriptionId`, and
+`app.mcpBroadcastNotification()` feeds both these streams and legacy SSE sessions.
+
+Request-scoped notifications (`notifications/progress`, `notifications/message`) are never
+delivered here; they belong on the response stream of the request they relate to.
+
+## Result Caching (2026-07-28)
+
+`server/discover`, the four list operations and `resources/read` must carry `ttlMs` and
+`cacheScope`. The default is `{ ttlMs: 0, cacheScope: 'private' }` — immediately stale and
+never shared between callers, which is safe for every server. Opt into caching explicitly:
+
+```typescript
+await app.register(mcpPlugin, {
+  caching: {
+    discover: { ttlMs: 3_600_000, cacheScope: 'public' },
+    toolsList: { ttlMs: 300_000, cacheScope: 'public' },
+    resourcesRead: { ttlMs: 30_000, cacheScope: 'private' }
+  }
+})
+```
+
+> `cacheScope: 'public'` lets shared proxies serve one caller's response to another, **even
+> from an authenticated endpoint**. Only use it for results that genuinely do not vary per
+> user, and never rely on it for access control.
+
 ## Origin Validation
 
 Browser clients can be protected against DNS rebinding by allow-listing origins. A rejected
@@ -248,10 +479,27 @@ await app.register(mcpPlugin, {
 Requests without an `Origin` header are always accepted — the header is set by browsers, so
 its absence means the request did not come from one.
 
-## Tasks (MCP 2025-11-25, experimental)
+## Tasks
 
 Tasks let a tool call return immediately with a task handle while the work continues in the
-background. The client then polls `tasks/get` and collects the result with `tasks/result`.
+background, and the client polls for the outcome.
+
+The shape differs by era. In `2026-07-28` tasks are the official
+`io.modelcontextprotocol/tasks` **extension**: the client declares it in its per-request
+capabilities, the server advertises it under `capabilities.extensions`, and polling is
+`tasks/get` alone. In `2025-11-25` tasks were part of the core protocol, with a per-call
+`task` field and a blocking `tasks/result`. One `enableTasks: true` turns on both.
+
+| | `2025-11-25` (core) | `2026-07-28` (extension) |
+|---|---|---|
+| Negotiated via | `capabilities.tasks` | `capabilities.extensions['io.modelcontextprotocol/tasks']` |
+| Client opts in | `task` field per call | extension in `clientCapabilities` |
+| Poll | `tasks/get` | `tasks/get` (result and error inlined) |
+| Await result | `tasks/result` (blocks) | — removed, poll instead |
+| Provide input | — | `tasks/update` |
+| Enumerate | `tasks/list` | — removed |
+| Cancel | `tasks/cancel` | `tasks/cancel` |
+| Handle field names | `ttl`, `pollInterval` | `ttlMs`, `pollIntervalMs` |
 
 Enable the feature on the plugin, then opt individual tools in with `execution.taskSupport`:
 
@@ -268,7 +516,23 @@ app.mcpAddTool({
 })
 ```
 
-A client opts in per call by adding a `task` field:
+On `2026-07-28`, a client that declared the extension may get a task handle back from any
+tool that permits one — the server decides, and there is no per-call opt-in:
+
+```jsonc
+// -> tools/call, with "io.modelcontextprotocol/tasks": {} in clientCapabilities.extensions
+// <- CreateTaskResult
+{ "resultType": "task", "taskId": "…", "status": "working", "ttlMs": 60000, "pollIntervalMs": 1000 }
+
+// -> tasks/get { "taskId": "…" }
+// <- the terminal state, with the original result inlined
+{ "resultType": "complete", "status": "completed", "result": { "content": [ ... ] } }
+```
+
+A tool declaring `taskSupport: 'required'` refuses a client that did not declare the
+extension, with `-32021`.
+
+On `2025-11-25`, the client opts in per call instead:
 
 ```jsonc
 // -> tools/call
@@ -277,7 +541,7 @@ A client opts in per call by adding a `task` field:
 { "task": { "taskId": "…", "status": "working", "ttl": 60000, "pollInterval": 1000 } }
 ```
 
-Supported operations: `tasks/get`, `tasks/result` (blocks until the task is terminal),
+and may then use `tasks/get`, `tasks/result` (blocks until the task is terminal),
 `tasks/list` and `tasks/cancel`, plus optional `notifications/tasks/status` pushes over SSE.
 
 Retention defaults to 60 seconds when the client does not request a `ttl`. Tasks are meant
@@ -2156,14 +2420,28 @@ The plugin exposes the following endpoints using a dual-endpoint architecture:
 
 ## Supported MCP Methods
 
-- `initialize`: Server initialization
-- `ping`: Health check
+Served on both eras:
+
 - `tools/list`: List available tools
 - `tools/call`: Execute a tool (calls registered handler or returns error)
 - `resources/list`: List available resources
+- `resources/templates/list`: List resource templates
 - `resources/read`: Read a resource (calls registered handler or returns error)
 - `prompts/list`: List available prompts
 - `prompts/get`: Get a prompt (calls registered handler or returns error)
+
+`2026-07-28` only:
+
+- `server/discover`: Supported versions, capabilities and identity in one request
+- `subscriptions/listen`: Long-lived notification stream
+- `tasks/get`, `tasks/update`, `tasks/cancel`: Tasks extension
+
+`2025-11-25` and earlier only:
+
+- `initialize`: Server initialization
+- `ping`: Health check
+- `resources/subscribe`, `resources/unsubscribe`: Per-resource subscriptions
+- `tasks/get`, `tasks/result`, `tasks/list`, `tasks/cancel`: Core tasks
 
 ## Security Best Practices
 
@@ -2444,6 +2722,60 @@ Set up alerts for:
 Remember: Security is a layered approach. No single measure provides complete protection.
 
 ## Migration from Earlier Versions
+
+### Upgrading to MCP 2026-07-28
+
+Existing deployments keep working: the handshake path is untouched, and clients that speak
+`2025-11-25` or earlier need no changes. Adopting the new revision is opt-in per client.
+
+**What is new**
+
+- Requests carry `_meta` with `io.modelcontextprotocol/protocolVersion` and
+  `io.modelcontextprotocol/clientCapabilities`, plus `MCP-Protocol-Version`, `Mcp-Method`
+  and (where applicable) `Mcp-Name` headers that must agree with the body
+- `server/discover`, `subscriptions/listen`, multi round-trip requests, cacheable results
+- Tasks moved from the core protocol to the `io.modelcontextprotocol/tasks` extension
+
+**What changes for server authors**
+
+1. **Server-initiated requests are gone.** If you called `app.mcpElicit()` /
+   `app.mcpElicitUrl()` to prompt a user mid-call, that only reaches legacy clients. For
+   modern clients, throw `InputRequired` from the handler instead and read
+   `context.inputResponses` on the retry — see
+   [Multi Round-Trip Requests](#multi-round-trip-requests-2026-07-28).
+2. **Set `requestStateSecret`** if more than one instance can serve a retry. Without it each
+   process seals with its own random key and a retry landing elsewhere is refused.
+3. **Decide your caching hints.** The default of `ttlMs: 0` is safe but means clients never
+   cache. See [Result Caching](#result-caching-2026-07-28).
+4. **Sessions do not exist for modern clients.** `context.sessionId` is `undefined` on that
+   path, and `app.mcpSendToSession()` cannot reach them. Anything that must span requests
+   needs an explicit handle passed as a tool argument.
+5. **`enableSSE` no longer gates broadcasts.** `app.mcpBroadcastNotification()` now always
+   publishes, because `subscriptions/listen` is core to the modern protocol; legacy SSE
+   delivery is still gated by the flag.
+
+**One gotcha for existing code**
+
+`LATEST_PROTOCOL_VERSION` now means `2026-07-28`, not `2025-11-25`. If you send it as the
+`MCP-Protocol-Version` header, that header alone commits the request to the modern path —
+and a body without `_meta` is then answered with `-32602`. Code that wants the newest
+*handshake* revision should use `LATEST_LEGACY_PROTOCOL_VERSION`:
+
+```diff
+-import { LATEST_PROTOCOL_VERSION } from '@platformatic/mcp'
+-headers: { 'mcp-protocol-version': LATEST_PROTOCOL_VERSION }
++import { LATEST_LEGACY_PROTOCOL_VERSION } from '@platformatic/mcp'
++headers: { 'mcp-protocol-version': LATEST_LEGACY_PROTOCOL_VERSION }
+```
+
+The header is deliberately era-determining rather than the body alone. The transport mirrors
+body fields into headers so gateways can route on them without parsing JSON; if the era were
+decided by the body, a caller could send modern headers with a body that omits `_meta` and
+slip past every header/body check onto the unvalidated legacy path — exactly the split-brain
+the spec's "Server Validation" section exists to prevent.
+
+**Deprecated upstream** (still functional, removal no earlier than twelve months): Roots,
+Sampling, Logging, the HTTP+SSE transport, and OAuth Dynamic Client Registration.
 
 ### Upgrading to MCP 2025-06-18
 

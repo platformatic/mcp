@@ -1,7 +1,7 @@
 import type { Redis } from 'ioredis'
 import type { TaskStatus } from '../schema.ts'
-import type { TaskStore, TaskRecord, TaskOutcome } from './task-store.ts'
-import { canTransition, isTerminal, taskHasExpired } from './task-store.ts'
+import type { TaskStore, TaskRecord, TaskUpdateOptions } from './task-store.ts'
+import { applyInputRequestUpdates, canTransition, isTerminal, taskHasExpired } from './task-store.ts'
 
 const TASK_KEY_PREFIX = 'mcp:task:'
 const TASK_INDEX_KEY = 'mcp:tasks'
@@ -68,7 +68,7 @@ export class RedisTaskStore implements TaskStore {
   async updateStatus (
     taskId: string,
     status: TaskStatus,
-    options: { statusMessage?: string, outcome?: TaskOutcome } = {}
+    options: TaskUpdateOptions = {}
   ): Promise<TaskRecord | null> {
     const task = await this.get(taskId)
     if (!task) return null
@@ -93,6 +93,7 @@ export class RedisTaskStore implements TaskStore {
     if (options.outcome !== undefined) {
       updated.outcome = options.outcome
     }
+    applyInputRequestUpdates(updated, options)
 
     // The read above and this write are two round trips, so a concurrent write
     // can slip between them. Re-check the stored status atomically in Lua and

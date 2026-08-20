@@ -3,7 +3,7 @@ import type { TestContext } from 'node:test'
 import Fastify from 'fastify'
 import { Type } from '@sinclair/typebox'
 import mcpPlugin from '../src/index.ts'
-import { JSONRPC_VERSION, LATEST_PROTOCOL_VERSION, METHOD_NOT_FOUND, INVALID_PARAMS } from '../src/schema.ts'
+import { JSONRPC_VERSION, LATEST_LEGACY_PROTOCOL_VERSION, METHOD_NOT_FOUND, INVALID_PARAMS } from '../src/schema.ts'
 import type { Task, CreateTaskResult, ListTasksResult, CallToolResult } from '../src/schema.ts'
 import { MemoryTaskStore } from '../src/stores/memory-task-store.ts'
 import { canTransition, isTerminal, taskHasExpired, toWireTask } from '../src/stores/task-store.ts'
@@ -29,7 +29,7 @@ async function call (app: any, method: string, params: unknown, id = 1) {
   const response = await app.inject({
     method: 'POST',
     url: '/mcp',
-    headers: { 'mcp-protocol-version': LATEST_PROTOCOL_VERSION },
+    headers: { 'mcp-protocol-version': LATEST_LEGACY_PROTOCOL_VERSION },
     payload: { jsonrpc: JSONRPC_VERSION, id, method, params }
   })
   return response.json()
@@ -368,7 +368,7 @@ describe('tasks over the wire', () => {
       const res = await app.inject({
         method: 'POST',
         url: '/mcp',
-        headers: { authorization: `Bearer ${token}`, 'mcp-protocol-version': LATEST_PROTOCOL_VERSION },
+        headers: { authorization: `Bearer ${token}`, 'mcp-protocol-version': LATEST_LEGACY_PROTOCOL_VERSION },
         payload: { jsonrpc: JSONRPC_VERSION, id: 1, method, params }
       })
       return res.json()
@@ -378,7 +378,7 @@ describe('tasks over the wire', () => {
     const tokenB = createTestJWT({ sub: 'user-b' })
 
     // With auth, the capability is advertised
-    const init = await authedCall(tokenA, 'initialize', { protocolVersion: LATEST_PROTOCOL_VERSION, capabilities: {} })
+    const init = await authedCall(tokenA, 'initialize', { protocolVersion: LATEST_LEGACY_PROTOCOL_VERSION, capabilities: {} })
     t.assert.deepStrictEqual(init.result.capabilities.tasks.list, {})
 
     // Each subject creates a task
@@ -418,7 +418,7 @@ describe('tasks over the wire', () => {
       const res = await app.inject({
         method: 'POST',
         url: '/mcp',
-        headers: { authorization: `Bearer ${token}`, 'mcp-protocol-version': LATEST_PROTOCOL_VERSION },
+        headers: { authorization: `Bearer ${token}`, 'mcp-protocol-version': LATEST_LEGACY_PROTOCOL_VERSION },
         payload: { jsonrpc: JSONRPC_VERSION, id: 1, method, params }
       })
       return res.json()

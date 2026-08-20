@@ -1,6 +1,6 @@
 import type { TaskStatus } from '../schema.ts'
-import type { TaskStore, TaskRecord, TaskOutcome } from './task-store.ts'
-import { canTransition, isTerminal, taskHasExpired } from './task-store.ts'
+import type { TaskStore, TaskRecord, TaskUpdateOptions } from './task-store.ts'
+import { applyInputRequestUpdates, canTransition, isTerminal, taskHasExpired } from './task-store.ts'
 
 /**
  * In-process task store for single-instance deployments.
@@ -39,7 +39,7 @@ export class MemoryTaskStore implements TaskStore {
   async updateStatus (
     taskId: string,
     status: TaskStatus,
-    options: { statusMessage?: string, outcome?: TaskOutcome } = {}
+    options: TaskUpdateOptions = {}
   ): Promise<TaskRecord | null> {
     // Read straight from the map with no intervening await, so the terminal
     // check and the write cannot interleave with a concurrent updateStatus.
@@ -71,6 +71,7 @@ export class MemoryTaskStore implements TaskStore {
     if (options.outcome !== undefined) {
       updated.outcome = options.outcome
     }
+    applyInputRequestUpdates(updated, options)
 
     this.tasks.set(taskId, updated)
     return { ...updated }
