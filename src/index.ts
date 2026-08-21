@@ -280,6 +280,7 @@ export type {
   ToolAccessOperation,
   McpCallToolContext,
   McpCallToolOutcome,
+  MCPToolCallCompleteEvent,
   MCPTool,
   MCPResource,
   MCPPrompt,

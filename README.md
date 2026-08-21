@@ -1558,6 +1558,33 @@ Visibility and execution policies may intentionally differ — a tool hidden fro
 
 A hook that throws denies access (fail closed) and logs a warning. Only an explicit `true` grants access. Without the hook, every registered tool stays visible and callable.
 
+## Observing Tool Calls
+
+Provide `onToolCallComplete` to observe every tool call, regardless of transport, in one place:
+
+```typescript
+await app.register(mcpPlugin, {
+  onToolCallComplete: async (event) => {
+    logger.info({
+      tool: event.toolName,
+      source: event.source,
+      durationMs: event.durationMs,
+      ok: event.outcome.ok
+    }, 'tool call completed')
+  }
+})
+```
+
+The hook fires exactly once per tool call, after it settles: for JSON-RPC `tools/call`, for `app.mcpCallTool()`, and for a task-augmented call once execution finishes (not when the task is merely accepted). It also fires for access denial, unknown tools, invalid arguments, and task-required outcomes. It does not fire for `tools/list`, initialization/ping, or malformed requests where no tool name was resolved.
+
+`event.source` is `'json-rpc'`, `'in-process'`, or `'task'`. `event.outcome` is the same `McpCallToolOutcome` returned by `mcpCallTool()`. The hook is awaited before the response is sent, so keep it fast; a throwing or rejecting hook is logged and otherwise ignored — it never changes the tool response.
+
+Synchronous sources (`'json-rpc'` and `'in-process'`) expose the active `request`/`reply`. Task events never do: a task can finish after the original HTTP response has already completed, so `request`/`reply` are absent on `source: 'task'` events. Every event, regardless of source, carries `requestId` for correlation.
+
+Duration semantics also differ by source: `'json-rpc'` and `'in-process'` durations include authorization, validation, sanitization, and execution. Task durations measure only actual execution — validation, sanitization, and the tool call — excluding the time the task spent queued.
+
+`event.arguments` are the raw, unredacted tool arguments. Redact sensitive values yourself before logging or persisting them.
+
 ## Customizing MCP Route Schemas
 
 Use `transformRouteSchema` to customize Fastify/OpenAPI schema metadata on MCP transport routes without replacing handlers or route definitions.
@@ -1824,6 +1851,7 @@ await app.register(import('@fastify/bearer-auth'), {
 - `instructions`: Optional server instructions
 - `enableSSE`: Enable Server-Sent Events support (default: false)
 - `canAccessTool`: Per-request tool authorization hook consulted by `tools/list` and `tools/call` (optional)
+- `onToolCallComplete`: Transport-neutral hook fired once after every tool call settles, across JSON-RPC, `mcpCallTool()`, and tasks (optional)
 - `authorization`: OAuth 2.1 authorization configuration (optional)
   - `enabled`: Enable OAuth 2.1 authorization (default: false)
   - `authorizationServers`: Authorization server URIs
