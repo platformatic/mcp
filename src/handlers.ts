@@ -31,7 +31,7 @@ import {
 } from './schema.ts'
 import type { RequestId } from './schema.ts'
 
-import type { MCPTool, MCPResource, MCPPrompt, MCPPluginOptions, ResourceHandlers, McpCallToolOutcome } from './types.ts'
+import type { MCPTool, MCPResource, MCPPrompt, MCPPluginOptions, ResourceHandlers, McpCallToolOutcome, ToolAccessOperation } from './types.ts'
 import type { SessionStore } from './stores/session-store.ts'
 import type { TaskStore, TaskRecord, TaskWaiters } from './stores/task-store.ts'
 import { isTerminal, toWireTask } from './stores/task-store.ts'
@@ -173,19 +173,25 @@ function withSchemaDialect<T> (schema: T, protocolVersion: string | undefined): 
  * exposing a tool the deployment meant to gate; the error is logged so a
  * misbehaving hook is visible to the operator.
  */
-async function checkToolAccess (toolName: string, dependencies: ToolCallDependencies): Promise<boolean> {
+async function checkToolAccess (
+  toolName: string,
+  operation: ToolAccessOperation,
+  dependencies: ToolCallDependencies
+): Promise<boolean> {
   const hook = dependencies.opts.canAccessTool
   if (!hook) return true
   try {
     return await hook(toolName, {
       authContext: dependencies.authContext,
       request: dependencies.request,
-      sessionId: dependencies.sessionId
+      sessionId: dependencies.sessionId,
+      operation
     }) === true
   } catch (error) {
     dependencies.request.log.warn({
       err: error,
-      tool: toolName
+      tool: toolName,
+      operation
     }, 'canAccessTool hook threw; denying access')
     return false
   }
@@ -218,7 +224,7 @@ async function handleToolsList (request: JSONRPCRequest, dependencies: HandlerDe
   const accessResults = await mapWithConcurrency(
     registeredTools,
     TOOL_ACCESS_CONCURRENCY,
-    tool => checkToolAccess(tool.definition.name, dependencies)
+    tool => checkToolAccess(tool.definition.name, 'list', dependencies)
   )
   const accessibleTools = registeredTools.filter((_tool, index) => accessResults[index])
   const result: ListToolsResult = {
@@ -334,7 +340,7 @@ async function resolveRegisteredTool (
   toolName: string,
   dependencies: ToolCallDependencies
 ): Promise<{ ok: true, tool: MCPTool } | { ok: false, reason: 'not-found' }> {
-  const isAllowed = await checkToolAccess(toolName, dependencies)
+  const isAllowed = await checkToolAccess(toolName, 'call', dependencies)
   if (!isAllowed) {
     return { ok: false, reason: 'not-found' }
   }

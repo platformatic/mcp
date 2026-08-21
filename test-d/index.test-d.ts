@@ -359,12 +359,16 @@ const accessHook: NonNullable<MCPPluginOptions['canAccessTool']> = (toolName, co
   expectType<string>(toolName)
   expectAssignable<string[] | undefined>(context.authContext?.scopes)
   expectAssignable<string | undefined>(context.sessionId)
+  expectType<'list' | 'call'>(context.operation)
   return context.request !== undefined
 }
 expectAssignable<MCPPluginOptions>({ canAccessTool: accessHook })
 
-// The context type is exported and carries a required request
-expectAssignable<ToolAccessContext>({ request: {} as FastifyRequest })
+// The context type is exported and carries a required request and operation
+expectAssignable<ToolAccessContext>({ request: {} as FastifyRequest, operation: 'list' })
+expectAssignable<ToolAccessContext>({ request: {} as FastifyRequest, operation: 'call' })
+expectNotAssignable<ToolAccessContext>({ request: {} as FastifyRequest })
+expectNotAssignable<ToolAccessContext>({ request: {} as FastifyRequest, operation: 'delete' })
 expectNotAssignable<ToolAccessContext>({})
 
 // mcpCallTool is decorated on Fastify and returns the exported outcome union
