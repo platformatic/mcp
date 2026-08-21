@@ -31,7 +31,7 @@ import {
 } from './schema.ts'
 import type { RequestId } from './schema.ts'
 
-import type { MCPTool, MCPResource, MCPPrompt, MCPPluginOptions, ResourceHandlers, McpCallToolOutcome, ToolAccessOperation } from './types.ts'
+import type { MCPTool, MCPResource, MCPPrompt, MCPPluginOptions, ResourceHandlers, McpCallToolOutcome, ToolAccessOperation, MCPToolCallCompleteEvent } from './types.ts'
 import type { SessionStore } from './stores/session-store.ts'
 import type { TaskStore, TaskRecord, TaskWaiters } from './stores/task-store.ts'
 import { isTerminal, toWireTask } from './stores/task-store.ts'
@@ -300,6 +300,7 @@ async function handleToolsCall (
 
   const params = paramsValidation.data
   const toolName = params.name
+  const startedAt = performance.now()
 
   // A denied tool answers exactly like an unknown one, so a caller cannot
   // distinguish "does not exist" from "exists but not for you" by the protocol
@@ -310,6 +311,7 @@ async function handleToolsCall (
   // the model cannot correct itself out of missing access.
   const resolved = await resolveRegisteredTool(toolName, dependencies)
   if (!resolved.ok) {
+    await emitToolCallComplete('json-rpc', toolName, params.arguments || {}, resolved, startedAt, dependencies)
     return toolCallOutcomeToJsonRpc(request.id, toolName, resolved)
   }
 
@@ -322,18 +324,64 @@ async function handleToolsCall (
     : undefined
   const augmentation = resolveTaskAugmentation(resolved.tool, taskParams !== undefined)
   if ('error' in augmentation) {
+    await emitToolCallComplete('json-rpc', toolName, params.arguments || {}, { ok: false, reason: 'task-required' }, startedAt, dependencies)
     return createError(request.id, METHOD_NOT_FOUND, augmentation.error)
   }
   if (augmentation.mode === 'task') {
     return await runToolCallAsTask(
       request,
       taskParams?.ttl,
-      () => executeToolCall(request, resolved.tool, params, sessionId, dependencies),
+      // Timed from when the task actually starts executing, not from when it
+      // was queued, so `durationMs` reflects work done rather than wait time.
+      () => executeToolCall(request, resolved.tool, params, sessionId, dependencies, { source: 'task', startedAt: performance.now() }),
       dependencies
     )
   }
 
-  return await executeToolCall(request, resolved.tool, params, sessionId, dependencies)
+  return await executeToolCall(request, resolved.tool, params, sessionId, dependencies, { source: 'json-rpc', startedAt })
+}
+
+/** An observability failure must never change the tool response. */
+async function emitToolCallComplete (
+  source: MCPToolCallCompleteEvent['source'],
+  toolName: string,
+  args: Record<string, unknown>,
+  outcome: McpCallToolOutcome,
+  startedAt: number,
+  dependencies: ToolCallDependencies
+): Promise<void> {
+  const hook = dependencies.opts.onToolCallComplete
+  if (!hook) {
+    return
+  }
+
+  const common = {
+    toolName,
+    arguments: args,
+    authContext: dependencies.authContext,
+    sessionId: dependencies.sessionId,
+    requestId: dependencies.request.id,
+    durationMs: performance.now() - startedAt,
+    outcome
+  }
+
+  // Tasks may complete after the originating HTTP response has already been
+  // sent, so they must never carry the (possibly finished) request/reply.
+  const event: MCPToolCallCompleteEvent = source === 'task'
+    ? { ...common, source }
+    : { ...common, source, request: dependencies.request, reply: dependencies.reply }
+
+  try {
+    await hook(event)
+  } catch (error) {
+    if (source === 'task') {
+      // request.log may belong to an already-finished request; app.log plus
+      // the correlation id is the safe choice for task-time failures.
+      dependencies.app.log.error({ err: error, tool: toolName, requestId: common.requestId }, 'onToolCallComplete hook failed')
+    } else {
+      dependencies.request.log.error({ err: error, tool: toolName }, 'onToolCallComplete hook failed')
+    }
+  }
 }
 
 type RegisteredToolResolution =
@@ -399,17 +447,29 @@ export async function callRegisteredTool (
   args: Record<string, unknown>,
   dependencies: ToolCallDependencies
 ): Promise<McpCallToolOutcome> {
+  const startedAt = performance.now()
+
   const resolved = await resolveRegisteredTool(name, dependencies)
   if (!resolved.ok) {
+    await emitToolCallComplete('in-process', name, args, resolved, startedAt, dependencies)
     return resolved
   }
 
   const augmentation = resolveTaskAugmentation(resolved.tool, false)
   if ('error' in augmentation) {
-    return { ok: false, reason: 'task-required' }
+    const outcome: McpCallToolOutcome = { ok: false, reason: 'task-required' }
+    await emitToolCallComplete('in-process', name, args, outcome, startedAt, dependencies)
+    return outcome
   }
 
-  return await executeRegisteredTool(resolved.tool, name, args, dependencies)
+  const outcome = await executeRegisteredTool(resolved.tool, name, args, dependencies)
+  await emitToolCallComplete('in-process', name, args, outcome, startedAt, dependencies)
+  return outcome
+}
+
+interface ToolCallObservationContext {
+  source: MCPToolCallCompleteEvent['source']
+  startedAt: number
 }
 
 async function executeToolCall (
@@ -417,11 +477,15 @@ async function executeToolCall (
   tool: MCPTool,
   params: { name: string, arguments?: Record<string, unknown> },
   sessionId: string | undefined,
-  dependencies: HandlerDependencies
+  dependencies: HandlerDependencies,
+  observation: ToolCallObservationContext
 ): Promise<JSONRPCResponse | JSONRPCError> {
   const toolName = params.name
+  const args = params.arguments || {}
 
-  const outcome = await executeRegisteredTool(tool, toolName, params.arguments || {}, { ...dependencies, sessionId })
+  const callDependencies = { ...dependencies, sessionId }
+  const outcome = await executeRegisteredTool(tool, toolName, args, callDependencies)
+  await emitToolCallComplete(observation.source, toolName, args, outcome, observation.startedAt, callDependencies)
   return toolCallOutcomeToJsonRpc(request.id, toolName, outcome)
 }
 

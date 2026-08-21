@@ -225,6 +225,34 @@ export type McpCallToolOutcome =
   | { ok: false, reason: 'invalid-arguments', detail: string }
   | { ok: false, reason: 'task-required' }
 
+interface MCPToolCallCompleteEventBase {
+  toolName: string
+  arguments: Record<string, unknown>
+  authContext?: AuthorizationContext
+  sessionId?: string
+  /** Correlates this event back to the originating request, for every source */
+  requestId: string
+  durationMs: number
+  outcome: McpCallToolOutcome
+}
+
+/**
+ * `source: 'task'` fires after the original HTTP response may already have
+ * completed, so it must not carry the (possibly finished) `request`/`reply`
+ * objects that the synchronous sources expose.
+ */
+export type MCPToolCallCompleteEvent =
+  | (MCPToolCallCompleteEventBase & {
+    source: 'json-rpc' | 'in-process'
+    request: FastifyRequest
+    reply: FastifyReply
+  })
+  | (MCPToolCallCompleteEventBase & {
+    source: 'task'
+    request?: undefined
+    reply?: undefined
+  })
+
 export interface MCPPluginOptions {
   serverInfo?: Implementation
   capabilities?: ServerCapabilities
@@ -276,6 +304,18 @@ export interface MCPPluginOptions {
     toolName: string,
     context: ToolAccessContext
   ) => boolean | Promise<boolean>
+  /**
+   * Fires once per tool call, after it settles, regardless of transport
+   * (JSON-RPC, `app.mcpCallTool()`, or a completed task). Not called for
+   * `tools/list`, initialization/ping, or malformed requests where no tool
+   * name was resolved. Awaited before the response is sent, so keep it fast;
+   * a throwing hook is logged and otherwise ignored, it never changes the
+   * tool response. `event.arguments` are the raw, unredacted tool
+   * arguments, so redact sensitive values yourself before logging them.
+   */
+  onToolCallComplete?: (
+    event: MCPToolCallCompleteEvent
+  ) => void | Promise<void>
   /**
    * Customize Fastify/OpenAPI schema metadata for MCP transport routes.
    * This callback runs once per registered route during startup.

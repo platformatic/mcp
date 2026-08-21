@@ -32,6 +32,7 @@ import type {
   MCPRouteSchemaTransformer,
   McpCallToolContext,
   McpCallToolOutcome,
+  MCPToolCallCompleteEvent,
 } from '../dist/index.js'
 
 // ─── ToolHandler ─────────────────────────────────────────────────────
@@ -394,6 +395,31 @@ expectAssignable<McpCallToolOutcome>({ ok: false, reason: 'access-denied' })
 expectAssignable<McpCallToolOutcome>({ ok: false, reason: 'invalid-arguments', detail: 'missing input' })
 expectAssignable<McpCallToolOutcome>({ ok: false, reason: 'task-required' })
 expectNotAssignable<McpCallToolOutcome>({ ok: false, reason: 'nope' })
+
+// ─── onToolCallComplete event ───────────────────────────────────────
+
+// Every source carries a requestId
+expectType<string>(({} as MCPToolCallCompleteEvent).requestId)
+
+// Synchronous sources expose the live request/reply
+declare const jsonRpcEvent: MCPToolCallCompleteEvent & { source: 'json-rpc' | 'in-process' }
+expectType<FastifyRequest>(jsonRpcEvent.request)
+expectType<FastifyReply>(jsonRpcEvent.reply)
+
+// Task events cannot carry request/reply
+declare const taskEvent: MCPToolCallCompleteEvent & { source: 'task' }
+expectType<undefined>(taskEvent.request)
+expectType<undefined>(taskEvent.reply)
+expectNotAssignable<MCPToolCallCompleteEvent & { source: 'task' }>({
+  source: 'task',
+  toolName: 'echo',
+  arguments: {},
+  requestId: 'req-1',
+  durationMs: 1,
+  outcome: { ok: true, result: { content: [] } },
+  request: {} as FastifyRequest,
+  reply: {} as FastifyReply,
+})
 
 // Sync and async hooks are both accepted
 expectAssignable<MCPPluginOptions>({ canAccessTool: () => true })
