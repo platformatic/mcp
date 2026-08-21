@@ -1,6 +1,6 @@
 {
   "name": "@platformatic/mcp",
-  "version": "1.2.2",
+  "version": "2.3.0",
   "description": "Scalable Fastify adapter for the Model Context Protocol (MCP)",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -35,7 +35,7 @@
   "homepage": "https://github.com/platformatic/mcp#readme",
   "devDependencies": {
     "@fastify/pre-commit": "^2.2.0",
-    "@modelcontextprotocol/inspector": "^0.21.0",
+    "@modelcontextprotocol/inspector": "^0.22.0",
     "@modelcontextprotocol/sdk": "^1.13.3",
     "@sinclair/typebox": "^0.34.37",
     "@types/node": "^24.0.10",
@@ -49,10 +49,12 @@
   },
   "dependencies": {
     "@fastify/cors": "^11.1.0",
-    "@fastify/jwt": "^9.1.0",
-    "@fastify/type-provider-typebox": "^5.2.0",
+    "ajv": "^8.17.1",
+    "@fastify/jwt": "^10.0.0",
+    "@fastify/type-provider-typebox": "^6.0.0",
     "fast-jwt": "^6.0.2",
-    "fastify-plugin": "^5.0.1",
+    "fastify-error": "^1.0.0",
+    "fastify-plugin": "^6.0.0",
     "get-jwks": "^11.0.1",
     "ioredis": "^5.0.0",
     "mqemitter": "^7.1.0",

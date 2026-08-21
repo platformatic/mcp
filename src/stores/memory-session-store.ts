@@ -22,13 +22,29 @@ export class MemorySessionStore implements SessionStore {
     this.messageHistory.set(metadata.id, [])
   }
 
+  async update (metadata: SessionMetadata): Promise<void> {
+    const existing = this.sessions.get(metadata.id)
+    if (!existing) {
+      return
+    }
+    // Only the negotiated version and activity time are the caller's to change.
+    // Writing the whole record back would roll the event counter back to a stale
+    // value if a concurrent SSE message bumped it between get() and update().
+    existing.lastActivity = metadata.lastActivity
+    if (metadata.protocolVersion !== undefined) {
+      existing.protocolVersion = metadata.protocolVersion
+    }
+  }
+
   async get (sessionId: string): Promise<SessionMetadata | null> {
     const session = this.sessions.get(sessionId)
     return session ? { ...session } : null
   }
 
-  async list (): Promise<SessionMetadata[]> {
-    return Array.from(this.sessions.values(), session => ({ ...session }))
+  async * iterate (): AsyncIterable<SessionMetadata> {
+    for (const session of this.sessions.values()) {
+      yield { ...session }
+    }
   }
 
   async delete (sessionId: string): Promise<void> {
@@ -70,6 +86,14 @@ export class MemorySessionStore implements SessionStore {
     // Update session metadata
     const session = this.sessions.get(sessionId)
     if (session) {
+      // Persist the numeric counter, not just lastEventId. get() hands callers a
+      // copy, so the `++session.eventId` a caller does on that copy is otherwise
+      // never stored — leaving every SSE event with id "1" and breaking
+      // Last-Event-ID resumption. The Redis backend already persists this.
+      const numericEventId = parseInt(eventId, 10)
+      if (!Number.isNaN(numericEventId)) {
+        session.eventId = numericEventId
+      }
       session.lastEventId = eventId
       session.lastActivity = new Date()
     }

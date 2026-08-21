@@ -35,6 +35,35 @@ describe('RedisSessionStore', () => {
     assert.strictEqual(result, null)
   })
 
+  testWithRedis('should iterate sessions without returning message histories', async (redis) => {
+    const store = new RedisSessionStore({ redis, maxMessages: 100 })
+    const now = new Date()
+
+    await store.create({
+      id: 'iterated-session-1',
+      eventId: 0,
+      createdAt: now,
+      lastActivity: now
+    })
+    await store.create({
+      id: 'iterated-session-2',
+      eventId: 0,
+      createdAt: now,
+      lastActivity: now
+    })
+    await store.addMessage('iterated-session-1', '1', {
+      jsonrpc: '2.0',
+      method: 'test'
+    })
+
+    const ids: string[] = []
+    for await (const session of store.iterate()) {
+      ids.push(session.id)
+    }
+
+    assert.deepStrictEqual(ids.sort(), ['iterated-session-1', 'iterated-session-2'])
+  })
+
   testWithRedis('should delete session and its history', async (redis) => {
     const store = new RedisSessionStore({ redis, maxMessages: 100 })
 
@@ -237,5 +266,57 @@ describe('RedisSessionStore', () => {
 
     const history = await store.getMessagesFrom('non-existent-session', '0')
     assert.strictEqual(history.length, 0)
+  })
+
+  testWithRedis('update does not recreate a session that expired first', async (redis) => {
+    const store = new RedisSessionStore({ redis, maxMessages: 100 })
+
+    const metadata: SessionMetadata = {
+      id: 'expiring-session',
+      eventId: 1,
+      createdAt: new Date('2023-01-01T00:00:00.000Z'),
+      lastActivity: new Date('2023-01-01T00:00:00.000Z'),
+      protocolVersion: '2025-11-25'
+    }
+    await store.create(metadata)
+
+    // Simulate the session's TTL elapsing between the existence check and the
+    // write. A non-atomic check-then-write would resurrect it here without a TTL.
+    await redis.del('session:expiring-session')
+
+    metadata.eventId = 2
+    metadata.lastActivity = new Date('2023-01-01T00:05:00.000Z')
+    await store.update(metadata)
+
+    assert.strictEqual(await store.get('expiring-session'), null, 'session must not be recreated')
+    assert.strictEqual(await redis.exists('session:expiring-session'), 0, 'no key should exist')
+  })
+
+  testWithRedis('update persists the protocol version and preserves TTL and event counter', async (redis) => {
+    const store = new RedisSessionStore({ redis, maxMessages: 100 })
+
+    await store.create({
+      id: 'ttl-session',
+      eventId: 5,
+      createdAt: new Date('2023-01-01T00:00:00.000Z'),
+      lastActivity: new Date('2023-01-01T00:00:00.000Z')
+    })
+
+    // A stale eventId in the update payload must NOT roll the counter back: the
+    // event counter is owned by addMessage, not update.
+    await store.update({
+      id: 'ttl-session',
+      eventId: 2,
+      createdAt: new Date('2023-01-01T00:00:00.000Z'),
+      lastActivity: new Date('2023-01-01T00:05:00.000Z'),
+      protocolVersion: '2025-11-25'
+    })
+
+    const ttl = await redis.ttl('session:ttl-session')
+    assert.ok(ttl > 3500 && ttl <= 3600, `expected the 1h TTL to persist, got ${ttl}`)
+
+    const updated = await store.get('ttl-session')
+    assert.strictEqual(updated?.protocolVersion, '2025-11-25')
+    assert.strictEqual(updated?.eventId, 5, 'the event counter must not be rolled back by update')
   })
 })

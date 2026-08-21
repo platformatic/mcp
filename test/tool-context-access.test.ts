@@ -4,7 +4,7 @@ import Fastify from 'fastify'
 import mcpPlugin from '../src/index.ts'
 import type {
   JSONRPCRequest,
-  JSONRPCResponse,
+  JSONRPCResultResponse,
   CallToolResult,
   ReadResourceResult,
   GetPromptResult
@@ -62,7 +62,7 @@ describe('Tool Context Access', () => {
       })
 
       t.assert.strictEqual(response.statusCode, 200)
-      const body = response.json() as JSONRPCResponse
+      const body = response.json() as JSONRPCResultResponse
       const result = body.result as CallToolResult
 
       // The test should pass when we have access to request object
@@ -280,7 +280,7 @@ describe('Tool Context Access', () => {
       })
 
       t.assert.strictEqual(response.statusCode, 200)
-      const body = response.json() as JSONRPCResponse
+      const body = response.json() as JSONRPCResultResponse
       const result = body.result as CallToolResult
       const textContent = result.content[0] as { type: 'text', text: string }
       t.assert.strictEqual(textContent.text, 'Echo: Hello World', 'Traditional handler should still work')
@@ -330,7 +330,7 @@ describe('Tool Context Access', () => {
       })
 
       t.assert.strictEqual(response.statusCode, 200)
-      const body = response.json() as JSONRPCResponse
+      const body = response.json() as JSONRPCResultResponse
       const result = body.result as CallToolResult
       const textContent = result.content[0] as { type: 'text', text: string }
       t.assert.ok(textContent.text.includes('test-session-123'), 'SessionId should still be accessible')
@@ -486,7 +486,7 @@ describe('Tool Context Access', () => {
       t.assert.strictEqual(response.statusCode, 200)
       t.assert.strictEqual(response.headers['x-resource-processed'], 'true')
 
-      const body = response.json() as JSONRPCResponse
+      const body = response.json() as JSONRPCResultResponse
       const result = body.result as ReadResourceResult
 
       // Verify context was passed correctly
@@ -542,7 +542,7 @@ describe('Tool Context Access', () => {
 
       t.assert.strictEqual(response.statusCode, 200)
 
-      const body = response.json() as JSONRPCResponse
+      const body = response.json() as JSONRPCResultResponse
       const result = body.result as ReadResourceResult
       const firstContent = result.contents[0]
       t.assert.strictEqual('text' in firstContent ? firstContent.text : '', 'Legacy resource content')
@@ -612,7 +612,7 @@ describe('Tool Context Access', () => {
       t.assert.strictEqual(response.statusCode, 200)
       t.assert.strictEqual(response.headers['x-prompt-processed'], 'true')
 
-      const body = response.json() as JSONRPCResponse
+      const body = response.json() as JSONRPCResultResponse
       const result = body.result as GetPromptResult
 
       // Verify context was passed correctly
@@ -679,7 +679,7 @@ describe('Tool Context Access', () => {
 
       t.assert.strictEqual(response.statusCode, 200)
 
-      const body = response.json() as JSONRPCResponse
+      const body = response.json() as JSONRPCResultResponse
       const result = body.result as GetPromptResult
       t.assert.strictEqual(result.messages[0].content.type, 'text')
       if (result.messages[0].content.type === 'text') {

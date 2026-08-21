@@ -10,7 +10,19 @@ export interface OAuthClientConfig {
   resourceUri?: string
   scopes?: string[]
   dynamicRegistration?: boolean
+  /**
+   * OAuth Client ID Metadata Document (SEP-991), the registration mechanism
+   * recommended from 2025-11-25 on. When enabled we publish our client metadata
+   * as JSON and use its HTTPS URL as the `client_id`, so no registration call —
+   * dynamic or manual — is needed against the authorization server.
+   *
+   * Pass `true` for the default path, or an object to override it.
+   */
+  clientIdMetadataDocument?: boolean | { path?: string }
 }
+
+/** Where the client metadata document is served unless overridden */
+export const DEFAULT_CLIENT_ID_METADATA_PATH = '/.well-known/oauth-client'
 
 export interface PKCEChallenge {
   codeVerifier: string
@@ -65,6 +77,42 @@ interface OIDCEndpoints {
 const discoveryCache = new Map<string, { endpoints: OIDCEndpoints; timestamp: number }>()
 const DISCOVERY_CACHE_TTL = 5 * 60 * 1000 // 5 minutes
 
+/**
+ * Build the ordered list of metadata URLs to try for an issuer.
+ *
+ * The 2025-11-25 revision (SEP-797) requires supporting OpenID Connect Discovery
+ * 1.0 alongside RFC 8414. Issuers with a path component have two spellings each,
+ * so the full chain is:
+ *
+ * 1. RFC 8414 path-insertion:  `{origin}/.well-known/oauth-authorization-server{path}`
+ * 2. OIDC path-insertion:      `{origin}/.well-known/openid-configuration{path}`
+ * 3. OIDC path-appending:      `{issuer}/.well-known/openid-configuration`
+ *
+ * For an issuer without a path all three collapse to two distinct URLs.
+ */
+export function buildDiscoveryUrls (authorizationServer: string): string[] {
+  const issuer = authorizationServer.replace(/\/$/, '')
+
+  let origin: string
+  let path: string
+  try {
+    const url = new URL(issuer)
+    origin = url.origin
+    path = url.pathname === '/' ? '' : url.pathname
+  } catch {
+    // Not a parseable URL; fall back to simple appending
+    return [`${issuer}/.well-known/openid-configuration`]
+  }
+
+  const urls = [
+    `${origin}/.well-known/oauth-authorization-server${path}`,
+    `${origin}/.well-known/openid-configuration${path}`,
+    `${issuer}/.well-known/openid-configuration`
+  ]
+
+  return [...new Set(urls)]
+}
+
 async function discoverOIDCEndpoints (
   authorizationServer: string,
   logger?: FastifyBaseLogger
@@ -76,27 +124,30 @@ async function discoverOIDCEndpoints (
     return cached.endpoints
   }
 
-  try {
-    const discoveryUrl = `${authorizationServer}/.well-known/openid-configuration`
-    logger?.info({ discoveryUrl }, 'OAuth client: fetching OIDC discovery document')
+  for (const discoveryUrl of buildDiscoveryUrls(authorizationServer)) {
+    try {
+      logger?.info({ discoveryUrl }, 'OAuth client: fetching authorization server metadata')
 
-    const response = await fetch(discoveryUrl)
-    if (response.ok) {
-      const metadata = await response.json() as Record<string, string>
-      const endpoints: OIDCEndpoints = {
-        authorizationEndpoint: metadata.authorization_endpoint,
-        tokenEndpoint: metadata.token_endpoint,
-        introspectionEndpoint: metadata.introspection_endpoint,
-        registrationEndpoint: metadata.registration_endpoint
+      const response = await fetch(discoveryUrl)
+      if (response.ok) {
+        const metadata = await response.json() as Record<string, string>
+        const endpoints: OIDCEndpoints = {
+          authorizationEndpoint: metadata.authorization_endpoint,
+          tokenEndpoint: metadata.token_endpoint,
+          introspectionEndpoint: metadata.introspection_endpoint,
+          registrationEndpoint: metadata.registration_endpoint
+        }
+        discoveryCache.set(authorizationServer, { endpoints, timestamp: now })
+        logger?.info({ discoveryUrl, endpoints }, 'OAuth client: authorization server metadata discovered')
+        return endpoints
       }
-      discoveryCache.set(authorizationServer, { endpoints, timestamp: now })
-      logger?.info({ endpoints }, 'OAuth client: OIDC endpoints discovered')
-      return endpoints
+      logger?.debug({ discoveryUrl, status: response.status }, 'OAuth client: metadata endpoint returned non-OK, trying next')
+    } catch (error) {
+      logger?.debug({ discoveryUrl, error: error instanceof Error ? error.message : String(error) }, 'OAuth client: metadata fetch failed, trying next')
     }
-    logger?.warn({ status: response.status }, 'OAuth client: OIDC discovery failed, using defaults')
-  } catch (error) {
-    logger?.warn({ error: error instanceof Error ? error.message : String(error) }, 'OAuth client: OIDC discovery error, using defaults')
   }
+
+  logger?.warn({ authorizationServer }, 'OAuth client: discovery exhausted all well-known locations, using defaults')
 
   // Default endpoints (original behavior for backwards compatibility)
   const defaults: OIDCEndpoints = {
@@ -109,9 +160,55 @@ async function discoverOIDCEndpoints (
   return defaults
 }
 
+/**
+ * Build the client metadata document we publish when using CIMD (SEP-991).
+ * `client_id` must equal the URL the document is served from.
+ */
+export function buildClientIdMetadataDocument (opts: OAuthClientConfig, documentUrl: string): Record<string, unknown> {
+  return {
+    client_id: documentUrl,
+    client_name: 'MCP Server',
+    client_uri: opts.resourceUri,
+    redirect_uris: [`${opts.resourceUri}/oauth/callback`],
+    grant_types: ['authorization_code', 'refresh_token'],
+    response_types: ['code'],
+    token_endpoint_auth_method: 'none',
+    scope: (opts.scopes || ['read']).join(' ')
+  }
+}
+
 const oauthClientPlugin: FastifyPluginAsync<OAuthClientConfig> = async (fastify, opts) => {
   // Discover OIDC endpoints on startup
   const endpoints = await discoverOIDCEndpoints(opts.authorizationServer, fastify.log)
+
+  // SEP-991: publish a client metadata document and adopt its URL as our client_id
+  if (opts.clientIdMetadataDocument) {
+    const path = (typeof opts.clientIdMetadataDocument === 'object' && opts.clientIdMetadataDocument.path) ||
+      DEFAULT_CLIENT_ID_METADATA_PATH
+
+    if (!opts.resourceUri) {
+      throw new Error('clientIdMetadataDocument requires resourceUri so the document URL can be resolved')
+    }
+
+    const documentUrl = `${opts.resourceUri.replace(/\/$/, '')}${path}`
+    const document = buildClientIdMetadataDocument(opts, documentUrl)
+
+    // The authorization server fetches this document unauthenticated to resolve
+    // the client_id. The auth preHandler only exempts /.well-known, so a custom
+    // path outside it would sit behind bearer auth and be unreachable (401).
+    if (!path.startsWith('/.well-known/')) {
+      fastify.log.warn({ path },
+        'clientIdMetadataDocument path is outside /.well-known; add it to authorization.excludedPaths or the authorization server will get 401 when fetching it')
+    }
+
+    fastify.get(path, async (_request, reply) => {
+      return reply.type('application/json').send(document)
+    })
+
+    // The document URL *is* the client identifier, so registration is unnecessary
+    opts.clientId = documentUrl
+    fastify.log.info({ documentUrl }, 'OAuth client: using Client ID Metadata Document as client_id')
+  }
 
   // Our OAuth client implementation is completely independent and doesn't need @fastify/oauth2
   // @fastify/oauth2 can be optionally registered by users if they want the additional routes,

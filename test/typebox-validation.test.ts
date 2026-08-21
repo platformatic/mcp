@@ -4,7 +4,7 @@ import Fastify from 'fastify'
 import { Type } from '@sinclair/typebox'
 import mcpPlugin from '../src/index.ts'
 import { JSONRPC_VERSION, INVALID_PARAMS } from '../src/schema.ts'
-import type { JSONRPCRequest, JSONRPCResponse, JSONRPCError, CallToolResult, GetPromptResult, ReadResourceResult } from '../src/schema.ts'
+import type { JSONRPCRequest, JSONRPCResultResponse, JSONRPCError, CallToolResult, GetPromptResult, ReadResourceResult } from '../src/schema.ts'
 
 describe('TypeBox Validation', () => {
   describe('Tool Validation', () => {
@@ -56,7 +56,7 @@ describe('TypeBox Validation', () => {
       })
 
       assert.strictEqual(validResponse.statusCode, 200)
-      const validBody = validResponse.json() as JSONRPCResponse
+      const validBody = validResponse.json() as JSONRPCResultResponse
       assert.strictEqual(validBody.jsonrpc, JSONRPC_VERSION)
       assert.strictEqual(validBody.id, 1)
       const validResult = validBody.result as CallToolResult
@@ -105,7 +105,7 @@ describe('TypeBox Validation', () => {
       })
 
       assert.strictEqual(invalidResponse.statusCode, 200)
-      const invalidBody = invalidResponse.json() as JSONRPCResponse
+      const invalidBody = invalidResponse.json() as JSONRPCResultResponse
       assert.strictEqual(invalidBody.jsonrpc, JSONRPC_VERSION)
       assert.strictEqual(invalidBody.id, 1)
       const invalidResult = invalidBody.result as CallToolResult
@@ -154,7 +154,7 @@ describe('TypeBox Validation', () => {
       })
 
       assert.strictEqual(wrongTypeResponse.statusCode, 200)
-      const wrongTypeBody = wrongTypeResponse.json() as JSONRPCResponse
+      const wrongTypeBody = wrongTypeResponse.json() as JSONRPCResultResponse
       const wrongTypeResult = wrongTypeBody.result as CallToolResult
       assert.strictEqual(wrongTypeResult.isError, true)
       assert.ok((wrongTypeResult.content[0] as any).text.includes('Invalid tool arguments'))
@@ -211,7 +211,7 @@ describe('TypeBox Validation', () => {
       })
 
       assert.strictEqual(complexResponse.statusCode, 200)
-      const complexBody = complexResponse.json() as JSONRPCResponse
+      const complexBody = complexResponse.json() as JSONRPCResultResponse
       const complexResult = complexBody.result as CallToolResult
       assert.ok((complexResult.content[0] as any).text.includes('User: Alice, Age: 30'))
     })
@@ -250,7 +250,7 @@ describe('TypeBox Validation', () => {
       })
 
       assert.strictEqual(unsafeResponse.statusCode, 200)
-      const unsafeBody = unsafeResponse.json() as JSONRPCResponse
+      const unsafeBody = unsafeResponse.json() as JSONRPCResultResponse
       const unsafeResult = unsafeBody.result as CallToolResult
       assert.ok((unsafeResult.content[0] as any).text.includes('Unsafe tool called'))
     })
@@ -291,7 +291,7 @@ describe('TypeBox Validation', () => {
       })
 
       assert.strictEqual(listResponse.statusCode, 200)
-      const listBody = listResponse.json() as JSONRPCResponse
+      const listBody = listResponse.json() as JSONRPCResultResponse
       const listResult = listBody.result as any
       assert.ok(Array.isArray(listResult.tools))
 
@@ -346,7 +346,7 @@ describe('TypeBox Validation', () => {
       })
 
       assert.strictEqual(validResponse.statusCode, 200)
-      const validBody = validResponse.json() as JSONRPCResponse
+      const validBody = validResponse.json() as JSONRPCResultResponse
       const validResult = validBody.result as ReadResourceResult
       assert.ok((validResult.contents[0] as any).text.includes('File content'))
     })
@@ -419,7 +419,7 @@ describe('TypeBox Validation', () => {
 
       // Should work since file://test.txt matches the pattern
       assert.strictEqual(invalidResponse.statusCode, 200)
-      const invalidBody = invalidResponse.json() as JSONRPCResponse
+      const invalidBody = invalidResponse.json() as JSONRPCResultResponse
       const invalidResult = invalidBody.result as ReadResourceResult
       assert.ok((invalidResult.contents[0] as any).text.includes('File content'))
     })
@@ -481,7 +481,7 @@ describe('TypeBox Validation', () => {
       })
 
       assert.strictEqual(validResponse.statusCode, 200)
-      const validBody = validResponse.json() as JSONRPCResponse
+      const validBody = validResponse.json() as JSONRPCResultResponse
       const validResult = validBody.result as GetPromptResult
       assert.ok((validResult.messages[0].content as any).text.includes('Review typescript code'))
     })
@@ -541,7 +541,7 @@ describe('TypeBox Validation', () => {
       })
 
       assert.strictEqual(invalidResponse.statusCode, 200)
-      const invalidBody = invalidResponse.json() as JSONRPCResponse
+      const invalidBody = invalidResponse.json() as JSONRPCResultResponse
       const invalidResult = invalidBody.result as GetPromptResult
       assert.ok((invalidResult.messages[0].content as any).text.includes('Invalid prompt arguments'))
     })
@@ -622,7 +622,7 @@ describe('TypeBox Validation', () => {
       })
 
       assert.strictEqual(listResponse.statusCode, 200)
-      const listBody = listResponse.json() as JSONRPCResponse
+      const listBody = listResponse.json() as JSONRPCResultResponse
       const listResult = listBody.result as any
 
       const reviewPrompt = listResult.prompts.find((prompt: any) => prompt.name === 'code-review')
@@ -681,7 +681,7 @@ describe('TypeBox Validation', () => {
       })
 
       assert.strictEqual(unsafeResponse.statusCode, 200)
-      const unsafeBody = unsafeResponse.json() as JSONRPCResponse
+      const unsafeBody = unsafeResponse.json() as JSONRPCResultResponse
       const unsafeResult = unsafeBody.result as GetPromptResult
       assert.ok((unsafeResult.messages[0].content as any).text.includes('Unsafe prompt called'))
     })
@@ -760,7 +760,7 @@ describe('TypeBox Validation', () => {
       })
 
       assert.strictEqual(wrongResponse.statusCode, 200)
-      const wrongBody = wrongResponse.json() as JSONRPCResponse
+      const wrongBody = wrongResponse.json() as JSONRPCResultResponse
       const wrongResult = wrongBody.result as CallToolResult
       assert.strictEqual(wrongResult.isError, true)
       assert.ok((wrongResult.content[0] as any).text.includes('Invalid tool arguments'))

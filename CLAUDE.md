@@ -114,7 +114,7 @@ Uses a base TypeScript configuration (`tsconfig.base.json`) extended by the main
 ## Testing
 
 The project includes comprehensive test coverage:
-- **178 tests total** covering all functionality including OAuth 2.1 authorization
+- **369 tests total** covering all functionality including OAuth 2.1 authorization and tasks
 - **Memory backend tests**: Session management, message broadcasting, SSE handling
 - **Redis backend tests**: Session persistence, cross-instance messaging, failover
 - **Integration tests**: Full plugin lifecycle, multi-instance deployment

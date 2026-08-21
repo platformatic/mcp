@@ -216,14 +216,20 @@ export class TokenRefreshService {
    * This is separated from coordination logic for clarity
    */
   private async performTokenRefresh (): Promise<void> {
-    const sessions = await this.sessionStore.list()
-    const refreshableSessions = sessions.filter(session =>
-      session.authorization &&
-      session.tokenRefresh &&
-      shouldAttemptRefresh(session.authorization, session.tokenRefresh)
-    )
+    let checkedSessions = 0
+    let refreshedCandidates = 0
 
-    for (const session of refreshableSessions) {
+    for await (const session of this.sessionStore.iterate()) {
+      checkedSessions += 1
+      if (
+        !session.authorization ||
+        !session.tokenRefresh ||
+        !shouldAttemptRefresh(session.authorization, session.tokenRefresh)
+      ) {
+        continue
+      }
+
+      refreshedCandidates += 1
       try {
         await this.refreshSessionToken(session.id)
       } catch (error) {
@@ -240,8 +246,8 @@ export class TokenRefreshService {
     if (this.fastify) {
       this.fastify.log.debug({
         instanceId: this.instanceId,
-        checkedSessions: sessions.length,
-        refreshedCandidates: refreshableSessions.length
+        checkedSessions,
+        refreshedCandidates
       }, 'Token refresh service check completed')
     }
   }
