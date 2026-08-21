@@ -343,10 +343,36 @@ describe('OAuth Routes', () => {
     assert.strictEqual(body.authenticated, false)
   })
 
-  test('should handle dynamic client registration', async (t) => {
+  test('should return 501 when dcrHooks not configured', async (t) => {
+    const fastify = Fastify()
+    t.after(async () => {
+      await fastify.close()
+    })
+
+    const config = {
+      authorizationServer: 'https://auth.example.com',
+      dynamicRegistration: true
+    }
+
+    await fastify.register(oauthClientPlugin, config)
+    const sessionStore = new MemorySessionStore(100)
+    await fastify.register(authRoutesPlugin, { sessionStore })
+
+    const response = await fastify.inject({
+      method: 'POST',
+      url: '/oauth/register',
+      payload: { redirect_uris: ['http://localhost/callback'] }
+    })
+
+    assert.strictEqual(response.statusCode, 501)
+    const body = JSON.parse(response.body)
+    assert.strictEqual(body.error, 'not_implemented')
+  })
+
+  test('should handle dynamic client registration with dcrHooks', async (t) => {
     const mockPool = mockAgent.get('https://auth.example.com')
     mockPool.intercept({
-      path: '/oauth/register',
+      path: '/oauth2/register',
       method: 'POST'
     }).reply(200, {
       client_id: 'dynamic-client-id',
@@ -365,18 +391,89 @@ describe('OAuth Routes', () => {
 
     await fastify.register(oauthClientPlugin, config)
     const sessionStore = new MemorySessionStore(100)
-    await fastify.register(authRoutesPlugin, { sessionStore })
+    await fastify.register(authRoutesPlugin, {
+      sessionStore,
+      dcrHooks: {
+        upstreamEndpoint: 'https://auth.example.com/oauth2/register'
+      }
+    })
 
     const response = await fastify.inject({
       method: 'POST',
-      url: '/oauth/register'
+      url: '/oauth/register',
+      payload: {
+        client_name: 'Test Client',
+        redirect_uris: ['http://localhost/callback']
+      }
     })
 
     assert.strictEqual(response.statusCode, 200)
     const body = JSON.parse(response.body)
     assert.strictEqual(body.client_id, 'dynamic-client-id')
     assert.strictEqual(body.client_secret, 'dynamic-client-secret')
-    assert.strictEqual(body.registration_status, 'success')
+  })
+
+  test('should call dcrHooks onRequest and onResponse', async (t) => {
+    const mockPool = mockAgent.get('https://auth.example.com')
+    mockPool.intercept({
+      path: '/oauth2/register',
+      method: 'POST'
+    }).reply(200, {
+      client_id: 'dynamic-client-id',
+      client_secret: 'dynamic-client-secret',
+      client_uri: '' // Empty string that should be cleaned
+    })
+
+    const fastify = Fastify()
+    t.after(async () => {
+      await fastify.close()
+    })
+
+    const config = {
+      authorizationServer: 'https://auth.example.com',
+      dynamicRegistration: true
+    }
+
+    let onRequestCalled = false
+    let onResponseCalled = false
+
+    await fastify.register(oauthClientPlugin, config)
+    const sessionStore = new MemorySessionStore(100)
+    await fastify.register(authRoutesPlugin, {
+      sessionStore,
+      dcrHooks: {
+        upstreamEndpoint: 'https://auth.example.com/oauth2/register',
+        onRequest: async (request, _log) => {
+          onRequestCalled = true
+          // Add metadata
+          return { ...request, software_id: 'test-software' }
+        },
+        onResponse: async (response, _request, _log) => {
+          onResponseCalled = true
+          // Clean empty client_uri
+          const cleaned = { ...response }
+          if (cleaned.client_uri === '') {
+            delete cleaned.client_uri
+          }
+          return cleaned
+        }
+      }
+    })
+
+    const response = await fastify.inject({
+      method: 'POST',
+      url: '/oauth/register',
+      payload: {
+        client_name: 'Test Client',
+        redirect_uris: ['http://localhost/callback']
+      }
+    })
+
+    assert.strictEqual(response.statusCode, 200)
+    assert.strictEqual(onRequestCalled, true)
+    assert.strictEqual(onResponseCalled, true)
+    const body = JSON.parse(response.body)
+    assert.strictEqual(body.client_uri, undefined) // Should be cleaned
   })
 
   test('should handle logout request', async (t) => {

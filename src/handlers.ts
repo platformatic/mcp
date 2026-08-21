@@ -1,4 +1,6 @@
+import { randomUUID } from 'node:crypto'
 import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify'
+import createFastifyError from 'fastify-error'
 import type {
   JSONRPCMessage,
   JSONRPCRequest,
@@ -9,23 +11,39 @@ import type {
   EmptyResult,
   ListToolsResult,
   ListResourcesResult,
+  ListResourceTemplatesResult,
   ListPromptsResult,
   CallToolResult,
   ReadResourceResult,
-  GetPromptResult
+  GetPromptResult,
+  CreateTaskResult,
+  ListTasksResult
 } from './schema.ts'
 
 import {
   JSONRPC_VERSION,
   LATEST_PROTOCOL_VERSION,
+  SUPPORTED_PROTOCOL_VERSIONS,
   METHOD_NOT_FOUND,
   INTERNAL_ERROR,
-  INVALID_PARAMS
+  INVALID_PARAMS,
+  INVALID_REQUEST
 } from './schema.ts'
+import type { RequestId } from './schema.ts'
 
-import type { MCPTool, MCPResource, MCPPrompt, MCPPluginOptions, ResourceHandlers, TracerLike } from './types.ts'
+import type { MCPTool, MCPResource, MCPPrompt, MCPPluginOptions, ResourceHandlers, McpCallToolOutcome, TracerLike } from './types.ts'
+import type { SessionStore } from './stores/session-store.ts'
+import type { TaskStore, TaskRecord, TaskWaiters } from './stores/task-store.ts'
+import { isTerminal, toWireTask } from './stores/task-store.ts'
 import type { AuthorizationContext } from './types/auth-types.ts'
+import {
+  supportsTasks,
+  supportsSchemaDialect,
+  trimDefinitionToRevision,
+  capabilitiesForRevision
+} from './protocol-version.ts'
 import { validate, CallToolRequestSchema, ReadResourceRequestSchema, GetPromptRequestSchema, isTypeBoxSchema } from './validation/index.ts'
+import type { JsonSchemaValidator } from './validation/json-schema-validator.ts'
 import { sanitizeToolParams, assessToolSecurity, SECURITY_WARNINGS } from './security.ts'
 import { MCP_ATTR } from './telemetry-constants.ts'
 
@@ -49,7 +67,25 @@ export type HandlerDependencies = {
   reply: FastifyReply
   authContext?: AuthorizationContext
   tracer?: TracerLike
+  sessionStore?: SessionStore
+  taskStore?: TaskStore
+  taskWaiters?: TaskWaiters
+  jsonSchemaValidator?: JsonSchemaValidator
+  sessionId?: string
+  /** The revision this client negotiated; responses are shaped to match it */
+  protocolVersion?: string
 }
+
+type ToolCallDependencies = Pick<HandlerDependencies,
+  'app' |
+  'opts' |
+  'tools' |
+  'request' |
+  'reply' |
+  'authContext' |
+  'jsonSchemaValidator' |
+  'sessionId'
+>
 
 export function createResponse (id: string | number, result: any): JSONRPCResponse {
   return {
@@ -59,19 +95,62 @@ export function createResponse (id: string | number, result: any): JSONRPCRespon
   }
 }
 
-export function createError (id: string | number, code: number, message: string, data?: any): JSONRPCError {
+export function createError (id: string | number | null, code: number, message: string, data?: any): JSONRPCError {
   return {
     jsonrpc: JSONRPC_VERSION,
-    id,
+    // JSON-RPC requires an explicit null id when the request id is unknown
+    // (e.g. an unparseable batch); RequestId does not model null, so cast.
+    id: id as RequestId,
     error: { code, message, data }
   }
 }
 
-function handleInitialize (request: JSONRPCRequest, dependencies: HandlerDependencies): JSONRPCResponse {
-  const { opts, capabilities, serverInfo } = dependencies
+/**
+ * Pick the protocol revision to use for this session.
+ *
+ * The spec requires that we echo back the client's requested version when we
+ * support it, and otherwise respond with the newest version we do support so
+ * the client can decide whether to continue or disconnect.
+ */
+export function negotiateProtocolVersion (requested: unknown): string {
+  if (typeof requested === 'string' && (SUPPORTED_PROTOCOL_VERSIONS as readonly string[]).includes(requested)) {
+    return requested
+  }
+  return LATEST_PROTOCOL_VERSION
+}
+
+async function handleInitialize (
+  request: JSONRPCRequest,
+  sessionId: string | undefined,
+  dependencies: HandlerDependencies
+): Promise<JSONRPCResponse> {
+  const { app, opts, capabilities, serverInfo, sessionStore } = dependencies
+
+  const requested = (request.params as { protocolVersion?: unknown } | undefined)?.protocolVersion
+  const protocolVersion = negotiateProtocolVersion(requested)
+
+  if (requested !== undefined && requested !== protocolVersion) {
+    app.log.warn({
+      requested,
+      offered: protocolVersion,
+      sessionId
+    }, 'Unsupported protocol version requested, offering latest supported version')
+  }
+
+  // Remember what we agreed on so later requests can be checked against it
+  if (sessionId && sessionStore) {
+    const session = await sessionStore.get(sessionId)
+    if (session) {
+      session.protocolVersion = protocolVersion
+      session.lastActivity = new Date()
+      await sessionStore.update(session)
+    }
+  }
+
   const result: InitializeResult = {
-    protocolVersion: LATEST_PROTOCOL_VERSION,
-    capabilities,
+    protocolVersion,
+    // Never advertise a capability the agreed revision cannot express
+    capabilities: capabilitiesForRevision(capabilities, protocolVersion),
     serverInfo,
     instructions: opts.instructions
   }
@@ -83,38 +162,127 @@ function handlePing (request: JSONRPCRequest): JSONRPCResponse {
   return createResponse(request.id, result)
 }
 
-function handleToolsList (request: JSONRPCRequest, dependencies: HandlerDependencies): JSONRPCResponse {
-  const { tools } = dependencies
+/**
+ * SEP-1613 made JSON Schema 2020-12 the default dialect for MCP schemas.
+ * We declare it explicitly on the schemas we publish so clients never have to
+ * guess, while leaving an author-supplied `$schema` untouched.
+ */
+const JSON_SCHEMA_DIALECT = 'https://json-schema.org/draft/2020-12/schema'
+
+function withSchemaDialect<T> (schema: T, protocolVersion: string | undefined): T {
+  if (!supportsSchemaDialect(protocolVersion)) return schema
+  if (!schema || typeof schema !== 'object') return schema
+  if ('$schema' in (schema as Record<string, unknown>)) return schema
+  return { $schema: JSON_SCHEMA_DIALECT, ...(schema as Record<string, unknown>) } as T
+}
+
+/**
+ * Evaluate the `canAccessTool` hook for one tool. No hook means every tool is
+ * accessible. A hook that throws denies access (fail closed) rather than
+ * exposing a tool the deployment meant to gate; the error is logged so a
+ * misbehaving hook is visible to the operator.
+ */
+async function checkToolAccess (toolName: string, dependencies: ToolCallDependencies): Promise<boolean> {
+  const hook = dependencies.opts.canAccessTool
+  if (!hook) return true
+  try {
+    return await hook(toolName, {
+      authContext: dependencies.authContext,
+      request: dependencies.request,
+      sessionId: dependencies.sessionId
+    }) === true
+  } catch (error) {
+    dependencies.request.log.warn({
+      err: error,
+      tool: toolName
+    }, 'canAccessTool hook threw; denying access')
+    return false
+  }
+}
+
+const TOOL_ACCESS_CONCURRENCY = 8
+
+const UnhandledToolCallOutcomeError = createFastifyError(
+  'MCP_ERR_UNHANDLED_TOOL_CALL_OUTCOME',
+  'Unhandled tool call outcome: %s'
+)
+
+async function mapWithConcurrency<T, R> (items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length)
+  let next = 0
+  async function worker (): Promise<void> {
+    while (next < items.length) {
+      const index = next++
+      results[index] = await fn(items[index])
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker))
+  return results
+}
+
+async function handleToolsList (request: JSONRPCRequest, dependencies: HandlerDependencies): Promise<JSONRPCResponse> {
+  const { tools, protocolVersion } = dependencies
+  // Per-tool checks run concurrently (bounded); order stays registration order
+  const registeredTools = Array.from(tools.values())
+  const accessResults = await mapWithConcurrency(
+    registeredTools,
+    TOOL_ACCESS_CONCURRENCY,
+    tool => checkToolAccess(tool.definition.name, dependencies)
+  )
+  const accessibleTools = registeredTools.filter((_tool, index) => accessResults[index])
   const result: ListToolsResult = {
-    tools: Array.from(tools.values()).map(t => {
-      const tool = t.definition
+    tools: accessibleTools.map(t => {
+      const tool = trimDefinitionToRevision(t.definition, protocolVersion)
       // TypeBox schemas are already JSON Schema compatible
-      if (isTypeBoxSchema(tool.inputSchema)) {
-        return {
-          ...tool,
-          inputSchema: tool.inputSchema
-        }
+      const serialized: typeof tool = {
+        ...tool,
+        inputSchema: withSchemaDialect(tool.inputSchema, protocolVersion)
       }
-      return tool
+      if (serialized.outputSchema) {
+        serialized.outputSchema = withSchemaDialect(serialized.outputSchema, protocolVersion)
+      }
+      return serialized
     }),
     nextCursor: undefined
   }
   return createResponse(request.id, result)
 }
 
+const URI_TEMPLATE_REGEX = /\{[^}]+\}/
+
+function isTemplateUri (uri: string): boolean {
+  return URI_TEMPLATE_REGEX.test(uri)
+}
+
 function handleResourcesList (request: JSONRPCRequest, dependencies: HandlerDependencies): JSONRPCResponse {
-  const { resources } = dependencies
+  const { resources, protocolVersion } = dependencies
   const result: ListResourcesResult = {
-    resources: Array.from(resources.values()).map(r => r.definition),
+    resources: Array.from(resources.values())
+      .filter(r => !isTemplateUri(r.definition.uri))
+      .map(r => trimDefinitionToRevision(r.definition, protocolVersion)),
+    nextCursor: undefined
+  }
+  return createResponse(request.id, result)
+}
+
+function handleResourceTemplatesList (request: JSONRPCRequest, dependencies: HandlerDependencies): JSONRPCResponse {
+  const { resources, protocolVersion } = dependencies
+  const result: ListResourceTemplatesResult = {
+    resourceTemplates: Array.from(resources.values())
+      .filter(r => isTemplateUri(r.definition.uri))
+      .map(r => {
+        const { uri, ...rest } = trimDefinitionToRevision(r.definition, protocolVersion)
+        return { ...rest, uriTemplate: uri }
+      }),
     nextCursor: undefined
   }
   return createResponse(request.id, result)
 }
 
 function handlePromptsList (request: JSONRPCRequest, dependencies: HandlerDependencies): JSONRPCResponse {
-  const { prompts } = dependencies
+  const { prompts, protocolVersion } = dependencies
   const result: ListPromptsResult = {
-    prompts: Array.from(prompts.values()).map(p => p.definition),
+    prompts: Array.from(prompts.values()).map(p => trimDefinitionToRevision(p.definition, protocolVersion)),
     nextCursor: undefined
   }
   return createResponse(request.id, result)
@@ -125,8 +293,6 @@ async function handleToolsCall (
   sessionId: string | undefined,
   dependencies: HandlerDependencies
 ): Promise<JSONRPCResponse | JSONRPCError> {
-  const { tools } = dependencies
-
   // Validate the request parameters structure
   const paramsValidation = validate(CallToolRequestSchema, request.params)
   if (!paramsValidation.success) {
@@ -138,10 +304,130 @@ async function handleToolsCall (
   const params = paramsValidation.data
   const toolName = params.name
 
-  const tool = tools.get(toolName)
-  if (!tool) {
-    return createError(request.id, METHOD_NOT_FOUND, `Tool '${toolName}' not found`)
+  // A denied tool answers exactly like an unknown one, so a caller cannot
+  // distinguish "does not exist" from "exists but not for you" by the protocol
+  // response (mirrors the tools/list filtering). The hook runs even for
+  // unknown names. No timing guarantee: latency depends on what the hook
+  // itself does per name.
+  // Authorization is a protocol-level rejection, not a SEP-1303 tool error:
+  // the model cannot correct itself out of missing access.
+  const resolved = await resolveRegisteredTool(toolName, dependencies)
+  if (!resolved.ok) {
+    return toolCallOutcomeToJsonRpc(request.id, toolName, resolved)
   }
+
+  // Decide up front whether this call runs as a task, so the rest of the
+  // handler can stay unaware of it.
+  // A client on an older revision cannot have meant `task`, because we never
+  // declared the capability to it. The spec says to ignore it in that case.
+  const taskParams = supportsTasks(dependencies.protocolVersion)
+    ? (request.params as { task?: { ttl?: number } } | undefined)?.task
+    : undefined
+  const augmentation = resolveTaskAugmentation(resolved.tool, taskParams !== undefined)
+  if ('error' in augmentation) {
+    return createError(request.id, METHOD_NOT_FOUND, augmentation.error)
+  }
+  if (augmentation.mode === 'task') {
+    return await runToolCallAsTask(
+      request,
+      taskParams?.ttl,
+      () => executeToolCall(request, resolved.tool, params, sessionId, dependencies),
+      dependencies
+    )
+  }
+
+  return await executeToolCall(request, resolved.tool, params, sessionId, dependencies)
+}
+
+async function resolveRegisteredTool (
+  toolName: string,
+  dependencies: ToolCallDependencies
+): Promise<{ ok: true, tool: MCPTool } | { ok: false, reason: 'not-found' }> {
+  const isAllowed = await checkToolAccess(toolName, dependencies)
+  if (!isAllowed) {
+    return { ok: false, reason: 'not-found' }
+  }
+
+  const tool = dependencies.tools.get(toolName)
+  if (!tool) {
+    return { ok: false, reason: 'not-found' }
+  }
+
+  return { ok: true, tool }
+}
+
+function toolCallOutcomeToJsonRpc (
+  id: RequestId,
+  toolName: string,
+  outcome: McpCallToolOutcome
+): JSONRPCResponse | JSONRPCError {
+  if (outcome.ok) {
+    return createResponse(id, outcome.result)
+  }
+
+  switch (outcome.reason) {
+    case 'invalid-arguments': {
+      const result: CallToolResult = {
+        content: [{
+          type: 'text',
+          text: `Invalid tool arguments: ${outcome.detail}`
+        }],
+        isError: true
+      }
+      return createResponse(id, result)
+    }
+    case 'not-found':
+      return createError(id, METHOD_NOT_FOUND, `Tool '${toolName}' not found`)
+    // Unreachable from the JSON-RPC path today (handleToolsCall resolves task
+    // augmentation itself), but kept in the mapping so the two paths stay
+    // consistent if they ever converge. Mirrors resolveTaskAugmentation's error.
+    case 'task-required':
+      return createError(id, METHOD_NOT_FOUND, `Tool '${toolName}' requires task-augmented execution`)
+    default: {
+      const unhandled: never = outcome
+      throw new UnhandledToolCallOutcomeError(JSON.stringify(unhandled))
+    }
+  }
+}
+
+export async function callRegisteredTool (
+  name: string,
+  args: Record<string, unknown>,
+  dependencies: ToolCallDependencies
+): Promise<McpCallToolOutcome> {
+  const resolved = await resolveRegisteredTool(name, dependencies)
+  if (!resolved.ok) {
+    return resolved
+  }
+
+  const augmentation = resolveTaskAugmentation(resolved.tool, false)
+  if ('error' in augmentation) {
+    return { ok: false, reason: 'task-required' }
+  }
+
+  return await executeRegisteredTool(resolved.tool, name, args, dependencies)
+}
+
+async function executeToolCall (
+  request: JSONRPCRequest,
+  tool: MCPTool,
+  params: { name: string, arguments?: Record<string, unknown> },
+  sessionId: string | undefined,
+  dependencies: HandlerDependencies
+): Promise<JSONRPCResponse | JSONRPCError> {
+  const toolName = params.name
+
+  const outcome = await executeRegisteredTool(tool, toolName, params.arguments || {}, { ...dependencies, sessionId })
+  return toolCallOutcomeToJsonRpc(request.id, toolName, outcome)
+}
+
+async function executeRegisteredTool (
+  tool: MCPTool,
+  toolName: string,
+  args: Record<string, unknown>,
+  dependencies: ToolCallDependencies
+): Promise<McpCallToolOutcome> {
+  const sessionId = dependencies.sessionId
 
   if (!tool.handler) {
     const result: CallToolResult = {
@@ -151,7 +437,7 @@ async function handleToolsCall (
       }],
       isError: true
     }
-    return createResponse(request.id, result)
+    return { ok: true, result }
   }
 
   // Assess security risks from tool annotations
@@ -167,7 +453,7 @@ async function handleToolsCall (
   }
 
   // Validate and sanitize tool arguments against the tool's input schema
-  let toolArguments = params.arguments || {}
+  let toolArguments = args
 
   try {
     // Sanitize arguments to prevent injection attacks
@@ -179,7 +465,16 @@ async function handleToolsCall (
       error: sanitizeError instanceof Error ? sanitizeError.message : 'Unknown sanitization error'
     }, 'Tool arguments sanitization failed')
 
-    return createError(request.id, INVALID_PARAMS, `${SECURITY_WARNINGS.UNVALIDATED_INPUT}: ${sanitizeError instanceof Error ? sanitizeError.message : 'Sanitization failed'}`)
+    // SEP-1303: input validation failures are tool execution errors, not protocol
+    // errors, so the model gets a chance to correct itself.
+    const result: CallToolResult = {
+      content: [{
+        type: 'text',
+        text: `${SECURITY_WARNINGS.UNVALIDATED_INPUT}: ${sanitizeError instanceof Error ? sanitizeError.message : 'Sanitization failed'}`
+      }],
+      isError: true
+    }
+    return { ok: true, result }
   }
   if ('inputSchema' in tool.definition) {
     // Check if it's a TypeBox schema
@@ -188,20 +483,13 @@ async function handleToolsCall (
       // TypeBox schema - use our validation
       const argumentsValidation = validate(schema, toolArguments)
       if (!argumentsValidation.success) {
-        const result: CallToolResult = {
-          content: [{
-            type: 'text',
-            text: `Invalid tool arguments: ${argumentsValidation.error.message}`
-          }],
-          isError: true
-        }
-        return createResponse(request.id, result)
+        return { ok: false, reason: 'invalid-arguments', detail: argumentsValidation.error.message }
       }
 
       // Use validated arguments
       try {
         const result = await tool.handler(argumentsValidation.data, { sessionId, request: dependencies.request, reply: dependencies.reply, authContext: dependencies.authContext })
-        return createResponse(request.id, result)
+        return { ok: true, result }
       } catch (error: any) {
         const result: CallToolResult = {
           content: [{
@@ -210,13 +498,21 @@ async function handleToolsCall (
           }],
           isError: true
         }
-        return createResponse(request.id, result)
+        return { ok: true, result }
       }
     } else {
-      // Regular JSON Schema - basic validation or pass through
+      // Regular JSON Schema - validated with AJV when opted in, pass through otherwise
+      if (dependencies.jsonSchemaValidator) {
+        const validationError = dependencies.jsonSchemaValidator.validate(schema, toolArguments)
+        if (validationError !== null) {
+          // SEP-1303: a tool execution error, not a protocol error (same as the
+          // TypeBox branch above)
+          return { ok: false, reason: 'invalid-arguments', detail: validationError }
+        }
+      }
       try {
         const result = await tool.handler(toolArguments, { sessionId, request: dependencies.request, reply: dependencies.reply, authContext: dependencies.authContext })
-        return createResponse(request.id, result)
+        return { ok: true, result }
       } catch (error: any) {
         const result: CallToolResult = {
           content: [{
@@ -225,7 +521,7 @@ async function handleToolsCall (
           }],
           isError: true
         }
-        return createResponse(request.id, result)
+        return { ok: true, result }
       }
     }
   } else {
@@ -237,7 +533,7 @@ async function handleToolsCall (
         reply: dependencies.reply,
         authContext: dependencies.authContext
       })
-      return createResponse(request.id, result)
+      return { ok: true, result }
     } catch (error: any) {
       const result: CallToolResult = {
         content: [{
@@ -246,7 +542,7 @@ async function handleToolsCall (
         }],
         isError: true
       }
-      return createResponse(request.id, result)
+      return { ok: true, result }
     }
   }
 }
@@ -462,6 +758,440 @@ async function handlePromptsGet (
   }
 }
 
+/* ---------------------------------------------------------------- tasks --- */
+
+/** `_meta` key that ties every task-related message back to its task */
+export const RELATED_TASK_META_KEY = 'io.modelcontextprotocol/related-task'
+
+/** Suggested client polling interval, in milliseconds */
+const DEFAULT_POLL_INTERVAL = 1000
+
+/** Retention applied when the requestor does not ask for a specific ttl */
+const DEFAULT_TASK_TTL = 60_000
+
+/** Ceiling on retention, so a client cannot pin resources indefinitely */
+const MAX_TASK_TTL = 3600_000
+
+/**
+ * Resolve the effective task ttl bounds from plugin options. Tasks are meant for
+ * long-running work, so a deployment whose tools outlive the 60s default can
+ * raise `taskDefaultTtlMs` / `taskMaxTtlMs` rather than have tasks expire before
+ * they finish (an expired task's `tasks/result` returns "not found").
+ */
+function taskTtlBounds (dependencies: HandlerDependencies): { defaultTtl: number, maxTtl: number } {
+  return {
+    defaultTtl: dependencies.opts.taskDefaultTtlMs ?? DEFAULT_TASK_TTL,
+    maxTtl: dependencies.opts.taskMaxTtlMs ?? MAX_TASK_TTL
+  }
+}
+
+/**
+ * The authorization subject a task belongs to.
+ *
+ * When the deployment cannot identify requestors this is undefined, and tasks
+ * are reachable by anyone holding the (cryptographically random) task id. That
+ * limitation is why `tasks/list` is only advertised when auth is in play.
+ */
+function taskSubject (dependencies: HandlerDependencies): string | undefined {
+  return dependencies.authContext?.userId
+}
+
+/**
+ * Whether this deployment can tie a task to a requestor.
+ *
+ * Mirrors the gate in `index.ts` that decides whether to advertise
+ * `tasks.list`. Without authorization every task shares the undefined subject,
+ * so listing would hand every task's id to any caller — defeating the "random
+ * task id is the capability" model that protects `tasks/get|result|cancel`.
+ */
+function canIdentifyRequestors (dependencies: HandlerDependencies): boolean {
+  return dependencies.opts.authorization?.enabled === true
+}
+
+/**
+ * Enforce task isolation: a requestor may only touch its own tasks.
+ * Returns null (surfaced as "invalid params") rather than a distinct "forbidden"
+ * code so that probing for task ids cannot distinguish existence from ownership.
+ */
+function assertTaskAccess (task: TaskRecord | null, dependencies: HandlerDependencies): TaskRecord | null {
+  if (!task) return null
+
+  const subject = taskSubject(dependencies)
+
+  if (canIdentifyRequestors(dependencies)) {
+    // Auth on: a task is reachable only by the exact subject that owns it. A
+    // token without a `sub` claim identifies no one, so an undefined subject
+    // must never match another subject-less task via `undefined === undefined`.
+    if (subject === undefined || task.authSubject !== subject) return null
+    return task
+  }
+
+  // Auth off: no requestor can be identified, so the random task id is the
+  // capability and every (subject-less) task is reachable by whoever holds it.
+  return task
+}
+
+function relatedTaskMeta (taskId: string): Record<string, unknown> {
+  return { [RELATED_TASK_META_KEY]: { taskId } }
+}
+
+/**
+ * Should this `tools/call` run as a task?
+ *
+ * Combines the `task` request field with the tool's own `execution.taskSupport`
+ * declaration, which the spec layers on top of the server capability.
+ */
+export function resolveTaskAugmentation (
+  tool: MCPTool,
+  requested: boolean
+): { mode: 'task' | 'direct' } | { error: string } {
+  const support = (tool.definition as any).execution?.taskSupport ?? 'forbidden'
+
+  if (requested && support === 'forbidden') {
+    return { error: `Tool '${tool.definition.name}' does not support task-augmented execution` }
+  }
+  if (!requested && support === 'required') {
+    return { error: `Tool '${tool.definition.name}' requires task-augmented execution` }
+  }
+  return { mode: requested ? 'task' : 'direct' }
+}
+
+function newTaskRecord (
+  method: string,
+  ttl: number | undefined,
+  subject: string | undefined,
+  bounds: { defaultTtl: number, maxTtl: number }
+): TaskRecord {
+  const now = new Date().toISOString()
+  const requested = ttl ?? bounds.defaultTtl
+  return {
+    taskId: randomUUID(),
+    status: 'working',
+    createdAt: now,
+    lastUpdatedAt: now,
+    // Receivers may override the requested ttl; we cap it
+    ttl: Math.min(requested, bounds.maxTtl),
+    pollInterval: DEFAULT_POLL_INTERVAL,
+    method,
+    authSubject: subject
+  }
+}
+
+async function handleTasksGet (
+  request: JSONRPCRequest,
+  dependencies: HandlerDependencies
+): Promise<JSONRPCResponse | JSONRPCError> {
+  const { taskStore } = dependencies
+  if (!taskStore) {
+    return createError(request.id, METHOD_NOT_FOUND, 'Tasks are not enabled on this server')
+  }
+
+  const taskId = (request.params as { taskId?: string } | undefined)?.taskId
+  if (!taskId) {
+    return createError(request.id, INVALID_PARAMS, 'Missing required parameter: taskId')
+  }
+
+  const task = assertTaskAccess(await taskStore.get(taskId), dependencies)
+  if (!task) {
+    return createError(request.id, INVALID_PARAMS, 'Failed to retrieve task: Task not found')
+  }
+
+  return createResponse(request.id, toWireTask(task))
+}
+
+/**
+ * Suspend for `ms`, or reject as soon as `signal` aborts.
+ */
+function delay (ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new Error('aborted'))
+      return
+    }
+    const onAbort = () => {
+      clearTimeout(timer)
+      reject(new Error('aborted'))
+    }
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    if (typeof timer.unref === 'function') timer.unref()
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+/**
+ * Block until the task reaches a terminal status, or throw when `signal` aborts.
+ *
+ * Two mechanisms run together:
+ *  - an in-process waiter that fires the instant *this* instance completes the
+ *    task, giving zero-latency wake-ups for single-instance and same-instance
+ *    cases; and
+ *  - bounded polling of the shared task store, which is what makes this correct
+ *    across instances: with a Redis-backed store the task may complete on a
+ *    different instance, whose `notify()` this process never sees, so polling is
+ *    the only mechanism guaranteed to observe the terminal state.
+ *
+ * Returns null if the task disappears (expires or is deleted) while waiting.
+ */
+async function awaitTaskTerminal (
+  taskId: string,
+  initial: TaskRecord,
+  dependencies: HandlerDependencies,
+  signal: AbortSignal
+): Promise<TaskRecord | null> {
+  const { taskStore, taskWaiters } = dependencies
+  if (!taskStore) return initial
+
+  // A single waiter for the whole call. Resolves to a terminal task when this
+  // instance completes it, or to null when aborted — caught here so that losing
+  // the race below can never surface as an unhandled rejection.
+  const accelerator: Promise<TaskRecord | null> = taskWaiters
+    ? taskWaiters.wait(taskId, signal).then(task => task).catch(() => null)
+    : new Promise<TaskRecord | null>(() => {})
+
+  let task: TaskRecord | null = initial
+  while (task && !isTerminal(task.status)) {
+    const pollDelay = task.pollInterval ?? DEFAULT_POLL_INTERVAL
+    const winner = await Promise.race([
+      accelerator,
+      delay(pollDelay, signal).then(() => null)
+    ])
+
+    if (winner && isTerminal(winner.status)) {
+      return winner
+    }
+    // The poll timer elapsed (or the accelerator aborted); the shared store is
+    // the source of truth, so re-read it before deciding whether to loop again.
+    task = await taskStore.get(taskId)
+  }
+
+  return task
+}
+
+async function handleTasksResult (
+  request: JSONRPCRequest,
+  dependencies: HandlerDependencies
+): Promise<JSONRPCResponse | JSONRPCError> {
+  const { taskStore } = dependencies
+  if (!taskStore) {
+    return createError(request.id, METHOD_NOT_FOUND, 'Tasks are not enabled on this server')
+  }
+
+  const taskId = (request.params as { taskId?: string } | undefined)?.taskId
+  if (!taskId) {
+    return createError(request.id, INVALID_PARAMS, 'Missing required parameter: taskId')
+  }
+
+  let task = assertTaskAccess(await taskStore.get(taskId), dependencies)
+  if (!task) {
+    return createError(request.id, INVALID_PARAMS, 'Failed to retrieve task: Task not found')
+  }
+
+  // `tasks/result` blocks until the task is terminal. Works across instances:
+  // see awaitTaskTerminal.
+  if (!isTerminal(task.status)) {
+    const controller = new AbortController()
+    dependencies.request.raw.on('close', () => controller.abort())
+    try {
+      const settled = await awaitTaskTerminal(taskId, task, dependencies, controller.signal)
+      if (!settled) {
+        return createError(request.id, INVALID_PARAMS, 'Failed to retrieve task: Task not found')
+      }
+      task = settled
+    } catch {
+      return createError(request.id, INTERNAL_ERROR, 'Client disconnected while awaiting task result')
+    }
+  }
+
+  if (!isTerminal(task.status)) {
+    return createError(request.id, INTERNAL_ERROR, 'Task did not reach a terminal status')
+  }
+
+  if (!task.outcome) {
+    return createError(request.id, INTERNAL_ERROR, 'Task completed without recording a result')
+  }
+
+  // Return exactly what the underlying request would have returned, re-tagged
+  // with this request's id and the related-task metadata the spec requires.
+  if ('error' in task.outcome) {
+    return {
+      jsonrpc: JSONRPC_VERSION,
+      id: request.id,
+      error: task.outcome.error
+    }
+  }
+
+  return createResponse(request.id, {
+    ...task.outcome.result,
+    _meta: {
+      ...(task.outcome.result as any)._meta,
+      ...relatedTaskMeta(taskId)
+    }
+  })
+}
+
+async function handleTasksList (
+  request: JSONRPCRequest,
+  dependencies: HandlerDependencies
+): Promise<JSONRPCResponse | JSONRPCError> {
+  const { taskStore } = dependencies
+  if (!taskStore) {
+    return createError(request.id, METHOD_NOT_FOUND, 'Tasks are not enabled on this server')
+  }
+
+  // Never advertised without auth (see index.ts), so treat it as nonexistent
+  // rather than leaking every anonymous task's id to the caller.
+  if (!canIdentifyRequestors(dependencies)) {
+    return createError(request.id, METHOD_NOT_FOUND, 'Method tasks/list not found')
+  }
+
+  const subject = taskSubject(dependencies)
+  if (subject === undefined) {
+    // Auth is on but this token carries no `sub`, so it owns nothing we can
+    // identify. Listing the undefined-subject tasks would expose every other
+    // subject-less caller's tasks, so return an empty set instead.
+    return createResponse(request.id, { tasks: [], nextCursor: undefined } as ListTasksResult)
+  }
+
+  const tasks = await taskStore.list(subject)
+  const result: ListTasksResult = {
+    tasks: tasks.map(toWireTask),
+    nextCursor: undefined
+  }
+  return createResponse(request.id, result)
+}
+
+async function handleTasksCancel (
+  request: JSONRPCRequest,
+  dependencies: HandlerDependencies
+): Promise<JSONRPCResponse | JSONRPCError> {
+  const { taskStore } = dependencies
+  if (!taskStore) {
+    return createError(request.id, METHOD_NOT_FOUND, 'Tasks are not enabled on this server')
+  }
+
+  const taskId = (request.params as { taskId?: string } | undefined)?.taskId
+  if (!taskId) {
+    return createError(request.id, INVALID_PARAMS, 'Missing required parameter: taskId')
+  }
+
+  const task = assertTaskAccess(await taskStore.get(taskId), dependencies)
+  if (!task) {
+    return createError(request.id, INVALID_PARAMS, 'Failed to retrieve task: Task not found')
+  }
+
+  if (isTerminal(task.status)) {
+    return createError(request.id, INVALID_PARAMS, `Cannot cancel task: already in terminal status '${task.status}'`)
+  }
+
+  let cancelled: TaskRecord | null
+  try {
+    cancelled = await taskStore.updateStatus(taskId, 'cancelled', {
+      statusMessage: 'The task was cancelled by request.',
+      outcome: createError(request.id, INTERNAL_ERROR, 'Task was cancelled')
+    })
+  } catch {
+    // The task reached a terminal status between our check above and the write
+    // (it completed or was cancelled concurrently). The spec maps this to
+    // invalid params, not an internal error.
+    return createError(request.id, INVALID_PARAMS, 'Cannot cancel task: the task reached a terminal status before it could be cancelled')
+  }
+
+  if (!cancelled) {
+    return createError(request.id, INVALID_PARAMS, 'Failed to retrieve task: Task not found')
+  }
+
+  dependencies.taskWaiters?.notify(cancelled)
+  await notifyTaskStatus(cancelled, dependencies)
+
+  return createResponse(request.id, toWireTask(cancelled))
+}
+
+/**
+ * Push a `notifications/tasks/status` to the session that owns the task.
+ * Optional per the spec — requestors must keep polling regardless — so a failure
+ * to deliver is logged and swallowed.
+ */
+async function notifyTaskStatus (task: TaskRecord, dependencies: HandlerDependencies): Promise<void> {
+  const { app, sessionId } = dependencies
+  if (!sessionId || typeof (app as any).mcpSendToSession !== 'function') return
+
+  try {
+    await (app as any).mcpSendToSession(sessionId, {
+      jsonrpc: JSONRPC_VERSION,
+      method: 'notifications/tasks/status',
+      params: toWireTask(task)
+    })
+  } catch (error) {
+    app.log.debug({ err: error, taskId: task.taskId }, 'Failed to deliver task status notification')
+  }
+}
+
+/**
+ * Run a tool call as a task: record it, answer immediately with a
+ * `CreateTaskResult`, and let execution finish in the background.
+ */
+async function runToolCallAsTask (
+  request: JSONRPCRequest,
+  ttl: number | undefined,
+  execute: () => Promise<JSONRPCResponse | JSONRPCError>,
+  dependencies: HandlerDependencies
+): Promise<JSONRPCResponse | JSONRPCError> {
+  const { taskStore, taskWaiters, app } = dependencies
+  if (!taskStore) {
+    return createError(request.id, METHOD_NOT_FOUND, 'Tasks are not enabled on this server')
+  }
+
+  const task = newTaskRecord('tools/call', ttl, taskSubject(dependencies), taskTtlBounds(dependencies))
+  await taskStore.create(task)
+
+  // Deliberately not awaited: the point of a task is to return control now.
+  const execution = (async () => {
+    let outcome: TaskRecord['outcome']
+    let status: 'completed' | 'failed' = 'completed'
+    let statusMessage: string | undefined
+
+    try {
+      const result = await execute()
+      outcome = result
+      // A tool result carrying isError counts as a failed task
+      if ('result' in result && (result.result as CallToolResult)?.isError === true) {
+        status = 'failed'
+        statusMessage = 'Tool execution reported an error'
+      } else if ('error' in result) {
+        status = 'failed'
+        statusMessage = result.error.message
+      }
+    } catch (error: any) {
+      status = 'failed'
+      statusMessage = `Tool execution failed: ${error?.message || error}`
+      outcome = createError(request.id, INTERNAL_ERROR, statusMessage)
+    }
+
+    try {
+      const updated = await taskStore.updateStatus(task.taskId, status, { statusMessage, outcome })
+      if (updated) {
+        taskWaiters?.notify(updated)
+        await notifyTaskStatus(updated, dependencies)
+      }
+    } catch (error) {
+      // The task was cancelled or expired while the tool was still running
+      app.log.debug({ err: error, taskId: task.taskId }, 'Could not record task outcome')
+    }
+  })()
+
+  // Nothing awaits `execution`; keep an explicit rejection guard so an
+  // unexpected throw can never become an unhandled rejection.
+  execution.catch((error) => {
+    app.log.error({ err: error, taskId: task.taskId }, 'Task execution failed unexpectedly')
+  })
+
+  const result: CreateTaskResult = { task: toWireTask(task) }
+  return createResponse(request.id, result)
+}
+
 async function handleResourcesSubscribe (
   request: JSONRPCRequest,
   sessionId: string | undefined,
@@ -552,13 +1282,15 @@ export async function handleRequest (
 
     switch (request.method) {
       case 'initialize':
-        return wrap(async () => handleInitialize(request, dependencies))
+        return wrap(() => handleInitialize(request, sessionId, dependencies))
       case 'ping':
         return wrap(async () => handlePing(request))
       case 'tools/list':
         return wrap(async () => handleToolsList(request, dependencies))
       case 'resources/list':
         return wrap(async () => handleResourcesList(request, dependencies))
+      case 'resources/templates/list':
+        return wrap(async () => handleResourceTemplatesList(request, dependencies))
       case 'prompts/list':
         return wrap(async () => handlePromptsList(request, dependencies))
       case 'tools/call':
@@ -571,6 +1303,19 @@ export async function handleRequest (
         return wrap(() => handleResourcesUnsubscribe(request, sessionId, dependencies))
       case 'prompts/get':
         return wrap(() => handlePromptsGet(request, sessionId, dependencies))
+      case 'tasks/get':
+      case 'tasks/result':
+      case 'tasks/list':
+      case 'tasks/cancel':
+        // Tasks arrived in 2025-11-25; to an older client these methods simply
+        // do not exist, and we never advertised them.
+        if (!supportsTasks(dependencies.protocolVersion)) {
+          return createError(request.id, METHOD_NOT_FOUND, `Method ${request.method} not found`)
+        }
+        if (request.method === 'tasks/get') return wrap(() => handleTasksGet(request, dependencies))
+        if (request.method === 'tasks/result') return wrap(() => handleTasksResult(request, dependencies))
+        if (request.method === 'tasks/list') return wrap(() => handleTasksList(request, dependencies))
+        return wrap(() => handleTasksCancel(request, dependencies))
       default:
         return createError(request.id, METHOD_NOT_FOUND, `Method ${request.method} not found`)
     }
@@ -597,6 +1342,12 @@ export async function processMessage (
   sessionId: string | undefined,
   dependencies: HandlerDependencies
 ): Promise<JSONRPCResponse | JSONRPCError | null> {
+  if (Array.isArray(message)) {
+    // JSON-RPC batching was removed in the 2025-06-18 revision. Refuse it with a
+    // proper protocol error rather than throwing, which the transport would
+    // otherwise surface as an opaque HTTP 500.
+    return createError(null, INVALID_REQUEST, 'Batch requests are not supported')
+  }
   if ('id' in message && 'method' in message) {
     return await handleRequest(message as JSONRPCRequest, sessionId, dependencies)
   } else if ('method' in message) {

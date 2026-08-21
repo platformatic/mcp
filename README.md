@@ -18,8 +18,10 @@ npm install @sinclair/typebox
 
 ## Features
 
-- **Complete MCP 2025-06-18 Support**: Implements the full Model Context Protocol specification with elicitation
-- **Elicitation Support**: Server-to-client information requests with schema validation
+- **Complete MCP 2025-11-25 Support**: Implements the current Model Context Protocol revision, negotiating down to `2025-06-18`, `2025-03-26` and `2024-11-05` for older clients
+- **Tasks (experimental)**: Task-augmented tool calls with polling, deferred result retrieval and cancellation
+- **Elicitation Support**: Server-to-client information requests in both form and URL mode, with schema validation
+- **Icons**: Optional icon metadata on tools, resources, resource templates and prompts
 - **TypeBox Validation**: Type-safe schema validation with automatic TypeScript inference
 - **Security Enhancements**: Input sanitization, rate limiting, and security assessment
 - **Multiple Transport Support**: HTTP/SSE and stdio transports for flexible communication
@@ -122,9 +124,206 @@ app.mcpAddPrompt({
 await app.listen({ port: 3000 })
 ```
 
-## Elicitation Support (MCP 2025-06-18)
+## In-process MCP Client
+
+The plugin decorates the Fastify instance with `mcpClient()`, a client that talks to the
+server through `app.inject()` — no port binding, so it's equally useful for tests or for
+driving the server from other in-process code:
+
+```typescript
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import Fastify from 'fastify'
+import type { FastifyInstance } from 'fastify'
+import mcpPlugin from '@platformatic/mcp'
+
+test('calls an MCP tool', async (t) => {
+  const app: FastifyInstance = Fastify()
+  t.after(() => app.close())
+
+  await app.register(mcpPlugin, { enableSSE: true })
+
+  app.mcpAddTool({
+    name: 'echo',
+    description: 'Echo a message',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        message: { type: 'string' }
+      },
+      required: ['message'],
+      additionalProperties: false
+    }
+  }, async ({ message }) => {
+    return {
+      content: [{ type: 'text', text: message }]
+    }
+  })
+
+  await app.ready()
+
+  const client = app.mcpClient()
+
+  await client.initialize()
+
+  const response = await client.callTool('echo', {
+    message: 'hello'
+  })
+
+  assert.equal(response.statusCode, 200)
+  assert.ok('result' in response.body)
+  assert.deepEqual(response.body.result, {
+    content: [{ type: 'text', text: 'hello' }]
+  })
+})
+```
+
+The client:
+
+- Uses `app.inject()` only (no port binding).
+- Manages sequential JSON-RPC request IDs per client instance.
+- `initialize()` performs the complete MCP lifecycle handshake (`initialize` plus `notifications/initialized`).
+- `initialize()` rejects when `notifications/initialized` is not accepted with an empty `202` or `204` response.
+- Commits `mcp-session-id` and negotiated protocol version only after the full initialization handshake succeeds.
+- Forwards headers passed to `initialize()` to both lifecycle requests, except MCP-managed `mcp-session-id` and `mcp-protocol-version` on `notifications/initialized`.
+- Captures committed `mcp-session-id` from successful initialization and sends it automatically on later requests.
+- Lets you pass custom headers (including authorization) globally or per request.
+
+Responses are a discriminated union — narrow with `'result' in response.body` or
+`'error' in response.body`. Malformed or non-JSON-RPC responses throw a coded Fastify error
+instead of returning.
+
+Note: no OAuth/JWT credentials are generated for you.
+
+## Protocol Version Negotiation
+
+The server answers `initialize` with the client's requested revision when it is one it
+supports, and otherwise offers the newest one it has:
+
+```typescript
+import { LATEST_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS } from '@platformatic/mcp'
+
+LATEST_PROTOCOL_VERSION      // '2025-11-25'
+SUPPORTED_PROTOCOL_VERSIONS  // ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05']
+```
+
+On the HTTP transport, requests after `initialize` must carry the agreed revision in the
+`MCP-Protocol-Version` header. An unsupported value is answered with `400`; an absent header
+is treated as `2025-03-26`, which predates the header.
+
+**Responses are shaped to the revision the client negotiated.** A client on an older revision
+never sees a field or method that revision does not define:
+
+| | `< 2025-11-25` | `2025-11-25` |
+|---|---|---|
+| `tasks` capability | not advertised | advertised |
+| `tasks/*` methods | `-32601` method not found | available |
+| `task` field on `tools/call` | ignored | honoured |
+| `icons` on listings | stripped | present |
+| `execution.taskSupport` | stripped | present |
+| `$schema` on tool schemas | omitted | JSON Schema 2020-12 |
+| URL mode elicitation | refused | available |
+
+When SSE is enabled the negotiated revision is stored on the session and is **authoritative**:
+a request whose `MCP-Protocol-Version` header contradicts what the session agreed is rejected
+with `400`, so a client cannot opt into newer behaviour after negotiating an older revision.
+When the header is omitted the session's revision is used in preference to the `2025-03-26`
+default. `initialize` is exempt, so a client may re-negotiate on an existing session.
+
+> Without SSE there is no session to remember the negotiation, so each request is judged
+> solely by its header. A client that omits it falls back to `2025-03-26` and will not see
+> `2025-11-25` features. Compliant clients always send the header.
+
+## Origin Validation
+
+Browser clients can be protected against DNS rebinding by allow-listing origins. A rejected
+origin is answered with `403`:
+
+```typescript
+await app.register(mcpPlugin, {
+  allowedOrigins: ['https://app.example.com'] // omit to disable, '*' or true to allow any
+})
+```
+
+Requests without an `Origin` header are always accepted — the header is set by browsers, so
+its absence means the request did not come from one.
+
+## Tasks (MCP 2025-11-25, experimental)
+
+Tasks let a tool call return immediately with a task handle while the work continues in the
+background. The client then polls `tasks/get` and collects the result with `tasks/result`.
+
+Enable the feature on the plugin, then opt individual tools in with `execution.taskSupport`:
+
+```typescript
+await app.register(mcpPlugin, { enableTasks: true })
+
+app.mcpAddTool({
+  name: 'generate-report',
+  description: 'Builds a large report',
+  inputSchema: Type.Object({ month: Type.String() }),
+  execution: { taskSupport: 'optional' } // 'forbidden' (default) | 'optional' | 'required'
+}, async (params) => {
+  return { content: [{ type: 'text', text: await buildReport(params.month) }] }
+})
+```
+
+A client opts in per call by adding a `task` field:
+
+```jsonc
+// -> tools/call
+{ "name": "generate-report", "arguments": { "month": "July" }, "task": { "ttl": 60000 } }
+// <- CreateTaskResult
+{ "task": { "taskId": "…", "status": "working", "ttl": 60000, "pollInterval": 1000 } }
+```
+
+Supported operations: `tasks/get`, `tasks/result` (blocks until the task is terminal),
+`tasks/list` and `tasks/cancel`, plus optional `notifications/tasks/status` pushes over SSE.
+
+Retention defaults to 60 seconds when the client does not request a `ttl`. Tasks are meant
+for long-running work, so if your tools can outlive that, raise the bounds — otherwise a task
+can expire before it finishes and its `tasks/result` returns "not found":
+
+```typescript
+await app.register(mcpPlugin, {
+  enableTasks: true,
+  taskDefaultTtlMs: 15 * 60_000, // retention when the client requests no ttl
+  taskMaxTtlMs: 60 * 60_000      // ceiling on a client-requested ttl
+})
+```
+
+Tasks are stored in memory by default and in Redis when a `redis` option is given, so any
+instance can serve a poll for a task created on another.
+
+**Security**: when authorization is enabled, tasks are bound to the token subject and a
+requestor can only reach its own. Without authorization no requestor can be identified, so
+tasks are reachable by anyone holding the (random UUID) task id, and `tasks/list` is both
+unadvertised **and refused** — otherwise it would hand every anonymous task's id to any
+caller and defeat that model.
+
+## Elicitation Support (MCP 2025-11-25)
 
 The plugin supports the elicitation capability, allowing servers to request structured information from clients. This enables dynamic data collection with schema validation.
+
+Two modes are available. **Form mode** collects structured data through the client, and
+**URL mode** sends the user out of band for anything sensitive — credentials, payments,
+third-party OAuth — so it never passes through the MCP client:
+
+```typescript
+// URL mode: returns the elicitation id, or null if the request could not be sent
+const elicitationId = await app.mcpElicitUrl(
+  sessionId,
+  'Authorize access to your Example Co files',
+  'https://mcp.example.com/connect'
+)
+
+// Later, once the out-of-band interaction finishes
+await app.mcpNotifyElicitationComplete(sessionId, elicitationId)
+```
+
+Servers **MUST NOT** request passwords, API keys or payment details through form mode — use
+URL mode for those. URLs are rejected if they are malformed, use a scheme other than
+http(s), or embed credentials.
 
 ### Basic Elicitation
 
@@ -405,7 +604,7 @@ TypeBox validation provides structured error messages:
 The plugin maintains backward compatibility with JSON Schema and unvalidated tools:
 
 ```typescript
-// JSON Schema (still supported)
+// JSON Schema (accepted, but NOT validated at runtime by default — see below)
 app.mcpAddTool({
   name: 'legacy-tool',
   description: 'Uses JSON Schema',
@@ -430,6 +629,28 @@ app.mcpAddTool({
 })
 ```
 
+**Important:** only TypeBox schemas are validated at runtime by default. A tool registered with a plain JSON Schema `inputSchema` receives its arguments **unvalidated** unless you opt in to AJV validation.
+
+### Validating plain JSON Schema inputs with AJV
+
+Set `validateJsonSchemaInputs: {}` to validate plain-JSON-Schema tool inputs with [AJV](https://ajv.js.org/) (draft 2020-12, matching the plugin's published schema dialect) before the handler runs. TypeBox tools are unaffected — they keep their existing TypeBox validation.
+
+```typescript
+await app.register(mcpPlugin, {
+  validateJsonSchemaInputs: {
+    allErrors: true,
+    useDefaults: false
+  }
+})
+```
+
+Behavior when enabled:
+
+- Invalid arguments return a tool execution error (`isError: true` with an `Invalid tool arguments: ...` message, capped at 5 reported errors), not a protocol error — the same SEP-1303 semantics as TypeBox validation.
+- Validation is non-mutating: no type coercion, no defaults injection, no property removal. Handlers receive the arguments exactly as the client sent them. `format` keywords are annotation-only (JSON Schema 2020-12's own default).
+- A plain JSON Schema that AJV cannot compile makes `mcpAddTool` throw, so a misconfigured tool fails at startup instead of running unvalidated.
+- Compiled validators are cached per schema, and the option also applies to stdio transports and task-augmented (`task: {}`) calls.
+
 ### Performance
 
 TypeBox validation is highly optimized:
@@ -448,6 +669,9 @@ This plugin supports the MCP Streamable HTTP transport specification, enabling b
 ```typescript
 await app.register(mcpPlugin, {
   enableSSE: true, // Enable SSE support (default: false)
+  // Optionally close streams after a while so clients fall back to polling and
+  // resume with Last-Event-ID (SEP-1699). Omit to keep streams open indefinitely.
+  sseMaxConnectionMs: 300_000,
   // ... other options
 })
 ```
@@ -500,6 +724,40 @@ await app.register(mcpPlugin, {
 })
 ```
 
+### Message Broker Exports
+
+`MemoryMessageBroker`, `RedisMessageBroker`, and the `MessageBroker` interface are exported from the package's public entry point, so you can use them directly without deep-importing into `dist/brokers/...`:
+
+```typescript
+import { MessageBroker, MemoryMessageBroker, RedisMessageBroker } from '@platformatic/mcp'
+
+const broker: MessageBroker = new MemoryMessageBroker()
+// or: new RedisMessageBroker(redis)
+```
+
+- **`MessageBroker`**: the pub/sub interface the plugin uses internally to deliver messages to SSE clients — `publish(topic, message)`, `subscribe(topic, handler)`, `unsubscribe(topic)`, and `close()`.
+- **`MemoryMessageBroker`**: in-process implementation backed by [MQEmitter](https://github.com/mcollina/mqemitter). Used automatically when no `redis` option is passed; messages only reach clients connected to the same server instance.
+- **`RedisMessageBroker`**: distributed implementation backed by [mqemitter-redis](https://github.com/mcollina/mqemitter-redis). Used automatically when the `redis` option is passed; publishes go through Redis so messages reach clients connected to *any* server instance.
+
+These are the same broker classes the plugin instantiates internally based on the `redis` option. Exporting them lets you construct one directly for custom pub/sub logic, tests, or scripts that need to publish/subscribe without spinning up the full plugin.
+
+### Session Store Exports
+
+`MemorySessionStore`, `RedisSessionStore`, and the `SessionStore`/`SessionMetadata` types are exported from the package's public entry point, matching the broker and task store exports:
+
+```typescript
+import { SessionStore, MemorySessionStore, RedisSessionStore } from '@platformatic/mcp'
+
+const store: SessionStore = new MemorySessionStore()
+// or: new RedisSessionStore({ redis })
+```
+
+- **`SessionStore`**: the interface the plugin uses to persist SSE session metadata, message history, and token-to-session mappings.
+- **`MemorySessionStore`**: in-process implementation used automatically when no `redis` option is passed. Takes an optional `maxMessages` history cap (default 100).
+- **`RedisSessionStore`**: distributed implementation used automatically when the `redis` option is passed; sessions and message history live in Redis so any instance can serve any client.
+
+These are the same store classes the plugin instantiates internally based on the `redis` option. Exporting them lets you construct or inspect one directly in tests and scripts.
+
 ### Multi-Instance Deployment
 
 With Redis configuration, you can run multiple instances of your MCP server:
@@ -514,6 +772,15 @@ PORT=3001 REDIS_HOST=redis.example.com node server.js
 # Instance 3
 PORT=3002 REDIS_HOST=redis.example.com node server.js
 ```
+
+### Graceful Shutdown
+
+`RedisMessageBroker.close()` is bounded: it waits up to `closeTimeoutMs` (default 2000ms) for
+mqemitter-redis to close its Redis connections gracefully, then falls back to forcibly
+disconnecting them so Fastify's `onClose` hooks - and the process shutdown deadline enforced by
+most orchestrators - are never blocked by a Redis outage or a stuck reconnect. Pass
+`closeTimeoutMs` and `onCloseTimeout` as a second argument to `RedisMessageBroker` to customize
+this behavior, e.g. to log when a shutdown had to fall back to the forced path.
 
 ### Session Persistence Features
 
@@ -1265,6 +1532,75 @@ app.mcpAddTool({
 })
 ```
 
+### Per-Tool Authorization
+
+Tool-level checks like the one above keep the tool visible to every client and only fail at call time. To gate tools per request — hiding them from `tools/list` and rejecting `tools/call` in one place — provide a `canAccessTool` hook:
+
+```typescript
+await app.register(mcpPlugin, {
+  authorization: { /* ... */ },
+  canAccessTool: (toolName, { authContext }) => {
+    if (toolName === 'admin-tool') {
+      return authContext?.scopes?.includes('tools:admin') === true
+    }
+    return true
+  }
+})
+```
+
+The hook receives the tool name and a per-request context (`authContext`, `request`, `sessionId`), and may be sync or async. It is consulted at both dispatch points, so list and call can never disagree:
+
+- `tools/list` omits every tool the hook denies for that request. Per-tool checks run concurrently with a fixed cap (8 at a time), so an async hook backed by a database or HTTP service is not flooded with one lookup per registered tool; the listing keeps registration order.
+- `tools/call` on a denied tool returns the same `-32601` "Tool 'name' not found" protocol error as an unknown tool, and the hook runs even for unknown names, so callers cannot probe for tools they are not allowed to see by response shape. Response timing is not guaranteed to be indistinguishable — it depends on what the hook itself does per name. Task-augmented calls (`task` field) go through the same gate.
+
+A hook that throws denies access (fail closed) and logs a warning. Only an explicit `true` grants access. Without the hook, every registered tool stays visible and callable.
+
+## Customizing MCP Route Schemas
+
+Use `transformRouteSchema` to customize Fastify/OpenAPI schema metadata on MCP transport routes without replacing handlers or route definitions.
+
+```typescript
+import Fastify from 'fastify'
+import mcpPlugin from '@platformatic/mcp'
+
+const app = Fastify()
+
+await app.register(mcpPlugin, {
+  transformRouteSchema (schema, { routeId }) {
+    return {
+      ...schema,
+      tags: ['MCP'],
+      security: [{ oauth2: ['tools:read'] }],
+      operationId: routeId.replace('.', '-'),
+      'x-roles': ['admin']
+    }
+  }
+})
+```
+
+Route IDs are stable and map to MCP transport routes:
+
+| Route ID | Method | Purpose |
+|---|---|---|
+| `mcp.post` | `POST` | MCP JSON-RPC messages |
+| `mcp.get` | `GET` | MCP streaming/SSE connection |
+| `mcp.delete` | `DELETE` | MCP session termination |
+
+Behavior notes:
+
+- The callback runs once per registered MCP transport route during startup.
+- The plugin passes the original route schema object to the callback.
+- Spread the incoming schema when you want to preserve existing fields.
+- The callback is synchronous and must return a schema object.
+- Returned metadata applies only to Fastify/OpenAPI schema fields.
+- OAuth and well-known routes are not customized by this option in this version.
+
+Security notes:
+
+- OpenAPI schema metadata does not enforce authentication or authorization.
+- For example, `security: [{ oauth2: ['tools:read'] }]` documents expectations but does not install auth checks.
+- Enforcement still depends on your configured auth hooks, token validation, and tool access controls.
+
 ### OAuth Routes
 
 The plugin automatically registers OAuth management routes:
@@ -1484,6 +1820,7 @@ await app.register(import('@fastify/bearer-auth'), {
 - `capabilities`: MCP capabilities configuration
 - `instructions`: Optional server instructions
 - `enableSSE`: Enable Server-Sent Events support (default: false)
+- `canAccessTool`: Per-request tool authorization hook consulted by `tools/list` and `tools/call` (optional)
 - `authorization`: OAuth 2.1 authorization configuration (optional)
   - `enabled`: Enable OAuth 2.1 authorization (default: false)
   - `authorizationServers`: Authorization server URIs
@@ -1530,6 +1867,32 @@ app.mcpAddTool(
 )
 ```
 
+#### Server-Side Tool Invocation
+
+Use `app.mcpCallTool()` when application code needs to run a registered tool without making a loopback `POST /mcp` request or building a JSON-RPC envelope. The call uses the same tool registry, input validation, `canAccessTool` hook, argument sanitization, required task execution check and handler error conversion as `tools/call`, but it does not create or use an MCP session, SSE stream, message broker or Redis connection. `mcpCallTool()` executes the tool access, validation, sanitization, and handler pipeline. It does not run Fastify lifecycle hooks and is only available in the Fastify encapsulation scope where the MCP plugin was registered and its descendants.
+
+```typescript
+const outcome = await app.mcpCallTool('search', { query: 'fastify' }, { request, reply })
+
+if (outcome.ok) {
+  return outcome.result
+}
+
+switch (outcome.reason) {
+  case 'not-found':
+    reply.code(404)
+    return { error: 'Tool not found' }
+  case 'invalid-arguments':
+    reply.code(400)
+    return { error: outcome.detail }
+  case 'task-required':
+    reply.code(409)
+    return { error: 'Tool must be invoked through task-augmented tools/call' }
+}
+```
+
+The `canAccessTool` hook still runs before validation and before the handler, and receives the same `request` object passed to `mcpCallTool()`. Denied tools and unknown tools both return `{ ok: false, reason: 'not-found' }`, matching the JSON-RPC `tools/call` path's public behavior. Pass the route's real `reply` so tool handlers can use the full Fastify reply API. Pass `authContext` when the in-process caller has one so access hooks and handlers see the same authorization context they would receive over HTTP. If the tool handler throws, the outcome is `{ ok: true, result }` with `result.isError: true`, matching the JSON-RPC `tools/call` path.
+
 #### Type-Safe Resource Registration
 
 ```typescript
@@ -1561,6 +1924,51 @@ app.mcpAddPrompt(
   handler?: (name: string, args: any, context: HandlerContext) => Promise<GetPromptResult>
 )
 ```
+
+#### Server-Side Tool Registry Introspection
+
+Use these decorators to introspect tool registration state from server-side code:
+
+- `app.mcpHasTool(name: string): boolean`
+- `app.mcpListToolNames(): readonly string[]`
+
+Important behavior:
+
+- Available only within the MCP plugin Fastify encapsulation scope (the registration scope and descendants)
+- Reports registration state, not request-specific visibility
+- Does not evaluate `canAccessTool`
+- Returns a read-only snapshot of names in registration order
+
+Because this API is authorization-agnostic by design, avoid exposing it directly to untrusted clients unless you enforce your own authorization.
+
+```typescript
+await app.register(mcpPlugin)
+
+app.mcpAddTool({
+  name: 'search',
+  description: 'Search documents',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      query: { type: 'string' }
+    },
+    required: ['query']
+  }
+}, async ({ query }) => {
+  return {
+    content: [{ type: 'text', text: `Searching for ${query}` }]
+  }
+})
+
+app.get('/internal/tool-status', async () => {
+  return {
+    searchRegistered: app.mcpHasTool('search'),
+    registeredTools: app.mcpListToolNames()
+  }
+})
+```
+
+This route is illustrative only and should be protected in real deployments.
 
 #### HTTP Context Access in Tool Handlers
 

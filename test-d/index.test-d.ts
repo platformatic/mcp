@@ -5,7 +5,8 @@ import {
   expectNotAssignable,
 } from 'tsd'
 import { Type } from '@sinclair/typebox'
-import type { FastifyReply } from 'fastify'
+import type { FastifyInstance, FastifyReply, FastifyRequest, FastifySchema, HTTPMethods } from 'fastify'
+import { RedisMessageBroker, MemoryMessageBroker, RedisSessionStore, MemorySessionStore } from '../dist/index.js'
 import type {
   ToolHandler,
   ResourceHandler,
@@ -22,6 +23,15 @@ import type {
   UnsafeMCPResource,
   UnsafeMCPPrompt,
   JSONRPCMessage,
+  MessageBroker,
+  SessionStore,
+  SessionMetadata,
+  ToolAccessContext,
+  MCPRouteId,
+  MCPRouteSchemaContext,
+  MCPRouteSchemaTransformer,
+  McpCallToolContext,
+  McpCallToolOutcome,
 } from '../dist/index.js'
 
 // ─── ToolHandler ─────────────────────────────────────────────────────
@@ -205,6 +215,45 @@ expectAssignable<UnsafeMCPPrompt>({ definition: { name: 'anything' } })
 // Empty options are valid
 expectAssignable<MCPPluginOptions>({})
 
+const routeSchemaContext: MCPRouteSchemaContext = {
+  routeId: 'mcp.post',
+  method: 'POST',
+  url: '/mcp'
+}
+expectType<MCPRouteId>(routeSchemaContext.routeId)
+expectType<HTTPMethods>(routeSchemaContext.method)
+
+const routeSchemaTransformer: MCPRouteSchemaTransformer = (schema, context) => {
+  const routeId: MCPRouteId = context.routeId
+  expectType<MCPRouteSchemaContext>(context)
+
+  return {
+    ...schema,
+    tags: [routeId]
+  }
+}
+
+expectAssignable<MCPPluginOptions>({
+  transformRouteSchema: routeSchemaTransformer
+})
+
+expectError<MCPRouteSchemaContext>({
+  routeId: 'invalid.route',
+  method: 'POST',
+  url: '/mcp'
+})
+
+expectNotAssignable<MCPRouteSchemaTransformer>(async (schema: FastifySchema) => {
+  return {
+    ...schema,
+    tags: ['async-not-allowed']
+  }
+})
+
+expectNotAssignable<MCPRouteSchemaTransformer>((_schema: FastifySchema) => {
+  return undefined
+})
+
 // Full options
 expectAssignable<MCPPluginOptions>({
   serverInfo: { name: 'test', version: '1.0.0' },
@@ -260,3 +309,126 @@ expectAssignable<SSESession>({
 // Missing required fields
 expectNotAssignable<SSESession>({ id: 'sess-1' })
 expectNotAssignable<SSESession>({ id: 'sess-1', eventId: 0 })
+
+// ─── Message brokers ────────────────────────────────────────────────
+
+// Both broker implementations are importable from the package root
+expectType<typeof RedisMessageBroker>(RedisMessageBroker)
+expectType<typeof MemoryMessageBroker>(MemoryMessageBroker)
+
+// MemoryMessageBroker satisfies the MessageBroker interface
+expectAssignable<MessageBroker>(new MemoryMessageBroker())
+
+// RedisMessageBroker's methods match the MessageBroker interface shape,
+// checked via the prototype since constructing one needs a live Redis client
+expectType<(topic: string, message: JSONRPCMessage) => Promise<void>>(
+  RedisMessageBroker.prototype.publish
+)
+expectType<(topic: string, handler: (message: JSONRPCMessage) => void) => Promise<void>>(
+  RedisMessageBroker.prototype.subscribe
+)
+expectType<(topic: string) => Promise<void>>(RedisMessageBroker.prototype.unsubscribe)
+expectType<() => Promise<void>>(RedisMessageBroker.prototype.close)
+
+// Constructor still requires a real Redis instance, not an arbitrary object
+expectError(new RedisMessageBroker({}))
+
+// ─── Session stores ─────────────────────────────────────────────────
+
+// Both session store implementations are importable from the package root
+expectType<typeof RedisSessionStore>(RedisSessionStore)
+expectType<typeof MemorySessionStore>(MemorySessionStore)
+
+// MemorySessionStore satisfies the SessionStore interface
+expectAssignable<SessionStore>(new MemorySessionStore())
+
+// RedisSessionStore's methods match the SessionStore interface shape,
+// checked via the prototype since constructing one needs a live Redis client
+expectType<(metadata: SessionMetadata) => Promise<void>>(RedisSessionStore.prototype.create)
+expectType<(sessionId: string) => Promise<SessionMetadata | null>>(RedisSessionStore.prototype.get)
+expectType<(sessionId: string) => Promise<void>>(RedisSessionStore.prototype.delete)
+
+// Constructor still requires a real Redis instance, not an arbitrary object
+expectError(new RedisSessionStore({}))
+expectError(new RedisSessionStore())
+
+// ─── canAccessTool hook ─────────────────────────────────────────────
+
+// Hook parameters are fully typed: tool name plus per-request context
+const accessHook: NonNullable<MCPPluginOptions['canAccessTool']> = (toolName, context) => {
+  expectType<string>(toolName)
+  expectAssignable<string[] | undefined>(context.authContext?.scopes)
+  expectAssignable<string | undefined>(context.sessionId)
+  return context.request !== undefined
+}
+expectAssignable<MCPPluginOptions>({ canAccessTool: accessHook })
+
+// The context type is exported and carries a required request
+expectAssignable<ToolAccessContext>({ request: {} as FastifyRequest })
+expectNotAssignable<ToolAccessContext>({})
+
+// mcpCallTool is decorated on Fastify and returns the exported outcome union
+const fastifyApp = {} as FastifyInstance
+expectType<Promise<McpCallToolOutcome>>(
+  fastifyApp.mcpCallTool('echo', {}, { request: {} as FastifyRequest, reply: {} as FastifyReply })
+)
+expectAssignable<McpCallToolContext>({
+  request: {} as FastifyRequest,
+  reply: {} as FastifyReply
+})
+expectAssignable<McpCallToolContext>({
+  request: {} as FastifyRequest,
+  reply: {} as FastifyReply,
+  authContext: { userId: 'user-123', tokenType: 'Bearer' }
+})
+expectNotAssignable<McpCallToolContext>({ request: {} as FastifyRequest })
+expectNotAssignable<McpCallToolContext>({})
+expectAssignable<McpCallToolOutcome>({ ok: true, result: { content: [{ type: 'text', text: 'ok' }] } })
+expectAssignable<McpCallToolOutcome>({ ok: false, reason: 'not-found' })
+expectNotAssignable<McpCallToolOutcome>({ ok: false, reason: 'unknown-tool' })
+expectNotAssignable<McpCallToolOutcome>({ ok: false, reason: 'access-denied' })
+expectAssignable<McpCallToolOutcome>({ ok: false, reason: 'invalid-arguments', detail: 'missing input' })
+expectAssignable<McpCallToolOutcome>({ ok: false, reason: 'task-required' })
+expectNotAssignable<McpCallToolOutcome>({ ok: false, reason: 'nope' })
+
+// Sync and async hooks are both accepted
+expectAssignable<MCPPluginOptions>({ canAccessTool: () => true })
+expectAssignable<MCPPluginOptions>({ canAccessTool: async () => false })
+
+// Non-boolean returns and non-function values are rejected
+expectNotAssignable<MCPPluginOptions>({ canAccessTool: () => 'yes' })
+expectNotAssignable<MCPPluginOptions>({ canAccessTool: true })
+
+// ─── Plugin options ─────────────────────────────────────────────────
+
+// validateJsonSchemaInputs is an optional object
+expectAssignable<MCPPluginOptions>({ validateJsonSchemaInputs: {} })
+
+expectAssignable<MCPPluginOptions>({
+  validateJsonSchemaInputs: {
+    allErrors: true,
+    useDefaults: false
+  }
+})
+
+expectAssignable<MCPPluginOptions>({})
+
+expectNotAssignable<MCPPluginOptions>({
+  validateJsonSchemaInputs: true
+})
+
+expectNotAssignable<MCPPluginOptions>({
+  validateJsonSchemaInputs: false
+})
+
+expectNotAssignable<MCPPluginOptions>({
+  validateJsonSchemaInputs: 'yes'
+})
+
+// ─── Fastify decorators ─────────────────────────────────────────────
+
+const app = {} as FastifyInstance
+
+expectType<boolean>(app.mcpHasTool('search'))
+expectType<readonly string[]>(app.mcpListToolNames())
+expectError(app.mcpListToolNames().push('search'))
