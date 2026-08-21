@@ -277,6 +277,7 @@ export type {
   MCPRouteSchemaContext,
   MCPRouteSchemaTransformer,
   ToolAccessContext,
+  ToolAccessOperation,
   McpCallToolContext,
   McpCallToolOutcome,
   MCPTool,

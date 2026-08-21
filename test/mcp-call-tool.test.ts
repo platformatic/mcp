@@ -29,6 +29,7 @@ async function buildApp (t: TestContext) {
   let taskOnlyInvocations = 0
   let jsonSchemaInvocations = 0
   let accessContextRequest: FastifyRequest | undefined
+  let accessContextOperation: string | undefined
   let directRouteRequest: FastifyRequest | undefined
 
   const app = Fastify({ logger: false })
@@ -39,6 +40,7 @@ async function buildApp (t: TestContext) {
     validateJsonSchemaInputs: {},
     canAccessTool: (toolName, context) => {
       accessContextRequest = context.request
+      accessContextOperation = context.operation
       if (toolName === 'wallet-summary') {
         return context.authContext?.scopes?.includes('wallet-summary:read') === true
       }
@@ -177,6 +179,7 @@ async function buildApp (t: TestContext) {
     getJsonSchemaInvocations: () => jsonSchemaInvocations,
     getTaskOnlyInvocations: () => taskOnlyInvocations,
     getAccessContextRequest: () => accessContextRequest,
+    getAccessContextOperation: () => accessContextOperation,
     getDirectRouteRequest: () => directRouteRequest
   }
 }
@@ -277,6 +280,18 @@ describe('mcpCallTool', () => {
     })
 
     t.assert.strictEqual(getAccessContextRequest(), getDirectRouteRequest())
+  })
+
+  test('mcpCallTool() invokes canAccessTool with operation call', async (t: TestContext) => {
+    const { app, getAccessContextOperation } = await buildApp(t)
+
+    await app.inject({
+      method: 'POST',
+      url: '/direct-tool-call',
+      payload: { name: 'echo', args: { message: 'hello' } }
+    })
+
+    t.assert.strictEqual(getAccessContextOperation(), 'call')
   })
 
   test('matches the JSON-RPC tools/call path for success and failure outcomes', async (t: TestContext) => {

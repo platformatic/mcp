@@ -181,11 +181,19 @@ export interface UnsafeMCPPrompt {
   handler?: UnsafePromptHandler
 }
 
+/**
+ * Which operation `canAccessTool` is deciding: `list` for `tools/list`
+ * visibility, `call` for `tools/call` execution (including HTTP,
+ * task-augmented, and `mcpCallTool()` calls, and calls to unknown tools).
+ */
+export type ToolAccessOperation = 'list' | 'call'
+
 /** Per-request context handed to the `canAccessTool` hook. */
 export interface ToolAccessContext {
   authContext?: AuthorizationContext
   request: FastifyRequest
   sessionId?: string
+  operation: ToolAccessOperation
 }
 
 export type MCPRouteId =
@@ -257,6 +265,10 @@ export interface MCPPluginOptions {
    * `tools/call` runs the hook even for unknown names. Response timing is not
    * guaranteed to be indistinguishable: it depends on what the hook itself
    * does per name. A hook that throws denies access.
+   * `context.operation` tells the hook which decision it is making: `'list'`
+   * for `tools/list` visibility, `'call'` for execution (HTTP, task-augmented,
+   * and `mcpCallTool()` calls, and unknown tool names, all use `'call'`).
+   * Visibility and execution policies may intentionally differ.
    * Omit to keep every registered tool visible and callable.
    */
   canAccessTool?: (

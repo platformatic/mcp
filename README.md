@@ -1539,19 +1539,22 @@ Tool-level checks like the one above keep the tool visible to every client and o
 ```typescript
 await app.register(mcpPlugin, {
   authorization: { /* ... */ },
-  canAccessTool: (toolName, { authContext }) => {
-    if (toolName === 'admin-tool') {
-      return authContext?.scopes?.includes('tools:admin') === true
+  canAccessTool: (toolName, context) => {
+    if (context.operation === 'list') {
+      return canSeeTool(toolName, context.authContext)
     }
-    return true
+
+    return canExecuteTool(toolName, context.authContext)
   }
 })
 ```
 
-The hook receives the tool name and a per-request context (`authContext`, `request`, `sessionId`), and may be sync or async. It is consulted at both dispatch points, so list and call can never disagree:
+The hook receives the tool name and a per-request context (`authContext`, `request`, `sessionId`, `operation`), and may be sync or async. It is consulted at both dispatch points, so list and call can never disagree:
 
-- `tools/list` omits every tool the hook denies for that request. Per-tool checks run concurrently with a fixed cap (8 at a time), so an async hook backed by a database or HTTP service is not flooded with one lookup per registered tool; the listing keeps registration order.
-- `tools/call` on a denied tool returns the same `-32601` "Tool 'name' not found" protocol error as an unknown tool, and the hook runs even for unknown names, so callers cannot probe for tools they are not allowed to see by response shape. Response timing is not guaranteed to be indistinguishable — it depends on what the hook itself does per name. Task-augmented calls (`task` field) go through the same gate.
+- `tools/list` omits every tool the hook denies for that request, calling the hook with `operation: 'list'`. Per-tool checks run concurrently with a fixed cap (8 at a time), so an async hook backed by a database or HTTP service is not flooded with one lookup per registered tool; the listing keeps registration order.
+- `tools/call` on a denied tool returns the same `-32601` "Tool 'name' not found" protocol error as an unknown tool, calling the hook with `operation: 'call'`. The hook runs even for unknown names, so callers cannot probe for tools they are not allowed to see by response shape. Response timing is not guaranteed to be indistinguishable — it depends on what the hook itself does per name. Task-augmented calls (`task` field) and `app.mcpCallTool()` also use `operation: 'call'`.
+
+Visibility and execution policies may intentionally differ — a tool hidden from `tools/list` can still be callable by a client that already knows its name.
 
 A hook that throws denies access (fail closed) and logs a warning. Only an explicit `true` grants access. Without the hook, every registered tool stays visible and callable.
 
