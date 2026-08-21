@@ -221,6 +221,7 @@ export interface McpCallToolContext {
 export type McpCallToolOutcome =
   | { ok: true, result: CallToolResult }
   | { ok: false, reason: 'not-found' }
+  | { ok: false, reason: 'access-denied' }
   | { ok: false, reason: 'invalid-arguments', detail: string }
   | { ok: false, reason: 'task-required' }
 

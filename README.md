@@ -1885,6 +1885,9 @@ switch (outcome.reason) {
   case 'not-found':
     reply.code(404)
     return { error: 'Tool not found' }
+  case 'access-denied':
+    reply.code(403)
+    return { error: 'Tool access denied' }
   case 'invalid-arguments':
     reply.code(400)
     return { error: outcome.detail }
@@ -1894,7 +1897,7 @@ switch (outcome.reason) {
 }
 ```
 
-The `canAccessTool` hook still runs before validation and before the handler, and receives the same `request` object passed to `mcpCallTool()`. Denied tools and unknown tools both return `{ ok: false, reason: 'not-found' }`, matching the JSON-RPC `tools/call` path's public behavior. Pass the route's real `reply` so tool handlers can use the full Fastify reply API. Pass `authContext` when the in-process caller has one so access hooks and handlers see the same authorization context they would receive over HTTP. If the tool handler throws, the outcome is `{ ok: true, result }` with `result.isError: true`, matching the JSON-RPC `tools/call` path.
+The `canAccessTool` hook still runs before validation and before the handler, and receives the same `request` object passed to `mcpCallTool()`. Unlike the JSON-RPC `tools/call` path — which always answers a denied tool exactly like an unknown one, so a remote client cannot probe for tools it is not allowed to see — `mcpCallTool()` is a trusted in-process call and reports the precise reason: `{ ok: false, reason: 'not-found' }` when the tool is not registered, `{ ok: false, reason: 'access-denied' }` when it is registered but `canAccessTool` denied it (existence takes precedence, so an unknown name is always `not-found` even if the hook would also have denied it). Pass the route's real `reply` so tool handlers can use the full Fastify reply API. Pass `authContext` when the in-process caller has one so access hooks and handlers see the same authorization context they would receive over HTTP. If the tool handler throws, the outcome is `{ ok: true, result }` with `result.isError: true`, matching the JSON-RPC `tools/call` path. Every argument rejection that happens before the handler runs — TypeBox validation, AJV validation, or argument sanitization — is reported as `{ ok: false, reason: 'invalid-arguments', detail }`; the handler is never invoked for those.
 
 #### Type-Safe Resource Registration
 
