@@ -44,7 +44,7 @@ import {
 } from './protocol-version.ts'
 import { validate, CallToolRequestSchema, ReadResourceRequestSchema, GetPromptRequestSchema, isTypeBoxSchema } from './validation/index.ts'
 import type { JsonSchemaValidator } from './validation/json-schema-validator.ts'
-import { sanitizeToolParams, assessToolSecurity, SECURITY_WARNINGS } from './security.ts'
+import { sanitizeToolParams, assessToolSecurity } from './security.ts'
 
 type HandlerDependencies = {
   app: FastifyInstance
@@ -336,18 +336,24 @@ async function handleToolsCall (
   return await executeToolCall(request, resolved.tool, params, sessionId, dependencies)
 }
 
+type RegisteredToolResolution =
+  | { ok: true, tool: MCPTool }
+  | { ok: false, reason: 'not-found' }
+  | { ok: false, reason: 'access-denied' }
+
 async function resolveRegisteredTool (
   toolName: string,
   dependencies: ToolCallDependencies
-): Promise<{ ok: true, tool: MCPTool } | { ok: false, reason: 'not-found' }> {
+): Promise<RegisteredToolResolution> {
   const isAllowed = await checkToolAccess(toolName, 'call', dependencies)
-  if (!isAllowed) {
+  const tool = dependencies.tools.get(toolName)
+
+  if (!tool) {
     return { ok: false, reason: 'not-found' }
   }
 
-  const tool = dependencies.tools.get(toolName)
-  if (!tool) {
-    return { ok: false, reason: 'not-found' }
+  if (!isAllowed) {
+    return { ok: false, reason: 'access-denied' }
   }
 
   return { ok: true, tool }
@@ -374,6 +380,7 @@ function toolCallOutcomeToJsonRpc (
       return createResponse(id, result)
     }
     case 'not-found':
+    case 'access-denied':
       return createError(id, METHOD_NOT_FOUND, `Tool '${toolName}' not found`)
     // Unreachable from the JSON-RPC path today (handleToolsCall resolves task
     // augmentation itself), but kept in the mapping so the two paths stay
@@ -462,16 +469,13 @@ async function executeRegisteredTool (
       error: sanitizeError instanceof Error ? sanitizeError.message : 'Unknown sanitization error'
     }, 'Tool arguments sanitization failed')
 
-    // SEP-1303: input validation failures are tool execution errors, not protocol
-    // errors, so the model gets a chance to correct itself.
-    const result: CallToolResult = {
-      content: [{
-        type: 'text',
-        text: `${SECURITY_WARNINGS.UNVALIDATED_INPUT}: ${sanitizeError instanceof Error ? sanitizeError.message : 'Sanitization failed'}`
-      }],
-      isError: true
+    // A pre-handler rejection, same as the TypeBox/AJV validation branches
+    // below: the handler never runs.
+    return {
+      ok: false,
+      reason: 'invalid-arguments',
+      detail: sanitizeError instanceof Error ? sanitizeError.message : 'Tool arguments failed sanitization'
     }
-    return { ok: true, result }
   }
   if ('inputSchema' in tool.definition) {
     // Check if it's a TypeBox schema
