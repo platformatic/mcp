@@ -107,12 +107,12 @@ describe('Tool Authorization (canAccessTool)', () => {
     t.assert.strictEqual(unknownBody.error.message, "Tool 'no-such-tool' not found")
   })
 
-  test('the hook is invoked for unknown tool names too', async (t: TestContext) => {
+  test('the hook is invoked for unknown tool names too, with operation call', async (t: TestContext) => {
     // Same code path for unknown and denied names: identical protocol response
-    const checkedNames: string[] = []
+    const checked: Array<{ toolName: string, operation: string }> = []
     const app = await buildApp(t, {
-      canAccessTool: async (toolName) => {
-        checkedNames.push(toolName)
+      canAccessTool: async (toolName, context) => {
+        checked.push({ toolName, operation: context.operation })
         await new Promise(resolve => setImmediate(resolve))
         return toolName !== 'restricted-tool'
       }
@@ -121,17 +121,38 @@ describe('Tool Authorization (canAccessTool)', () => {
     await app.inject({ method: 'POST', url: '/mcp', payload: callRequest('restricted-tool') })
     await app.inject({ method: 'POST', url: '/mcp', payload: callRequest('no-such-tool') })
 
+    const checkedNames = checked.map(c => c.toolName)
     t.assert.ok(checkedNames.includes('restricted-tool'), 'denied registered name must be checked')
     t.assert.ok(checkedNames.includes('no-such-tool'), 'unknown name must be checked')
+    t.assert.ok(checked.every(c => c.operation === 'call'), 'tools/call always supplies operation call')
   })
 
-  test('tools/list evaluates independent checks concurrently', async (t: TestContext) => {
+  test('tools/list supplies operation list, tools/call supplies operation call', async (t: TestContext) => {
+    const operations: string[] = []
+    const app = await buildApp(t, {
+      canAccessTool: (_toolName, context) => {
+        operations.push(context.operation)
+        return true
+      }
+    })
+
+    await app.inject({ method: 'POST', url: '/mcp', payload: listRequest() })
+    t.assert.ok(operations.length > 0 && operations.every(op => op === 'list'))
+
+    operations.length = 0
+    await app.inject({ method: 'POST', url: '/mcp', payload: callRequest('public-tool') })
+    t.assert.deepStrictEqual(operations, ['call'])
+  })
+
+  test('tools/list evaluates independent checks concurrently, all with operation list', async (t: TestContext) => {
     let activeChecks = 0
     let maxConcurrentChecks = 0
+    const operations: string[] = []
     const app = await buildApp(t, {
-      canAccessTool: async () => {
+      canAccessTool: async (_toolName, context) => {
         activeChecks++
         maxConcurrentChecks = Math.max(maxConcurrentChecks, activeChecks)
+        operations.push(context.operation)
         await new Promise(resolve => setImmediate(resolve))
         activeChecks--
         return true
@@ -143,6 +164,7 @@ describe('Tool Authorization (canAccessTool)', () => {
     t.assert.strictEqual(maxConcurrentChecks, 2)
     // Concurrency must not reorder: registration order is preserved
     t.assert.deepStrictEqual(listedToolNames(listResponse), ['public-tool', 'restricted-tool'])
+    t.assert.deepStrictEqual(operations, ['list', 'list'])
   })
 
   test('tools/list caps concurrent hook evaluations with many tools', async (t: TestContext) => {
@@ -230,12 +252,16 @@ describe('Tool Authorization (canAccessTool)', () => {
     t.assert.deepStrictEqual(listedToolNames(listResponse), [])
   })
 
-  test('task-augmented calls inherit the gate', async (t: TestContext) => {
+  test('task-augmented calls inherit the gate, with operation call', async (t: TestContext) => {
+    const operations: string[] = []
     const app = Fastify({ logger: false })
     t.after(() => app.close())
     await app.register(mcpPlugin, {
       enableTasks: true,
-      canAccessTool: (toolName) => toolName !== 'restricted-task-tool'
+      canAccessTool: (toolName, context) => {
+        operations.push(context.operation)
+        return toolName !== 'restricted-task-tool'
+      }
     })
     app.mcpAddTool({
       name: 'restricted-task-tool',
@@ -259,6 +285,7 @@ describe('Tool Authorization (canAccessTool)', () => {
     const taskCallBody = taskCallResponse.json() as JSONRPCErrorResponse
     t.assert.strictEqual(taskCallBody.error.code, METHOD_NOT_FOUND)
     t.assert.strictEqual(taskCallBody.error.message, "Tool 'restricted-task-tool' not found")
+    t.assert.deepStrictEqual(operations, ['call'])
   })
 
   test('hook receives the authContext of the calling token', async (t: TestContext) => {

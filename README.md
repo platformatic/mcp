@@ -1539,21 +1539,51 @@ Tool-level checks like the one above keep the tool visible to every client and o
 ```typescript
 await app.register(mcpPlugin, {
   authorization: { /* ... */ },
-  canAccessTool: (toolName, { authContext }) => {
-    if (toolName === 'admin-tool') {
-      return authContext?.scopes?.includes('tools:admin') === true
+  canAccessTool: (toolName, context) => {
+    if (context.operation === 'list') {
+      return canSeeTool(toolName, context.authContext)
     }
-    return true
+
+    return canExecuteTool(toolName, context.authContext)
   }
 })
 ```
 
-The hook receives the tool name and a per-request context (`authContext`, `request`, `sessionId`), and may be sync or async. It is consulted at both dispatch points, so list and call can never disagree:
+The hook receives the tool name and a per-request context (`authContext`, `request`, `sessionId`, `operation`), and may be sync or async. It is consulted at both dispatch points, so list and call can never disagree:
 
-- `tools/list` omits every tool the hook denies for that request. Per-tool checks run concurrently with a fixed cap (8 at a time), so an async hook backed by a database or HTTP service is not flooded with one lookup per registered tool; the listing keeps registration order.
-- `tools/call` on a denied tool returns the same `-32601` "Tool 'name' not found" protocol error as an unknown tool, and the hook runs even for unknown names, so callers cannot probe for tools they are not allowed to see by response shape. Response timing is not guaranteed to be indistinguishable — it depends on what the hook itself does per name. Task-augmented calls (`task` field) go through the same gate.
+- `tools/list` omits every tool the hook denies for that request, calling the hook with `operation: 'list'`. Per-tool checks run concurrently with a fixed cap (8 at a time), so an async hook backed by a database or HTTP service is not flooded with one lookup per registered tool; the listing keeps registration order.
+- `tools/call` on a denied tool returns the same `-32601` "Tool 'name' not found" protocol error as an unknown tool, calling the hook with `operation: 'call'`. The hook runs even for unknown names, so callers cannot probe for tools they are not allowed to see by response shape. Response timing is not guaranteed to be indistinguishable — it depends on what the hook itself does per name. Task-augmented calls (`task` field) and `app.mcpCallTool()` also use `operation: 'call'`.
+
+Visibility and execution policies may intentionally differ — a tool hidden from `tools/list` can still be callable by a client that already knows its name.
 
 A hook that throws denies access (fail closed) and logs a warning. Only an explicit `true` grants access. Without the hook, every registered tool stays visible and callable.
+
+## Observing Tool Calls
+
+Provide `onToolCallComplete` to observe every tool call, regardless of transport, in one place:
+
+```typescript
+await app.register(mcpPlugin, {
+  onToolCallComplete: async (event) => {
+    logger.info({
+      tool: event.toolName,
+      source: event.source,
+      durationMs: event.durationMs,
+      ok: event.outcome.ok
+    }, 'tool call completed')
+  }
+})
+```
+
+The hook fires exactly once per tool call, after it settles: for JSON-RPC `tools/call`, for `app.mcpCallTool()`, and for a task-augmented call once execution finishes (not when the task is merely accepted). It also fires for access denial, unknown tools, invalid arguments, and task-required outcomes. It does not fire for `tools/list`, initialization/ping, or malformed requests where no tool name was resolved.
+
+`event.source` is `'json-rpc'`, `'in-process'`, or `'task'`. `event.outcome` is the same `McpCallToolOutcome` returned by `mcpCallTool()`. The hook is awaited before the response is sent, so keep it fast; a throwing or rejecting hook is logged and otherwise ignored — it never changes the tool response.
+
+Synchronous sources (`'json-rpc'` and `'in-process'`) expose the active `request`/`reply`. Task events never do: a task can finish after the original HTTP response has already completed, so `request`/`reply` are absent on `source: 'task'` events. Every event, regardless of source, carries `requestId` for correlation.
+
+Duration semantics also differ by source: `'json-rpc'` and `'in-process'` durations include authorization, validation, sanitization, and execution. Task durations measure only actual execution — validation, sanitization, and the tool call — excluding the time the task spent queued.
+
+`event.arguments` are the raw, unredacted tool arguments. Redact sensitive values yourself before logging or persisting them.
 
 ## Customizing MCP Route Schemas
 
@@ -1821,6 +1851,7 @@ await app.register(import('@fastify/bearer-auth'), {
 - `instructions`: Optional server instructions
 - `enableSSE`: Enable Server-Sent Events support (default: false)
 - `canAccessTool`: Per-request tool authorization hook consulted by `tools/list` and `tools/call` (optional)
+- `onToolCallComplete`: Transport-neutral hook fired once after every tool call settles, across JSON-RPC, `mcpCallTool()`, and tasks (optional)
 - `authorization`: OAuth 2.1 authorization configuration (optional)
   - `enabled`: Enable OAuth 2.1 authorization (default: false)
   - `authorizationServers`: Authorization server URIs
@@ -1882,6 +1913,9 @@ switch (outcome.reason) {
   case 'not-found':
     reply.code(404)
     return { error: 'Tool not found' }
+  case 'access-denied':
+    reply.code(403)
+    return { error: 'Tool access denied' }
   case 'invalid-arguments':
     reply.code(400)
     return { error: outcome.detail }
@@ -1891,7 +1925,7 @@ switch (outcome.reason) {
 }
 ```
 
-The `canAccessTool` hook still runs before validation and before the handler, and receives the same `request` object passed to `mcpCallTool()`. Denied tools and unknown tools both return `{ ok: false, reason: 'not-found' }`, matching the JSON-RPC `tools/call` path's public behavior. Pass the route's real `reply` so tool handlers can use the full Fastify reply API. Pass `authContext` when the in-process caller has one so access hooks and handlers see the same authorization context they would receive over HTTP. If the tool handler throws, the outcome is `{ ok: true, result }` with `result.isError: true`, matching the JSON-RPC `tools/call` path.
+The `canAccessTool` hook still runs before validation and before the handler, and receives the same `request` object passed to `mcpCallTool()`. Unlike the JSON-RPC `tools/call` path — which always answers a denied tool exactly like an unknown one, so a remote client cannot probe for tools it is not allowed to see — `mcpCallTool()` is a trusted in-process call and reports the precise reason: `{ ok: false, reason: 'not-found' }` when the tool is not registered, `{ ok: false, reason: 'access-denied' }` when it is registered but `canAccessTool` denied it (existence takes precedence, so an unknown name is always `not-found` even if the hook would also have denied it). Pass the route's real `reply` so tool handlers can use the full Fastify reply API. Pass `authContext` when the in-process caller has one so access hooks and handlers see the same authorization context they would receive over HTTP. If the tool handler throws, the outcome is `{ ok: true, result }` with `result.isError: true`, matching the JSON-RPC `tools/call` path. Every argument rejection that happens before the handler runs — TypeBox validation, AJV validation, or argument sanitization — is reported as `{ ok: false, reason: 'invalid-arguments', detail }`; the handler is never invoked for those.
 
 #### Type-Safe Resource Registration
 

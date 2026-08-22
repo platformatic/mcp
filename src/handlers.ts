@@ -31,7 +31,7 @@ import {
 } from './schema.ts'
 import type { RequestId } from './schema.ts'
 
-import type { MCPTool, MCPResource, MCPPrompt, MCPPluginOptions, ResourceHandlers, McpCallToolOutcome, TracerLike } from './types.ts'
+import type { MCPTool, MCPResource, MCPPrompt, MCPPluginOptions, ResourceHandlers, McpCallToolOutcome, ToolAccessOperation, MCPToolCallCompleteEvent, TracerLike } from './types.ts'
 import type { SessionStore } from './stores/session-store.ts'
 import type { TaskStore, TaskRecord, TaskWaiters } from './stores/task-store.ts'
 import { isTerminal, toWireTask } from './stores/task-store.ts'
@@ -44,8 +44,8 @@ import {
 } from './protocol-version.ts'
 import { validate, CallToolRequestSchema, ReadResourceRequestSchema, GetPromptRequestSchema, isTypeBoxSchema } from './validation/index.ts'
 import type { JsonSchemaValidator } from './validation/json-schema-validator.ts'
-import { sanitizeToolParams, assessToolSecurity, SECURITY_WARNINGS } from './security.ts'
-import { MCP_ATTR } from './telemetry-constants.ts'
+import { sanitizeToolParams, assessToolSecurity } from './security.ts'
+import { MCP_ATTR, type SpanAttributeValue } from './telemetry-constants.ts'
 
 // Lazy-loaded telemetry module — only imported when a tracer is configured
 let _telemetry: typeof import('./telemetry.ts') | undefined
@@ -182,19 +182,25 @@ function withSchemaDialect<T> (schema: T, protocolVersion: string | undefined): 
  * exposing a tool the deployment meant to gate; the error is logged so a
  * misbehaving hook is visible to the operator.
  */
-async function checkToolAccess (toolName: string, dependencies: ToolCallDependencies): Promise<boolean> {
+async function checkToolAccess (
+  toolName: string,
+  operation: ToolAccessOperation,
+  dependencies: ToolCallDependencies
+): Promise<boolean> {
   const hook = dependencies.opts.canAccessTool
   if (!hook) return true
   try {
     return await hook(toolName, {
       authContext: dependencies.authContext,
       request: dependencies.request,
-      sessionId: dependencies.sessionId
+      sessionId: dependencies.sessionId,
+      operation
     }) === true
   } catch (error) {
     dependencies.request.log.warn({
       err: error,
-      tool: toolName
+      tool: toolName,
+      operation
     }, 'canAccessTool hook threw; denying access')
     return false
   }
@@ -227,7 +233,7 @@ async function handleToolsList (request: JSONRPCRequest, dependencies: HandlerDe
   const accessResults = await mapWithConcurrency(
     registeredTools,
     TOOL_ACCESS_CONCURRENCY,
-    tool => checkToolAccess(tool.definition.name, dependencies)
+    tool => checkToolAccess(tool.definition.name, 'list', dependencies)
   )
   const accessibleTools = registeredTools.filter((_tool, index) => accessResults[index])
   const result: ListToolsResult = {
@@ -303,6 +309,7 @@ async function handleToolsCall (
 
   const params = paramsValidation.data
   const toolName = params.name
+  const startedAt = performance.now()
 
   // A denied tool answers exactly like an unknown one, so a caller cannot
   // distinguish "does not exist" from "exists but not for you" by the protocol
@@ -313,6 +320,12 @@ async function handleToolsCall (
   // the model cannot correct itself out of missing access.
   const resolved = await resolveRegisteredTool(toolName, dependencies)
   if (!resolved.ok) {
+    // Keep the JSON-RPC observer aligned with the privacy-preserving protocol
+    // response: denied registered tools are indistinguishable from unknown ones.
+    const observedOutcome: McpCallToolOutcome = resolved.reason === 'access-denied'
+      ? { ok: false, reason: 'not-found' }
+      : resolved
+    await emitToolCallComplete('json-rpc', toolName, params.arguments || {}, observedOutcome, startedAt, dependencies)
     return toolCallOutcomeToJsonRpc(request.id, toolName, resolved)
   }
 
@@ -325,32 +338,84 @@ async function handleToolsCall (
     : undefined
   const augmentation = resolveTaskAugmentation(resolved.tool, taskParams !== undefined)
   if ('error' in augmentation) {
+    await emitToolCallComplete('json-rpc', toolName, params.arguments || {}, { ok: false, reason: 'task-required' }, startedAt, dependencies)
     return createError(request.id, METHOD_NOT_FOUND, augmentation.error)
   }
   if (augmentation.mode === 'task') {
     return await runToolCallAsTask(
       request,
       taskParams?.ttl,
-      () => executeToolCall(request, resolved.tool, params, sessionId, dependencies),
+      // Timed from when the task actually starts executing, not from when it
+      // was queued, so `durationMs` reflects work done rather than wait time.
+      () => executeToolCall(request, resolved.tool, params, sessionId, dependencies, { source: 'task', startedAt: performance.now() }),
       dependencies
     )
   }
 
-  return await executeToolCall(request, resolved.tool, params, sessionId, dependencies)
+  return await executeToolCall(request, resolved.tool, params, sessionId, dependencies, { source: 'json-rpc', startedAt })
 }
+
+/** An observability failure must never change the tool response. */
+async function emitToolCallComplete (
+  source: MCPToolCallCompleteEvent['source'],
+  toolName: string,
+  args: Record<string, unknown>,
+  outcome: McpCallToolOutcome,
+  startedAt: number,
+  dependencies: ToolCallDependencies
+): Promise<void> {
+  const hook = dependencies.opts.onToolCallComplete
+  if (!hook) {
+    return
+  }
+
+  const common = {
+    toolName,
+    arguments: args,
+    authContext: dependencies.authContext,
+    sessionId: dependencies.sessionId,
+    requestId: dependencies.request.id,
+    durationMs: performance.now() - startedAt,
+    outcome
+  }
+
+  // Tasks may complete after the originating HTTP response has already been
+  // sent, so they must never carry the (possibly finished) request/reply.
+  const event: MCPToolCallCompleteEvent = source === 'task'
+    ? { ...common, source }
+    : { ...common, source, request: dependencies.request, reply: dependencies.reply }
+
+  try {
+    await hook(event)
+  } catch (error) {
+    if (source === 'task') {
+      // request.log may belong to an already-finished request; app.log plus
+      // the correlation id is the safe choice for task-time failures.
+      dependencies.app.log.error({ err: error, tool: toolName, requestId: common.requestId }, 'onToolCallComplete hook failed')
+    } else {
+      dependencies.request.log.error({ err: error, tool: toolName }, 'onToolCallComplete hook failed')
+    }
+  }
+}
+
+type RegisteredToolResolution =
+  | { ok: true, tool: MCPTool }
+  | { ok: false, reason: 'not-found' }
+  | { ok: false, reason: 'access-denied' }
 
 async function resolveRegisteredTool (
   toolName: string,
   dependencies: ToolCallDependencies
-): Promise<{ ok: true, tool: MCPTool } | { ok: false, reason: 'not-found' }> {
-  const isAllowed = await checkToolAccess(toolName, dependencies)
-  if (!isAllowed) {
+): Promise<RegisteredToolResolution> {
+  const isAllowed = await checkToolAccess(toolName, 'call', dependencies)
+  const tool = dependencies.tools.get(toolName)
+
+  if (!tool) {
     return { ok: false, reason: 'not-found' }
   }
 
-  const tool = dependencies.tools.get(toolName)
-  if (!tool) {
-    return { ok: false, reason: 'not-found' }
+  if (!isAllowed) {
+    return { ok: false, reason: 'access-denied' }
   }
 
   return { ok: true, tool }
@@ -377,6 +442,7 @@ function toolCallOutcomeToJsonRpc (
       return createResponse(id, result)
     }
     case 'not-found':
+    case 'access-denied':
       return createError(id, METHOD_NOT_FOUND, `Tool '${toolName}' not found`)
     // Unreachable from the JSON-RPC path today (handleToolsCall resolves task
     // augmentation itself), but kept in the mapping so the two paths stay
@@ -395,17 +461,29 @@ export async function callRegisteredTool (
   args: Record<string, unknown>,
   dependencies: ToolCallDependencies
 ): Promise<McpCallToolOutcome> {
+  const startedAt = performance.now()
+
   const resolved = await resolveRegisteredTool(name, dependencies)
   if (!resolved.ok) {
+    await emitToolCallComplete('in-process', name, args, resolved, startedAt, dependencies)
     return resolved
   }
 
   const augmentation = resolveTaskAugmentation(resolved.tool, false)
   if ('error' in augmentation) {
-    return { ok: false, reason: 'task-required' }
+    const outcome: McpCallToolOutcome = { ok: false, reason: 'task-required' }
+    await emitToolCallComplete('in-process', name, args, outcome, startedAt, dependencies)
+    return outcome
   }
 
-  return await executeRegisteredTool(resolved.tool, name, args, dependencies)
+  const outcome = await executeRegisteredTool(resolved.tool, name, args, dependencies)
+  await emitToolCallComplete('in-process', name, args, outcome, startedAt, dependencies)
+  return outcome
+}
+
+interface ToolCallObservationContext {
+  source: MCPToolCallCompleteEvent['source']
+  startedAt: number
 }
 
 async function executeToolCall (
@@ -413,11 +491,15 @@ async function executeToolCall (
   tool: MCPTool,
   params: { name: string, arguments?: Record<string, unknown> },
   sessionId: string | undefined,
-  dependencies: HandlerDependencies
+  dependencies: HandlerDependencies,
+  observation: ToolCallObservationContext
 ): Promise<JSONRPCResponse | JSONRPCError> {
   const toolName = params.name
+  const args = params.arguments || {}
 
-  const outcome = await executeRegisteredTool(tool, toolName, params.arguments || {}, { ...dependencies, sessionId })
+  const callDependencies = { ...dependencies, sessionId }
+  const outcome = await executeRegisteredTool(tool, toolName, args, callDependencies)
+  await emitToolCallComplete(observation.source, toolName, args, outcome, observation.startedAt, callDependencies)
   return toolCallOutcomeToJsonRpc(request.id, toolName, outcome)
 }
 
@@ -465,16 +547,13 @@ async function executeRegisteredTool (
       error: sanitizeError instanceof Error ? sanitizeError.message : 'Unknown sanitization error'
     }, 'Tool arguments sanitization failed')
 
-    // SEP-1303: input validation failures are tool execution errors, not protocol
-    // errors, so the model gets a chance to correct itself.
-    const result: CallToolResult = {
-      content: [{
-        type: 'text',
-        text: `${SECURITY_WARNINGS.UNVALIDATED_INPUT}: ${sanitizeError instanceof Error ? sanitizeError.message : 'Sanitization failed'}`
-      }],
-      isError: true
+    // A pre-handler rejection, same as the TypeBox/AJV validation branches
+    // below: the handler never runs.
+    return {
+      ok: false,
+      reason: 'invalid-arguments',
+      detail: sanitizeError instanceof Error ? sanitizeError.message : 'Tool arguments failed sanitization'
     }
-    return { ok: true, result }
   }
   if ('inputSchema' in tool.definition) {
     // Check if it's a TypeBox schema
@@ -1250,6 +1329,88 @@ async function handleResourcesUnsubscribe (
   }
 }
 
+const STDIO_TRANSPORT_HEADER = 'x-platformatic-mcp-transport'
+
+function mcpContextCarrier (params: unknown): Record<string, string | string[]> | undefined {
+  if (typeof params !== 'object' || params === null || !('_meta' in params)) return undefined
+  const meta = params._meta
+  if (typeof meta !== 'object' || meta === null) return undefined
+
+  const carrier: Record<string, string | string[]> = {}
+  for (const [key, value] of Object.entries(meta)) {
+    if (typeof value === 'string' || (Array.isArray(value) && value.every(item => typeof item === 'string'))) {
+      carrier[key] = value as string | string[]
+    }
+  }
+  return Object.keys(carrier).length > 0 ? carrier : undefined
+}
+
+function normalizedNetworkProtocolVersion (version: string): string {
+  return version.endsWith('.0') ? version.slice(0, -2) : version
+}
+
+async function withMcpServerSpan<T> (
+  message: JSONRPCRequest | JSONRPCNotification,
+  sessionId: string | undefined,
+  dependencies: HandlerDependencies,
+  fn: () => Promise<T>
+): Promise<T> {
+  const { tracer, request } = dependencies
+  if (!tracer) return fn()
+
+  const params = message.params as any
+  const extraAttrs: Record<string, SpanAttributeValue> = {}
+  let target: string | undefined
+
+  if ('id' in message && message.id !== null && message.id !== undefined) {
+    extraAttrs[MCP_ATTR.JSONRPC_REQUEST_ID] = String(message.id)
+  }
+
+  if (message.method === 'tools/call' && params?.name) {
+    target = params.name
+    extraAttrs[MCP_ATTR.TOOL_NAME] = params.name
+    extraAttrs[MCP_ATTR.OPERATION_NAME] = 'execute_tool'
+  }
+  if (message.method === 'prompts/get' && params?.name) {
+    target = params.name
+    extraAttrs[MCP_ATTR.PROMPT_NAME] = params.name
+  }
+  if (['resources/read', 'resources/subscribe', 'resources/unsubscribe', 'notifications/resources/updated'].includes(message.method) && params?.uri) {
+    extraAttrs[MCP_ATTR.RESOURCE_URI] = params.uri
+  }
+
+  const protocolVersion = message.method === 'initialize'
+    ? negotiateProtocolVersion(params?.protocolVersion)
+    : dependencies.protocolVersion
+  if (protocolVersion) extraAttrs[MCP_ATTR.PROTOCOL_VERSION] = protocolVersion
+
+  const isStdio = request.headers[STDIO_TRANSPORT_HEADER] === 'stdio'
+  if (isStdio) {
+    extraAttrs[MCP_ATTR.NETWORK_TRANSPORT] = 'pipe'
+  } else {
+    const httpVersion = request.raw.httpVersion
+    extraAttrs[MCP_ATTR.NETWORK_TRANSPORT] = httpVersion.startsWith('3') ? 'quic' : 'tcp'
+    extraAttrs[MCP_ATTR.NETWORK_PROTOCOL_NAME] = 'http'
+    extraAttrs[MCP_ATTR.NETWORK_PROTOCOL_VERSION] = normalizedNetworkProtocolVersion(httpVersion)
+    if (request.ip) extraAttrs[MCP_ATTR.CLIENT_ADDRESS] = request.ip
+    if (request.socket.remotePort !== undefined) extraAttrs[MCP_ATTR.CLIENT_PORT] = request.socket.remotePort
+  }
+
+  const { withSpan, buildSpanAttributes } = await getTelemetry()
+  const spanName = target ? `${message.method} ${target}` : message.method
+  return withSpan(
+    tracer,
+    spanName,
+    buildSpanAttributes(message.method, sessionId, extraAttrs),
+    fn,
+    {
+      kind: 'server',
+      carrier: mcpContextCarrier(params),
+      recordMcpResponse: true
+    }
+  )
+}
+
 export async function handleRequest (
   request: JSONRPCRequest,
   sessionId: string | undefined,
@@ -1264,61 +1425,47 @@ export async function handleRequest (
   }, `JSON-RPC method invoked: ${request.method}`)
 
   try {
-    const { tracer } = dependencies
-
-    // Build method-specific extra span attributes before dispatching
-    const extraAttrs: Record<string, string> = {}
-    const params = request.params as any
-    if (request.method === 'tools/call' && params?.name) extraAttrs[MCP_ATTR.TOOL_NAME] = params.name
-    if (request.method === 'resources/read' && params?.uri) extraAttrs[MCP_ATTR.RESOURCE_URI] = params.uri
-    if (request.method === 'prompts/get' && params?.name) extraAttrs[MCP_ATTR.PROMPT_NAME] = params.name
-
-    const wrap = tracer
-      ? async (fn: () => Promise<JSONRPCResponse | JSONRPCError>) => {
-        const { withSpan, buildSpanAttributes } = await getTelemetry()
-        return withSpan(tracer, request.method, buildSpanAttributes(request.method, sessionId, extraAttrs), fn)
-      }
-      : async (fn: () => Promise<JSONRPCResponse | JSONRPCError>) => fn()
-
-    switch (request.method) {
-      case 'initialize':
-        return wrap(() => handleInitialize(request, sessionId, dependencies))
-      case 'ping':
-        return wrap(async () => handlePing(request))
-      case 'tools/list':
-        return wrap(async () => handleToolsList(request, dependencies))
-      case 'resources/list':
-        return wrap(async () => handleResourcesList(request, dependencies))
-      case 'resources/templates/list':
-        return wrap(async () => handleResourceTemplatesList(request, dependencies))
-      case 'prompts/list':
-        return wrap(async () => handlePromptsList(request, dependencies))
-      case 'tools/call':
-        return wrap(() => handleToolsCall(request, sessionId, dependencies))
-      case 'resources/read':
-        return wrap(() => handleResourcesRead(request, sessionId, dependencies))
-      case 'resources/subscribe':
-        return wrap(() => handleResourcesSubscribe(request, sessionId, dependencies))
-      case 'resources/unsubscribe':
-        return wrap(() => handleResourcesUnsubscribe(request, sessionId, dependencies))
-      case 'prompts/get':
-        return wrap(() => handlePromptsGet(request, sessionId, dependencies))
-      case 'tasks/get':
-      case 'tasks/result':
-      case 'tasks/list':
-      case 'tasks/cancel':
-        // Tasks arrived in 2025-11-25; to an older client these methods simply
-        // do not exist, and we never advertised them.
-        if (!supportsTasks(dependencies.protocolVersion)) {
+    return await withMcpServerSpan(request, sessionId, dependencies, async () => {
+      switch (request.method) {
+        case 'initialize':
+          return await handleInitialize(request, sessionId, dependencies)
+        case 'ping':
+          return handlePing(request)
+        case 'tools/list':
+          return await handleToolsList(request, dependencies)
+        case 'resources/list':
+          return handleResourcesList(request, dependencies)
+        case 'resources/templates/list':
+          return handleResourceTemplatesList(request, dependencies)
+        case 'prompts/list':
+          return handlePromptsList(request, dependencies)
+        case 'tools/call':
+          return await handleToolsCall(request, sessionId, dependencies)
+        case 'resources/read':
+          return await handleResourcesRead(request, sessionId, dependencies)
+        case 'resources/subscribe':
+          return await handleResourcesSubscribe(request, sessionId, dependencies)
+        case 'resources/unsubscribe':
+          return await handleResourcesUnsubscribe(request, sessionId, dependencies)
+        case 'prompts/get':
+          return await handlePromptsGet(request, sessionId, dependencies)
+        case 'tasks/get':
+        case 'tasks/result':
+        case 'tasks/list':
+        case 'tasks/cancel':
+          // Tasks arrived in 2025-11-25; to an older client these methods simply
+          // do not exist, and we never advertised them.
+          if (!supportsTasks(dependencies.protocolVersion)) {
+            return createError(request.id, METHOD_NOT_FOUND, `Method ${request.method} not found`)
+          }
+          if (request.method === 'tasks/get') return await handleTasksGet(request, dependencies)
+          if (request.method === 'tasks/result') return await handleTasksResult(request, dependencies)
+          if (request.method === 'tasks/list') return await handleTasksList(request, dependencies)
+          return await handleTasksCancel(request, dependencies)
+        default:
           return createError(request.id, METHOD_NOT_FOUND, `Method ${request.method} not found`)
-        }
-        if (request.method === 'tasks/get') return wrap(() => handleTasksGet(request, dependencies))
-        if (request.method === 'tasks/result') return wrap(() => handleTasksResult(request, dependencies))
-        if (request.method === 'tasks/list') return wrap(() => handleTasksList(request, dependencies))
-        return wrap(() => handleTasksCancel(request, dependencies))
-      default:
-        return createError(request.id, METHOD_NOT_FOUND, `Method ${request.method} not found`)
-    }
+      }
+    })
   } catch (error) {
     return createError(request.id, INTERNAL_ERROR, 'Internal server error', error)
   }
@@ -1351,8 +1498,10 @@ export async function processMessage (
   if ('id' in message && 'method' in message) {
     return await handleRequest(message as JSONRPCRequest, sessionId, dependencies)
   } else if ('method' in message) {
-    handleNotification(message as JSONRPCNotification, dependencies.app)
-    return null
+    return await withMcpServerSpan(message as JSONRPCNotification, sessionId, dependencies, async () => {
+      handleNotification(message as JSONRPCNotification, dependencies.app)
+      return null
+    })
   } else {
     throw new Error('Invalid JSON-RPC message')
   }

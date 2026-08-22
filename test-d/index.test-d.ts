@@ -32,6 +32,7 @@ import type {
   MCPRouteSchemaTransformer,
   McpCallToolContext,
   McpCallToolOutcome,
+  MCPToolCallCompleteEvent,
 } from '../dist/index.js'
 
 // ─── ToolHandler ─────────────────────────────────────────────────────
@@ -359,12 +360,16 @@ const accessHook: NonNullable<MCPPluginOptions['canAccessTool']> = (toolName, co
   expectType<string>(toolName)
   expectAssignable<string[] | undefined>(context.authContext?.scopes)
   expectAssignable<string | undefined>(context.sessionId)
+  expectType<'list' | 'call'>(context.operation)
   return context.request !== undefined
 }
 expectAssignable<MCPPluginOptions>({ canAccessTool: accessHook })
 
-// The context type is exported and carries a required request
-expectAssignable<ToolAccessContext>({ request: {} as FastifyRequest })
+// The context type is exported and carries a required request and operation
+expectAssignable<ToolAccessContext>({ request: {} as FastifyRequest, operation: 'list' })
+expectAssignable<ToolAccessContext>({ request: {} as FastifyRequest, operation: 'call' })
+expectNotAssignable<ToolAccessContext>({ request: {} as FastifyRequest })
+expectNotAssignable<ToolAccessContext>({ request: {} as FastifyRequest, operation: 'delete' })
 expectNotAssignable<ToolAccessContext>({})
 
 // mcpCallTool is decorated on Fastify and returns the exported outcome union
@@ -386,10 +391,35 @@ expectNotAssignable<McpCallToolContext>({})
 expectAssignable<McpCallToolOutcome>({ ok: true, result: { content: [{ type: 'text', text: 'ok' }] } })
 expectAssignable<McpCallToolOutcome>({ ok: false, reason: 'not-found' })
 expectNotAssignable<McpCallToolOutcome>({ ok: false, reason: 'unknown-tool' })
-expectNotAssignable<McpCallToolOutcome>({ ok: false, reason: 'access-denied' })
+expectAssignable<McpCallToolOutcome>({ ok: false, reason: 'access-denied' })
 expectAssignable<McpCallToolOutcome>({ ok: false, reason: 'invalid-arguments', detail: 'missing input' })
 expectAssignable<McpCallToolOutcome>({ ok: false, reason: 'task-required' })
 expectNotAssignable<McpCallToolOutcome>({ ok: false, reason: 'nope' })
+
+// ─── onToolCallComplete event ───────────────────────────────────────
+
+// Every source carries a requestId
+expectType<string>(({} as MCPToolCallCompleteEvent).requestId)
+
+// Synchronous sources expose the live request/reply
+declare const jsonRpcEvent: MCPToolCallCompleteEvent & { source: 'json-rpc' | 'in-process' }
+expectType<FastifyRequest>(jsonRpcEvent.request)
+expectType<FastifyReply>(jsonRpcEvent.reply)
+
+// Task events cannot carry request/reply
+declare const taskEvent: MCPToolCallCompleteEvent & { source: 'task' }
+expectType<undefined>(taskEvent.request)
+expectType<undefined>(taskEvent.reply)
+expectNotAssignable<MCPToolCallCompleteEvent & { source: 'task' }>({
+  source: 'task',
+  toolName: 'echo',
+  arguments: {},
+  requestId: 'req-1',
+  durationMs: 1,
+  outcome: { ok: true, result: { content: [] } },
+  request: {} as FastifyRequest,
+  reply: {} as FastifyReply,
+})
 
 // Sync and async hooks are both accepted
 expectAssignable<MCPPluginOptions>({ canAccessTool: () => true })

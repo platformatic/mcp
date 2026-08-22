@@ -1,7 +1,7 @@
 import { describe, it, mock } from 'node:test'
 import assert from 'node:assert/strict'
 import Fastify from 'fastify'
-import type { Tracer, Span } from '@opentelemetry/api'
+import { SpanKind, type Tracer, type Span } from '@opentelemetry/api'
 import mcpPlugin from '../src/index.ts'
 import { MCP_ATTR } from '../src/telemetry.ts'
 
@@ -14,22 +14,25 @@ function makeSpan (): Span & { end: ReturnType<typeof mock.fn>, setStatus: Retur
   } as unknown as any
 }
 
-function makeTracer (): { tracer: Tracer, spans: Span[], spanNames: string[], spanAttrs: Record<string, unknown>[] } {
+function makeTracer (): { tracer: Tracer, spans: Span[], spanNames: string[], spanAttrs: Record<string, unknown>[], spanKinds: number[] } {
   const spans: Span[] = []
   const spanNames: string[] = []
   const spanAttrs: Record<string, unknown>[] = []
+  const spanKinds: number[] = []
 
   const tracer: Tracer = {
-    startActiveSpan (name: string, opts: any, fn: (s: Span) => any) {
+    startActiveSpan (name: string, opts: any, ...args: any[]) {
       spanNames.push(name)
       spanAttrs.push(opts?.attributes ?? {})
+      spanKinds.push(opts?.kind)
       const span = makeSpan()
       spans.push(span)
+      const fn = args.at(-1) as (s: Span) => any
       return fn(span)
     }
   } as unknown as Tracer
 
-  return { tracer, spans, spanNames, spanAttrs }
+  return { tracer, spans, spanNames, spanAttrs, spanKinds }
 }
 
 async function buildApp (tracer: Tracer) {
@@ -50,8 +53,8 @@ async function buildApp (tracer: Tracer) {
 
 describe('telemetry integration', () => {
   describe('tools/call', () => {
-    it('creates a span with mcp.tool.name attribute', async () => {
-      const { tracer, spanNames, spanAttrs, spans } = makeTracer()
+    it('creates a span with gen_ai.tool.name attribute', async () => {
+      const { tracer, spanNames, spanAttrs, spanKinds, spans } = makeTracer()
       const app = await buildApp(tracer)
 
       const res = await app.inject({
@@ -62,10 +65,17 @@ describe('telemetry integration', () => {
       })
 
       assert.equal(res.statusCode, 200)
-      assert.ok(spanNames.includes('tools/call'), `expected tools/call span, got: ${spanNames}`)
-      const idx = spanNames.indexOf('tools/call')
+      assert.ok(spanNames.includes('tools/call echo'), `expected tools/call span, got: ${spanNames}`)
+      const idx = spanNames.indexOf('tools/call echo')
+      assert.equal(spanKinds[idx], SpanKind.SERVER)
       assert.equal(spanAttrs[idx][MCP_ATTR.METHOD_NAME], 'tools/call')
       assert.equal(spanAttrs[idx][MCP_ATTR.TOOL_NAME], 'echo')
+      assert.equal(spanAttrs[idx][MCP_ATTR.OPERATION_NAME], 'execute_tool')
+      assert.equal(spanAttrs[idx][MCP_ATTR.JSONRPC_REQUEST_ID], '1')
+      assert.equal(spanAttrs[idx][MCP_ATTR.NETWORK_TRANSPORT], 'tcp')
+      assert.equal(spanAttrs[idx][MCP_ATTR.NETWORK_PROTOCOL_NAME], 'http')
+      assert.equal(typeof spanAttrs[idx][MCP_ATTR.PROTOCOL_VERSION], 'string')
+      assert.equal((spans[idx] as any).setStatus.mock.calls.length, 0)
       assert.equal((spans[idx] as any).end.mock.calls.length, 1)
 
       await app.close()

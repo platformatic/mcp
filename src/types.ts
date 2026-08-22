@@ -190,13 +190,22 @@ export interface UnsafeMCPPrompt {
  */
 export interface TracerLike {
   startActiveSpan (name: string, options: any, fn: (span: any) => any): any
+  startActiveSpan (name: string, options: any, context: any, fn: (span: any) => any): any
 }
+
+/**
+ * Which operation `canAccessTool` is deciding: `list` for `tools/list`
+ * visibility, `call` for `tools/call` execution (including HTTP,
+ * task-augmented, and `mcpCallTool()` calls, and calls to unknown tools).
+ */
+export type ToolAccessOperation = 'list' | 'call'
 
 /** Per-request context handed to the `canAccessTool` hook. */
 export interface ToolAccessContext {
   authContext?: AuthorizationContext
   request: FastifyRequest
   sessionId?: string
+  operation: ToolAccessOperation
 }
 
 export type MCPRouteId =
@@ -224,8 +233,37 @@ export interface McpCallToolContext {
 export type McpCallToolOutcome =
   | { ok: true, result: CallToolResult }
   | { ok: false, reason: 'not-found' }
+  | { ok: false, reason: 'access-denied' }
   | { ok: false, reason: 'invalid-arguments', detail: string }
   | { ok: false, reason: 'task-required' }
+
+interface MCPToolCallCompleteEventBase {
+  toolName: string
+  arguments: Record<string, unknown>
+  authContext?: AuthorizationContext
+  sessionId?: string
+  /** Correlates this event back to the originating request, for every source */
+  requestId: string
+  durationMs: number
+  outcome: McpCallToolOutcome
+}
+
+/**
+ * `source: 'task'` fires after the original HTTP response may already have
+ * completed, so it must not carry the (possibly finished) `request`/`reply`
+ * objects that the synchronous sources expose.
+ */
+export type MCPToolCallCompleteEvent =
+  | (MCPToolCallCompleteEventBase & {
+    source: 'json-rpc' | 'in-process'
+    request: FastifyRequest
+    reply: FastifyReply
+  })
+  | (MCPToolCallCompleteEventBase & {
+    source: 'task'
+    request?: undefined
+    reply?: undefined
+  })
 
 export interface MCPPluginOptions {
   serverInfo?: Implementation
@@ -268,12 +306,28 @@ export interface MCPPluginOptions {
    * `tools/call` runs the hook even for unknown names. Response timing is not
    * guaranteed to be indistinguishable: it depends on what the hook itself
    * does per name. A hook that throws denies access.
+   * `context.operation` tells the hook which decision it is making: `'list'`
+   * for `tools/list` visibility, `'call'` for execution (HTTP, task-augmented,
+   * and `mcpCallTool()` calls, and unknown tool names, all use `'call'`).
+   * Visibility and execution policies may intentionally differ.
    * Omit to keep every registered tool visible and callable.
    */
   canAccessTool?: (
     toolName: string,
     context: ToolAccessContext
   ) => boolean | Promise<boolean>
+  /**
+   * Fires once per tool call, after it settles, regardless of transport
+   * (JSON-RPC, `app.mcpCallTool()`, or a completed task). Not called for
+   * `tools/list`, initialization/ping, or malformed requests where no tool
+   * name was resolved. Awaited before the response is sent, so keep it fast;
+   * a throwing hook is logged and otherwise ignored, it never changes the
+   * tool response. `event.arguments` are the raw, unredacted tool
+   * arguments, so redact sensitive values yourself before logging them.
+   */
+  onToolCallComplete?: (
+    event: MCPToolCallCompleteEvent
+  ) => void | Promise<void>
   /**
    * Customize Fastify/OpenAPI schema metadata for MCP transport routes.
    * This callback runs once per registered route during startup.

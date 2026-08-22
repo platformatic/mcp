@@ -211,7 +211,8 @@ export class StdioTransport {
         url: '/mcp',
         headers: {
           'content-type': 'application/json',
-          accept: 'application/json' // Explicitly request JSON, not SSE
+          accept: 'application/json', // Explicitly request JSON, not SSE
+          'x-platformatic-mcp-transport': 'stdio'
         },
         payload: message
       })

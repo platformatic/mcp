@@ -29,6 +29,7 @@ async function buildApp (t: TestContext) {
   let taskOnlyInvocations = 0
   let jsonSchemaInvocations = 0
   let accessContextRequest: FastifyRequest | undefined
+  let accessContextOperation: string | undefined
   let directRouteRequest: FastifyRequest | undefined
 
   const app = Fastify({ logger: false })
@@ -39,8 +40,12 @@ async function buildApp (t: TestContext) {
     validateJsonSchemaInputs: {},
     canAccessTool: (toolName, context) => {
       accessContextRequest = context.request
+      accessContextOperation = context.operation
       if (toolName === 'wallet-summary') {
         return context.authContext?.scopes?.includes('wallet-summary:read') === true
+      }
+      if (toolName === 'throws-access-check') {
+        throw new Error('access hook exploded')
       }
       return toolName !== 'restricted'
     }
@@ -133,6 +138,15 @@ async function buildApp (t: TestContext) {
     return { content: [{ type: 'text', text: 'wallet ok' }] }
   })
 
+  app.mcpAddTool({
+    name: 'throws-access-check',
+    description: 'Denied via a canAccessTool hook that throws',
+    inputSchema: Type.Object({})
+  }, async () => {
+    handlerInvocations++
+    return { content: [{ type: 'text', text: 'should not run' }] }
+  })
+
   app.post('/direct-tool-call', async (request, reply) => {
     directRouteRequest = request
     const body = request.body as DirectBody
@@ -177,6 +191,7 @@ async function buildApp (t: TestContext) {
     getJsonSchemaInvocations: () => jsonSchemaInvocations,
     getTaskOnlyInvocations: () => taskOnlyInvocations,
     getAccessContextRequest: () => accessContextRequest,
+    getAccessContextOperation: () => accessContextOperation,
     getDirectRouteRequest: () => directRouteRequest
   }
 }
@@ -232,23 +247,58 @@ describe('mcpCallTool', () => {
     })
   })
 
-  test('reports unknown and denied tools without invoking handlers', async (t: TestContext) => {
+  test('reports not-found for an unknown tool without invoking handlers', async (t: TestContext) => {
     const { app, getHandlerInvocations } = await buildApp(t)
 
-    const unknownResponse = await app.inject({
+    const response = await app.inject({
       method: 'POST',
       url: '/direct-tool-call',
       payload: { name: 'missing', args: {} }
     })
-    const deniedResponse = await app.inject({
+
+    t.assert.deepStrictEqual(response.json(), { ok: false, reason: 'not-found' })
+    t.assert.strictEqual(getHandlerInvocations(), 0)
+  })
+
+  test('reports access-denied for an unauthorized registered tool without invoking its handler', async (t: TestContext) => {
+    const { app, getHandlerInvocations } = await buildApp(t)
+
+    const response = await app.inject({
       method: 'POST',
       url: '/direct-tool-call',
       payload: { name: 'restricted', args: {} }
     })
 
-    t.assert.deepStrictEqual(unknownResponse.json(), { ok: false, reason: 'not-found' })
-    t.assert.deepStrictEqual(deniedResponse.json(), { ok: false, reason: 'not-found' })
+    t.assert.deepStrictEqual(response.json(), { ok: false, reason: 'access-denied' })
     t.assert.strictEqual(getHandlerInvocations(), 0)
+  })
+
+  test('reports access-denied when the access hook throws for an existing tool', async (t: TestContext) => {
+    const { app, getHandlerInvocations } = await buildApp(t)
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/direct-tool-call',
+      payload: { name: 'throws-access-check', args: {} }
+    })
+
+    t.assert.deepStrictEqual(response.json(), { ok: false, reason: 'access-denied' })
+    t.assert.strictEqual(getHandlerInvocations(), 0)
+  })
+
+  test('reports not-found, not access-denied, for an unknown tool the hook also denies', async (t: TestContext) => {
+    const { app } = await buildApp(t)
+
+    // canAccessTool denies everything except 'echo' and the explicitly
+    // allowed names, so an unknown name is denied by the hook too - but
+    // existence takes precedence in the outcome.
+    const response = await app.inject({
+      method: 'POST',
+      url: '/direct-tool-call',
+      payload: { name: 'restricted-and-missing', args: {} }
+    })
+
+    t.assert.deepStrictEqual(response.json(), { ok: false, reason: 'not-found' })
   })
 
   test('reports invalid arguments without invoking the handler', async (t: TestContext) => {
@@ -277,6 +327,18 @@ describe('mcpCallTool', () => {
     })
 
     t.assert.strictEqual(getAccessContextRequest(), getDirectRouteRequest())
+  })
+
+  test('mcpCallTool() invokes canAccessTool with operation call', async (t: TestContext) => {
+    const { app, getAccessContextOperation } = await buildApp(t)
+
+    await app.inject({
+      method: 'POST',
+      url: '/direct-tool-call',
+      payload: { name: 'echo', args: { message: 'hello' } }
+    })
+
+    t.assert.strictEqual(getAccessContextOperation(), 'call')
   })
 
   test('matches the JSON-RPC tools/call path for success and failure outcomes', async (t: TestContext) => {
@@ -319,7 +381,10 @@ describe('mcpCallTool', () => {
       url: '/mcp',
       payload: callRequest('restricted', {}, 3)
     })
-    t.assert.deepStrictEqual(directDenied.json(), { ok: false, reason: 'not-found' })
+    // mcpCallTool() reports the precise reason; the JSON-RPC wire protocol
+    // still masks it as `not-found` so remote clients can't tell denied
+    // tools apart from unknown ones.
+    t.assert.deepStrictEqual(directDenied.json(), { ok: false, reason: 'access-denied' })
     const deniedError = (rpcDenied.json() as JSONRPCErrorResponse).error
     t.assert.strictEqual(deniedError.code, METHOD_NOT_FOUND)
     t.assert.strictEqual(deniedError.message, "Tool 'restricted' not found")
@@ -396,6 +461,23 @@ describe('mcpCallTool', () => {
     t.assert.strictEqual(getJsonSchemaInvocations(), 0)
   })
 
+  test('reports invalid arguments when sanitization rejects the input', async (t: TestContext) => {
+    const { app, getHandlerInvocations } = await buildApp(t)
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/direct-tool-call',
+      // Exceeds the sanitizer's string length ceiling, satisfies the schema
+      payload: { name: 'echo', args: { message: 'x'.repeat(20000) } }
+    })
+    const body = response.json() as { ok: false, reason: string, detail: string }
+
+    t.assert.strictEqual(body.ok, false)
+    t.assert.strictEqual(body.reason, 'invalid-arguments')
+    t.assert.ok(body.detail.length > 0)
+    t.assert.strictEqual(getHandlerInvocations(), 0)
+  })
+
   test('passes the active session id to the non-task JSON-RPC tools/call path', async (t: TestContext) => {
     const { app } = await buildApp(t)
 
@@ -466,7 +548,7 @@ describe('mcpCallTool', () => {
       url: '/direct-tool-call',
       payload: { name: 'wallet-summary', args: {}, authScopes: ['profile:read'] }
     })
-    t.assert.deepStrictEqual(deniedResponse.json(), { ok: false, reason: 'not-found' })
+    t.assert.deepStrictEqual(deniedResponse.json(), { ok: false, reason: 'access-denied' })
 
     const allowedResponse = await app.inject({
       method: 'POST',
@@ -487,7 +569,7 @@ describe('mcpCallTool', () => {
       url: '/direct-tool-call',
       payload: { name: 'restricted', args: {}, spoofContextOverrides: true }
     })
-    t.assert.deepStrictEqual(deniedResponse.json(), { ok: false, reason: 'not-found' })
+    t.assert.deepStrictEqual(deniedResponse.json(), { ok: false, reason: 'access-denied' })
 
     const allowedResponse = await app.inject({
       method: 'POST',
