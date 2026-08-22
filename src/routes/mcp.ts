@@ -340,6 +340,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
           request,
           reply,
           authContext,
+          tracer: opts.telemetry?.tracer,
           sessionStore,
           taskStore,
           taskWaiters,

@@ -182,6 +182,18 @@ export interface UnsafeMCPPrompt {
 }
 
 /**
+ * Minimal tracer interface compatible with `@opentelemetry/api`'s `Tracer`.
+ * Defined locally so consumers don't need `@opentelemetry/api` installed just
+ * to import this package's types. Any real OTel `Tracer` satisfies this structurally.
+ *
+ * @see https://open-telemetry.github.io/opentelemetry-js/interfaces/_opentelemetry_api.Tracer.html
+ */
+export interface TracerLike {
+  startActiveSpan (name: string, options: any, fn: (span: any) => any): any
+  startActiveSpan (name: string, options: any, context: any, fn: (span: any) => any): any
+}
+
+/**
  * Which operation `canAccessTool` is deciding: `list` for `tools/list`
  * visibility, `call` for `tools/call` execution (including HTTP,
  * task-augmented, and `mcpCallTool()` calls, and calls to unknown tools).
@@ -337,6 +349,15 @@ export interface MCPPluginOptions {
     tls?: Record<string, unknown>
   }
   authorization?: AuthorizationConfig
+  /**
+   * Optional OpenTelemetry instrumentation.
+   * Provide a Tracer to enable per-operation spans with MCP semantic convention attributes.
+   * Any `Tracer` from `@opentelemetry/api` satisfies `TracerLike`.
+   * `@opentelemetry/api` must be installed as a peer dependency when using this option.
+   */
+  telemetry?: {
+    tracer: TracerLike
+  }
 }
 
 export interface SSESession {
