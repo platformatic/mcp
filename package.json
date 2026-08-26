@@ -57,7 +57,7 @@
     "fastify-error": "^1.0.0",
     "fastify-plugin": "^6.0.0",
     "get-jwks": "^11.0.1",
-    "ioredis": "^5.0.0",
+    "ioredis": "^6.0.0",
     "mqemitter": "^7.1.0",
     "mqemitter-redis": "^7.1.0",
     "safe-stable-stringify": "^2.5.0"
