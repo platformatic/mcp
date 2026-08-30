@@ -1,5 +1,7 @@
 import { test, describe } from 'node:test'
 import type { TestContext } from 'node:test'
+import { EventEmitter } from 'node:events'
+import { setTimeout as delay } from 'node:timers/promises'
 import {
   encodeHeaderValue,
   decodeHeaderValue,
@@ -9,7 +11,8 @@ import {
   validateToolParamHeaders
 } from '../src/modern/headers.ts'
 import { RequestStateSealer, digestRequest } from '../src/modern/request-state.ts'
-import { negotiateFilter, matchesFilter } from '../src/modern/subscriptions.ts'
+import { SubscriptionRegistry, negotiateFilter, matchesFilter } from '../src/modern/subscriptions.ts'
+import { TaskInputChannel } from '../src/modern/task-inputs.ts'
 import { parseRequestContext, bodyClaimsModern, isModernRequest } from '../src/modern/request-meta.ts'
 import { isModernRevision } from '../src/protocol-version.ts'
 import {
@@ -43,6 +46,10 @@ describe('header value encoding', () => {
 
   test('invalid Base64 inside the sentinel is rejected rather than guessed at', (t: TestContext) => {
     t.assert.strictEqual(decodeHeaderValue('=?base64?not!valid!?='), null)
+  })
+
+  test('malformed UTF-8 inside the sentinel is rejected', (t: TestContext) => {
+    t.assert.strictEqual(decodeHeaderValue('=?base64?/w==?='), null)
   })
 })
 
@@ -108,7 +115,53 @@ describe('x-mcp-header annotations', () => {
     t.assert.strictEqual(result.ok, false)
   })
 
-  test('integers compare numerically, not as strings', (t: TestContext) => {
+  for (const [keyword, value] of [
+    ['items', { type: 'string', 'x-mcp-header': 'Item' }],
+    ['allOf', [{ type: 'string', 'x-mcp-header': 'All' }]],
+    ['oneOf', [{ type: 'string', 'x-mcp-header': 'One' }]],
+    ['anyOf', [{ type: 'string', 'x-mcp-header': 'Any' }]],
+    ['not', { type: 'string', 'x-mcp-header': 'Not' }],
+    ['if', { type: 'string', 'x-mcp-header': 'If' }],
+    ['then', { type: 'string', 'x-mcp-header': 'Then' }],
+    ['else', { type: 'string', 'x-mcp-header': 'Else' }]
+  ] as const) {
+    test(`an annotation under ${keyword} invalidates the schema`, (t: TestContext) => {
+      const result = collectHeaderParams({ type: 'object', [keyword]: value })
+      t.assert.strictEqual(result.ok, false)
+    })
+  }
+
+  test('instance data containing an x-mcp-header key is not treated as a schema annotation', (t: TestContext) => {
+    const result = collectHeaderParams({
+      type: 'object',
+      examples: [{ 'x-mcp-header': 'ordinary instance data' }],
+      properties: { value: { type: 'string', 'x-mcp-header': 'Value' } }
+    })
+    t.assert.strictEqual(result.ok, true)
+  })
+
+  test('an annotation in a referenced definition is invalid', (t: TestContext) => {
+    const result = collectHeaderParams({
+      type: 'object',
+      $ref: '#/$defs/value',
+      $defs: {
+        value: {
+          type: 'object',
+          properties: { tenant: { type: 'string', 'x-mcp-header': 'Tenant' } }
+        }
+      }
+    })
+    t.assert.strictEqual(result.ok, false)
+  })
+
+  test('cyclic schemas are rejected without overflowing the stack', (t: TestContext) => {
+    const schema: Record<string, unknown> = { type: 'object' }
+    schema.properties = { self: schema }
+    const result = collectHeaderParams(schema)
+    t.assert.strictEqual(result.ok, false)
+  })
+
+  test('integers compare by canonical safe-integer representation', (t: TestContext) => {
     const schema = {
       type: 'object',
       properties: { count: { type: 'integer', 'x-mcp-header': 'Count' } }
@@ -120,6 +173,22 @@ describe('x-mcp-header annotations', () => {
     )
     t.assert.strictEqual(
       validateToolParamHeaders({ 'mcp-param-count': '43' }, schema, { count: 42 }).ok,
+      false
+    )
+    t.assert.strictEqual(
+      validateToolParamHeaders({ 'mcp-param-count': String(Number.MAX_SAFE_INTEGER) }, schema, { count: Number.MAX_SAFE_INTEGER }).ok,
+      true
+    )
+    t.assert.strictEqual(
+      validateToolParamHeaders({ 'mcp-param-count': String(Number.MIN_SAFE_INTEGER) }, schema, { count: Number.MIN_SAFE_INTEGER }).ok,
+      true
+    )
+    t.assert.strictEqual(
+      validateToolParamHeaders({ 'mcp-param-count': '9007199254740993' }, schema, { count: Number('9007199254740993') }).ok,
+      false
+    )
+    t.assert.strictEqual(
+      validateToolParamHeaders({ 'mcp-param-count': '-9007199254740992' }, schema, { count: -9007199254740992 }).ok,
       false
     )
   })
@@ -243,6 +312,106 @@ describe('subscription filters', () => {
     }
     t.assert.strictEqual(matchesFilter(progress, everything), false)
     t.assert.strictEqual(matchesFilter(message, everything), false)
+  })
+})
+
+describe('task input channel lifecycle', () => {
+  test('cancellation rejects a parked waiter immediately', async (t: TestContext) => {
+    const channel = new TaskInputChannel()
+    const waiting = channel.wait('task-1')
+    t.assert.strictEqual(channel.waiterCount, 1)
+
+    channel.abort('task-1', 'task cancelled')
+    await t.assert.rejects(waiting, /task cancelled/)
+    t.assert.strictEqual(channel.waiterCount, 0)
+    channel.close()
+  })
+
+  test('a retried broker delivery is deduplicated after resolving its waiter', async (t: TestContext) => {
+    const channel = new TaskInputChannel()
+    const waiting = channel.wait('task-1')
+    channel.deliver('task-1', { confirmation: 'yes' }, 'delivery-1')
+    t.assert.deepStrictEqual(await waiting, { confirmation: 'yes' })
+
+    // An ambiguous publish error may make the durable outbox retry a message
+    // that was already delivered. It must not be held for the next input round.
+    channel.deliver('task-1', { confirmation: 'yes' }, 'delivery-1')
+    t.assert.strictEqual(channel.pendingSize, 0)
+    channel.close()
+  })
+
+  test('pending answers expire autonomously and remain capacity bounded', async (t: TestContext) => {
+    const channel = new TaskInputChannel(20, 2)
+    channel.deliver('task-1', { a: 1 })
+    channel.deliver('task-2', { b: 2 })
+    channel.deliver('task-3', { c: 3 })
+
+    t.assert.strictEqual(channel.pendingSize, 2)
+    await delay(60)
+    t.assert.strictEqual(channel.pendingSize, 0)
+    channel.close()
+  })
+})
+
+describe('subscription backpressure', () => {
+  class FakeResponse extends EventEmitter {
+    writes: string[] = []
+    ended = false
+    writable = false
+
+    setHeader (): void {}
+    writeHead (): void {}
+
+    write (frame: string): boolean {
+      this.writes.push(frame)
+      return this.writable
+    }
+
+    end (): void {
+      this.ended = true
+      this.emit('close')
+    }
+  }
+
+  const logger = {
+    debug: () => {},
+    warn: () => {}
+  } as any
+
+  function replyFor (raw: FakeResponse): any {
+    return { raw, hijack: () => {} }
+  }
+
+  const changed = {
+    jsonrpc: JSONRPC_VERSION,
+    method: 'notifications/tools/list_changed'
+  } as any
+
+  test('queued frames flush only after drain', (t: TestContext) => {
+    const raw = new FakeResponse()
+    const registry = new SubscriptionRegistry(logger, 10_000)
+    registry.open(replyFor(raw), 1, { toolsListChanged: true })
+
+    // The acknowledgement filled the writable buffer. The notification must be
+    // queued rather than written again until the stream emits drain.
+    registry.deliver(changed)
+    t.assert.strictEqual(raw.writes.length, 1)
+
+    raw.writable = true
+    raw.emit('drain')
+    t.assert.strictEqual(raw.writes.length, 2)
+    registry.closeAll()
+  })
+
+  test('a slow subscription is closed when its bounded queue is exceeded', (t: TestContext) => {
+    const raw = new FakeResponse()
+    const registry = new SubscriptionRegistry(logger, 1)
+    registry.open(replyFor(raw), 1, { toolsListChanged: true })
+
+    registry.deliver(changed)
+    t.assert.strictEqual(raw.ended, true)
+    t.assert.strictEqual(registry.size, 0)
+    t.assert.strictEqual(raw.writes.length, 1)
   })
 })
 

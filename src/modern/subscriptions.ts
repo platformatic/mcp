@@ -16,12 +16,18 @@ import { META_SUBSCRIPTION_ID } from '../schema-2026.ts'
 
 /** How often a quiet stream emits an SSE comment to stay open through proxies. */
 const KEEPALIVE_MS = 30_000
+/** Per-client application queue beyond Node's own writable buffer. */
+const DEFAULT_MAX_BUFFERED_BYTES = 1024 * 1024
 
 interface Subscription {
   id: RequestId
   reply: FastifyReply
   filter: SubscriptionFilter
-  keepAlive: NodeJS.Timeout
+  keepAlive?: NodeJS.Timeout
+  blocked: boolean
+  queue: string[]
+  queuedBytes: number
+  onDrain?: () => void
 }
 
 /**
@@ -83,9 +89,11 @@ export function matchesFilter (notification: JSONRPCNotification, filter: Subscr
 export class SubscriptionRegistry {
   #subscriptions = new Set<Subscription>()
   #log: FastifyBaseLogger
+  #maxBufferedBytes: number
 
-  constructor (log: FastifyBaseLogger) {
+  constructor (log: FastifyBaseLogger, maxBufferedBytes: number = DEFAULT_MAX_BUFFERED_BYTES) {
     this.#log = log
+    this.#maxBufferedBytes = Math.max(1, maxBufferedBytes)
   }
 
   get size (): number {
@@ -111,16 +119,21 @@ export class SubscriptionRegistry {
     raw.setHeader('X-Accel-Buffering', 'no')
     raw.writeHead(200)
 
-    const keepAlive = setInterval(() => {
-      try {
-        raw.write(':\r\n')
-      } catch {
-        this.#close(subscription)
-      }
-    }, KEEPALIVE_MS)
-    keepAlive.unref()
+    const subscription: Subscription = {
+      id,
+      reply,
+      filter,
+      blocked: false,
+      queue: [],
+      queuedBytes: 0
+    }
 
-    const subscription: Subscription = { id, reply, filter, keepAlive }
+    subscription.keepAlive = setInterval(() => {
+      // Keepalives are disposable. Do not queue them behind real messages when
+      // the peer is already applying backpressure.
+      if (!subscription.blocked) this.#writeFrame(subscription, ':\r\n', false)
+    }, KEEPALIVE_MS)
+    subscription.keepAlive.unref()
     this.#subscriptions.add(subscription)
 
     // The acknowledgement must be the first thing on the stream, so the client
@@ -135,8 +148,7 @@ export class SubscriptionRegistry {
     })
 
     raw.on('close', () => {
-      clearInterval(keepAlive)
-      this.#subscriptions.delete(subscription)
+      this.#remove(subscription)
       this.#log.debug({ subscriptionId: id }, 'Subscription stream closed by client')
     })
   }
@@ -181,17 +193,82 @@ export class SubscriptionRegistry {
   }
 
   #write (subscription: Subscription, message: JSONRPCMessage): void {
+    this.#writeFrame(subscription, `data: ${JSON.stringify(message)}\n\n`, true)
+  }
+
+  #writeFrame (subscription: Subscription, frame: string, queueWhenBlocked: boolean): void {
+    if (!this.#subscriptions.has(subscription)) return
+
+    if (subscription.blocked) {
+      if (queueWhenBlocked) this.#enqueue(subscription, frame)
+      return
+    }
+
     try {
-      subscription.reply.raw.write(`data: ${JSON.stringify(message)}\n\n`)
+      if (!subscription.reply.raw.write(frame)) this.#waitForDrain(subscription)
     } catch (error) {
       this.#log.debug({ err: error, subscriptionId: subscription.id }, 'Failed to write to subscription stream')
       this.#close(subscription)
     }
   }
 
-  #close (subscription: Subscription): void {
-    clearInterval(subscription.keepAlive)
+  #enqueue (subscription: Subscription, frame: string): void {
+    const bytes = Buffer.byteLength(frame)
+    if (subscription.queuedBytes + bytes > this.#maxBufferedBytes) {
+      this.#log.warn({
+        subscriptionId: subscription.id,
+        maxBufferedBytes: this.#maxBufferedBytes
+      }, 'Closing slow subscription after its buffer limit was exceeded')
+      this.#close(subscription)
+      return
+    }
+
+    subscription.queue.push(frame)
+    subscription.queuedBytes += bytes
+  }
+
+  #waitForDrain (subscription: Subscription): void {
+    if (subscription.blocked || !this.#subscriptions.has(subscription)) return
+    subscription.blocked = true
+
+    const onDrain = () => {
+      subscription.onDrain = undefined
+      subscription.blocked = false
+      this.#flush(subscription)
+    }
+    subscription.onDrain = onDrain
+    subscription.reply.raw.once('drain', onDrain)
+  }
+
+  #flush (subscription: Subscription): void {
+    while (this.#subscriptions.has(subscription) && subscription.queue.length > 0) {
+      const frame = subscription.queue.shift()!
+      subscription.queuedBytes -= Buffer.byteLength(frame)
+      try {
+        if (!subscription.reply.raw.write(frame)) {
+          this.#waitForDrain(subscription)
+          return
+        }
+      } catch (error) {
+        this.#log.debug({ err: error, subscriptionId: subscription.id }, 'Failed to drain subscription buffer')
+        this.#close(subscription)
+        return
+      }
+    }
+  }
+
+  #remove (subscription: Subscription): void {
+    if (subscription.keepAlive) clearInterval(subscription.keepAlive)
+    if (subscription.onDrain) subscription.reply.raw.off('drain', subscription.onDrain)
+    subscription.onDrain = undefined
+    subscription.queue.length = 0
+    subscription.queuedBytes = 0
+    subscription.blocked = false
     this.#subscriptions.delete(subscription)
+  }
+
+  #close (subscription: Subscription): void {
+    this.#remove(subscription)
     try {
       subscription.reply.raw.end()
     } catch {

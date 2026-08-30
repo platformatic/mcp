@@ -511,6 +511,49 @@ describe('MCP client', () => {
     assert.equal(capturedHeaders[0]['mcp-param-region'], `=?base64?${Buffer.from('日本').toString('base64')}?=`)
   })
 
+  test('modern clients exclude tools with invalid x-mcp-header annotations', async (t) => {
+    const app = Fastify()
+    t.after(() => app.close())
+    app.post('/mcp', async (request) => {
+      const message = request.body as { id: string | number }
+      return {
+        jsonrpc: JSONRPC_VERSION,
+        id: message.id,
+        result: {
+          resultType: 'complete',
+          tools: [
+            {
+              name: 'valid',
+              inputSchema: {
+                type: 'object',
+                properties: { region: { type: 'string', 'x-mcp-header': 'Region' } }
+              }
+            },
+            {
+              name: 'invalid',
+              inputSchema: {
+                type: 'object',
+                allOf: [{ type: 'string', 'x-mcp-header': 'Tenant' }]
+              }
+            }
+          ],
+          ttlMs: 0,
+          cacheScope: 'private'
+        }
+      }
+    })
+    await app.ready()
+
+    const client = createMcpClient(app, { protocolVersion: LATEST_PROTOCOL_VERSION })
+    const response = await client.listTools()
+    assert.ok('result' in response.body)
+    assert.deepEqual(
+      (response.body.result as { tools: Array<{ name: string }> }).tools.map(tool => tool.name),
+      ['valid']
+    )
+    assert.deepEqual(JSON.parse(response.payload), response.body)
+  })
+
   test('modern clients can complete multi round-trip tool calls', async (t) => {
     const app = Fastify()
     t.after(() => app.close())

@@ -352,6 +352,68 @@ describe('2026-07-28: header validation', () => {
     t.assert.strictEqual(response.json().result.contents[0].text, 'ok')
   })
 
+  test('malformed UTF-8 in an encoded parameter header is rejected', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({
+        name: 'utf8-tool',
+        inputSchema: {
+          type: 'object',
+          properties: { value: { type: 'string', 'x-mcp-header': 'Value' } }
+        }
+      }, async () => ({ content: [{ type: 'text', text: 'ran' }] }))
+    })
+
+    const response = await call(app, 'tools/call', {
+      params: { name: 'utf8-tool', arguments: { value: '\uFFFD' } },
+      headers: { 'mcp-param-value': '=?base64?/w==?=' }
+    })
+    t.assert.strictEqual(response.statusCode, 400)
+    t.assert.strictEqual(response.json().error.code, HEADER_MISMATCH)
+  })
+
+  test('unsafe integer parameter headers are rejected without rounding collisions', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({
+        name: 'tenant-tool',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            tenant: { type: 'integer', 'x-mcp-header': 'Tenant' }
+          }
+        }
+      }, async () => ({ content: [{ type: 'text', text: 'ran' }] }))
+    })
+
+    const response = await call(app, 'tools/call', {
+      params: { name: 'tenant-tool', arguments: { tenant: Number('9007199254740993') } },
+      headers: { 'mcp-param-tenant': '9007199254740993' }
+    })
+
+    t.assert.strictEqual(response.statusCode, 400)
+    t.assert.strictEqual(response.json().error.code, HEADER_MISMATCH)
+  })
+
+  test('modern tools/list excludes definitions with unreachable x-mcp-header annotations', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({
+        name: 'invalid-header-tool',
+        inputSchema: {
+          type: 'object',
+          allOf: [{ type: 'string', 'x-mcp-header': 'Tenant' }]
+        }
+      }, async () => ({ content: [{ type: 'text', text: 'must not run' }] }))
+    })
+
+    const listed = await call(app, 'tools/list')
+    t.assert.deepStrictEqual(listed.json().result.tools, [])
+
+    const called = await call(app, 'tools/call', {
+      params: { name: 'invalid-header-tool', arguments: {} }
+    })
+    t.assert.strictEqual(called.statusCode, 400)
+    t.assert.strictEqual(called.json().error.code, HEADER_MISMATCH)
+  })
+
   test('a tool parameter marked x-mcp-header must be mirrored and must match', async (t: TestContext) => {
     const app = await buildServer(t, (app) => {
       app.mcpAddTool({

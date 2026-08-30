@@ -389,16 +389,51 @@ export function createMcpClient (
       : requestOptions.protocolVersion
   }
 
-  function rememberToolSchemas (response: McpClientResponse): void {
-    if (!('result' in response.body) || !isRecord(response.body.result)) return
+  function filterAndRememberToolSchemas (
+    response: McpClientResponse,
+    rejectInvalidHeaderAnnotations: boolean
+  ): McpClientResponse {
+    if (!('result' in response.body) || !isRecord(response.body.result)) return response
     const tools = response.body.result.tools
-    if (!Array.isArray(tools)) return
+    if (!Array.isArray(tools)) return response
 
+    const accepted: Tool[] = []
     for (const entry of tools as Tool[]) {
-      if (typeof entry?.name === 'string' && 'inputSchema' in entry) {
-        toolSchemas.set(entry.name, entry.inputSchema)
+      if (typeof entry?.name !== 'string' || !('inputSchema' in entry)) {
+        accepted.push(entry)
+        continue
       }
+
+      const annotations = collectHeaderParams(entry.inputSchema)
+      if (rejectInvalidHeaderAnnotations && !annotations.ok) {
+        // Streamable HTTP clients MUST exclude malformed x-mcp-header tools.
+        // Also forget an earlier valid schema with the same name so a stale
+        // cache cannot keep generating headers for a now-invalid definition.
+        toolSchemas.delete(entry.name)
+        continue
+      }
+
+      toolSchemas.set(entry.name, entry.inputSchema)
+      accepted.push(entry)
     }
+
+    if (accepted.length === tools.length) return response
+
+    const body = {
+      ...response.body,
+      result: {
+        ...response.body.result,
+        tools: accepted
+      }
+    } as JSONRPCResponse
+
+    const payload = JSON.stringify(body)
+    const headers = { ...response.headers }
+    if (headers['content-length'] !== undefined) {
+      headers['content-length'] = String(Buffer.byteLength(payload))
+    }
+
+    return { ...response, headers, body, payload }
   }
 
   function send (
@@ -559,8 +594,10 @@ export function createMcpClient (
       }
 
       const response = await send(request, requestOptions)
-      rememberToolSchemas(response)
-      return response
+      return filterAndRememberToolSchemas(
+        response,
+        isModernProtocolVersion(effectiveProtocolVersion(requestOptions))
+      )
     },
 
     async callTool (

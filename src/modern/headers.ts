@@ -8,6 +8,7 @@
  */
 
 import type { IncomingHttpHeaders } from 'node:http'
+import { TextDecoder } from 'node:util'
 
 const BASE64_PREFIX = '=?base64?'
 const BASE64_SUFFIX = '?='
@@ -17,6 +18,9 @@ const TCHAR = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/
 
 /** Visible ASCII, space and horizontal tab — what a header value may contain. */
 const SAFE_HEADER_VALUE = /^[\x20-\x7E\t]*$/
+
+/** Reject malformed byte sequences rather than replacing them with U+FFFD. */
+const UTF8_DECODER = new TextDecoder('utf-8', { fatal: true })
 
 export type HeaderCheck = { ok: true } | { ok: false, message: string }
 
@@ -40,7 +44,7 @@ export function decodeHeaderValue (raw: string): string | null {
     if (buffer.toString('base64').replace(/=+$/, '') !== encoded.replace(/=+$/, '')) {
       return null
     }
-    return buffer.toString('utf8')
+    return UTF8_DECODER.decode(buffer)
   } catch {
     return null
   }
@@ -162,47 +166,178 @@ export function collectHeaderParams (
 ): { ok: true, params: Map<string, string[]> } | { ok: false, message: string } {
   const params = new Map<string, string[]>()
   const seen = new Set<string>()
+  const ancestors = new WeakSet<object>()
 
-  const walk = (schema: unknown, path: string[]): string | undefined => {
-    if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return undefined
-    const record = schema as Record<string, unknown>
-
-    const properties = record.properties
-    if (!properties || typeof properties !== 'object') return undefined
-
-    for (const [key, value] of Object.entries(properties as Record<string, unknown>)) {
-      if (!value || typeof value !== 'object') continue
-      const property = value as Record<string, unknown>
-      const annotation = property['x-mcp-header']
-
-      if (annotation !== undefined) {
-        if (typeof annotation !== 'string' || annotation.length === 0) {
-          return `x-mcp-header on '${[...path, key].join('.')}' must be a non-empty string`
-        }
-        if (!TCHAR.test(annotation)) {
-          return `x-mcp-header '${annotation}' is not a valid HTTP field name`
-        }
-        const lower = annotation.toLowerCase()
-        if (seen.has(lower)) {
-          return `x-mcp-header '${annotation}' is declared more than once`
-        }
-        const type = property.type
-        if (type !== 'string' && type !== 'integer' && type !== 'boolean') {
-          return `x-mcp-header '${annotation}' may only annotate string, integer or boolean parameters`
-        }
-        seen.add(lower)
-        params.set(lower, [...path, key])
-      }
-
-      const nested = walk(property, [...path, key])
-      if (nested) return nested
-    }
-
-    return undefined
+  interface Visit {
+    kind: 'visit'
+    value: unknown
+    /** Argument path for annotations reached only through `properties`. */
+    argumentPath: string[]
+    /** JSON Schema path, used to explain an annotation in a forbidden location. */
+    schemaPath: string[]
+    /** Whether this schema node itself is an addressable property. */
+    addressable: boolean
+    /** Whether nested `properties` remain statically reachable from the root. */
+    chainReachable: boolean
   }
 
-  const error = walk(inputSchema, [])
-  if (error) return { ok: false, message: error }
+  interface Leave {
+    kind: 'leave'
+    value: object
+  }
+
+  const schemaMapKeywords = new Set([
+    '$defs',
+    'definitions',
+    'patternProperties',
+    'dependentSchemas',
+    'dependencies'
+  ])
+  const schemaValueKeywords = new Set([
+    'items',
+    'additionalItems',
+    'additionalProperties',
+    'unevaluatedItems',
+    'unevaluatedProperties',
+    'propertyNames',
+    'contains',
+    'not',
+    'if',
+    'then',
+    'else',
+    'contentSchema',
+    'allOf',
+    'anyOf',
+    'oneOf',
+    'prefixItems'
+  ])
+
+  const stack: Array<Visit | Leave> = [{
+    kind: 'visit',
+    value: inputSchema,
+    argumentPath: [],
+    schemaPath: [],
+    addressable: false,
+    chainReachable: true
+  }]
+
+  // Use an explicit depth-first stack so a maliciously deep schema cannot
+  // overflow the JavaScript call stack. `ancestors` rejects cycles while still
+  // allowing one schema object to be reused in separate branches.
+  while (stack.length > 0) {
+    const entry = stack.pop()!
+    if (entry.kind === 'leave') {
+      ancestors.delete(entry.value)
+      continue
+    }
+
+    const { value, argumentPath, schemaPath, addressable, chainReachable } = entry
+    if (!value || typeof value !== 'object') continue
+
+    if (ancestors.has(value)) {
+      return { ok: false, message: `Cyclic schema at '${schemaPath.join('.') || '<root>'}'` }
+    }
+    ancestors.add(value)
+    stack.push({ kind: 'leave', value })
+
+    if (Array.isArray(value)) {
+      for (let index = value.length - 1; index >= 0; index--) {
+        stack.push({
+          kind: 'visit',
+          value: value[index],
+          argumentPath,
+          schemaPath: [...schemaPath, String(index)],
+          addressable: false,
+          chainReachable: false
+        })
+      }
+      continue
+    }
+
+    const record = value as Record<string, unknown>
+    const annotation = record['x-mcp-header']
+    if (annotation !== undefined) {
+      if (!addressable) {
+        return {
+          ok: false,
+          message: `x-mcp-header at '${schemaPath.join('.') || '<root>'}' is not statically reachable through properties`
+        }
+      }
+      if (typeof annotation !== 'string' || annotation.length === 0) {
+        return { ok: false, message: `x-mcp-header on '${argumentPath.join('.')}' must be a non-empty string` }
+      }
+      if (!TCHAR.test(annotation)) {
+        return { ok: false, message: `x-mcp-header '${annotation}' is not a valid HTTP field name` }
+      }
+      const lower = annotation.toLowerCase()
+      if (seen.has(lower)) {
+        return { ok: false, message: `x-mcp-header '${annotation}' is declared more than once` }
+      }
+      const type = record.type
+      if (type !== 'string' && type !== 'integer' && type !== 'boolean') {
+        return {
+          ok: false,
+          message: `x-mcp-header '${annotation}' may only annotate string, integer or boolean parameters`
+        }
+      }
+      seen.add(lower)
+      params.set(lower, argumentPath)
+    }
+
+    const entries = Object.entries(record)
+    for (let index = entries.length - 1; index >= 0; index--) {
+      const [keyword, child] = entries[index]
+      if (keyword === 'x-mcp-header') continue
+
+      if (keyword === 'properties' && child && typeof child === 'object' && !Array.isArray(child)) {
+        const properties = Object.entries(child as Record<string, unknown>)
+        for (let propertyIndex = properties.length - 1; propertyIndex >= 0; propertyIndex--) {
+          const [name, property] = properties[propertyIndex]
+          stack.push({
+            kind: 'visit',
+            value: property,
+            argumentPath: [...argumentPath, name],
+            schemaPath: [...schemaPath, 'properties', name],
+            addressable: chainReachable,
+            chainReachable
+          })
+        }
+        continue
+      }
+
+      if (schemaMapKeywords.has(keyword) && child && typeof child === 'object' && !Array.isArray(child)) {
+        const schemas = Object.entries(child as Record<string, unknown>)
+        for (let schemaIndex = schemas.length - 1; schemaIndex >= 0; schemaIndex--) {
+          const [name, schema] = schemas[schemaIndex]
+          stack.push({
+            kind: 'visit',
+            value: schema,
+            argumentPath,
+            schemaPath: [...schemaPath, keyword, name],
+            addressable: false,
+            chainReachable: false
+          })
+        }
+        continue
+      }
+
+      if (schemaValueKeywords.has(keyword)) {
+        // Once a path leaves `properties`, it can never become reachable again,
+        // even if another `properties` appears below it. Do not inspect data
+        // keywords such as `examples`, `default`, `const` or `enum`: an object
+        // value there is an instance, not a subschema annotation.
+        stack.push({
+          kind: 'visit',
+          value: child,
+          argumentPath,
+          schemaPath: [...schemaPath, keyword],
+          addressable: false,
+          chainReachable: false
+        })
+      }
+    }
+  }
+
   return { ok: true, params }
 }
 
@@ -262,12 +397,13 @@ export function validateToolParamHeaders (
     }
 
     if (typeof value === 'number') {
-      // Compare numerically: '42' and 42.0 are the same value.
-      const asNumber = Number(decoded)
-      if (Number.isNaN(asNumber) || asNumber !== value) {
+      // Annotated integers are restricted to JavaScript's safe range. Compare
+      // the canonical decimal representation directly so two different unsafe
+      // values cannot collapse to the same Number through rounding.
+      if (!Number.isSafeInteger(value) || decoded !== String(value)) {
         return {
           ok: false,
-          message: `Header mismatch: Mcp-Param-${name} header value '${decoded}' does not match body value '${value}'`
+          message: `Header mismatch: Mcp-Param-${name} header value '${decoded}' does not match safe integer body value '${value}'`
         }
       }
       continue

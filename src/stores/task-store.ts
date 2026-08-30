@@ -27,6 +27,15 @@ export interface TaskRecord extends Task {
   inputRequests?: Record<string, unknown>
   /** Keys that have already been answered, so replays can be ignored. */
   answeredInputKeys?: string[]
+  /**
+   * Accepted answers waiting for successful broker publication.
+   *
+   * This is a durable outbox: if publication fails, a retry can republish the
+   * original values even though their keys are no longer outstanding.
+   */
+  pendingInputResponses?: Record<string, unknown>
+  /** Stable per-key delivery ids used to deduplicate ambiguous broker retries. */
+  pendingInputResponseIds?: Record<string, string>
 }
 
 /**
@@ -62,6 +71,16 @@ export interface TaskUpdateOptions {
    * satisfied.
    */
   clearAnsweredInputKeys?: boolean
+  /** Drop stale outbox entries when a new input round starts or a task settles. */
+  clearPendingInputResponses?: boolean
+}
+
+export interface TaskInputUpdate {
+  task: TaskRecord
+  /** Stored values that should be published for this update or retry. */
+  responses: Record<string, unknown>
+  /** Stable ids paired with each response key for broker deduplication. */
+  responseIds: Record<string, string>
 }
 
 export interface TaskStore {
@@ -73,6 +92,17 @@ export interface TaskStore {
    * @throws if the transition is not allowed
    */
   updateStatus(taskId: string, status: TaskStatus, options?: TaskUpdateOptions): Promise<TaskRecord | null>
+  /**
+   * Atomically accept outstanding input and stage it for broker publication.
+   * A retry of a staged key returns the original stored value.
+   */
+  updateInputResponses(
+    taskId: string,
+    responses: Record<string, unknown>,
+    responseId: string
+  ): Promise<TaskInputUpdate | null>
+  /** Remove values from the durable publication outbox after delivery succeeds. */
+  acknowledgeInputResponses(taskId: string, keys: string[]): Promise<void>
   /** Tasks visible to the given authorization subject, newest first */
   list(authSubject?: string): Promise<TaskRecord[]>
   delete(taskId: string): Promise<void>
@@ -145,6 +175,11 @@ export function applyInputRequestUpdates (task: TaskRecord, options: TaskUpdateO
     delete task.answeredInputKeys
   }
 
+  if (options.clearPendingInputResponses) {
+    delete task.pendingInputResponses
+    delete task.pendingInputResponseIds
+  }
+
   if (options.answeredInputKeys?.length) {
     task.answeredInputKeys = [...new Set([...(task.answeredInputKeys ?? []), ...options.answeredInputKeys])]
   }
@@ -159,6 +194,6 @@ export function taskHasExpired (task: TaskRecord, now: number = Date.now()): boo
  * Strip storage-only fields so a record can go on the wire as a spec `Task`.
  */
 export function toWireTask (task: TaskRecord): Task {
-  const { authSubject, method, outcome, ...wire } = task
+  const { authSubject, method, outcome, pendingInputResponses, pendingInputResponseIds, ...wire } = task
   return wire
 }

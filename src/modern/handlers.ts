@@ -54,7 +54,7 @@ import type { RequestContext } from './request-meta.ts'
 import { supportsTasksExtension } from './request-meta.ts'
 import { InputRequired, requiredCapabilityFor } from './input-required.ts'
 import type { RequestStateSealer } from './request-state.ts'
-import { validateToolParamHeaders } from './headers.ts'
+import { collectHeaderParams, validateToolParamHeaders } from './headers.ts'
 import type { TaskRecord } from '../stores/task-store.ts'
 import { isTerminal } from '../stores/task-store.ts'
 
@@ -128,6 +128,31 @@ function withCache<T extends Record<string, unknown>> (
  * `-32601`; this revision requires `-32602` for all three, so remap rather than
  * duplicate the lookups.
  */
+function filterInvalidHeaderTools (
+  response: JSONRPCResponse | JSONRPCError,
+  dependencies: ModernDependencies
+): JSONRPCResponse | JSONRPCError {
+  if ('error' in response) return response
+
+  const result = response.result as Record<string, unknown> | undefined
+  if (!result || !Array.isArray(result.tools)) return response
+
+  const tools = result.tools.filter((tool) => {
+    if (!tool || typeof tool !== 'object' || !('inputSchema' in tool)) return true
+    const collected = collectHeaderParams((tool as { inputSchema: unknown }).inputSchema)
+    if (collected.ok) return true
+
+    dependencies.app.log.warn({
+      tool: (tool as { name?: unknown }).name,
+      reason: collected.message
+    }, 'Excluded tool with invalid x-mcp-header annotation')
+    return false
+  })
+
+  if (tools.length === result.tools.length) return response
+  return createResponse(response.id, { ...result, tools })
+}
+
 function adapt (
   response: JSONRPCResponse | JSONRPCError,
   serverInfo: Implementation | undefined,
@@ -382,38 +407,41 @@ async function handleTasksUpdate (
     return createError(request.id, INVALID_PARAMS, `Task '${params.taskId}' not found`)
   }
 
-  const responses = params.inputResponses as Record<string, unknown>
-  const outstanding = record.inputRequests ?? {}
-  const answered = new Set(record.answeredInputKeys ?? [])
-
-  // Responses for keys we never issued, or already satisfied, are ignored
-  // rather than rejected — the spec makes this explicit so a client retrying a
-  // partially-delivered update cannot get stuck.
-  const accepted: Record<string, unknown> = {}
-  for (const [key, value] of Object.entries(responses)) {
-    if (key in outstanding && !answered.has(key)) {
-      accepted[key] = value
-    }
+  // Atomically move new answers into the store-backed publication outbox.
+  // Previously this only marked keys answered, so a broker failure made the
+  // values unrecoverable and a retry was silently ignored.
+  const update = await dependencies.taskStore!.updateInputResponses(
+    params.taskId,
+    params.inputResponses as Record<string, unknown>,
+    randomUUID()
+  )
+  if (!update) {
+    return createError(request.id, INVALID_PARAMS, `Task '${params.taskId}' not found`)
   }
 
-  if (Object.keys(accepted).length > 0) {
-    dependencies.app.log.debug({
-      taskId: params.taskId,
-      keys: Object.keys(accepted)
-    }, 'Accepted task input responses')
-
-    const remaining = Object.fromEntries(
-      Object.entries(outstanding).filter(([key]) => !(key in accepted))
-    )
-
-    await dependencies.taskStore!.updateStatus(params.taskId, record.status, {
-      inputRequests: Object.keys(remaining).length > 0 ? remaining : null,
-      answeredInputKeys: Object.keys(accepted)
+  const deliveries = new Map<string, Record<string, unknown>>()
+  for (const [key, value] of Object.entries(update.responses)) {
+    const deliveryId = update.responseIds[key]
+    if (!deliveryId) throw new Error(`Task input '${key}' has no delivery id`)
+    const batch = deliveries.get(deliveryId) ?? {}
+    Object.defineProperty(batch, key, {
+      value,
+      enumerable: true,
+      configurable: true,
+      writable: true
     })
+    deliveries.set(deliveryId, batch)
+  }
 
-    // Over the broker, not in-process: the execution waiting for these answers
-    // may well be on another instance.
-    await dependencies.taskInputs?.publish(params.taskId, accepted)
+  for (const [deliveryId, responses] of deliveries) {
+    const keys = Object.keys(responses)
+    dependencies.app.log.debug({ taskId: params.taskId, keys, deliveryId }, 'Publishing task input responses')
+
+    // Publish the durable values, then acknowledge the outbox. If publication
+    // fails, the request errors and an identical retry republishes the same
+    // delivery id, which every receiving instance deduplicates.
+    await dependencies.taskInputs?.publish(params.taskId, responses, deliveryId)
+    await dependencies.taskStore!.acknowledgeInputResponses(params.taskId, keys)
   }
 
   return createResponse(request.id, complete({}, dependencies.serverInfo))
@@ -435,18 +463,25 @@ async function handleTasksCancel (
 
   // Cancellation is cooperative: acknowledge the intent, and only move the task
   // if it has not already settled. A task that finished first stays finished.
+  // A retry of an already-cancelled task republishes cancellation so a transient
+  // broker failure cannot leave the owning instance parked until its ttl.
+  let publishCancellation = record.status === 'cancelled'
   if (!isTerminal(record.status)) {
     try {
       const cancelled = await dependencies.taskStore!.updateStatus(taskId, 'cancelled', {
-        statusMessage: 'Cancelled by the requestor'
+        statusMessage: 'Cancelled by the requestor',
+        inputRequests: null,
+        clearPendingInputResponses: true
       })
       if (cancelled) {
         dependencies.taskWaiters?.notify(cancelled)
+        publishCancellation = true
       }
     } catch (error) {
       dependencies.app.log.debug({ err: error, taskId }, 'Task settled before cancellation took effect')
     }
   }
+  if (publishCancellation) await dependencies.taskInputs?.cancel(taskId)
 
   return createResponse(request.id, complete({}, dependencies.serverInfo))
 }
@@ -539,7 +574,12 @@ async function runAsTask (
     }
 
     try {
-      const updated = await taskStore!.updateStatus(record.taskId, status, { statusMessage, outcome, inputRequests: null })
+      const updated = await taskStore!.updateStatus(record.taskId, status, {
+        statusMessage,
+        outcome,
+        inputRequests: null,
+        clearPendingInputResponses: true
+      })
       if (updated) taskWaiters?.notify(updated)
     } catch (error) {
       app.log.debug({ err: error, taskId: record.taskId }, 'Could not record task outcome')
@@ -727,7 +767,11 @@ export async function dispatchModern (
         return handleDiscover(request, scoped)
 
       case 'tools/list':
-        return adapt(await handleToolsList(request, scoped), scoped.serverInfo, hint('toolsList'))
+        return adapt(
+          filterInvalidHeaderTools(await handleToolsList(request, scoped), scoped),
+          scoped.serverInfo,
+          hint('toolsList')
+        )
       case 'resources/list':
         return adapt(handleResourcesList(request, scoped), scoped.serverInfo, hint('resourcesList'))
       case 'resources/templates/list':

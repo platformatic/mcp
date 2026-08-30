@@ -15,7 +15,7 @@ import type { MCPPluginOptions, MCPTool, MCPResource, MCPPrompt, ResourceHandler
 import type { CacheHint, CachingConfig } from './modern/handlers.ts'
 import { RequestStateSealer } from './modern/request-state.ts'
 import { SubscriptionRegistry } from './modern/subscriptions.ts'
-import { TaskInputChannel, TASK_INPUT_TOPIC } from './modern/task-inputs.ts'
+import { TaskInputChannel, TASK_INPUT_CANCEL_TOPIC, TASK_INPUT_TOPIC } from './modern/task-inputs.ts'
 import pubsubDecorators from './decorators/pubsub.ts'
 import metaDecorators from './decorators/meta.ts'
 import routes from './routes/mcp.ts'
@@ -173,19 +173,36 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
   // A `tasks/update` can land on any instance, but the execution waiting for
   // those answers lives on exactly one. Route the wake-up through the broker so
   // it reaches that instance; `deliver` is a no-op everywhere else.
-  taskInputs.setPublisher(async (taskId, inputResponses) => {
+  taskInputs.setPublisher(async (taskId, inputResponses, deliveryId) => {
     await messageBroker.publish(TASK_INPUT_TOPIC, {
       jsonrpc: JSONRPC_VERSION,
       method: 'notifications/tasks/input',
-      params: { taskId, inputResponses }
+      params: { taskId, inputResponses, deliveryId }
+    })
+  })
+  taskInputs.setCancellationPublisher(async (taskId) => {
+    await messageBroker.publish(TASK_INPUT_CANCEL_TOPIC, {
+      jsonrpc: JSONRPC_VERSION,
+      method: 'notifications/tasks/input_cancelled',
+      params: { taskId }
     })
   })
 
   if (enableTasks) {
     await messageBroker.subscribe(TASK_INPUT_TOPIC, (message) => {
-      const params = (message as { params?: { taskId?: unknown, inputResponses?: unknown } }).params
+      const params = (message as {
+        params?: { taskId?: unknown, inputResponses?: unknown, deliveryId?: unknown }
+      }).params
       if (typeof params?.taskId !== 'string' || !params.inputResponses) return
-      taskInputs.deliver(params.taskId, params.inputResponses as Record<string, unknown>)
+      taskInputs.deliver(
+        params.taskId,
+        params.inputResponses as Record<string, unknown>,
+        typeof params.deliveryId === 'string' ? params.deliveryId : undefined
+      )
+    })
+    await messageBroker.subscribe(TASK_INPUT_CANCEL_TOPIC, (message) => {
+      const taskId = (message as { params?: { taskId?: unknown } }).params?.taskId
+      if (typeof taskId === 'string') taskInputs.abort(taskId, 'task cancelled')
     })
   }
 
@@ -271,6 +288,7 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     // End modern subscription streams with the graceful-closure response, so
     // clients can tell a shutdown from a dropped connection.
     subscriptions.closeAll()
+    taskInputs.close()
 
     for (const streams of localStreams.values()) {
       for (const stream of streams) {
@@ -492,7 +510,7 @@ export type {
 export type { CacheHint, CachingConfig } from './modern/handlers.ts'
 
 // Task storage, for callers that want to supply or inspect a backend
-export type { TaskStore, TaskRecord, TaskOutcome } from './stores/task-store.ts'
+export type { TaskStore, TaskRecord, TaskOutcome, TaskInputUpdate } from './stores/task-store.ts'
 export { MemoryTaskStore } from './stores/memory-task-store.ts'
 export { RedisTaskStore } from './stores/redis-task-store.ts'
 
