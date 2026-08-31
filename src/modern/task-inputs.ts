@@ -331,7 +331,8 @@ export class TaskInputChannel {
         this.#removeAckWaiter(key, waiter)
         reject(new Error(`Timed out waiting for task input delivery acknowledgement '${deliveryId}'`))
       }, this.#ackTimeoutMs)
-      timer.unref()
+      // This timer settles an awaited request; unlike background expiry timers
+      // it must keep the event loop alive until success or timeout.
       waiter = { resolve, reject, timer }
 
       let set = this.#ackWaiters.get(key)
