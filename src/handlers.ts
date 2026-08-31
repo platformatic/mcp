@@ -414,7 +414,7 @@ async function handleToolsCall (
 }
 
 /** An observability failure must never change the tool response. */
-async function emitToolCallComplete (
+export async function emitToolCallComplete (
   source: MCPToolCallCompleteEvent['source'],
   toolName: string,
   args: Record<string, unknown>,
@@ -1379,7 +1379,7 @@ function normalizedNetworkProtocolVersion (version: string): string {
   return version.endsWith('.0') ? version.slice(0, -2) : version
 }
 
-async function withMcpServerSpan<T> (
+export async function withMcpServerSpan<T> (
   message: JSONRPCRequest | JSONRPCNotification,
   sessionId: string | undefined,
   dependencies: HandlerDependencies,

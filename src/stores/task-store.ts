@@ -27,6 +27,8 @@ export interface TaskRecord extends Task {
   inputRequests?: Record<string, unknown>
   /** Keys that have already been answered, so replays can be ignored. */
   answeredInputKeys?: string[]
+  /** Monotonic generation for input requests; incremented whenever a new round is issued. */
+  inputRequestRound?: number
   /**
    * Accepted answers waiting for successful broker publication.
    *
@@ -36,6 +38,10 @@ export interface TaskRecord extends Task {
   pendingInputResponses?: Record<string, unknown>
   /** Stable per-key delivery ids used to deduplicate ambiguous broker retries. */
   pendingInputResponseIds?: Record<string, string>
+  /** Input generation each pending response belongs to. */
+  pendingInputResponseRounds?: Record<string, number>
+  /** Whether cancellation interrupted an input wait and therefore needs broker acknowledgement. */
+  cancelledFromInputRequired?: boolean
 }
 
 /**
@@ -61,6 +67,7 @@ export function canTransition (from: TaskStatus, to: TaskStatus): boolean {
 export interface TaskUpdateOptions {
   statusMessage?: string
   outcome?: TaskOutcome
+  cancelledFromInputRequired?: boolean
   /** Replaces the outstanding input requests; `null` clears them. */
   inputRequests?: Record<string, unknown> | null
   /** Keys to mark as answered, merged with those already recorded. */
@@ -71,7 +78,9 @@ export interface TaskUpdateOptions {
    * satisfied.
    */
   clearAnsweredInputKeys?: boolean
-  /** Drop stale outbox entries when a new input round starts or a task settles. */
+  /** Advance the input generation when a handler issues a new set of questions. */
+  incrementInputRequestRound?: boolean
+  /** Drop stale outbox entries when a task settles. */
   clearPendingInputResponses?: boolean
 }
 
@@ -101,8 +110,11 @@ export interface TaskStore {
     responses: Record<string, unknown>,
     responseId: string
   ): Promise<TaskInputUpdate | null>
-  /** Remove values from the durable publication outbox after delivery succeeds. */
-  acknowledgeInputResponses(taskId: string, keys: string[]): Promise<void>
+  /**
+   * Remove delivered values from the outbox only when their stable delivery ids
+   * still match, so a delayed acknowledgement cannot delete a later round.
+   */
+  acknowledgeInputResponses(taskId: string, responseIds: Record<string, string>): Promise<void>
   /** Tasks visible to the given authorization subject, newest first */
   list(authSubject?: string): Promise<TaskRecord[]>
   delete(taskId: string): Promise<void>
@@ -175,9 +187,14 @@ export function applyInputRequestUpdates (task: TaskRecord, options: TaskUpdateO
     delete task.answeredInputKeys
   }
 
+  if (options.incrementInputRequestRound) {
+    task.inputRequestRound = (task.inputRequestRound ?? 0) + 1
+  }
+
   if (options.clearPendingInputResponses) {
     delete task.pendingInputResponses
     delete task.pendingInputResponseIds
+    delete task.pendingInputResponseRounds
   }
 
   if (options.answeredInputKeys?.length) {
@@ -194,6 +211,16 @@ export function taskHasExpired (task: TaskRecord, now: number = Date.now()): boo
  * Strip storage-only fields so a record can go on the wire as a spec `Task`.
  */
 export function toWireTask (task: TaskRecord): Task {
-  const { authSubject, method, outcome, pendingInputResponses, pendingInputResponseIds, ...wire } = task
+  const {
+    authSubject,
+    method,
+    outcome,
+    inputRequestRound,
+    pendingInputResponses,
+    pendingInputResponseIds,
+    pendingInputResponseRounds,
+    cancelledFromInputRequired,
+    ...wire
+  } = task
   return wire
 }

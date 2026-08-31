@@ -17,16 +17,14 @@ describe('RedisMessageBroker', () => {
     }
 
     let receivedMessage: JSONRPCMessage | null = null
-    const messagePromise = new Promise<void>((resolve) => {
-      broker.subscribe('test-topic', (message) => {
-        receivedMessage = message
-        resolve()
-      })
+    let resolveMessage: () => void = () => {}
+    const messagePromise = new Promise<void>((resolve) => { resolveMessage = resolve })
+    await broker.subscribe('test-topic', (message) => {
+      receivedMessage = message
+      resolveMessage()
     })
 
-    // Give subscription time to register
-    await sleep(100)
-
+    // subscribe() resolves only after Redis confirms readiness.
     await broker.publish('test-topic', testMessage)
     await messagePromise
 

@@ -514,8 +514,10 @@ describe('MCP client', () => {
   test('modern clients exclude tools with invalid x-mcp-header annotations', async (t) => {
     const app = Fastify()
     t.after(() => app.close())
-    app.post('/mcp', async (request) => {
+    app.post('/mcp', async (request, reply) => {
       const message = request.body as { id: string | number }
+      reply.header('etag', '"unfiltered"')
+      reply.header('content-digest', 'sha-256=:stale:')
       return {
         jsonrpc: JSONRPC_VERSION,
         id: message.id,
@@ -552,6 +554,9 @@ describe('MCP client', () => {
       ['valid']
     )
     assert.deepEqual(JSON.parse(response.payload), response.body)
+    assert.equal(response.headers.etag, undefined)
+    assert.equal(response.headers['content-digest'], undefined)
+    assert.equal(response.headers['content-length'], String(Buffer.byteLength(response.payload)))
   })
 
   test('modern clients can complete multi round-trip tool calls', async (t) => {

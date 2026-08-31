@@ -1,21 +1,17 @@
 /**
- * Delivery of `tasks/update` input responses to the code waiting for them.
+ * Cross-instance delivery of `tasks/update` input responses.
  *
- * A task that needs something from the client parks until the client answers,
- * and the answer arrives on a *different* request — which, behind a load
- * balancer, lands on an arbitrary instance. The waiter only exists in the
- * process actually running the task, so a purely process-local channel would
- * silently drop every answer that arrived anywhere else.
- *
- * So `publish` fans the answers out over the message broker and `deliver` is
- * what the broker subscription calls on each instance: a no-op everywhere
- * except the one holding the waiter.
+ * Redis Pub/Sub confirms publication, not delivery to the replica that owns a
+ * task execution. Delivery therefore uses an explicit acknowledgement: the
+ * publishing request waits until the owning waiter (or its pre-wait buffer)
+ * consumes the message. The task store keeps the response in an outbox until
+ * that acknowledgement arrives, so retries remain safe.
  */
 
 import type { InputResponses } from '../schema-2026.ts'
 
-/** Broker topics carrying task answers and cancellation between instances. */
 export const TASK_INPUT_TOPIC = 'mcp/tasks/input'
+export const TASK_INPUT_ACK_TOPIC = 'mcp/tasks/input/ack'
 export const TASK_INPUT_CANCEL_TOPIC = 'mcp/tasks/input/cancel'
 
 interface Waiter {
@@ -25,40 +21,57 @@ interface Waiter {
   onAbort?: () => void
 }
 
+interface PendingDelivery {
+  taskId: string
+  deliveryId: string
+  responses: InputResponses
+  expiresAt: number
+}
+
+interface AckWaiter {
+  resolve: () => void
+  reject: (error: Error) => void
+  timer: NodeJS.Timeout
+}
+
 type Publisher = (taskId: string, responses: Record<string, unknown>, deliveryId: string) => Promise<void>
-type CancellationPublisher = (taskId: string) => Promise<void>
+type AcknowledgementPublisher = (taskId: string, deliveryId: string, keys: string[]) => Promise<void>
+type CancellationPublisher = (taskId: string, cancellationId: string) => Promise<void>
+
+const DEFAULT_RETENTION_MS = 3_600_000
+const DEFAULT_ACK_TIMEOUT_MS = 5_000
+const DEFAULT_MAX_PENDING = 1000
 
 export class TaskInputChannel {
   #waiters = new Map<string, Set<Waiter>>()
-  /**
-   * Answers that arrived before anyone was waiting for them.
-   *
-   * The store write in `tasks/update` and the `wait()` in the running task are
-   * separate async chains, so the answer genuinely can land first. Holding it
-   * here means a task parks and resumes immediately rather than blocking until
-   * its ttl elapses.
-   */
-  #pending = new Map<string, { responses: InputResponses, expiresAt: number }>()
-  /** Recently received delivery ids, retained so ambiguous retries are harmless. */
+  #pending = new Map<string, PendingDelivery>()
   #seenDeliveries = new Map<string, number>()
+  #cancellations = new Map<string, { expiresAt: number, cancellationId: string, acknowledged: boolean }>()
+  #ackWaiters = new Map<string, Set<AckWaiter>>()
   #publish?: Publisher
+  #publishAcknowledgement?: AcknowledgementPublisher
   #publishCancellation?: CancellationPublisher
-  #pendingTimer?: NodeJS.Timeout
+  #expiryTimer?: NodeJS.Timeout
   #closed = false
 
-  /** How long an unclaimed answer is held. */
-  readonly #pendingTtlMs: number
-  /** Hard bound for bursts received by replicas that do not own the task. */
+  readonly #retentionMs: number
+  readonly #ackTimeoutMs: number
   readonly #maxPending: number
   readonly #maxSeenDeliveries: number
+  readonly #maxCancellations: number
 
-  constructor (pendingTtlMs: number = 60_000, maxPending: number = 1000) {
-    this.#pendingTtlMs = Math.max(1, pendingTtlMs)
+  constructor (
+    retentionMs: number = DEFAULT_RETENTION_MS,
+    maxPending: number = DEFAULT_MAX_PENDING,
+    ackTimeoutMs: number = DEFAULT_ACK_TIMEOUT_MS
+  ) {
+    this.#retentionMs = Math.max(1, retentionMs)
+    this.#ackTimeoutMs = Math.max(1, ackTimeoutMs)
     this.#maxPending = Math.max(1, maxPending)
     this.#maxSeenDeliveries = this.#maxPending * 4
+    this.#maxCancellations = this.#maxPending
   }
 
-  /** Exposed for lifecycle assertions and operational diagnostics. */
   get pendingSize (): number {
     return this.#pending.size
   }
@@ -69,55 +82,98 @@ export class TaskInputChannel {
     return count
   }
 
-  /** Wire up cross-instance delivery. Called once, at plugin registration. */
   setPublisher (publish: Publisher): void {
     this.#publish = publish
   }
 
-  /** Wire up cross-instance cancellation. Called once, at registration. */
+  setAcknowledgementPublisher (publish: AcknowledgementPublisher): void {
+    this.#publishAcknowledgement = publish
+  }
+
   setCancellationPublisher (publish: CancellationPublisher): void {
     this.#publishCancellation = publish
   }
 
-  /** Announce answers to whichever instance is running the task. */
+  /**
+   * Publish and wait for acknowledgement from the replica that consumed it.
+   * Publication success alone is deliberately insufficient.
+   */
   async publish (
     taskId: string,
     responses: Record<string, unknown>,
     deliveryId: string
   ): Promise<void> {
-    if (!this.#publish) {
-      this.deliver(taskId, responses, deliveryId)
-      return
+    if (this.#closed) throw new Error('channel closed')
+
+    const acknowledgement = this.#registerAckWaiter(taskId, deliveryId)
+    try {
+      if (this.#publish) {
+        await this.#publish(taskId, responses, deliveryId)
+      } else {
+        this.deliver(taskId, responses, deliveryId)
+      }
+      await acknowledgement.promise
+    } catch (error) {
+      acknowledgement.cancel()
+      throw error
     }
-    await this.#publish(taskId, responses, deliveryId)
   }
 
-  /** Announce cancellation so the owning instance releases its waiter. */
-  async cancel (taskId: string): Promise<void> {
+  async cancel (taskId: string, waitForAcknowledgement: boolean = false): Promise<void> {
+    const cancellationId = `cancel:${taskId}`
     if (!this.#publishCancellation) {
-      this.abort(taskId, 'cancelled')
+      this.abort(taskId, 'cancelled', cancellationId)
       return
     }
-    await this.#publishCancellation(taskId)
+
+    if (!waitForAcknowledgement) {
+      await this.#publishCancellation(taskId, cancellationId)
+      return
+    }
+
+    const acknowledgement = this.#registerAckWaiter(taskId, cancellationId)
+    try {
+      await this.#publishCancellation(taskId, cancellationId)
+      await acknowledgement.promise
+    } catch (error) {
+      acknowledgement.cancel()
+      throw error
+    }
   }
 
-  /**
-   * Wait for the client to answer at least one outstanding input request.
-   *
-   * Resolves with whatever arrived; a caller expecting several keys should keep
-   * waiting until it has them all.
-   */
+  /** Called by the acknowledgement broker subscription on every replica. */
+  confirmDelivery (taskId: string, deliveryId: string): void {
+    const key = this.#deliveryKey(taskId, deliveryId)
+    const waiters = this.#ackWaiters.get(key)
+    if (!waiters) return
+    for (const waiter of [...waiters]) {
+      this.#removeAckWaiter(key, waiter)
+      waiter.resolve()
+    }
+  }
+
   wait (taskId: string, signal?: AbortSignal): Promise<InputResponses> {
     if (this.#closed) return Promise.reject(new Error('channel closed'))
+    this.#pruneExpired()
 
-    // Something answered before we got here — take it rather than block.
-    const early = this.#pending.get(taskId)
-    if (early) {
-      this.#pending.delete(taskId)
-      this.#schedulePendingPrune()
-      if (early.expiresAt > Date.now()) {
-        return Promise.resolve(early.responses)
+    const cancellation = this.#cancellations.get(taskId)
+    if (cancellation) {
+      cancellation.acknowledged = true
+      this.#acknowledge(taskId, cancellation.cancellationId, [])
+      return Promise.reject(new Error('task cancelled'))
+    }
+
+    const early = [...this.#pending.entries()].filter(([, entry]) => entry.taskId === taskId)
+    if (early.length > 0) {
+      const responses: InputResponses = {}
+      for (const [key, entry] of early) {
+        this.#pending.delete(key)
+        Object.assign(responses, entry.responses)
+        this.#markConsumed(entry.taskId, entry.deliveryId)
+        this.#acknowledge(entry.taskId, entry.deliveryId, Object.keys(entry.responses))
       }
+      this.#scheduleExpiry()
+      return Promise.resolve(responses)
     }
 
     if (signal?.aborted) return Promise.reject(new Error('aborted'))
@@ -133,129 +189,234 @@ export class TaskInputChannel {
       }
       set.add(waiter)
       signal?.addEventListener('abort', waiter.onAbort, { once: true })
+
+      // Cancellation can race the registration above. Re-check after the
+      // waiter is visible so either the tombstone or abort() rejects it.
+      const racedCancellation = this.#cancellations.get(taskId)
+      if (racedCancellation) {
+        racedCancellation.acknowledged = true
+        this.#rejectWaiter(taskId, waiter, new Error('task cancelled'))
+        this.#acknowledge(taskId, racedCancellation.cancellationId, [])
+      }
     })
   }
 
-  /** Hand responses to anyone waiting on this task in this process. */
   deliver (taskId: string, responses: Record<string, unknown>, deliveryId?: string): void {
     if (this.#closed) return
-
     this.#pruneExpired()
-    if (deliveryId) {
-      const seenKey = `${taskId}\u0000${deliveryId}`
-      if (this.#seenDeliveries.has(seenKey)) return
-      this.#seenDeliveries.set(seenKey, Date.now() + this.#pendingTtlMs)
-      while (this.#seenDeliveries.size > this.#maxSeenDeliveries) {
-        const oldest = this.#seenDeliveries.keys().next().value as string | undefined
-        if (oldest === undefined) break
-        this.#seenDeliveries.delete(oldest)
-      }
-      this.#schedulePendingPrune()
+
+    const id = deliveryId ?? `local-${taskId}`
+    const deliveryKey = this.#deliveryKey(taskId, id)
+
+    // A retry after an acknowledgement/store race must be acknowledged again,
+    // but never delivered to a later input round.
+    if (this.#seenDeliveries.has(deliveryKey)) {
+      this.#acknowledge(taskId, id, Object.keys(responses))
+      return
     }
 
     const set = this.#waiters.get(taskId)
     if (!set || set.size === 0) {
-      // Nobody here is waiting. Either the task runs on another instance — in
-      // which case this is correctly a bounded, expiring no-op — or it has not
-      // parked yet, so hold the answers for the wait that is about to happen.
-      const held = this.#pending.get(taskId)?.responses ?? {}
-      this.#pending.delete(taskId)
-      this.#pending.set(taskId, {
-        responses: { ...held, ...(responses as InputResponses) },
-        expiresAt: Date.now() + this.#pendingTtlMs
-      })
-
-      while (this.#pending.size > this.#maxPending) {
-        const oldest = this.#pending.keys().next().value as string | undefined
-        if (oldest === undefined) break
-        this.#pending.delete(oldest)
+      if (!this.#pending.has(deliveryKey)) {
+        this.#pending.set(deliveryKey, {
+          taskId,
+          deliveryId: id,
+          responses: responses as InputResponses,
+          expiresAt: Date.now() + this.#retentionMs
+        })
+        this.#evictOldest(this.#pending, this.#maxPending)
+        this.#scheduleExpiry()
       }
-      this.#schedulePendingPrune()
       return
     }
 
+    this.#markConsumed(taskId, id)
     for (const waiter of [...set]) {
       this.#resolveWaiter(taskId, waiter, responses as InputResponses)
     }
+    this.#acknowledge(taskId, id, Object.keys(responses))
   }
 
-  /** Reject local waiters and discard early answers for a cancelled task. */
-  abort (taskId: string, reason: string = 'cancelled'): void {
-    this.#pending.delete(taskId)
+  /** Reject current and future waits for a recently cancelled task. */
+  abort (
+    taskId: string,
+    reason: string = 'cancelled',
+    cancellationId: string = `cancel:${taskId}`
+  ): void {
+    const existing = this.#cancellations.get(taskId)
+    const cancellation = {
+      expiresAt: Date.now() + this.#retentionMs,
+      cancellationId,
+      acknowledged: existing?.acknowledged ?? false
+    }
+    this.#cancellations.delete(taskId)
+    this.#cancellations.set(taskId, cancellation)
+    this.#evictOldest(this.#cancellations, this.#maxCancellations)
+
+    for (const [key, entry] of this.#pending) {
+      if (entry.taskId === taskId) this.#pending.delete(key)
+    }
+
     const set = this.#waiters.get(taskId)
-    if (set) {
+    if (set && set.size > 0) {
+      cancellation.acknowledged = true
       for (const waiter of [...set]) {
         this.#rejectWaiter(taskId, waiter, new Error(reason))
       }
     }
-    this.#schedulePendingPrune()
+    if (cancellation.acknowledged) {
+      this.#acknowledge(taskId, cancellationId, [])
+    }
+    this.#scheduleExpiry()
   }
 
-  /** Drop anything held for a task that has finished. */
+  /** Drop transient data for a completed task without creating a tombstone. */
   forget (taskId: string): void {
-    this.abort(taskId, 'task finished')
+    for (const [key, entry] of this.#pending) {
+      if (entry.taskId === taskId) this.#pending.delete(key)
+    }
+    const set = this.#waiters.get(taskId)
+    if (set) {
+      for (const waiter of [...set]) {
+        this.#rejectWaiter(taskId, waiter, new Error('task finished'))
+      }
+    }
+    this.#scheduleExpiry()
   }
 
-  /** Release timers and waiters during application shutdown. */
   close (): void {
     this.#closed = true
-    if (this.#pendingTimer) clearTimeout(this.#pendingTimer)
-    this.#pendingTimer = undefined
+    if (this.#expiryTimer) clearTimeout(this.#expiryTimer)
+    this.#expiryTimer = undefined
     this.#pending.clear()
     this.#seenDeliveries.clear()
-    for (const taskId of [...this.#waiters.keys()]) {
-      this.abort(taskId, 'channel closed')
+    this.#cancellations.clear()
+
+    for (const taskId of [...this.#waiters.keys()]) this.forget(taskId)
+    for (const [key, waiters] of this.#ackWaiters) {
+      for (const waiter of [...waiters]) {
+        this.#removeAckWaiter(key, waiter)
+        waiter.reject(new Error('channel closed'))
+      }
     }
+  }
+
+  #acknowledge (taskId: string, deliveryId: string, keys: string[]): void {
+    if (!this.#publishAcknowledgement) {
+      this.confirmDelivery(taskId, deliveryId)
+      return
+    }
+    this.#publishAcknowledgement(taskId, deliveryId, keys).catch(() => {
+      // The sender times out and retains its outbox. A retry is re-acknowledged
+      // by the seen-delivery branch above.
+    })
+  }
+
+  #markConsumed (taskId: string, deliveryId: string): void {
+    const key = this.#deliveryKey(taskId, deliveryId)
+    this.#seenDeliveries.delete(key)
+    this.#seenDeliveries.set(key, Date.now() + this.#retentionMs)
+    this.#evictOldest(this.#seenDeliveries, this.#maxSeenDeliveries)
+    this.#scheduleExpiry()
+  }
+
+  #registerAckWaiter (taskId: string, deliveryId: string): {
+    promise: Promise<void>
+    cancel: () => void
+  } {
+    const key = this.#deliveryKey(taskId, deliveryId)
+    let waiter: AckWaiter
+    const promise = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.#removeAckWaiter(key, waiter)
+        reject(new Error(`Timed out waiting for task input delivery acknowledgement '${deliveryId}'`))
+      }, this.#ackTimeoutMs)
+      timer.unref()
+      waiter = { resolve, reject, timer }
+
+      let set = this.#ackWaiters.get(key)
+      if (!set) {
+        set = new Set()
+        this.#ackWaiters.set(key, set)
+      }
+      set.add(waiter)
+    })
+
+    return {
+      promise,
+      cancel: () => {
+        if (waiter) this.#removeAckWaiter(key, waiter)
+      }
+    }
+  }
+
+  #removeAckWaiter (key: string, waiter: AckWaiter): void {
+    clearTimeout(waiter.timer)
+    const set = this.#ackWaiters.get(key)
+    if (!set) return
+    set.delete(waiter)
+    if (set.size === 0) this.#ackWaiters.delete(key)
   }
 
   #pruneExpired (): void {
     const now = Date.now()
-    for (const [taskId, entry] of this.#pending) {
-      if (entry.expiresAt <= now) this.#pending.delete(taskId)
+    for (const [key, entry] of this.#pending) {
+      if (entry.expiresAt <= now) this.#pending.delete(key)
     }
-    for (const [deliveryId, expiresAt] of this.#seenDeliveries) {
-      if (expiresAt <= now) this.#seenDeliveries.delete(deliveryId)
+    for (const [key, expiresAt] of this.#seenDeliveries) {
+      if (expiresAt <= now) this.#seenDeliveries.delete(key)
     }
-    this.#schedulePendingPrune()
+    for (const [taskId, cancellation] of this.#cancellations) {
+      if (cancellation.expiresAt <= now) this.#cancellations.delete(taskId)
+    }
+    this.#scheduleExpiry()
   }
 
-  #schedulePendingPrune (): void {
-    if (this.#pendingTimer) clearTimeout(this.#pendingTimer)
-    this.#pendingTimer = undefined
-    if (this.#pending.size === 0 && this.#seenDeliveries.size === 0) return
+  #scheduleExpiry (): void {
+    if (this.#expiryTimer) clearTimeout(this.#expiryTimer)
+    this.#expiryTimer = undefined
 
-    let earliest = Infinity
-    for (const entry of this.#pending.values()) {
-      earliest = Math.min(earliest, entry.expiresAt)
-    }
-    for (const expiresAt of this.#seenDeliveries.values()) {
-      earliest = Math.min(earliest, expiresAt)
-    }
+    const expiries = [
+      ...[...this.#pending.values()].map(entry => entry.expiresAt),
+      ...this.#seenDeliveries.values(),
+      ...[...this.#cancellations.values()].map(cancellation => cancellation.expiresAt)
+    ]
+    if (expiries.length === 0) return
 
-    this.#pendingTimer = setTimeout(() => {
-      this.#pendingTimer = undefined
+    this.#expiryTimer = setTimeout(() => {
+      this.#expiryTimer = undefined
       this.#pruneExpired()
-    }, Math.max(1, earliest - Date.now()))
-    this.#pendingTimer.unref()
+    }, Math.max(1, Math.min(...expiries) - Date.now()))
+    this.#expiryTimer.unref()
   }
 
   #resolveWaiter (taskId: string, waiter: Waiter, responses: InputResponses): void {
-    this.#remove(taskId, waiter)
+    this.#removeWaiter(taskId, waiter)
     waiter.resolve(responses)
   }
 
   #rejectWaiter (taskId: string, waiter: Waiter, error: Error): void {
-    this.#remove(taskId, waiter)
+    this.#removeWaiter(taskId, waiter)
     waiter.reject(error)
   }
 
-  #remove (taskId: string, waiter: Waiter): void {
+  #removeWaiter (taskId: string, waiter: Waiter): void {
     const set = this.#waiters.get(taskId)
     if (!set) return
     set.delete(waiter)
-    if (waiter.signal && waiter.onAbort) {
-      waiter.signal.removeEventListener('abort', waiter.onAbort)
-    }
+    if (waiter.signal && waiter.onAbort) waiter.signal.removeEventListener('abort', waiter.onAbort)
     if (set.size === 0) this.#waiters.delete(taskId)
+  }
+
+  #deliveryKey (taskId: string, deliveryId: string): string {
+    return `${taskId}\u0000${deliveryId}`
+  }
+
+  #evictOldest<K, V> (map: Map<K, V>, maximum: number): void {
+    while (map.size > maximum) {
+      const oldest = map.keys().next().value as K | undefined
+      if (oldest === undefined) break
+      map.delete(oldest)
+    }
   }
 }

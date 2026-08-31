@@ -1004,6 +1004,109 @@ describe('2026-07-28: tasks extension', () => {
     t.assert.strictEqual(task.inputRequests, undefined)
   })
 
+  test('cancelling an input-blocked task is acknowledged by its owner', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({
+        name: 'blocked',
+        inputSchema: Type.Object({}),
+        execution: { taskSupport: 'required' }
+      } as any, async () => {
+        throw new InputRequired({
+          inputRequests: {
+            confirmation: elicitForm('Confirm?', { type: 'object', properties: {} })
+          }
+        })
+      })
+    }, { enableTasks: true })
+    const capabilities: ClientCapabilities = {
+      extensions: { [TASKS_EXTENSION]: {} },
+      elicitation: { form: {} }
+    }
+
+    const created = (await call(app, 'tools/call', {
+      params: { name: 'blocked', arguments: {} },
+      capabilities
+    })).json().result
+
+    let task: any
+    for (let attempt = 0; attempt < 40; attempt++) {
+      task = (await call(app, 'tasks/get', {
+        params: { taskId: created.taskId },
+        capabilities
+      })).json().result
+      if (task.status === 'input_required') break
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+
+    const cancelled = await call(app, 'tasks/cancel', {
+      params: { taskId: created.taskId },
+      capabilities
+    })
+    t.assert.strictEqual(cancelled.json().result.resultType, 'complete')
+    task = (await call(app, 'tasks/get', {
+      params: { taskId: created.taskId },
+      capabilities
+    })).json().result
+    t.assert.strictEqual(task.status, 'cancelled')
+  })
+
+  test('a task fails rather than ambiguously reusing an input key', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({
+        name: 'repeat-key',
+        inputSchema: Type.Object({}),
+        execution: { taskSupport: 'required' }
+      } as any, async () => {
+        throw new InputRequired({
+          inputRequests: {
+            confirmation: elicitForm('Confirm?', {
+              type: 'object',
+              properties: { value: { type: 'string' } }
+            })
+          }
+        })
+      })
+    }, { enableTasks: true })
+    const capabilities: ClientCapabilities = {
+      extensions: { [TASKS_EXTENSION]: {} },
+      elicitation: { form: {} }
+    }
+
+    const created = (await call(app, 'tools/call', {
+      params: { name: 'repeat-key', arguments: {} },
+      capabilities
+    })).json().result
+
+    let task: any
+    for (let attempt = 0; attempt < 40; attempt++) {
+      task = (await call(app, 'tasks/get', {
+        params: { taskId: created.taskId },
+        capabilities
+      })).json().result
+      if (task.status === 'input_required') break
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+
+    await call(app, 'tasks/update', {
+      params: {
+        taskId: created.taskId,
+        inputResponses: { confirmation: { action: 'accept', content: { value: 'yes' } } }
+      },
+      capabilities
+    })
+
+    for (let attempt = 0; attempt < 40; attempt++) {
+      task = (await call(app, 'tasks/get', {
+        params: { taskId: created.taskId },
+        capabilities
+      })).json().result
+      if (task.status === 'failed') break
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+    t.assert.strictEqual(task.status, 'failed')
+    t.assert.match(task.error.message, /keys must be unique/)
+  })
+
   test('tasks/* are absent when tasks are not enabled', async (t: TestContext) => {
     const app = await buildServer(t)
 

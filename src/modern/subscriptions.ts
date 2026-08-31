@@ -18,6 +18,7 @@ import { META_SUBSCRIPTION_ID } from '../schema-2026.ts'
 const KEEPALIVE_MS = 30_000
 /** Per-client application queue beyond Node's own writable buffer. */
 const DEFAULT_MAX_BUFFERED_BYTES = 1024 * 1024
+const DEFAULT_CLOSE_DRAIN_TIMEOUT_MS = 1000
 
 interface Subscription {
   id: RequestId
@@ -28,6 +29,7 @@ interface Subscription {
   queue: string[]
   queuedBytes: number
   onDrain?: () => void
+  onClose?: () => void
 }
 
 /**
@@ -90,10 +92,17 @@ export class SubscriptionRegistry {
   #subscriptions = new Set<Subscription>()
   #log: FastifyBaseLogger
   #maxBufferedBytes: number
+  #closeDrainTimeoutMs: number
+  #closing = false
 
-  constructor (log: FastifyBaseLogger, maxBufferedBytes: number = DEFAULT_MAX_BUFFERED_BYTES) {
+  constructor (
+    log: FastifyBaseLogger,
+    maxBufferedBytes: number = DEFAULT_MAX_BUFFERED_BYTES,
+    closeDrainTimeoutMs: number = DEFAULT_CLOSE_DRAIN_TIMEOUT_MS
+  ) {
     this.#log = log
     this.#maxBufferedBytes = Math.max(1, maxBufferedBytes)
+    this.#closeDrainTimeoutMs = Math.max(1, closeDrainTimeoutMs)
   }
 
   get size (): number {
@@ -108,10 +117,12 @@ export class SubscriptionRegistry {
     reply: FastifyReply,
     id: RequestId,
     filter: SubscriptionFilter
-  ): void {
+  ): boolean {
+    const raw = reply.raw
+    if (this.#closing || raw.destroyed || raw.closed || raw.writableEnded) return false
+
     reply.hijack()
 
-    const raw = reply.raw
     raw.setHeader('Content-Type', 'text/event-stream')
     raw.setHeader('Cache-Control', 'no-cache')
     raw.setHeader('Connection', 'keep-alive')
@@ -127,6 +138,12 @@ export class SubscriptionRegistry {
       queue: [],
       queuedBytes: 0
     }
+
+    subscription.onClose = () => {
+      this.#remove(subscription)
+      this.#log.debug({ subscriptionId: id }, 'Subscription stream closed by client')
+    }
+    raw.once('close', subscription.onClose)
 
     subscription.keepAlive = setInterval(() => {
       // Keepalives are disposable. Do not queue them behind real messages when
@@ -147,10 +164,7 @@ export class SubscriptionRegistry {
       }
     })
 
-    raw.on('close', () => {
-      this.#remove(subscription)
-      this.#log.debug({ subscriptionId: id }, 'Subscription stream closed by client')
-    })
+    return this.#subscriptions.has(subscription)
   }
 
   /** Fan a notification out to every subscription that asked for it. */
@@ -179,16 +193,20 @@ export class SubscriptionRegistry {
    * client it may reconnect rather than assume something broke.
    */
   closeAll (): void {
+    this.#closing = true
     for (const subscription of [...this.#subscriptions]) {
-      this.#write(subscription, {
+      const completion = {
         jsonrpc: JSONRPC_VERSION,
         id: subscription.id,
         result: {
           resultType: 'complete',
           _meta: { [META_SUBSCRIPTION_ID]: subscription.id }
         }
-      } as JSONRPCMessage)
-      this.#close(subscription)
+      } as JSONRPCMessage
+      // `end(frame)` appends the completion after Node's existing writable
+      // buffer even when write() previously returned false. Queuing and then
+      // clearing it would silently drop the protocol's graceful completion.
+      this.#close(subscription, `data: ${JSON.stringify(completion)}\n\n`)
     }
   }
 
@@ -260,19 +278,40 @@ export class SubscriptionRegistry {
   #remove (subscription: Subscription): void {
     if (subscription.keepAlive) clearInterval(subscription.keepAlive)
     if (subscription.onDrain) subscription.reply.raw.off('drain', subscription.onDrain)
+    if (subscription.onClose) subscription.reply.raw.off('close', subscription.onClose)
     subscription.onDrain = undefined
+    subscription.onClose = undefined
     subscription.queue.length = 0
     subscription.queuedBytes = 0
     subscription.blocked = false
     this.#subscriptions.delete(subscription)
   }
 
-  #close (subscription: Subscription): void {
+  #close (subscription: Subscription, finalFrame?: string): void {
     this.#remove(subscription)
+    const raw = subscription.reply.raw
     try {
-      subscription.reply.raw.end()
+      raw.end(finalFrame)
+      if (!raw.writableFinished && !raw.destroyed && !raw.closed) {
+        // A peer that stopped reading may never drain `end(finalFrame)`. Bound
+        // graceful shutdown, then force the socket closed so Fastify's close
+        // cannot wait forever on a stream no longer present in the registry.
+        const timer = setTimeout(() => {
+          try {
+            if (!raw.destroyed && !raw.closed) raw.destroy()
+          } catch {
+            // best-effort shutdown
+          }
+        }, this.#closeDrainTimeoutMs)
+        timer.unref()
+        raw.once('close', () => clearTimeout(timer))
+      }
     } catch {
-      // already gone
+      try {
+        raw.destroy()
+      } catch {
+        // already gone
+      }
     }
   }
 }

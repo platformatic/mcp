@@ -93,6 +93,9 @@ export class RedisTaskStore implements TaskStore {
     if (options.outcome !== undefined) {
       updated.outcome = options.outcome
     }
+    if (options.cancelledFromInputRequired !== undefined) {
+      updated.cancelledFromInputRequired = options.cancelledFromInputRequired
+    }
     applyInputRequestUpdates(updated, options)
 
     // The read above and this write are two round trips, so a concurrent write
@@ -116,10 +119,15 @@ export class RedisTaskStore implements TaskStore {
        if ARGV[2] == '1' then
          proposed.inputRequests = cur.inputRequests
          proposed.answeredInputKeys = cur.answeredInputKeys
+         proposed.inputRequestRound = cur.inputRequestRound
        end
        if ARGV[3] == '1' then
          proposed.pendingInputResponses = cur.pendingInputResponses
          proposed.pendingInputResponseIds = cur.pendingInputResponseIds
+         proposed.pendingInputResponseRounds = cur.pendingInputResponseRounds
+       end
+       if ARGV[4] == '1' then
+         proposed.inputRequestRound = (cur.inputRequestRound or 0) + 1
        end
 
        local encoded = cjson.encode(proposed)
@@ -129,7 +137,8 @@ export class RedisTaskStore implements TaskStore {
       this.key(taskId),
       JSON.stringify(updated),
       preserveInputRequests ? '1' : '0',
-      preservePendingResponses ? '1' : '0'
+      preservePendingResponses ? '1' : '0',
+      options.incrementInputRequestRound ? '1' : '0'
     )
 
     if (result === null) return null
@@ -156,6 +165,8 @@ export class RedisTaskStore implements TaskStore {
        local outstanding = task.inputRequests or {}
        local pending = task.pendingInputResponses or {}
        local pendingIds = task.pendingInputResponseIds or {}
+       local pendingRounds = task.pendingInputResponseRounds or {}
+       local currentRound = task.inputRequestRound or 0
        local answered = task.answeredInputKeys or {}
        local answeredSet = {}
        for _, key in ipairs(answered) do answeredSet[key] = true end
@@ -166,7 +177,7 @@ export class RedisTaskStore implements TaskStore {
        local changed = false
 
        for key, value in pairs(submitted) do
-         if pending[key] ~= nil then
+         if pending[key] ~= nil and (pendingRounds[key] == nil or pendingRounds[key] == currentRound) then
            deliverable[key] = pending[key]
            responseIds[key] = pendingIds[key] or ARGV[3]
          elseif not terminal and outstanding[key] ~= nil and not answeredSet[key] then
@@ -174,6 +185,7 @@ export class RedisTaskStore implements TaskStore {
            responseIds[key] = ARGV[3]
            pending[key] = value
            pendingIds[key] = ARGV[3]
+           pendingRounds[key] = currentRound
            outstanding[key] = nil
            answeredSet[key] = true
            table.insert(answered, key)
@@ -190,6 +202,7 @@ export class RedisTaskStore implements TaskStore {
          task.answeredInputKeys = answered
          task.pendingInputResponses = pending
          task.pendingInputResponseIds = pendingIds
+         task.pendingInputResponseRounds = pendingRounds
          task.lastUpdatedAt = ARGV[2]
          redis.call('SET', KEYS[1], cjson.encode(task), 'KEEPTTL')
        end
@@ -215,8 +228,8 @@ export class RedisTaskStore implements TaskStore {
     }
   }
 
-  async acknowledgeInputResponses (taskId: string, keys: string[]): Promise<void> {
-    if (keys.length === 0) return
+  async acknowledgeInputResponses (taskId: string, responseIds: Record<string, string>): Promise<void> {
+    if (Object.keys(responseIds).length === 0) return
 
     await this.redis.eval(
       `local raw = redis.call('GET', KEYS[1])
@@ -224,20 +237,24 @@ export class RedisTaskStore implements TaskStore {
        local ok, task = pcall(cjson.decode, raw)
        if not ok or not task.pendingInputResponses then return 0 end
 
-       local keys = cjson.decode(ARGV[1])
-       for _, key in ipairs(keys) do
-         task.pendingInputResponses[key] = nil
-         if task.pendingInputResponseIds then task.pendingInputResponseIds[key] = nil end
+       local acknowledgements = cjson.decode(ARGV[1])
+       for key, deliveryId in pairs(acknowledgements) do
+         if task.pendingInputResponseIds and task.pendingInputResponseIds[key] == deliveryId then
+           task.pendingInputResponses[key] = nil
+           task.pendingInputResponseIds[key] = nil
+           if task.pendingInputResponseRounds then task.pendingInputResponseRounds[key] = nil end
+         end
        end
        if next(task.pendingInputResponses) == nil then
          task.pendingInputResponses = nil
          task.pendingInputResponseIds = nil
+         task.pendingInputResponseRounds = nil
        end
        redis.call('SET', KEYS[1], cjson.encode(task), 'KEEPTTL')
        return 1`,
       1,
       this.key(taskId),
-      JSON.stringify(keys)
+      JSON.stringify(responseIds)
     )
   }
 

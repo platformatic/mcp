@@ -28,7 +28,7 @@ import type { SessionStore, SessionMetadata } from '../stores/session-store.ts'
 import type { TaskStore, TaskWaiters } from '../stores/task-store.ts'
 import type { MessageBroker } from '../brokers/message-broker.ts'
 import type { AuthorizationContext } from '../types/auth-types.ts'
-import { processMessage, createError } from '../handlers.ts'
+import { processMessage, createError, withMcpServerSpan } from '../handlers.ts'
 import type { CachingConfig } from '../modern/handlers.ts'
 import { dispatchModern } from '../modern/handlers.ts'
 import { isModernRequest, parseRequestContext } from '../modern/request-meta.ts'
@@ -454,7 +454,10 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
       const filter = negotiateFilter(requested, capabilities)
       request.log.info({ subscriptionId: message.id, filter }, 'Opening subscription stream')
-      subscriptions.open(reply, message.id, filter)
+      if (!subscriptions.open(reply, message.id, filter) && !reply.sent) {
+        reply.code(503).type('application/json')
+        return createError(message.id, INTERNAL_ERROR, 'Server is shutting down')
+      }
       return reply
     }
 
@@ -470,6 +473,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
       request,
       reply,
       authContext,
+      tracer: opts.telemetry?.tracer,
       taskStore,
       taskWaiters,
       jsonSchemaValidator,
@@ -498,7 +502,26 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
   app.post('/mcp', postRouteOptions, async (request: FastifyRequest, reply: FastifyReply) => {
     try {
       if (isModern(request)) {
-        return await handleModernPost(request, reply)
+        const message = request.body as JSONRPCRequest | JSONRPCNotification
+        return await withMcpServerSpan(message, undefined, {
+          app,
+          opts,
+          capabilities,
+          serverInfo,
+          tools,
+          resources,
+          prompts,
+          resourceHandlers,
+          request,
+          reply,
+          authContext: authContextFrom(request),
+          tracer: opts.telemetry?.tracer,
+          taskStore,
+          taskWaiters,
+          jsonSchemaValidator,
+          taskInputs,
+          protocolVersion: (request as any).mcpProtocolVersion
+        }, async () => await handleModernPost(request, reply))
       }
 
       const message = request.body as JSONRPCMessage

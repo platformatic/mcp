@@ -429,8 +429,12 @@ export function createMcpClient (
 
     const payload = JSON.stringify(body)
     const headers = { ...response.headers }
-    if (headers['content-length'] !== undefined) {
-      headers['content-length'] = String(Buffer.byteLength(payload))
+    // The client changed the representation, so origin validators and digests
+    // no longer describe what callers receive. Length can be recomputed; the
+    // others must be dropped rather than left stale.
+    headers['content-length'] = String(Buffer.byteLength(payload))
+    for (const name of ['etag', 'content-md5', 'digest', 'content-digest', 'content-encoding']) {
+      delete headers[name]
     }
 
     return { ...response, headers, body, payload }

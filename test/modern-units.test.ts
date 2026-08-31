@@ -161,7 +161,7 @@ describe('x-mcp-header annotations', () => {
     t.assert.strictEqual(result.ok, false)
   })
 
-  test('integers compare by canonical safe-integer representation', (t: TestContext) => {
+  test('integers compare numerically after enforcing safe bounds', (t: TestContext) => {
     const schema = {
       type: 'object',
       properties: { count: { type: 'integer', 'x-mcp-header': 'Count' } }
@@ -169,6 +169,10 @@ describe('x-mcp-header annotations', () => {
 
     t.assert.strictEqual(
       validateToolParamHeaders({ 'mcp-param-count': '42' }, schema, { count: 42 }).ok,
+      true
+    )
+    t.assert.strictEqual(
+      validateToolParamHeaders({ 'mcp-param-count': '42.0' }, schema, { count: 42 }).ok,
       true
     )
     t.assert.strictEqual(
@@ -327,6 +331,53 @@ describe('task input channel lifecycle', () => {
     channel.close()
   })
 
+  test('publication resolves only after the consuming replica acknowledges delivery', async (t: TestContext) => {
+    const channel = new TaskInputChannel(1000, 10, 50)
+    channel.setPublisher(async (taskId, responses, deliveryId) => {
+      channel.deliver(taskId, responses, deliveryId)
+    })
+    channel.setAcknowledgementPublisher(async (taskId, deliveryId) => {
+      channel.confirmDelivery(taskId, deliveryId)
+    })
+
+    const waiting = channel.wait('task-1')
+    await channel.publish('task-1', { confirmation: 'yes' }, 'delivery-1')
+    t.assert.deepStrictEqual(await waiting, { confirmation: 'yes' })
+    channel.close()
+  })
+
+  test('publication times out when no task owner consumes it', async (t: TestContext) => {
+    const channel = new TaskInputChannel(1000, 10, 20)
+    channel.setPublisher(async () => {})
+    await t.assert.rejects(
+      channel.publish('task-1', { confirmation: 'yes' }, 'delivery-1'),
+      /acknowledgement/
+    )
+    channel.close()
+  })
+
+  test('input-blocked cancellation waits for acknowledgement from the owner', async (t: TestContext) => {
+    const channel = new TaskInputChannel(1000, 10, 50)
+    channel.setCancellationPublisher(async (taskId, cancellationId) => {
+      channel.abort(taskId, 'task cancelled', cancellationId)
+    })
+    channel.setAcknowledgementPublisher(async (taskId, cancellationId) => {
+      channel.confirmDelivery(taskId, cancellationId)
+    })
+
+    const waiting = channel.wait('task-1')
+    await channel.cancel('task-1', true)
+    await t.assert.rejects(waiting, /cancelled/)
+    channel.close()
+  })
+
+  test('cancellation arriving before wait leaves a tombstone', async (t: TestContext) => {
+    const channel = new TaskInputChannel()
+    channel.abort('task-1', 'task cancelled')
+    await t.assert.rejects(channel.wait('task-1'), /cancelled/)
+    channel.close()
+  })
+
   test('a retried broker delivery is deduplicated after resolving its waiter', async (t: TestContext) => {
     const channel = new TaskInputChannel()
     const waiting = channel.wait('task-1')
@@ -358,6 +409,11 @@ describe('subscription backpressure', () => {
     writes: string[] = []
     ended = false
     writable = false
+    destroyed = false
+    closed = false
+    writableEnded = false
+    writableFinished = false
+    finishOnEnd = true
 
     setHeader (): void {}
     writeHead (): void {}
@@ -367,8 +423,20 @@ describe('subscription backpressure', () => {
       return this.writable
     }
 
-    end (): void {
+    end (frame?: string): void {
+      if (frame) this.writes.push(frame)
       this.ended = true
+      this.writableEnded = true
+      if (this.finishOnEnd) {
+        this.writableFinished = true
+        this.closed = true
+        this.emit('close')
+      }
+    }
+
+    destroy (): void {
+      this.destroyed = true
+      this.closed = true
       this.emit('close')
     }
   }
@@ -401,6 +469,44 @@ describe('subscription backpressure', () => {
     raw.emit('drain')
     t.assert.strictEqual(raw.writes.length, 2)
     registry.closeAll()
+  })
+
+  test('graceful completion is appended even while the stream is backpressured', (t: TestContext) => {
+    const raw = new FakeResponse()
+    const registry = new SubscriptionRegistry(logger, 10_000)
+    registry.open(replyFor(raw), 1, { toolsListChanged: true })
+
+    registry.closeAll()
+    t.assert.strictEqual(raw.ended, true)
+    t.assert.strictEqual(raw.writes.length, 2)
+    t.assert.match(raw.writes[1], /"resultType":"complete"/)
+  })
+
+  test('an already-closed response is not registered', (t: TestContext) => {
+    const registry = new SubscriptionRegistry(logger)
+    const raw = new FakeResponse()
+    raw.destroyed = true
+    t.assert.strictEqual(registry.open(replyFor(raw), 1, { toolsListChanged: true }), false)
+    t.assert.strictEqual(registry.size, 0)
+  })
+
+  test('a closing registry refuses new subscriptions', (t: TestContext) => {
+    const registry = new SubscriptionRegistry(logger)
+    registry.closeAll()
+    const raw = new FakeResponse()
+    t.assert.strictEqual(registry.open(replyFor(raw), 1, { toolsListChanged: true }), false)
+    t.assert.strictEqual(registry.size, 0)
+  })
+
+  test('a shutdown stream that cannot drain is forcibly destroyed', async (t: TestContext) => {
+    const raw = new FakeResponse()
+    raw.finishOnEnd = false
+    const registry = new SubscriptionRegistry(logger, 10_000, 20)
+    registry.open(replyFor(raw), 1, { toolsListChanged: true })
+
+    registry.closeAll()
+    await delay(60)
+    t.assert.strictEqual(raw.destroyed, true)
   })
 
   test('a slow subscription is closed when its bounded queue is exceeded', (t: TestContext) => {

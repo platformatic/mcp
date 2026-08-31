@@ -121,14 +121,18 @@ describe('task store', () => {
     const wire = toWireTask(record({
       authSubject: 'user-1',
       outcome: { jsonrpc: '2.0', id: 1, result: {} },
+      inputRequestRound: 1,
       pendingInputResponses: { confirmation: true },
-      pendingInputResponseIds: { confirmation: 'delivery-1' }
+      pendingInputResponseIds: { confirmation: 'delivery-1' },
+      pendingInputResponseRounds: { confirmation: 1 }
     }))
     t.assert.strictEqual('authSubject' in wire, false)
     t.assert.strictEqual('method' in wire, false)
     t.assert.strictEqual('outcome' in wire, false)
+    t.assert.strictEqual('inputRequestRound' in wire, false)
     t.assert.strictEqual('pendingInputResponses' in wire, false)
     t.assert.strictEqual('pendingInputResponseIds' in wire, false)
+    t.assert.strictEqual('pendingInputResponseRounds' in wire, false)
     t.assert.strictEqual(wire.taskId, 'task-1')
   })
 
@@ -169,12 +173,29 @@ describe('task store', () => {
     t.assert.deepStrictEqual(retry?.responses, { confirmation: 'yes' })
     t.assert.deepStrictEqual(retry?.responseIds, { confirmation: 'delivery-1' })
 
-    await store.acknowledgeInputResponses('task-1', ['confirmation'])
+    await store.acknowledgeInputResponses('task-1', { confirmation: 'wrong-delivery' })
+    t.assert.deepStrictEqual((await store.get('task-1'))?.pendingInputResponses, { confirmation: 'yes' })
+
+    await store.acknowledgeInputResponses('task-1', { confirmation: 'delivery-1' })
     t.assert.strictEqual((await store.get('task-1'))?.pendingInputResponses, undefined)
     t.assert.deepStrictEqual(
       (await store.updateInputResponses('task-1', { confirmation: 'yes' }, 'delivery-3'))?.responses,
       {}
     )
+  })
+
+  test('MemoryTaskStore republishes outbox entries created before input rounds were recorded', async (t: TestContext) => {
+    const store = new MemoryTaskStore()
+    await store.create(record({
+      status: 'input_required',
+      pendingInputResponses: { confirmation: 'legacy' },
+      pendingInputResponseIds: { confirmation: 'delivery-1' },
+      answeredInputKeys: ['confirmation']
+    }))
+
+    const retry = await store.updateInputResponses('task-1', { confirmation: 'retry' }, 'delivery-2')
+    t.assert.deepStrictEqual(retry?.responses, { confirmation: 'legacy' })
+    t.assert.deepStrictEqual(retry?.responseIds, { confirmation: 'delivery-1' })
   })
 
   test('MemoryTaskStore isolates tasks by authorization subject', async (t: TestContext) => {

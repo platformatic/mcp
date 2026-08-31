@@ -42,6 +42,7 @@ import {
   createError,
   createResponse,
   executeToolCall,
+  emitToolCallComplete,
   resolveRegisteredTool,
   handleToolsList,
   handleResourcesList,
@@ -441,7 +442,10 @@ async function handleTasksUpdate (
     // fails, the request errors and an identical retry republishes the same
     // delivery id, which every receiving instance deduplicates.
     await dependencies.taskInputs?.publish(params.taskId, responses, deliveryId)
-    await dependencies.taskStore!.acknowledgeInputResponses(params.taskId, keys)
+    await dependencies.taskStore!.acknowledgeInputResponses(
+      params.taskId,
+      Object.fromEntries(keys.map(key => [key, deliveryId]))
+    )
   }
 
   return createResponse(request.id, complete({}, dependencies.serverInfo))
@@ -466,10 +470,12 @@ async function handleTasksCancel (
   // A retry of an already-cancelled task republishes cancellation so a transient
   // broker failure cannot leave the owning instance parked until its ttl.
   let publishCancellation = record.status === 'cancelled'
+  let waitForCancellationAck = record.status === 'input_required' || record.cancelledFromInputRequired === true
   if (!isTerminal(record.status)) {
     try {
       const cancelled = await dependencies.taskStore!.updateStatus(taskId, 'cancelled', {
         statusMessage: 'Cancelled by the requestor',
+        cancelledFromInputRequired: record.status === 'input_required',
         inputRequests: null,
         clearPendingInputResponses: true
       })
@@ -479,9 +485,15 @@ async function handleTasksCancel (
       }
     } catch (error) {
       dependencies.app.log.debug({ err: error, taskId }, 'Task settled before cancellation took effect')
+      // Another cancellation may have won but failed to publish. Re-read the
+      // durable state so this successful retry republishes instead of silently
+      // leaving the owning waiter blocked.
+      const current = await dependencies.taskStore!.get(taskId)
+      publishCancellation = current?.status === 'cancelled'
+      waitForCancellationAck = current?.cancelledFromInputRequired === true
     }
   }
-  if (publishCancellation) await dependencies.taskInputs?.cancel(taskId)
+  if (publishCancellation) await dependencies.taskInputs?.cancel(taskId, waitForCancellationAck)
 
   return createResponse(request.id, complete({}, dependencies.serverInfo))
 }
@@ -539,15 +551,21 @@ async function runAsTask (
         // the task in `input_required` and let `tasks/update` deliver it —
         // this is the extension's equivalent of an `InputRequiredResult`.
         if (error instanceof InputRequired && error.inputRequests && taskInputs && round < MAX_TASK_INPUT_ROUNDS) {
+          const current = await taskStore!.get(record.taskId)
+          const answered = new Set(current?.answeredInputKeys ?? [])
+          const reusedKeys = Object.keys(error.inputRequests).filter(key => answered.has(key))
+          if (reusedKeys.length > 0) {
+            status = 'failed'
+            statusMessage = `Task input request keys must be unique; reused: ${reusedKeys.join(', ')}`
+            outcome = createError(request.id, INTERNAL_ERROR, statusMessage)
+            break
+          }
+
           try {
             const parked = await taskStore!.updateStatus(record.taskId, 'input_required', {
               statusMessage: error.message,
               inputRequests: error.inputRequests as Record<string, unknown>,
-              // Start the round with a clean slate. Keys answered in an earlier
-              // round must not suppress a fresh question that happens to reuse
-              // one — otherwise `tasks/update` acks it and drops it, and the
-              // task hangs until its ttl.
-              clearAnsweredInputKeys: true
+              incrementInputRequestRound: true
             })
             if (parked) taskWaiters?.notify(parked)
 
@@ -616,10 +634,19 @@ async function modernToolsCall (
     return createError(request.id, INVALID_PARAMS, 'Invalid tool call parameters: "name" is required')
   }
 
+  const startedAt = performance.now()
+  const args = params.arguments && typeof params.arguments === 'object' && !Array.isArray(params.arguments)
+    ? params.arguments as Record<string, unknown>
+    : {}
+
   // Resolve through the shared authorization gate. Denied and unknown tools
   // are deliberately indistinguishable so authorization cannot leak names.
   const resolved = await resolveRegisteredTool(params.name, dependencies)
   if (!resolved.ok) {
+    const observed = resolved.reason === 'access-denied'
+      ? { ok: false as const, reason: 'not-found' as const }
+      : resolved
+    await emitToolCallComplete('json-rpc', params.name, args, observed, startedAt, dependencies)
     return createError(request.id, INVALID_PARAMS, `Unknown tool: ${params.name}`)
   }
   const tool = resolved.tool
@@ -632,6 +659,11 @@ async function modernToolsCall (
       params.arguments
     )
     if (!headerCheck.ok) {
+      await emitToolCallComplete('json-rpc', params.name, args, {
+        ok: false,
+        reason: 'invalid-arguments',
+        detail: headerCheck.message
+      }, startedAt, dependencies)
       return createError(request.id, HEADER_MISMATCH, headerCheck.message)
     }
   }
@@ -642,14 +674,19 @@ async function modernToolsCall (
 
   if (taskSupport === 'required') {
     if (!tasksAvailable) {
+      await emitToolCallComplete('json-rpc', params.name, args, { ok: false, reason: 'task-required' }, startedAt, dependencies)
       return createError(request.id, INVALID_PARAMS, `Tool '${params.name}' requires task-augmented execution, which is not enabled`)
     }
     if (!clientHasTasks) {
+      await emitToolCallComplete('json-rpc', params.name, args, { ok: false, reason: 'task-required' }, startedAt, dependencies)
       return missingCapability(request.id, { extensions: { [TASKS_EXTENSION]: {} } })
     }
   }
 
-  const run = (inputResponses?: Record<string, unknown>) => executeToolCall(
+  const run = (
+    inputResponses: Record<string, unknown> | undefined,
+    observation: { source: 'json-rpc' | 'task', startedAt: number }
+  ) => executeToolCall(
     request,
     tool,
     { name: params.name as string, arguments: params.arguments as Record<string, unknown> | undefined },
@@ -658,16 +695,21 @@ async function modernToolsCall (
     // the original request, so the handler context is rebuilt around them.
     inputResponses
       ? { ...dependencies, mrtr: { ...dependencies.mrtr, inputResponses } }
-      : dependencies
+      : dependencies,
+    observation
   )
 
   // 2026-07-28 lets the server decide: a client that declared the extension may
   // get a task handle back without having asked for one per request.
   if (tasksAvailable && clientHasTasks && taskSupport !== 'forbidden') {
-    return await runAsTask(request, run, dependencies)
+    return await runAsTask(
+      request,
+      inputResponses => run(inputResponses, { source: 'task', startedAt: performance.now() }),
+      dependencies
+    )
   }
 
-  return adapt(await run(), dependencies.serverInfo)
+  return adapt(await run(undefined, { source: 'json-rpc', startedAt }), dependencies.serverInfo)
 }
 
 /* ------------------------------------------------------------------ */

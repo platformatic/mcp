@@ -52,7 +52,8 @@ async function openListenStream (url: string, id: number, notifications: Record<
 async function readFrames (
   response: Response,
   stop: (frames: any[]) => boolean,
-  timeoutMs = 3000
+  timeoutMs = 3000,
+  cancel = true
 ): Promise<any[]> {
   const frames: any[] = []
   const reader = response.body!.getReader()
@@ -78,7 +79,11 @@ async function readFrames (
     if (stop(frames)) break
   }
 
-  reader.cancel().catch(() => {})
+  if (cancel) {
+    reader.cancel().catch(() => {})
+  } else {
+    reader.releaseLock()
+  }
   return frames
 }
 
@@ -96,7 +101,7 @@ describe('2026-07-28: subscription stream lifecycle over a real socket', () => {
     t.assert.strictEqual(response.status, 200)
 
     // Wait for the acknowledgement so the stream is definitely registered.
-    const ack = await readFrames(response, (frames) => frames.length >= 1)
+    const ack = await readFrames(response, (frames) => frames.length >= 1, 3000, false)
     t.assert.strictEqual(ack[0].method, 'notifications/subscriptions/acknowledged')
 
     // An open SSE response is an in-flight request. If the streams were only

@@ -15,7 +15,12 @@ import type { MCPPluginOptions, MCPTool, MCPResource, MCPPrompt, ResourceHandler
 import type { CacheHint, CachingConfig } from './modern/handlers.ts'
 import { RequestStateSealer } from './modern/request-state.ts'
 import { SubscriptionRegistry } from './modern/subscriptions.ts'
-import { TaskInputChannel, TASK_INPUT_CANCEL_TOPIC, TASK_INPUT_TOPIC } from './modern/task-inputs.ts'
+import {
+  TaskInputChannel,
+  TASK_INPUT_ACK_TOPIC,
+  TASK_INPUT_CANCEL_TOPIC,
+  TASK_INPUT_TOPIC
+} from './modern/task-inputs.ts'
 import pubsubDecorators from './decorators/pubsub.ts'
 import metaDecorators from './decorators/meta.ts'
 import routes from './routes/mcp.ts'
@@ -121,7 +126,7 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
   // Waiters are process-local by design: only the instance serving a given
   // tasks/result request needs to be woken when that task finishes.
   const taskWaiters = new TaskWaiters()
-  const taskInputs = new TaskInputChannel()
+  const taskInputs = new TaskInputChannel(opts.taskMaxTtlMs ?? 3_600_000)
 
   if (enableTasks) {
     // Advertise which task operations we support. `tasks/list` is only offered
@@ -180,11 +185,18 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
       params: { taskId, inputResponses, deliveryId }
     })
   })
-  taskInputs.setCancellationPublisher(async (taskId) => {
+  taskInputs.setAcknowledgementPublisher(async (taskId, deliveryId, keys) => {
+    await messageBroker.publish(TASK_INPUT_ACK_TOPIC, {
+      jsonrpc: JSONRPC_VERSION,
+      method: 'notifications/tasks/input_acknowledged',
+      params: { taskId, deliveryId, keys }
+    })
+  })
+  taskInputs.setCancellationPublisher(async (taskId, cancellationId) => {
     await messageBroker.publish(TASK_INPUT_CANCEL_TOPIC, {
       jsonrpc: JSONRPC_VERSION,
       method: 'notifications/tasks/input_cancelled',
-      params: { taskId }
+      params: { taskId, cancellationId }
     })
   })
 
@@ -200,9 +212,21 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
         typeof params.deliveryId === 'string' ? params.deliveryId : undefined
       )
     })
+    await messageBroker.subscribe(TASK_INPUT_ACK_TOPIC, (message) => {
+      const params = (message as { params?: { taskId?: unknown, deliveryId?: unknown } }).params
+      if (typeof params?.taskId === 'string' && typeof params.deliveryId === 'string') {
+        taskInputs.confirmDelivery(params.taskId, params.deliveryId)
+      }
+    })
     await messageBroker.subscribe(TASK_INPUT_CANCEL_TOPIC, (message) => {
-      const taskId = (message as { params?: { taskId?: unknown } }).params?.taskId
-      if (typeof taskId === 'string') taskInputs.abort(taskId, 'task cancelled')
+      const params = (message as { params?: { taskId?: unknown, cancellationId?: unknown } }).params
+      if (typeof params?.taskId === 'string') {
+        taskInputs.abort(
+          params.taskId,
+          'task cancelled',
+          typeof params.cancellationId === 'string' ? params.cancellationId : undefined
+        )
+      }
     })
   }
 

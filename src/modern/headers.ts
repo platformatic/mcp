@@ -397,10 +397,11 @@ export function validateToolParamHeaders (
     }
 
     if (typeof value === 'number') {
-      // Annotated integers are restricted to JavaScript's safe range. Compare
-      // the canonical decimal representation directly so two different unsafe
-      // values cannot collapse to the same Number through rounding.
-      if (!Number.isSafeInteger(value) || decoded !== String(value)) {
+      // Compare numerically as the transport recommends (`42.0` equals `42`),
+      // but require both representations to resolve to safe integers first so
+      // distinct large values cannot collapse through Number rounding.
+      const headerValue = Number(decoded)
+      if (!Number.isSafeInteger(value) || !Number.isSafeInteger(headerValue) || headerValue !== value) {
         return {
           ok: false,
           message: `Header mismatch: Mcp-Param-${name} header value '${decoded}' does not match safe integer body value '${value}'`

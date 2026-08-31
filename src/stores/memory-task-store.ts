@@ -71,6 +71,9 @@ export class MemoryTaskStore implements TaskStore {
     if (options.outcome !== undefined) {
       updated.outcome = options.outcome
     }
+    if (options.cancelledFromInputRequired !== undefined) {
+      updated.cancelledFromInputRequired = options.cancelledFromInputRequired
+    }
     applyInputRequestUpdates(updated, options)
 
     this.tasks.set(taskId, updated)
@@ -92,12 +95,14 @@ export class MemoryTaskStore implements TaskStore {
     const answered = new Set(task.answeredInputKeys ?? [])
     const pending = { ...(task.pendingInputResponses ?? {}) }
     const pendingIds = { ...(task.pendingInputResponseIds ?? {}) }
+    const pendingRounds = { ...(task.pendingInputResponseRounds ?? {}) }
+    const currentRound = task.inputRequestRound ?? 0
     const deliverable: Array<[string, unknown]> = []
     const responseIds: Array<[string, string]> = []
     let changed = false
 
     for (const [key, value] of Object.entries(responses)) {
-      if (Object.hasOwn(pending, key)) {
+      if (Object.hasOwn(pending, key) && (pendingRounds[key] ?? currentRound) === currentRound) {
         // A prior request staged this key but failed before acknowledging its
         // broker publication. Retry the durable value, not a changed replay.
         deliverable.push([key, pending[key]])
@@ -117,6 +122,12 @@ export class MemoryTaskStore implements TaskStore {
           configurable: true,
           writable: true
         })
+        Object.defineProperty(pendingRounds, key, {
+          value: currentRound,
+          enumerable: true,
+          configurable: true,
+          writable: true
+        })
         delete outstanding[key]
         answered.add(key)
         changed = true
@@ -130,7 +141,8 @@ export class MemoryTaskStore implements TaskStore {
           ...(Object.keys(outstanding).length > 0 ? { inputRequests: outstanding } : { inputRequests: undefined }),
           answeredInputKeys: [...answered],
           pendingInputResponses: pending,
-          pendingInputResponseIds: pendingIds
+          pendingInputResponseIds: pendingIds,
+          pendingInputResponseRounds: pendingRounds
         }
       : task
 
@@ -142,24 +154,33 @@ export class MemoryTaskStore implements TaskStore {
     }
   }
 
-  async acknowledgeInputResponses (taskId: string, keys: string[]): Promise<void> {
+  async acknowledgeInputResponses (taskId: string, responseIds: Record<string, string>): Promise<void> {
     const task = this.tasks.get(taskId)
     if (!task || !task.pendingInputResponses) return
 
-    const acknowledged = new Set(keys)
+    const acknowledged = new Set(
+      Object.entries(responseIds)
+        .filter(([key, deliveryId]) => task.pendingInputResponseIds?.[key] === deliveryId)
+        .map(([key]) => key)
+    )
     const remaining = Object.fromEntries(
       Object.entries(task.pendingInputResponses).filter(([key]) => !acknowledged.has(key))
     )
     const remainingIds = Object.fromEntries(
       Object.entries(task.pendingInputResponseIds ?? {}).filter(([key]) => !acknowledged.has(key))
     )
+    const remainingRounds = Object.fromEntries(
+      Object.entries(task.pendingInputResponseRounds ?? {}).filter(([key]) => !acknowledged.has(key))
+    )
     const updated = { ...task }
     if (Object.keys(remaining).length > 0) {
       updated.pendingInputResponses = remaining
       updated.pendingInputResponseIds = remainingIds
+      updated.pendingInputResponseRounds = remainingRounds
     } else {
       delete updated.pendingInputResponses
       delete updated.pendingInputResponseIds
+      delete updated.pendingInputResponseRounds
     }
     this.tasks.set(taskId, updated)
   }

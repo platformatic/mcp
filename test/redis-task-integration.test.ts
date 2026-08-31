@@ -4,7 +4,9 @@ import fastify from 'fastify'
 import { Type } from '@sinclair/typebox'
 import mcpPlugin from '../src/index.ts'
 import { testWithRedis } from './redis-test-utils.ts'
-import { JSONRPC_VERSION, LATEST_LEGACY_PROTOCOL_VERSION } from '../src/schema.ts'
+import { JSONRPC_VERSION, LATEST_LEGACY_PROTOCOL_VERSION, LATEST_PROTOCOL_VERSION } from '../src/schema.ts'
+import { InputRequired, elicitForm } from '../src/modern/input-required.ts'
+import { META_CLIENT_CAPABILITIES, META_PROTOCOL_VERSION, TASKS_EXTENSION } from '../src/schema-2026.ts'
 import type { CreateTaskResult, CallToolResult } from '../src/schema.ts'
 
 async function call (app: any, method: string, params: unknown, id = 1) {
@@ -13,6 +15,35 @@ async function call (app: any, method: string, params: unknown, id = 1) {
     url: '/mcp',
     headers: { 'mcp-protocol-version': LATEST_LEGACY_PROTOCOL_VERSION },
     payload: { jsonrpc: JSONRPC_VERSION, id, method, params }
+  })
+  return response.json()
+}
+
+async function modernCall (app: any, method: string, params: Record<string, unknown>, id = 1) {
+  const capabilities = {
+    extensions: { [TASKS_EXTENSION]: {} },
+    elicitation: { form: {} }
+  }
+  const response = await app.inject({
+    method: 'POST',
+    url: '/mcp',
+    headers: {
+      'mcp-protocol-version': LATEST_PROTOCOL_VERSION,
+      'mcp-method': method,
+      ...(typeof params.name === 'string' ? { 'mcp-name': params.name } : {})
+    },
+    payload: {
+      jsonrpc: JSONRPC_VERSION,
+      id,
+      method,
+      params: {
+        ...params,
+        _meta: {
+          [META_PROTOCOL_VERSION]: LATEST_PROTOCOL_VERSION,
+          [META_CLIENT_CAPABILITIES]: capabilities
+        }
+      }
+    }
   })
   return response.json()
 }
@@ -59,6 +90,68 @@ describe('Redis task integration (multi-instance)', () => {
     // exercises the polling path against the shared store.
     const result = await call(b, 'tasks/result', { taskId })
     assert.strictEqual(result.result.content[0].text, '42')
+  })
+
+  testWithRedis('modern task input is acknowledged by the owning instance', async (redis, t) => {
+    const redisOpts = {
+      host: redis.options.host!,
+      port: redis.options.port!,
+      db: redis.options.db!
+    }
+
+    const a = fastify()
+    t.after(() => a.close())
+    await a.register(mcpPlugin, { enableTasks: true, redis: redisOpts })
+    a.mcpAddTool({
+      name: 'confirm',
+      inputSchema: Type.Object({}),
+      execution: { taskSupport: 'required' }
+    } as any, async (_args: unknown, context: any): Promise<CallToolResult> => {
+      const answer = context.inputResponses?.confirmation
+      if (!answer) {
+        throw new InputRequired({
+          inputRequests: {
+            confirmation: elicitForm('Confirm?', {
+              type: 'object',
+              properties: { value: { type: 'string' } },
+              required: ['value']
+            })
+          }
+        })
+      }
+      return { content: [{ type: 'text', text: answer.content.value }] }
+    })
+    await a.ready()
+
+    const b = fastify()
+    t.after(() => b.close())
+    await b.register(mcpPlugin, { enableTasks: true, redis: redisOpts })
+    await b.ready()
+
+    const created = await modernCall(a, 'tools/call', { name: 'confirm', arguments: {} })
+    const taskId = created.result.taskId
+
+    let task: any
+    for (let attempt = 0; attempt < 100; attempt++) {
+      task = (await modernCall(b, 'tasks/get', { taskId }, 2)).result
+      if (task.status === 'input_required') break
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+    assert.strictEqual(task.status, 'input_required')
+
+    const updated = await modernCall(b, 'tasks/update', {
+      taskId,
+      inputResponses: { confirmation: { action: 'accept', content: { value: 'yes' } } }
+    }, 3)
+    assert.strictEqual(updated.result.resultType, 'complete')
+
+    for (let attempt = 0; attempt < 100; attempt++) {
+      task = (await modernCall(b, 'tasks/get', { taskId }, 4)).result
+      if (task.status === 'completed') break
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+    assert.strictEqual(task.status, 'completed')
+    assert.strictEqual(task.result.content[0].text, 'yes')
   })
 
   testWithRedis('tasks/get on a second instance sees the terminal state', async (redis, t) => {
