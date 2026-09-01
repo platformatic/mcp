@@ -92,7 +92,7 @@ describe('Redis task integration (multi-instance)', () => {
     assert.strictEqual(result.result.content[0].text, '42')
   })
 
-  testWithRedis('modern task input is acknowledged by the owning instance', async (redis, t) => {
+  testWithRedis('modern task input published on one instance reaches the owning instance', async (redis, t) => {
     const redisOpts = {
       host: redis.options.host!,
       port: redis.options.port!,

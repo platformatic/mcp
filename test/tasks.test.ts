@@ -156,7 +156,7 @@ describe('task store', () => {
     t.assert.strictEqual(await store.get('task-1'), null)
   })
 
-  test('MemoryTaskStore retries staged input until publication is acknowledged', async (t: TestContext) => {
+  test('MemoryTaskStore retries staged input until publication is accepted', async (t: TestContext) => {
     const store = new MemoryTaskStore()
     await store.create(record({
       status: 'input_required',
@@ -168,7 +168,7 @@ describe('task store', () => {
     t.assert.strictEqual((await store.get('task-1'))?.inputRequests, undefined)
     t.assert.deepStrictEqual((await store.get('task-1'))?.pendingInputResponses, { confirmation: 'yes' })
 
-    // Simulate broker publication failure: no acknowledgement was recorded.
+    // Simulate broker publication failure: delivery acceptance was not recorded.
     const retry = await store.updateInputResponses('task-1', { confirmation: 'changed replay' }, 'delivery-2')
     t.assert.deepStrictEqual(retry?.responses, { confirmation: 'yes' })
     t.assert.deepStrictEqual(retry?.responseIds, { confirmation: 'delivery-1' })
@@ -448,6 +448,58 @@ describe('tasks over the wire', () => {
     // A cannot reach B's task by id either
     const cross = await authedCall(tokenA, 'tasks/get', { taskId: taskB })
     t.assert.strictEqual(cross.error.code, INVALID_PARAMS)
+  })
+
+  test('custom upstream authentication scopes legacy tasks by subject', async (t: TestContext) => {
+    const app = Fastify({ logger: false })
+    t.after(() => app.close())
+    app.addHook('preHandler', async (request) => {
+      ;(request as any).upstreamUserId = request.headers['x-auth-user']
+    })
+    await app.register(mcpPlugin, {
+      enableTasks: true,
+      resolveAuthorizationContext: (request) => {
+        const userId = (request as any).upstreamUserId
+        return typeof userId === 'string' ? { userId } : undefined
+      }
+    })
+    app.mcpAddTool({
+      name: 'noop',
+      inputSchema: Type.Object({}),
+      execution: { taskSupport: 'optional' }
+    } as any, async (): Promise<CallToolResult> => ({ content: [{ type: 'text', text: 'ok' }] }))
+    await app.ready()
+
+    const upstreamCall = async (userId: string, method: string, params: unknown) => {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/mcp',
+        headers: {
+          'x-auth-user': userId,
+          'mcp-protocol-version': LATEST_LEGACY_PROTOCOL_VERSION
+        },
+        payload: { jsonrpc: JSONRPC_VERSION, id: 1, method, params }
+      })
+      return response.json()
+    }
+
+    const initialized = await upstreamCall('user-a', 'initialize', {
+      protocolVersion: LATEST_LEGACY_PROTOCOL_VERSION,
+      capabilities: {}
+    })
+    t.assert.deepStrictEqual(initialized.result.capabilities.tasks.list, {})
+
+    const created = await upstreamCall('user-a', 'tools/call', {
+      name: 'noop',
+      arguments: {},
+      task: {}
+    })
+    const taskId = (created.result as CreateTaskResult).task.taskId
+
+    const rejected = await upstreamCall('user-b', 'tasks/get', { taskId })
+    t.assert.strictEqual(rejected.error.code, INVALID_PARAMS)
+    const listed = (await upstreamCall('user-a', 'tasks/list', {})).result as ListTasksResult
+    t.assert.deepStrictEqual(listed.tasks.map(task => task.taskId), [taskId])
   })
 
   test('a token without sub cannot list or reach subject-less tasks', async (t: TestContext) => {

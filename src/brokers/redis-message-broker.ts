@@ -85,7 +85,7 @@ export class RedisMessageBroker implements MessageBroker {
       }
       // A real Redis subscription normally confirms immediately. Bound the
       // readiness wait so a partially responsive Redis endpoint cannot hang
-      // plugin registration forever; publications still require consumer ACKs.
+      // plugin registration forever.
       const timer = setTimeout(finish, SUBSCRIBE_READY_TIMEOUT_MS)
       timer.unref()
 

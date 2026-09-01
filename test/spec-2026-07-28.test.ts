@@ -583,6 +583,47 @@ describe('2026-07-28: multi round-trip requests', () => {
     t.assert.match(error.message, /integrity/)
   })
 
+  test('custom upstream authentication binds state to its resolved principal', async (t: TestContext) => {
+    const app = Fastify()
+    t.after(() => app.close())
+    app.addHook('preHandler', async (request) => {
+      ;(request as any).upstreamUserId = request.headers['x-auth-user']
+    })
+    let resolutions = 0
+    await app.register(mcpPlugin, {
+      requestStateSecret: 'shared-test-secret',
+      resolveAuthorizationContext: (request) => {
+        resolutions++
+        const userId = (request as any).upstreamUserId
+        return typeof userId === 'string' ? { userId, tokenType: 'upstream' } : undefined
+      }
+    })
+    registerElicitingTool(app, [])
+    await app.ready()
+
+    const params = { name: 'greet', arguments: {} }
+    const first = (await call(app, 'tools/call', {
+      params,
+      capabilities: elicitationCapable,
+      headers: { 'x-auth-user': 'user-a' }
+    })).json().result
+
+    const rejected = await call(app, 'tools/call', {
+      id: 2,
+      capabilities: elicitationCapable,
+      headers: { 'x-auth-user': 'user-b' },
+      params: {
+        ...params,
+        requestState: first.requestState,
+        inputResponses: { who: { action: 'accept', content: { name: 'octocat' } } }
+      }
+    })
+
+    t.assert.strictEqual(rejected.json().error.code, INVALID_PARAMS)
+    t.assert.match(rejected.json().error.message, /different principal/)
+    t.assert.strictEqual(resolutions, 2, 'the resolver runs exactly once per request')
+  })
+
   test('state minted for one call cannot be replayed onto another', async (t: TestContext) => {
     const app = await buildServer(t, (app) => {
       registerElicitingTool(app, [])
@@ -908,6 +949,59 @@ describe('2026-07-28: tasks extension', () => {
     t.assert.deepStrictEqual(error.data.requiredCapabilities, { extensions: { [TASKS_EXTENSION]: {} } })
   })
 
+  test('custom upstream authentication isolates task ownership', async (t: TestContext) => {
+    let release: (value: string) => void = () => {}
+    const pending = new Promise<string>((resolve) => { release = resolve })
+    const app = Fastify()
+    t.after(async () => {
+      release('done')
+      await app.close()
+    })
+    app.addHook('preHandler', async (request) => {
+      ;(request as any).upstreamUserId = request.headers['x-auth-user']
+    })
+    await app.register(mcpPlugin, {
+      enableTasks: true,
+      resolveAuthorizationContext: (request) => {
+        const userId = (request as any).upstreamUserId
+        return typeof userId === 'string' ? { userId } : undefined
+      }
+    })
+    app.mcpAddTool({
+      name: 'private-task',
+      inputSchema: Type.Object({}),
+      execution: { taskSupport: 'required' }
+    } as any, async () => ({ content: [{ type: 'text', text: await pending }] }))
+    await app.ready()
+
+    const created = (await call(app, 'tools/call', {
+      params: { name: 'private-task', arguments: {} },
+      capabilities: tasksCapable,
+      headers: { 'x-auth-user': 'user-a' }
+    })).json().result
+
+    const rejectedGet = await call(app, 'tasks/get', {
+      params: { taskId: created.taskId },
+      capabilities: tasksCapable,
+      headers: { 'x-auth-user': 'user-b' }
+    })
+    t.assert.strictEqual(rejectedGet.json().error.code, INVALID_PARAMS)
+
+    const rejectedCancel = await call(app, 'tasks/cancel', {
+      params: { taskId: created.taskId },
+      capabilities: tasksCapable,
+      headers: { 'x-auth-user': 'user-b' }
+    })
+    t.assert.strictEqual(rejectedCancel.json().error.code, INVALID_PARAMS)
+
+    const ownerGet = await call(app, 'tasks/get', {
+      params: { taskId: created.taskId },
+      capabilities: tasksCapable,
+      headers: { 'x-auth-user': 'user-a' }
+    })
+    t.assert.strictEqual(ownerGet.json().result.taskId, created.taskId)
+  })
+
   test('tasks/cancel acknowledges and settles the task', async (t: TestContext) => {
     let release: (value: string) => void = () => {}
     const pending = new Promise<string>((resolve) => { release = resolve })
@@ -1004,7 +1098,7 @@ describe('2026-07-28: tasks extension', () => {
     t.assert.strictEqual(task.inputRequests, undefined)
   })
 
-  test('cancelling an input-blocked task is acknowledged by its owner', async (t: TestContext) => {
+  test('cancelling an input-blocked task reaches its owner', async (t: TestContext) => {
     const app = await buildServer(t, (app) => {
       app.mcpAddTool({
         name: 'blocked',

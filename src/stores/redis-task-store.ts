@@ -93,9 +93,6 @@ export class RedisTaskStore implements TaskStore {
     if (options.outcome !== undefined) {
       updated.outcome = options.outcome
     }
-    if (options.cancelledFromInputRequired !== undefined) {
-      updated.cancelledFromInputRequired = options.cancelledFromInputRequired
-    }
     applyInputRequestUpdates(updated, options)
 
     // The read above and this write are two round trips, so a concurrent write

@@ -362,12 +362,14 @@ function toDetailedTask (record: TaskRecord): Record<string, unknown> {
 
 /**
  * A task is reachable only by the subject that created it, when the deployment
- * can identify subjects at all. Without authorization the random task id is the
- * capability, which is why we never enumerate tasks.
+ * can identify subjects at all. Without identity resolution the random task id
+ * is the capability, which is why we never enumerate tasks.
  */
 function taskVisibleTo (record: TaskRecord | null, dependencies: ModernDependencies): TaskRecord | null {
   if (!record) return null
-  if (dependencies.opts.authorization?.enabled !== true) return record
+  const identifiesRequestors = dependencies.opts.authorization?.enabled === true ||
+    dependencies.opts.resolveAuthorizationContext !== undefined
+  if (!identifiesRequestors) return record
 
   const subject = dependencies.authContext?.userId
   if (subject === undefined || record.authSubject !== subject) return null
@@ -438,9 +440,10 @@ async function handleTasksUpdate (
     const keys = Object.keys(responses)
     dependencies.app.log.debug({ taskId: params.taskId, keys, deliveryId }, 'Publishing task input responses')
 
-    // Publish the durable values, then acknowledge the outbox. If publication
-    // fails, the request errors and an identical retry republishes the same
-    // delivery id, which every receiving instance deduplicates.
+    // Publish the durable values, then acknowledge the outbox. Under the broker
+    // contract, successful publication is confirmation that the intended
+    // consumer accepted delivery. A failure retains the original values and
+    // delivery id for an identical retry; receivers deduplicate that retry.
     await dependencies.taskInputs?.publish(params.taskId, responses, deliveryId)
     await dependencies.taskStore!.acknowledgeInputResponses(
       params.taskId,
@@ -470,12 +473,10 @@ async function handleTasksCancel (
   // A retry of an already-cancelled task republishes cancellation so a transient
   // broker failure cannot leave the owning instance parked until its ttl.
   let publishCancellation = record.status === 'cancelled'
-  let waitForCancellationAck = record.status === 'input_required' || record.cancelledFromInputRequired === true
   if (!isTerminal(record.status)) {
     try {
       const cancelled = await dependencies.taskStore!.updateStatus(taskId, 'cancelled', {
         statusMessage: 'Cancelled by the requestor',
-        cancelledFromInputRequired: record.status === 'input_required',
         inputRequests: null,
         clearPendingInputResponses: true
       })
@@ -490,10 +491,9 @@ async function handleTasksCancel (
       // leaving the owning waiter blocked.
       const current = await dependencies.taskStore!.get(taskId)
       publishCancellation = current?.status === 'cancelled'
-      waitForCancellationAck = current?.cancelledFromInputRequired === true
     }
   }
-  if (publishCancellation) await dependencies.taskInputs?.cancel(taskId, waitForCancellationAck)
+  if (publishCancellation) await dependencies.taskInputs?.cancel(taskId)
 
   return createResponse(request.id, complete({}, dependencies.serverInfo))
 }

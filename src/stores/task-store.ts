@@ -40,8 +40,6 @@ export interface TaskRecord extends Task {
   pendingInputResponseIds?: Record<string, string>
   /** Input generation each pending response belongs to. */
   pendingInputResponseRounds?: Record<string, number>
-  /** Whether cancellation interrupted an input wait and therefore needs broker acknowledgement. */
-  cancelledFromInputRequired?: boolean
 }
 
 /**
@@ -67,7 +65,6 @@ export function canTransition (from: TaskStatus, to: TaskStatus): boolean {
 export interface TaskUpdateOptions {
   statusMessage?: string
   outcome?: TaskOutcome
-  cancelledFromInputRequired?: boolean
   /** Replaces the outstanding input requests; `null` clears them. */
   inputRequests?: Record<string, unknown> | null
   /** Keys to mark as answered, merged with those already recorded. */
@@ -112,7 +109,7 @@ export interface TaskStore {
   ): Promise<TaskInputUpdate | null>
   /**
    * Remove delivered values from the outbox only when their stable delivery ids
-   * still match, so a delayed acknowledgement cannot delete a later round.
+   * still match, so delayed publication completion cannot delete a later round.
    */
   acknowledgeInputResponses(taskId: string, responseIds: Record<string, string>): Promise<void>
   /** Tasks visible to the given authorization subject, newest first */
@@ -219,7 +216,6 @@ export function toWireTask (task: TaskRecord): Task {
     pendingInputResponses,
     pendingInputResponseIds,
     pendingInputResponseRounds,
-    cancelledFromInputRequired,
     ...wire
   } = task
   return wire

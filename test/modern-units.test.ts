@@ -331,43 +331,58 @@ describe('task input channel lifecycle', () => {
     channel.close()
   })
 
-  test('publication resolves only after the consuming replica acknowledges delivery', async (t: TestContext) => {
-    const channel = new TaskInputChannel(1000, 10, 50)
+  test('queued input is not acknowledged before broker delivery is accepted', async (t: TestContext) => {
+    const channel = new TaskInputChannel(1000, 10)
+    let acceptPublication: () => void = () => {}
+    const accepted = new Promise<void>((resolve) => { acceptPublication = resolve })
     channel.setPublisher(async (taskId, responses, deliveryId) => {
       channel.deliver(taskId, responses, deliveryId)
-    })
-    channel.setAcknowledgementPublisher(async (taskId, deliveryId) => {
-      channel.confirmDelivery(taskId, deliveryId)
+      await accepted
     })
 
     const waiting = channel.wait('task-1')
-    await channel.publish('task-1', { confirmation: 'yes' }, 'delivery-1')
+    let publicationSettled = false
+    const publication = channel.publish('task-1', { confirmation: 'yes' }, 'delivery-1')
+      .then(() => { publicationSettled = true })
+
     t.assert.deepStrictEqual(await waiting, { confirmation: 'yes' })
+    await delay(0)
+    t.assert.strictEqual(publicationSettled, false)
+
+    acceptPublication()
+    await publication
+    t.assert.strictEqual(publicationSettled, true)
     channel.close()
   })
 
-  test('publication times out when no task owner consumes it', async (t: TestContext) => {
-    const channel = new TaskInputChannel(1000, 10, 20)
+  test('broker publication acceptance is treated as delivery confirmation', async (t: TestContext) => {
+    const channel = new TaskInputChannel(1000, 10)
     channel.setPublisher(async () => {})
-    await t.assert.rejects(
-      channel.publish('task-1', { confirmation: 'yes' }, 'delivery-1'),
-      /acknowledgement/
-    )
+
+    await channel.publish('task-1', { confirmation: 'yes' }, 'delivery-1')
+    t.assert.strictEqual(channel.pendingSize, 0)
     channel.close()
   })
 
-  test('input-blocked cancellation waits for acknowledgement from the owner', async (t: TestContext) => {
-    const channel = new TaskInputChannel(1000, 10, 50)
-    channel.setCancellationPublisher(async (taskId, cancellationId) => {
-      channel.abort(taskId, 'task cancelled', cancellationId)
-    })
-    channel.setAcknowledgementPublisher(async (taskId, cancellationId) => {
-      channel.confirmDelivery(taskId, cancellationId)
+  test('input-blocked cancellation waits for broker acceptance', async (t: TestContext) => {
+    const channel = new TaskInputChannel(1000, 10)
+    let acceptPublication: () => void = () => {}
+    const accepted = new Promise<void>((resolve) => { acceptPublication = resolve })
+    channel.setCancellationPublisher(async (taskId) => {
+      channel.abort(taskId, 'task cancelled')
+      await accepted
     })
 
     const waiting = channel.wait('task-1')
-    await channel.cancel('task-1', true)
+    let cancellationSettled = false
+    const cancellation = channel.cancel('task-1').then(() => { cancellationSettled = true })
     await t.assert.rejects(waiting, /cancelled/)
+    await delay(0)
+    t.assert.strictEqual(cancellationSettled, false)
+
+    acceptPublication()
+    await cancellation
+    t.assert.strictEqual(cancellationSettled, true)
     channel.close()
   })
 
@@ -391,13 +406,13 @@ describe('task input channel lifecycle', () => {
     channel.close()
   })
 
-  test('pending answers expire autonomously and remain capacity bounded', async (t: TestContext) => {
-    const channel = new TaskInputChannel(20, 2)
-    channel.deliver('task-1', { a: 1 })
-    channel.deliver('task-2', { b: 2 })
-    channel.deliver('task-3', { c: 3 })
+  test('a burst of unmatched answers expires autonomously and remains bounded', async (t: TestContext) => {
+    const channel = new TaskInputChannel(20, 32)
+    for (let index = 0; index < 1000; index++) {
+      channel.deliver(`task-${index}`, { value: index }, `delivery-${index}`)
+    }
 
-    t.assert.strictEqual(channel.pendingSize, 2)
+    t.assert.strictEqual(channel.pendingSize, 32)
     await delay(60)
     t.assert.strictEqual(channel.pendingSize, 0)
     channel.close()

@@ -94,7 +94,7 @@ describe('RedisTaskStore', () => {
     t.assert.strictEqual((await store.get('task-1'))?.status, 'cancelled')
   })
 
-  test('retries staged input until broker publication is acknowledged', async (t: TestContext) => {
+  test('retries staged input until broker publication is accepted', async (t: TestContext) => {
     await store.create(record({
       status: 'input_required',
       inputRequests: { confirmation: { method: 'elicitation/create' } }

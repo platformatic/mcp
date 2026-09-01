@@ -71,9 +71,6 @@ export class MemoryTaskStore implements TaskStore {
     if (options.outcome !== undefined) {
       updated.outcome = options.outcome
     }
-    if (options.cancelledFromInputRequired !== undefined) {
-      updated.cancelledFromInputRequired = options.cancelledFromInputRequired
-    }
     applyInputRequestUpdates(updated, options)
 
     this.tasks.set(taskId, updated)
@@ -103,8 +100,8 @@ export class MemoryTaskStore implements TaskStore {
 
     for (const [key, value] of Object.entries(responses)) {
       if (Object.hasOwn(pending, key) && (pendingRounds[key] ?? currentRound) === currentRound) {
-        // A prior request staged this key but failed before acknowledging its
-        // broker publication. Retry the durable value, not a changed replay.
+        // A prior request staged this key but did not complete broker delivery.
+        // Retry the durable value, not a changed replay.
         deliverable.push([key, pending[key]])
         responseIds.push([key, pendingIds[key] ?? responseId])
       } else if (!isTerminal(task.status) && Object.hasOwn(outstanding, key) && !answered.has(key)) {

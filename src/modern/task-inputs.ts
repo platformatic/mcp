@@ -1,17 +1,15 @@
 /**
  * Cross-instance delivery of `tasks/update` input responses.
  *
- * Redis Pub/Sub confirms publication, not delivery to the replica that owns a
- * task execution. Delivery therefore uses an explicit acknowledgement: the
- * publishing request waits until the owning waiter (or its pre-wait buffer)
- * consumes the message. The task store keeps the response in an outbox until
- * that acknowledgement arrives, so retries remain safe.
+ * The message-broker contract treats a resolved publication as confirmation
+ * that the intended consumer accepted delivery. The task store keeps each
+ * response in a durable outbox until publication resolves, so failures remain
+ * safely retryable without acknowledging queued work early.
  */
 
 import type { InputResponses } from '../schema-2026.ts'
 
 export const TASK_INPUT_TOPIC = 'mcp/tasks/input'
-export const TASK_INPUT_ACK_TOPIC = 'mcp/tasks/input/ack'
 export const TASK_INPUT_CANCEL_TOPIC = 'mcp/tasks/input/cancel'
 
 interface Waiter {
@@ -28,45 +26,32 @@ interface PendingDelivery {
   expiresAt: number
 }
 
-interface AckWaiter {
-  resolve: () => void
-  reject: (error: Error) => void
-  timer: NodeJS.Timeout
-}
-
 type Publisher = (taskId: string, responses: Record<string, unknown>, deliveryId: string) => Promise<void>
-type AcknowledgementPublisher = (taskId: string, deliveryId: string, keys: string[]) => Promise<void>
-type CancellationPublisher = (taskId: string, cancellationId: string) => Promise<void>
+type CancellationPublisher = (taskId: string) => Promise<void>
 
 const DEFAULT_RETENTION_MS = 3_600_000
-const DEFAULT_ACK_TIMEOUT_MS = 5_000
 const DEFAULT_MAX_PENDING = 1000
 
 export class TaskInputChannel {
   #waiters = new Map<string, Set<Waiter>>()
   #pending = new Map<string, PendingDelivery>()
   #seenDeliveries = new Map<string, number>()
-  #cancellations = new Map<string, { expiresAt: number, cancellationId: string, acknowledged: boolean }>()
-  #ackWaiters = new Map<string, Set<AckWaiter>>()
+  #cancellations = new Map<string, { expiresAt: number }>()
   #publish?: Publisher
-  #publishAcknowledgement?: AcknowledgementPublisher
   #publishCancellation?: CancellationPublisher
   #expiryTimer?: NodeJS.Timeout
   #closed = false
 
   readonly #retentionMs: number
-  readonly #ackTimeoutMs: number
   readonly #maxPending: number
   readonly #maxSeenDeliveries: number
   readonly #maxCancellations: number
 
   constructor (
     retentionMs: number = DEFAULT_RETENTION_MS,
-    maxPending: number = DEFAULT_MAX_PENDING,
-    ackTimeoutMs: number = DEFAULT_ACK_TIMEOUT_MS
+    maxPending: number = DEFAULT_MAX_PENDING
   ) {
     this.#retentionMs = Math.max(1, retentionMs)
-    this.#ackTimeoutMs = Math.max(1, ackTimeoutMs)
     this.#maxPending = Math.max(1, maxPending)
     this.#maxSeenDeliveries = this.#maxPending * 4
     this.#maxCancellations = this.#maxPending
@@ -86,18 +71,11 @@ export class TaskInputChannel {
     this.#publish = publish
   }
 
-  setAcknowledgementPublisher (publish: AcknowledgementPublisher): void {
-    this.#publishAcknowledgement = publish
-  }
-
   setCancellationPublisher (publish: CancellationPublisher): void {
     this.#publishCancellation = publish
   }
 
-  /**
-   * Publish and wait for acknowledgement from the replica that consumed it.
-   * Publication success alone is deliberately insufficient.
-   */
+  /** Publish responses; resolution is the broker's delivery confirmation. */
   async publish (
     taskId: string,
     responses: Record<string, unknown>,
@@ -105,50 +83,19 @@ export class TaskInputChannel {
   ): Promise<void> {
     if (this.#closed) throw new Error('channel closed')
 
-    const acknowledgement = this.#registerAckWaiter(taskId, deliveryId)
-    try {
-      if (this.#publish) {
-        await this.#publish(taskId, responses, deliveryId)
-      } else {
-        this.deliver(taskId, responses, deliveryId)
-      }
-      await acknowledgement.promise
-    } catch (error) {
-      acknowledgement.cancel()
-      throw error
+    if (this.#publish) {
+      await this.#publish(taskId, responses, deliveryId)
+    } else {
+      this.deliver(taskId, responses, deliveryId)
     }
   }
 
-  async cancel (taskId: string, waitForAcknowledgement: boolean = false): Promise<void> {
-    const cancellationId = `cancel:${taskId}`
-    if (!this.#publishCancellation) {
-      this.abort(taskId, 'cancelled', cancellationId)
-      return
-    }
-
-    if (!waitForAcknowledgement) {
-      await this.#publishCancellation(taskId, cancellationId)
-      return
-    }
-
-    const acknowledgement = this.#registerAckWaiter(taskId, cancellationId)
-    try {
-      await this.#publishCancellation(taskId, cancellationId)
-      await acknowledgement.promise
-    } catch (error) {
-      acknowledgement.cancel()
-      throw error
-    }
-  }
-
-  /** Called by the acknowledgement broker subscription on every replica. */
-  confirmDelivery (taskId: string, deliveryId: string): void {
-    const key = this.#deliveryKey(taskId, deliveryId)
-    const waiters = this.#ackWaiters.get(key)
-    if (!waiters) return
-    for (const waiter of [...waiters]) {
-      this.#removeAckWaiter(key, waiter)
-      waiter.resolve()
+  /** Publish cancellation and wait for the broker to confirm acceptance. */
+  async cancel (taskId: string): Promise<void> {
+    if (this.#publishCancellation) {
+      await this.#publishCancellation(taskId)
+    } else {
+      this.abort(taskId, 'cancelled')
     }
   }
 
@@ -156,10 +103,7 @@ export class TaskInputChannel {
     if (this.#closed) return Promise.reject(new Error('channel closed'))
     this.#pruneExpired()
 
-    const cancellation = this.#cancellations.get(taskId)
-    if (cancellation) {
-      cancellation.acknowledged = true
-      this.#acknowledge(taskId, cancellation.cancellationId, [])
+    if (this.#cancellations.has(taskId)) {
       return Promise.reject(new Error('task cancelled'))
     }
 
@@ -170,7 +114,6 @@ export class TaskInputChannel {
         this.#pending.delete(key)
         Object.assign(responses, entry.responses)
         this.#markConsumed(entry.taskId, entry.deliveryId)
-        this.#acknowledge(entry.taskId, entry.deliveryId, Object.keys(entry.responses))
       }
       this.#scheduleExpiry()
       return Promise.resolve(responses)
@@ -192,11 +135,8 @@ export class TaskInputChannel {
 
       // Cancellation can race the registration above. Re-check after the
       // waiter is visible so either the tombstone or abort() rejects it.
-      const racedCancellation = this.#cancellations.get(taskId)
-      if (racedCancellation) {
-        racedCancellation.acknowledged = true
+      if (this.#cancellations.has(taskId)) {
         this.#rejectWaiter(taskId, waiter, new Error('task cancelled'))
-        this.#acknowledge(taskId, racedCancellation.cancellationId, [])
       }
     })
   }
@@ -208,12 +148,8 @@ export class TaskInputChannel {
     const id = deliveryId ?? `local-${taskId}`
     const deliveryKey = this.#deliveryKey(taskId, id)
 
-    // A retry after an acknowledgement/store race must be acknowledged again,
-    // but never delivered to a later input round.
-    if (this.#seenDeliveries.has(deliveryKey)) {
-      this.#acknowledge(taskId, id, Object.keys(responses))
-      return
-    }
+    // An ambiguous publication retry must never reach a later input round.
+    if (this.#seenDeliveries.has(deliveryKey)) return
 
     const set = this.#waiters.get(taskId)
     if (!set || set.size === 0) {
@@ -234,20 +170,12 @@ export class TaskInputChannel {
     for (const waiter of [...set]) {
       this.#resolveWaiter(taskId, waiter, responses as InputResponses)
     }
-    this.#acknowledge(taskId, id, Object.keys(responses))
   }
 
   /** Reject current and future waits for a recently cancelled task. */
-  abort (
-    taskId: string,
-    reason: string = 'cancelled',
-    cancellationId: string = `cancel:${taskId}`
-  ): void {
-    const existing = this.#cancellations.get(taskId)
+  abort (taskId: string, reason: string = 'cancelled'): void {
     const cancellation = {
-      expiresAt: Date.now() + this.#retentionMs,
-      cancellationId,
-      acknowledged: existing?.acknowledged ?? false
+      expiresAt: Date.now() + this.#retentionMs
     }
     this.#cancellations.delete(taskId)
     this.#cancellations.set(taskId, cancellation)
@@ -259,13 +187,9 @@ export class TaskInputChannel {
 
     const set = this.#waiters.get(taskId)
     if (set && set.size > 0) {
-      cancellation.acknowledged = true
       for (const waiter of [...set]) {
         this.#rejectWaiter(taskId, waiter, new Error(reason))
       }
-    }
-    if (cancellation.acknowledged) {
-      this.#acknowledge(taskId, cancellationId, [])
     }
     this.#scheduleExpiry()
   }
@@ -293,23 +217,6 @@ export class TaskInputChannel {
     this.#cancellations.clear()
 
     for (const taskId of [...this.#waiters.keys()]) this.forget(taskId)
-    for (const [key, waiters] of this.#ackWaiters) {
-      for (const waiter of [...waiters]) {
-        this.#removeAckWaiter(key, waiter)
-        waiter.reject(new Error('channel closed'))
-      }
-    }
-  }
-
-  #acknowledge (taskId: string, deliveryId: string, keys: string[]): void {
-    if (!this.#publishAcknowledgement) {
-      this.confirmDelivery(taskId, deliveryId)
-      return
-    }
-    this.#publishAcknowledgement(taskId, deliveryId, keys).catch(() => {
-      // The sender times out and retains its outbox. A retry is re-acknowledged
-      // by the seen-delivery branch above.
-    })
   }
 
   #markConsumed (taskId: string, deliveryId: string): void {
@@ -318,45 +225,6 @@ export class TaskInputChannel {
     this.#seenDeliveries.set(key, Date.now() + this.#retentionMs)
     this.#evictOldest(this.#seenDeliveries, this.#maxSeenDeliveries)
     this.#scheduleExpiry()
-  }
-
-  #registerAckWaiter (taskId: string, deliveryId: string): {
-    promise: Promise<void>
-    cancel: () => void
-  } {
-    const key = this.#deliveryKey(taskId, deliveryId)
-    let waiter: AckWaiter
-    const promise = new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.#removeAckWaiter(key, waiter)
-        reject(new Error(`Timed out waiting for task input delivery acknowledgement '${deliveryId}'`))
-      }, this.#ackTimeoutMs)
-      // This timer settles an awaited request; unlike background expiry timers
-      // it must keep the event loop alive until success or timeout.
-      waiter = { resolve, reject, timer }
-
-      let set = this.#ackWaiters.get(key)
-      if (!set) {
-        set = new Set()
-        this.#ackWaiters.set(key, set)
-      }
-      set.add(waiter)
-    })
-
-    return {
-      promise,
-      cancel: () => {
-        if (waiter) this.#removeAckWaiter(key, waiter)
-      }
-    }
-  }
-
-  #removeAckWaiter (key: string, waiter: AckWaiter): void {
-    clearTimeout(waiter.timer)
-    const set = this.#ackWaiters.get(key)
-    if (!set) return
-    set.delete(waiter)
-    if (set.size === 0) this.#ackWaiters.delete(key)
   }
 
   #pruneExpired (): void {

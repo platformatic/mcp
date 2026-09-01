@@ -417,6 +417,28 @@ await app.register(mcpPlugin, {
 > Replay is *bounded*, not eliminated. If a given `requestState` must be consumed at most
 > once, enforce that in your own handler.
 
+Applications that authenticate in their own Fastify hooks can expose that identity to MCP
+without enabling the built-in OAuth plugin:
+
+```typescript
+app.addHook('preHandler', async (request, reply) => {
+  request.user = await authenticateRequest(request, reply)
+})
+
+await app.register(mcpPlugin, {
+  resolveAuthorizationContext: (request) => ({
+    userId: request.user.id,
+    scopes: request.user.scopes
+  })
+})
+```
+
+The resolver runs once per MCP POST after Fastify preHandlers and is authoritative when
+configured. It only maps an already-authenticated request; it does **not** reject anonymous
+requests for you. Return a stable `userId` so `requestState`, modern and legacy tasks, tool
+access hooks, and handler contexts all use the same principal. If the resolver returns no
+`userId`, principal-bound request state is refused and the caller owns no tasks.
+
 ## Subscriptions (2026-07-28)
 
 `subscriptions/listen` replaces both the standalone `GET` stream and `resources/subscribe`.
@@ -559,11 +581,11 @@ await app.register(mcpPlugin, {
 Tasks are stored in memory by default and in Redis when a `redis` option is given, so any
 instance can serve a poll for a task created on another.
 
-**Security**: when authorization is enabled, tasks are bound to the token subject and a
-requestor can only reach its own. Without authorization no requestor can be identified, so
-tasks are reachable by anyone holding the (random UUID) task id, and `tasks/list` is both
-unadvertised **and refused** — otherwise it would hand every anonymous task's id to any
-caller and defeat that model.
+**Security**: when built-in authorization or `resolveAuthorizationContext` is configured,
+tasks are bound to the resolved `userId` and a requestor can only reach its own. Without an
+identity resolver no requestor can be identified, so tasks are reachable by anyone holding
+the (random UUID) task id, and `tasks/list` is both unadvertised **and refused** — otherwise
+it would hand every anonymous task's id to any caller and defeat that model.
 
 ## Elicitation Support (MCP 2025-11-25)
 
@@ -2114,6 +2136,7 @@ await app.register(import('@fastify/bearer-auth'), {
 - `capabilities`: MCP capabilities configuration
 - `instructions`: Optional server instructions
 - `enableSSE`: Enable Server-Sent Events support (default: false)
+- `resolveAuthorizationContext`: Maps identities established by upstream Fastify authentication hooks into MCP authorization context (optional)
 - `canAccessTool`: Per-request tool authorization hook consulted by `tools/list` and `tools/call` (optional)
 - `onToolCallComplete`: Transport-neutral hook fired once after every tool call settles, across JSON-RPC, `mcpCallTool()`, and tasks (optional)
 - `authorization`: OAuth 2.1 authorization configuration (optional)

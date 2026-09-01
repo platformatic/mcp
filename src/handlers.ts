@@ -919,12 +919,13 @@ function taskSubject (dependencies: HandlerDependencies): string | undefined {
  * Whether this deployment can tie a task to a requestor.
  *
  * Mirrors the gate in `index.ts` that decides whether to advertise
- * `tasks.list`. Without authorization every task shares the undefined subject,
+ * `tasks.list`. Without an identity resolver every task shares the undefined
+ * subject,
  * so listing would hand every task's id to any caller — defeating the "random
  * task id is the capability" model that protects `tasks/get|result|cancel`.
  */
 function canIdentifyRequestors (dependencies: HandlerDependencies): boolean {
-  return dependencies.opts.authorization?.enabled === true
+  return dependencies.opts.authorization?.enabled === true || dependencies.opts.resolveAuthorizationContext !== undefined
 }
 
 /**
@@ -938,15 +939,15 @@ function assertTaskAccess (task: TaskRecord | null, dependencies: HandlerDepende
   const subject = taskSubject(dependencies)
 
   if (canIdentifyRequestors(dependencies)) {
-    // Auth on: a task is reachable only by the exact subject that owns it. A
-    // token without a `sub` claim identifies no one, so an undefined subject
+    // Identity resolution on: a task is reachable only by its exact owner. A
+    // context without a `userId` identifies no one, so an undefined subject
     // must never match another subject-less task via `undefined === undefined`.
     if (subject === undefined || task.authSubject !== subject) return null
     return task
   }
 
-  // Auth off: no requestor can be identified, so the random task id is the
-  // capability and every (subject-less) task is reachable by whoever holds it.
+  // No identity resolver: the random task id is the capability and every
+  // subject-less task is reachable by whoever holds it.
   return task
 }
 

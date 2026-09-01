@@ -367,9 +367,13 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     }
   }
 
-  /** Build the authorization context from a validated token, if there is one. */
-  function authContextFrom (request: FastifyRequest): AuthorizationContext | undefined {
-    const payload = (request as any).tokenPayload
+  /** Resolve the request identity from custom upstream auth or our validated token. */
+  async function authContextFrom (request: FastifyRequest): Promise<AuthorizationContext | undefined> {
+    if (opts.resolveAuthorizationContext) {
+      return await opts.resolveAuthorizationContext(request)
+    }
+
+    const payload = request.tokenPayload
     if (!payload) return undefined
 
     return {
@@ -391,7 +395,11 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
    * everything needed to serve it, which is what lets an instance behind a
    * plain round-robin balancer handle any request.
    */
-  async function handleModernPost (request: FastifyRequest, reply: FastifyReply): Promise<unknown> {
+  async function handleModernPost (
+    request: FastifyRequest,
+    reply: FastifyReply,
+    authContext: AuthorizationContext | undefined
+  ): Promise<unknown> {
     const body = request.body as JSONRPCRequest | JSONRPCNotification
 
     // A notification has no id and gets no body back.
@@ -440,8 +448,6 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
       reply.code(400).type('application/json')
       return createError(message.id, HEADER_MISMATCH, headerCheck.message)
     }
-
-    const authContext = authContextFrom(request)
 
     // `subscriptions/listen` answers with a stream rather than a value, so it
     // never reaches the dispatcher.
@@ -501,6 +507,10 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
   app.post('/mcp', postRouteOptions, async (request: FastifyRequest, reply: FastifyReply) => {
     try {
+      // Resolve once so telemetry, authorization hooks, state sealing and task
+      // ownership all observe exactly the same identity for this request.
+      const resolvedAuthContext = await authContextFrom(request)
+
       if (isModern(request)) {
         const message = request.body as JSONRPCRequest | JSONRPCNotification
         return await withMcpServerSpan(message, undefined, {
@@ -514,14 +524,14 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
           resourceHandlers,
           request,
           reply,
-          authContext: authContextFrom(request),
+          authContext: resolvedAuthContext,
           tracer: opts.telemetry?.tracer,
           taskStore,
           taskWaiters,
           jsonSchemaValidator,
           taskInputs,
           protocolVersion: (request as any).mcpProtocolVersion
-        }, async () => await handleModernPost(request, reply))
+        }, async () => await handleModernPost(request, reply, resolvedAuthContext))
       }
 
       const message = request.body as JSONRPCMessage
@@ -544,10 +554,10 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         sessionId = session.id
       }
 
-      // Build auth context from validated token payload
-      let authContext = authContextFrom(request)
-      if (!authContext && sessionId) {
-        // Fallback to session-stored auth context
+      // Build auth context from validated token payload or the custom resolver.
+      let authContext = resolvedAuthContext
+      if (!authContext && !opts.resolveAuthorizationContext && sessionId) {
+        // Built-in OAuth may persist identity on a legacy SSE session.
         const session = await sessionStore.get(sessionId)
         authContext = session?.authorization
       }

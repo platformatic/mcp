@@ -17,7 +17,6 @@ import { RequestStateSealer } from './modern/request-state.ts'
 import { SubscriptionRegistry } from './modern/subscriptions.ts'
 import {
   TaskInputChannel,
-  TASK_INPUT_ACK_TOPIC,
   TASK_INPUT_CANCEL_TOPIC,
   TASK_INPUT_TOPIC
 } from './modern/task-inputs.ts'
@@ -130,13 +129,13 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
 
   if (enableTasks) {
     // Advertise which task operations we support. `tasks/list` is only offered
-    // when authorization is on, because without an identifiable requestor it
-    // would expose every task's metadata to anyone who can reach the server.
+    // when identity resolution is configured; otherwise enumeration would
+    // expose every task's metadata to anyone who can reach the server.
     //
     // This is the 2025-11-25 core shape, used only on the legacy path. Modern
     // clients see the `io.modelcontextprotocol/tasks` extension instead, which
     // `buildServerCapabilities` adds to the `server/discover` result.
-    const canIdentifyRequestors = opts.authorization?.enabled === true
+    const canIdentifyRequestors = opts.authorization?.enabled === true || opts.resolveAuthorizationContext !== undefined
     capabilities.tasks = {
       ...(canIdentifyRequestors ? { list: {} } : {}),
       cancel: {},
@@ -162,11 +161,11 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
   const sealer = new RequestStateSealer({
     secret: opts.requestStateSecret,
     ttlMs: opts.requestStateTtlMs,
-    // With authorization on, a token carrying no `sub` identifies nobody, and
-    // two such callers would share the same (undefined) principal — so state
+    // With identity resolution on, a request carrying no `userId` identifies
+    // nobody, and two such callers would share the undefined principal — so state
     // sealed for one would verify for the other. Refuse rather than bind to
     // nobody.
-    requirePrincipal: opts.authorization?.enabled === true
+    requirePrincipal: opts.authorization?.enabled === true || opts.resolveAuthorizationContext !== undefined
   })
 
   if (!opts.requestStateSecret) {
@@ -177,7 +176,8 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
 
   // A `tasks/update` can land on any instance, but the execution waiting for
   // those answers lives on exactly one. Route the wake-up through the broker so
-  // it reaches that instance; `deliver` is a no-op everywhere else.
+  // it reaches that instance. A resolved publication is the broker contract's
+  // delivery confirmation; only then may the durable outbox be acknowledged.
   taskInputs.setPublisher(async (taskId, inputResponses, deliveryId) => {
     await messageBroker.publish(TASK_INPUT_TOPIC, {
       jsonrpc: JSONRPC_VERSION,
@@ -185,18 +185,11 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
       params: { taskId, inputResponses, deliveryId }
     })
   })
-  taskInputs.setAcknowledgementPublisher(async (taskId, deliveryId, keys) => {
-    await messageBroker.publish(TASK_INPUT_ACK_TOPIC, {
-      jsonrpc: JSONRPC_VERSION,
-      method: 'notifications/tasks/input_acknowledged',
-      params: { taskId, deliveryId, keys }
-    })
-  })
-  taskInputs.setCancellationPublisher(async (taskId, cancellationId) => {
+  taskInputs.setCancellationPublisher(async (taskId) => {
     await messageBroker.publish(TASK_INPUT_CANCEL_TOPIC, {
       jsonrpc: JSONRPC_VERSION,
       method: 'notifications/tasks/input_cancelled',
-      params: { taskId, cancellationId }
+      params: { taskId }
     })
   })
 
@@ -212,20 +205,10 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
         typeof params.deliveryId === 'string' ? params.deliveryId : undefined
       )
     })
-    await messageBroker.subscribe(TASK_INPUT_ACK_TOPIC, (message) => {
-      const params = (message as { params?: { taskId?: unknown, deliveryId?: unknown } }).params
-      if (typeof params?.taskId === 'string' && typeof params.deliveryId === 'string') {
-        taskInputs.confirmDelivery(params.taskId, params.deliveryId)
-      }
-    })
     await messageBroker.subscribe(TASK_INPUT_CANCEL_TOPIC, (message) => {
-      const params = (message as { params?: { taskId?: unknown, cancellationId?: unknown } }).params
+      const params = (message as { params?: { taskId?: unknown } }).params
       if (typeof params?.taskId === 'string') {
-        taskInputs.abort(
-          params.taskId,
-          'task cancelled',
-          typeof params.cancellationId === 'string' ? params.cancellationId : undefined
-        )
+        taskInputs.abort(params.taskId, 'task cancelled')
       }
     })
   }
@@ -403,6 +386,7 @@ export type {
   MCPRouteId,
   MCPRouteSchemaContext,
   MCPRouteSchemaTransformer,
+  AuthorizationContextResolver,
   ToolAccessContext,
   ToolAccessOperation,
   McpCallToolContext,
@@ -435,6 +419,7 @@ export type { HandlerDependencies } from './handlers.ts'
 // Export authorization types
 export type {
   AuthorizationConfig,
+  AuthorizationContext,
   TokenValidationResult,
   ProtectedResourceMetadata,
   TokenIntrospectionResponse,

@@ -214,6 +214,11 @@ export interface TracerLike {
  */
 export type ToolAccessOperation = 'list' | 'call'
 
+/** Resolve an application-authenticated identity from a Fastify request. */
+export type AuthorizationContextResolver = (
+  request: FastifyRequest
+) => AuthorizationContext | undefined | Promise<AuthorizationContext | undefined>
+
 /** Per-request context handed to the `canAccessTool` hook. */
 export interface ToolAccessContext {
   authContext?: AuthorizationContext
@@ -335,6 +340,15 @@ export interface MCPPluginOptions {
   requestStateSecret?: string
   /** How long a sealed `requestState` stays valid. Defaults to 5 minutes. */
   requestStateTtlMs?: number
+  /**
+   * Resolve identities established by application-owned authentication hooks.
+   * When present, this resolver is authoritative instead of the built-in OAuth
+   * token payload. It runs once per MCP POST after Fastify preHandlers.
+   *
+   * The application remains responsible for rejecting unauthenticated requests.
+   * Return a context with `userId` to bind request state and tasks to a principal.
+   */
+  resolveAuthorizationContext?: AuthorizationContextResolver
   /**
    * Origins accepted on the MCP endpoints, to prevent DNS rebinding attacks.
    * Omit to disable validation (non-browser deployments), pass `'*'` or `true`
