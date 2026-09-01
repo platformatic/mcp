@@ -3,7 +3,7 @@ import type { TestContext } from 'node:test'
 import Fastify from 'fastify'
 import { request, Agent, setGlobalDispatcher } from 'undici'
 import mcpPlugin from '../src/index.ts'
-import { JSONRPC_VERSION, LATEST_PROTOCOL_VERSION } from '../src/schema.ts'
+import { JSONRPC_VERSION, LATEST_LEGACY_PROTOCOL_VERSION } from '../src/schema.ts'
 
 setGlobalDispatcher(new Agent({
   keepAliveTimeout: 10,
@@ -34,7 +34,7 @@ describe('Session DELETE', () => {
         id: 1,
         method: 'initialize',
         params: {
-          protocolVersion: LATEST_PROTOCOL_VERSION,
+          protocolVersion: LATEST_LEGACY_PROTOCOL_VERSION,
           capabilities: {},
           clientInfo: { name: 'test-client', version: '1.0.0' }
         }
@@ -121,7 +121,7 @@ describe('Session DELETE', () => {
         id: 1,
         method: 'initialize',
         params: {
-          protocolVersion: LATEST_PROTOCOL_VERSION,
+          protocolVersion: LATEST_LEGACY_PROTOCOL_VERSION,
           capabilities: {},
           clientInfo: { name: 'test-client', version: '1.0.0' }
         }
@@ -191,7 +191,7 @@ describe('Session DELETE', () => {
         id: 1,
         method: 'initialize',
         params: {
-          protocolVersion: LATEST_PROTOCOL_VERSION,
+          protocolVersion: LATEST_LEGACY_PROTOCOL_VERSION,
           capabilities: {},
           clientInfo: { name: 'test-client', version: '1.0.0' }
         }

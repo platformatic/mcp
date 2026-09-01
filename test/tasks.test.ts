@@ -3,7 +3,7 @@ import type { TestContext } from 'node:test'
 import Fastify from 'fastify'
 import { Type } from '@sinclair/typebox'
 import mcpPlugin from '../src/index.ts'
-import { JSONRPC_VERSION, LATEST_PROTOCOL_VERSION, METHOD_NOT_FOUND, INVALID_PARAMS } from '../src/schema.ts'
+import { JSONRPC_VERSION, LATEST_LEGACY_PROTOCOL_VERSION, METHOD_NOT_FOUND, INVALID_PARAMS } from '../src/schema.ts'
 import type { Task, CreateTaskResult, ListTasksResult, CallToolResult } from '../src/schema.ts'
 import { MemoryTaskStore } from '../src/stores/memory-task-store.ts'
 import { canTransition, isTerminal, taskHasExpired, toWireTask } from '../src/stores/task-store.ts'
@@ -29,7 +29,7 @@ async function call (app: any, method: string, params: unknown, id = 1) {
   const response = await app.inject({
     method: 'POST',
     url: '/mcp',
-    headers: { 'mcp-protocol-version': LATEST_PROTOCOL_VERSION },
+    headers: { 'mcp-protocol-version': LATEST_LEGACY_PROTOCOL_VERSION },
     payload: { jsonrpc: JSONRPC_VERSION, id, method, params }
   })
   return response.json()
@@ -118,10 +118,21 @@ describe('task store', () => {
   })
 
   test('toWireTask drops storage-only fields', (t: TestContext) => {
-    const wire = toWireTask(record({ authSubject: 'user-1', outcome: { jsonrpc: '2.0', id: 1, result: {} } }))
+    const wire = toWireTask(record({
+      authSubject: 'user-1',
+      outcome: { jsonrpc: '2.0', id: 1, result: {} },
+      inputRequestRound: 1,
+      pendingInputResponses: { confirmation: true },
+      pendingInputResponseIds: { confirmation: 'delivery-1' },
+      pendingInputResponseRounds: { confirmation: 1 }
+    }))
     t.assert.strictEqual('authSubject' in wire, false)
     t.assert.strictEqual('method' in wire, false)
     t.assert.strictEqual('outcome' in wire, false)
+    t.assert.strictEqual('inputRequestRound' in wire, false)
+    t.assert.strictEqual('pendingInputResponses' in wire, false)
+    t.assert.strictEqual('pendingInputResponseIds' in wire, false)
+    t.assert.strictEqual('pendingInputResponseRounds' in wire, false)
     t.assert.strictEqual(wire.taskId, 'task-1')
   })
 
@@ -143,6 +154,48 @@ describe('task store', () => {
     const store = new MemoryTaskStore()
     await store.create(record({ createdAt: new Date(Date.now() - 10_000).toISOString(), ttl: 1_000 }))
     t.assert.strictEqual(await store.get('task-1'), null)
+  })
+
+  test('MemoryTaskStore retries staged input until publication is accepted', async (t: TestContext) => {
+    const store = new MemoryTaskStore()
+    await store.create(record({
+      status: 'input_required',
+      inputRequests: { confirmation: { method: 'elicitation/create' } }
+    }))
+
+    const first = await store.updateInputResponses('task-1', { confirmation: 'yes' }, 'delivery-1')
+    t.assert.deepStrictEqual(first?.responses, { confirmation: 'yes' })
+    t.assert.strictEqual((await store.get('task-1'))?.inputRequests, undefined)
+    t.assert.deepStrictEqual((await store.get('task-1'))?.pendingInputResponses, { confirmation: 'yes' })
+
+    // Simulate broker publication failure: delivery acceptance was not recorded.
+    const retry = await store.updateInputResponses('task-1', { confirmation: 'changed replay' }, 'delivery-2')
+    t.assert.deepStrictEqual(retry?.responses, { confirmation: 'yes' })
+    t.assert.deepStrictEqual(retry?.responseIds, { confirmation: 'delivery-1' })
+
+    await store.acknowledgeInputResponses('task-1', { confirmation: 'wrong-delivery' })
+    t.assert.deepStrictEqual((await store.get('task-1'))?.pendingInputResponses, { confirmation: 'yes' })
+
+    await store.acknowledgeInputResponses('task-1', { confirmation: 'delivery-1' })
+    t.assert.strictEqual((await store.get('task-1'))?.pendingInputResponses, undefined)
+    t.assert.deepStrictEqual(
+      (await store.updateInputResponses('task-1', { confirmation: 'yes' }, 'delivery-3'))?.responses,
+      {}
+    )
+  })
+
+  test('MemoryTaskStore republishes outbox entries created before input rounds were recorded', async (t: TestContext) => {
+    const store = new MemoryTaskStore()
+    await store.create(record({
+      status: 'input_required',
+      pendingInputResponses: { confirmation: 'legacy' },
+      pendingInputResponseIds: { confirmation: 'delivery-1' },
+      answeredInputKeys: ['confirmation']
+    }))
+
+    const retry = await store.updateInputResponses('task-1', { confirmation: 'retry' }, 'delivery-2')
+    t.assert.deepStrictEqual(retry?.responses, { confirmation: 'legacy' })
+    t.assert.deepStrictEqual(retry?.responseIds, { confirmation: 'delivery-1' })
   })
 
   test('MemoryTaskStore isolates tasks by authorization subject', async (t: TestContext) => {
@@ -368,7 +421,7 @@ describe('tasks over the wire', () => {
       const res = await app.inject({
         method: 'POST',
         url: '/mcp',
-        headers: { authorization: `Bearer ${token}`, 'mcp-protocol-version': LATEST_PROTOCOL_VERSION },
+        headers: { authorization: `Bearer ${token}`, 'mcp-protocol-version': LATEST_LEGACY_PROTOCOL_VERSION },
         payload: { jsonrpc: JSONRPC_VERSION, id: 1, method, params }
       })
       return res.json()
@@ -378,7 +431,7 @@ describe('tasks over the wire', () => {
     const tokenB = createTestJWT({ sub: 'user-b' })
 
     // With auth, the capability is advertised
-    const init = await authedCall(tokenA, 'initialize', { protocolVersion: LATEST_PROTOCOL_VERSION, capabilities: {} })
+    const init = await authedCall(tokenA, 'initialize', { protocolVersion: LATEST_LEGACY_PROTOCOL_VERSION, capabilities: {} })
     t.assert.deepStrictEqual(init.result.capabilities.tasks.list, {})
 
     // Each subject creates a task
@@ -395,6 +448,58 @@ describe('tasks over the wire', () => {
     // A cannot reach B's task by id either
     const cross = await authedCall(tokenA, 'tasks/get', { taskId: taskB })
     t.assert.strictEqual(cross.error.code, INVALID_PARAMS)
+  })
+
+  test('custom upstream authentication scopes legacy tasks by subject', async (t: TestContext) => {
+    const app = Fastify({ logger: false })
+    t.after(() => app.close())
+    app.addHook('preHandler', async (request) => {
+      ;(request as any).upstreamUserId = request.headers['x-auth-user']
+    })
+    await app.register(mcpPlugin, {
+      enableTasks: true,
+      resolveAuthorizationContext: (request) => {
+        const userId = (request as any).upstreamUserId
+        return typeof userId === 'string' ? { userId } : undefined
+      }
+    })
+    app.mcpAddTool({
+      name: 'noop',
+      inputSchema: Type.Object({}),
+      execution: { taskSupport: 'optional' }
+    } as any, async (): Promise<CallToolResult> => ({ content: [{ type: 'text', text: 'ok' }] }))
+    await app.ready()
+
+    const upstreamCall = async (userId: string, method: string, params: unknown) => {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/mcp',
+        headers: {
+          'x-auth-user': userId,
+          'mcp-protocol-version': LATEST_LEGACY_PROTOCOL_VERSION
+        },
+        payload: { jsonrpc: JSONRPC_VERSION, id: 1, method, params }
+      })
+      return response.json()
+    }
+
+    const initialized = await upstreamCall('user-a', 'initialize', {
+      protocolVersion: LATEST_LEGACY_PROTOCOL_VERSION,
+      capabilities: {}
+    })
+    t.assert.deepStrictEqual(initialized.result.capabilities.tasks.list, {})
+
+    const created = await upstreamCall('user-a', 'tools/call', {
+      name: 'noop',
+      arguments: {},
+      task: {}
+    })
+    const taskId = (created.result as CreateTaskResult).task.taskId
+
+    const rejected = await upstreamCall('user-b', 'tasks/get', { taskId })
+    t.assert.strictEqual(rejected.error.code, INVALID_PARAMS)
+    const listed = (await upstreamCall('user-a', 'tasks/list', {})).result as ListTasksResult
+    t.assert.deepStrictEqual(listed.tasks.map(task => task.taskId), [taskId])
   })
 
   test('a token without sub cannot list or reach subject-less tasks', async (t: TestContext) => {
@@ -418,7 +523,7 @@ describe('tasks over the wire', () => {
       const res = await app.inject({
         method: 'POST',
         url: '/mcp',
-        headers: { authorization: `Bearer ${token}`, 'mcp-protocol-version': LATEST_PROTOCOL_VERSION },
+        headers: { authorization: `Bearer ${token}`, 'mcp-protocol-version': LATEST_LEGACY_PROTOCOL_VERSION },
         payload: { jsonrpc: JSONRPC_VERSION, id: 1, method, params }
       })
       return res.json()

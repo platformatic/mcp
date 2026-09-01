@@ -18,6 +18,28 @@ export interface TaskRecord extends Task {
   method: string
   /** Terminal outcome, present once the task reaches completed/failed/cancelled */
   outcome?: TaskOutcome
+  /**
+   * Outstanding server-to-client requests while the task sits in
+   * `input_required` (2026-07-28 tasks extension). Keys are unique for the
+   * lifetime of the task, so a client can deduplicate across polls and the
+   * server can ignore responses to keys it has already satisfied.
+   */
+  inputRequests?: Record<string, unknown>
+  /** Keys that have already been answered, so replays can be ignored. */
+  answeredInputKeys?: string[]
+  /** Monotonic generation for input requests; incremented whenever a new round is issued. */
+  inputRequestRound?: number
+  /**
+   * Accepted answers waiting for successful broker publication.
+   *
+   * This is a durable outbox: if publication fails, a retry can republish the
+   * original values even though their keys are no longer outstanding.
+   */
+  pendingInputResponses?: Record<string, unknown>
+  /** Stable per-key delivery ids used to deduplicate ambiguous broker retries. */
+  pendingInputResponseIds?: Record<string, string>
+  /** Input generation each pending response belongs to. */
+  pendingInputResponseRounds?: Record<string, number>
 }
 
 /**
@@ -39,6 +61,34 @@ export function canTransition (from: TaskStatus, to: TaskStatus): boolean {
   return ALLOWED_TRANSITIONS[from]?.includes(to) ?? false
 }
 
+/** Fields a status transition may set alongside the new status. */
+export interface TaskUpdateOptions {
+  statusMessage?: string
+  outcome?: TaskOutcome
+  /** Replaces the outstanding input requests; `null` clears them. */
+  inputRequests?: Record<string, unknown> | null
+  /** Keys to mark as answered, merged with those already recorded. */
+  answeredInputKeys?: string[]
+  /**
+   * Forget which keys have been answered. Set when a new round of questions is
+   * issued, so a key reused across rounds is not mistaken for one already
+   * satisfied.
+   */
+  clearAnsweredInputKeys?: boolean
+  /** Advance the input generation when a handler issues a new set of questions. */
+  incrementInputRequestRound?: boolean
+  /** Drop stale outbox entries when a task settles. */
+  clearPendingInputResponses?: boolean
+}
+
+export interface TaskInputUpdate {
+  task: TaskRecord
+  /** Stored values that should be published for this update or retry. */
+  responses: Record<string, unknown>
+  /** Stable ids paired with each response key for broker deduplication. */
+  responseIds: Record<string, string>
+}
+
 export interface TaskStore {
   create(task: TaskRecord): Promise<void>
   get(taskId: string): Promise<TaskRecord | null>
@@ -47,7 +97,21 @@ export interface TaskStore {
    * Returns the updated record, or null if the task is gone.
    * @throws if the transition is not allowed
    */
-  updateStatus(taskId: string, status: TaskStatus, options?: { statusMessage?: string, outcome?: TaskOutcome }): Promise<TaskRecord | null>
+  updateStatus(taskId: string, status: TaskStatus, options?: TaskUpdateOptions): Promise<TaskRecord | null>
+  /**
+   * Atomically accept outstanding input and stage it for broker publication.
+   * A retry of a staged key returns the original stored value.
+   */
+  updateInputResponses(
+    taskId: string,
+    responses: Record<string, unknown>,
+    responseId: string
+  ): Promise<TaskInputUpdate | null>
+  /**
+   * Remove delivered values from the outbox only when their stable delivery ids
+   * still match, so delayed publication completion cannot delete a later round.
+   */
+  acknowledgeInputResponses(taskId: string, responseIds: Record<string, string>): Promise<void>
   /** Tasks visible to the given authorization subject, newest first */
   list(authSubject?: string): Promise<TaskRecord[]>
   delete(taskId: string): Promise<void>
@@ -103,6 +167,38 @@ export class TaskWaiters {
   }
 }
 
+/**
+ * Fold the input-request fields of an update into a record, in place.
+ *
+ * Shared by both backends so `input_required` bookkeeping cannot drift between
+ * them: answered keys accumulate (never shrink) and clearing is explicit.
+ */
+export function applyInputRequestUpdates (task: TaskRecord, options: TaskUpdateOptions): void {
+  if (options.inputRequests === null) {
+    delete task.inputRequests
+  } else if (options.inputRequests !== undefined) {
+    task.inputRequests = options.inputRequests
+  }
+
+  if (options.clearAnsweredInputKeys) {
+    delete task.answeredInputKeys
+  }
+
+  if (options.incrementInputRequestRound) {
+    task.inputRequestRound = (task.inputRequestRound ?? 0) + 1
+  }
+
+  if (options.clearPendingInputResponses) {
+    delete task.pendingInputResponses
+    delete task.pendingInputResponseIds
+    delete task.pendingInputResponseRounds
+  }
+
+  if (options.answeredInputKeys?.length) {
+    task.answeredInputKeys = [...new Set([...(task.answeredInputKeys ?? []), ...options.answeredInputKeys])]
+  }
+}
+
 export function taskHasExpired (task: TaskRecord, now: number = Date.now()): boolean {
   if (task.ttl === null || task.ttl === undefined) return false
   return now - new Date(task.createdAt).getTime() > task.ttl
@@ -112,6 +208,15 @@ export function taskHasExpired (task: TaskRecord, now: number = Date.now()): boo
  * Strip storage-only fields so a record can go on the wire as a spec `Task`.
  */
 export function toWireTask (task: TaskRecord): Task {
-  const { authSubject, method, outcome, ...wire } = task
+  const {
+    authSubject,
+    method,
+    outcome,
+    inputRequestRound,
+    pendingInputResponses,
+    pendingInputResponseIds,
+    pendingInputResponseRounds,
+    ...wire
+  } = task
   return wire
 }
