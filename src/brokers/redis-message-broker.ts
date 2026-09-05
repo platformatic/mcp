@@ -53,7 +53,8 @@ export class RedisMessageBroker implements MessageBroker {
       host: redis.options.host,
       password: redis.options.password,
       db: redis.options.db || 0,
-      family: redis.options.family || 4
+      family: redis.options.family || 4,
+      enableReadyCheck: false
     })
     this.closeTimeoutMs = options.closeTimeoutMs ?? DEFAULT_CLOSE_TIMEOUT_MS
     this.onCloseTimeout = options.onCloseTimeout

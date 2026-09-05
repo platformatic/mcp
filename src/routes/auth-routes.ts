@@ -2,6 +2,8 @@ import type { FastifyInstance, FastifyPluginAsync } from 'fastify'
 import fp from 'fastify-plugin'
 import { Type } from '@sinclair/typebox'
 import type { PKCEChallenge } from '../auth/oauth-client.ts'
+import type { TokenValidator } from '../auth/token-validator.ts'
+import { createAuthorizationContext, createTokenRefreshInfo } from '../auth/token-utils.ts'
 import type { SessionStore } from '../stores/session-store.ts'
 import type { DCRHooks, DCRRequest, DCRResponse } from '../types/auth-types.ts'
 
@@ -26,6 +28,7 @@ export interface TokenRefreshBody {
 
 export interface AuthRoutesOptions {
   sessionStore: SessionStore
+  tokenValidator?: TokenValidator
   /** DCR hooks for custom request/response processing */
   dcrHooks?: DCRHooks
 }
@@ -101,7 +104,7 @@ const LogoutResponse = Type.Object({
 })
 
 const authRoutesPlugin: FastifyPluginAsync<AuthRoutesOptions> = async (fastify: FastifyInstance, opts) => {
-  const { sessionStore } = opts
+  const { sessionStore, tokenValidator } = opts
   // Initiate OAuth authorization flow
   fastify.get('/oauth/authorize', {
     schema: {
@@ -199,9 +202,6 @@ const authRoutesPlugin: FastifyPluginAsync<AuthRoutesOptions> = async (fastify: 
 
       const sessionData = sessionMetadata.authSession as AuthSession
 
-      // Clean up session data
-      await sessionStore.delete(state)
-
       // Exchange authorization code for tokens (include redirect_uri for OIDC compliance)
       const tokens = await fastify.oauthClient.exchangeCodeForToken(
         code,
@@ -210,6 +210,36 @@ const authRoutesPlugin: FastifyPluginAsync<AuthRoutesOptions> = async (fastify: 
         state,
         sessionData.callbackUrl
       )
+
+      if (tokenValidator) {
+        const validationResult = await tokenValidator.validateToken(tokens.access_token)
+        if (!validationResult.valid || !validationResult.payload) {
+          return reply.status(500).send({
+            error: 'token_validation_failed',
+            error_description: validationResult.error || 'Access token validation failed'
+          })
+        }
+
+        const authContext = createAuthorizationContext(
+          validationResult.payload,
+          tokens.access_token,
+          {
+            refreshToken: tokens.refresh_token,
+            authorizationServer: validationResult.payload.iss
+          }
+        )
+
+        const refreshInfo = tokens.refresh_token
+          ? createTokenRefreshInfo(
+            tokens.refresh_token,
+            authContext.clientId || '',
+            authContext.authorizationServer || '',
+            authContext.scopes || []
+          )
+          : undefined
+
+        await sessionStore.updateAuthorization(state, authContext, refreshInfo)
+      }
 
       // Return tokens to client or redirect with tokens
       if (sessionData.originalUrl) {
