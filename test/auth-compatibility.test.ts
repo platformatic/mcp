@@ -3,7 +3,7 @@ import type { TestContext } from 'node:test'
 import Fastify from 'fastify'
 import mcpPlugin from '../src/index.ts'
 import type { JSONRPCRequest, InitializeResult } from '../src/schema.ts'
-import { JSONRPC_VERSION, LATEST_PROTOCOL_VERSION } from '../src/schema.ts'
+import { JSONRPC_VERSION, LATEST_LEGACY_PROTOCOL_VERSION } from '../src/schema.ts'
 
 describe('Authorization Compatibility Tests', () => {
   test('should work without authorization config (backward compatibility)', async (t: TestContext) => {
@@ -20,7 +20,7 @@ describe('Authorization Compatibility Tests', () => {
       id: 1,
       method: 'initialize',
       params: {
-        protocolVersion: LATEST_PROTOCOL_VERSION,
+        protocolVersion: LATEST_LEGACY_PROTOCOL_VERSION,
         capabilities: {},
         clientInfo: { name: 'test-client', version: '1.0.0' }
       }
@@ -55,7 +55,7 @@ describe('Authorization Compatibility Tests', () => {
       id: 1,
       method: 'initialize',
       params: {
-        protocolVersion: LATEST_PROTOCOL_VERSION,
+        protocolVersion: LATEST_LEGACY_PROTOCOL_VERSION,
         capabilities: {},
         clientInfo: { name: 'test-client', version: '1.0.0' }
       }
@@ -227,7 +227,7 @@ describe('Authorization Compatibility Tests', () => {
       {
         method: 'initialize',
         params: {
-          protocolVersion: LATEST_PROTOCOL_VERSION,
+          protocolVersion: LATEST_LEGACY_PROTOCOL_VERSION,
           capabilities: {},
           clientInfo: { name: 'test-client', version: '1.0.0' }
         }
@@ -291,7 +291,7 @@ describe('Authorization Compatibility Tests', () => {
       id: 1,
       method: 'initialize',
       params: {
-        protocolVersion: LATEST_PROTOCOL_VERSION,
+        protocolVersion: LATEST_LEGACY_PROTOCOL_VERSION,
         capabilities: {},
         clientInfo: { name: 'test-client', version: '1.0.0' }
       }

@@ -9,6 +9,18 @@
 /** The revision that introduced tasks, icons, URL elicitation and the JSON Schema dialect */
 export const REVISION_2025_11_25 = '2025-11-25'
 
+/** The revision that dropped the handshake and made the protocol stateless */
+export const REVISION_2026_07_28 = '2026-07-28'
+
+/**
+ * True for revisions that carry version, identity and capabilities in each
+ * request's `_meta` instead of negotiating once ("modern"). Everything older
+ * establishes state with `initialize` ("legacy").
+ */
+export function isModernRevision (version: string | undefined): boolean {
+  return atLeast(version, REVISION_2026_07_28)
+}
+
 /**
  * True when `version` is `minimum` or newer. An absent version is treated as
  * older than everything, so features stay off unless we positively know better.

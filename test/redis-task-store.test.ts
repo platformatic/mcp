@@ -94,6 +94,64 @@ describe('RedisTaskStore', () => {
     t.assert.strictEqual((await store.get('task-1'))?.status, 'cancelled')
   })
 
+  test('retries staged input until broker publication is accepted', async (t: TestContext) => {
+    await store.create(record({
+      status: 'input_required',
+      inputRequests: { confirmation: { method: 'elicitation/create' } }
+    }))
+
+    const first = await store.updateInputResponses('task-1', { confirmation: 'yes' }, 'delivery-1')
+    t.assert.deepStrictEqual(first?.responses, { confirmation: 'yes' })
+    t.assert.deepStrictEqual((await store.get('task-1'))?.pendingInputResponses, { confirmation: 'yes' })
+
+    const retry = await store.updateInputResponses('task-1', { confirmation: 'changed replay' }, 'delivery-2')
+    t.assert.deepStrictEqual(retry?.responses, { confirmation: 'yes' })
+    t.assert.deepStrictEqual(retry?.responseIds, { confirmation: 'delivery-1' })
+
+    await store.acknowledgeInputResponses('task-1', { confirmation: 'wrong-delivery' })
+    t.assert.deepStrictEqual((await store.get('task-1'))?.pendingInputResponses, { confirmation: 'yes' })
+
+    await store.acknowledgeInputResponses('task-1', { confirmation: 'delivery-1' })
+    t.assert.strictEqual((await store.get('task-1'))?.pendingInputResponses, undefined)
+    t.assert.deepStrictEqual(
+      (await store.updateInputResponses('task-1', { confirmation: 'yes' }, 'delivery-3'))?.responses,
+      {}
+    )
+  })
+
+  test('republishes outbox entries created before input rounds were recorded', async (t: TestContext) => {
+    await store.create(record({
+      status: 'input_required',
+      pendingInputResponses: { confirmation: 'legacy' },
+      pendingInputResponseIds: { confirmation: 'delivery-1' },
+      answeredInputKeys: ['confirmation']
+    }))
+
+    const retry = await store.updateInputResponses('task-1', { confirmation: 'retry' }, 'delivery-2')
+    t.assert.deepStrictEqual(retry?.responses, { confirmation: 'legacy' })
+    t.assert.deepStrictEqual(retry?.responseIds, { confirmation: 'delivery-1' })
+  })
+
+  test('a status update cannot clobber concurrently staged input', async (t: TestContext) => {
+    for (let index = 0; index < 20; index++) {
+      const taskId = `race-${index}`
+      await store.create(record({
+        taskId,
+        status: 'input_required',
+        inputRequests: { confirmation: { method: 'elicitation/create' } }
+      }))
+
+      await Promise.all([
+        store.updateStatus(taskId, 'working'),
+        store.updateInputResponses(taskId, { confirmation: 'yes' }, `delivery-${index}`)
+      ])
+
+      const task = await store.get(taskId)
+      t.assert.deepStrictEqual(task?.pendingInputResponses, { confirmation: 'yes' })
+      t.assert.deepStrictEqual(task?.pendingInputResponseIds, { confirmation: `delivery-${index}` })
+    }
+  })
+
   test('a status change does not extend the retention window', async (t: TestContext) => {
     await store.create(record({ ttl: 60_000 }))
     const before = await redis.ttl('mcp:task:task-1')
