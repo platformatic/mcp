@@ -35,6 +35,35 @@ describe('RedisSessionStore', () => {
     assert.strictEqual(result, null)
   })
 
+  testWithRedis('should iterate sessions without returning message histories', async (redis) => {
+    const store = new RedisSessionStore({ redis, maxMessages: 100 })
+    const now = new Date()
+
+    await store.create({
+      id: 'iterated-session-1',
+      eventId: 0,
+      createdAt: now,
+      lastActivity: now
+    })
+    await store.create({
+      id: 'iterated-session-2',
+      eventId: 0,
+      createdAt: now,
+      lastActivity: now
+    })
+    await store.addMessage('iterated-session-1', '1', {
+      jsonrpc: '2.0',
+      method: 'test'
+    })
+
+    const ids: string[] = []
+    for await (const session of store.iterate()) {
+      ids.push(session.id)
+    }
+
+    assert.deepStrictEqual(ids.sort(), ['iterated-session-1', 'iterated-session-2'])
+  })
+
   testWithRedis('should delete session and its history', async (redis) => {
     const store = new RedisSessionStore({ redis, maxMessages: 100 })
 

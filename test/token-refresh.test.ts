@@ -46,6 +46,74 @@ describe('Token Refresh Service', () => {
       service.stop()
     })
 
+    test('should refresh expiring sessions during background checks', async (t) => {
+      const fastify = Fastify()
+      t.after(async () => {
+        await fastify.close()
+      })
+
+      const sessionStore = new MemorySessionStore(100)
+      const messageBroker = new MemoryMessageBroker()
+      let refreshCalls = 0
+
+      const mockOAuthClient = {
+        refreshToken: async (refreshToken: string) => {
+          refreshCalls += 1
+          assert.strictEqual(refreshToken, 'refresh-123')
+          return {
+            access_token: `background-access-token-${refreshCalls}`,
+            token_type: 'Bearer',
+            expires_in: 3600,
+            refresh_token: `background-refresh-token-${refreshCalls}`,
+            scope: 'read write'
+          }
+        }
+      }
+
+      const service = new TokenRefreshService({
+        sessionStore,
+        messageBroker,
+        oauthClient: mockOAuthClient,
+        checkIntervalMs: 25,
+        refreshBufferMinutes: 1
+      })
+
+      const session = {
+        id: 'session-background',
+        eventId: 0,
+        createdAt: new Date(),
+        lastActivity: new Date()
+      }
+
+      await sessionStore.create(session)
+      await sessionStore.updateAuthorization(session.id, {
+        userId: 'user123',
+        tokenHash: hashToken('old-token'),
+        expiresAt: new Date(Date.now() + 30000)
+      }, {
+        refreshToken: 'refresh-123',
+        clientId: 'client456',
+        authorizationServer: 'https://auth.example.com',
+        scopes: ['read', 'write'],
+        refreshAttempts: 0
+      })
+
+      service.start(fastify)
+      t.after(async () => {
+        await service.stop()
+      })
+
+      await new Promise(resolve => setTimeout(resolve, 80))
+
+      assert.strictEqual(refreshCalls, 1)
+
+      const updatedSession = await sessionStore.get(session.id)
+      assert.ok(updatedSession?.authorization?.tokenHash)
+      assert.strictEqual(updatedSession?.tokenRefresh?.refreshToken, 'background-refresh-token-1')
+      assert.ok(updatedSession?.authorization?.expiresAt instanceof Date)
+      assert.ok(updatedSession!.authorization!.expiresAt! > new Date(Date.now() + 3000000))
+    })
+
     test('should handle manual token refresh', async (_t) => {
       const sessionStore = new MemorySessionStore(100)
       const messageBroker = new MemoryMessageBroker()

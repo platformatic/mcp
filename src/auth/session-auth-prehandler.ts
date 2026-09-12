@@ -27,12 +27,19 @@ export function createSessionAuthPreHandler (
     }
 
     // Skip authorization for well-known endpoints
-    if (request.url.startsWith('/.well-known/')) {
+    if (request.url.startsWith('/.well-known/') || request.url.startsWith('/mcp/.well-known')) {
       return
     }
 
-    // Skip authorization for the start of the OAuth authorization flow.
-    if (request.url.startsWith('/oauth/authorize')) {
+    // Skip authorization for OAuth flow endpoints (authorize initiates, callback receives code, register is pre-auth)
+    if (request.url.startsWith('/oauth/authorize') || request.url.startsWith('/oauth/callback') || request.url.startsWith('/oauth/register')) {
+      return
+    }
+
+    // Skip authorization for custom excluded paths
+    if (config.excludedPaths?.some(path =>
+      typeof path === 'string' ? request.url.startsWith(path) : path.test(request.url)
+    )) {
       return
     }
 

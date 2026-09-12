@@ -258,4 +258,19 @@ describe('RedisMessageBroker', () => {
 
     // Close should not throw - will be handled by t.after()
   })
+
+  testWithRedis('should disable ready checks on pub/sub connections', async (redis, t) => {
+    const broker = new RedisMessageBroker(redis)
+    t.after(() => broker.close())
+
+    const internalBroker = broker as unknown as {
+      emitter: {
+        subConn: { options: { enableReadyCheck: boolean } }
+        pubConn: { options: { enableReadyCheck: boolean } }
+      }
+    }
+
+    assert.strictEqual(internalBroker.emitter.subConn.options.enableReadyCheck, false)
+    assert.strictEqual(internalBroker.emitter.pubConn.options.enableReadyCheck, false)
+  })
 })

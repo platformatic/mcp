@@ -5,6 +5,7 @@ import Fastify from 'fastify'
 import oauthClientPlugin from '../src/auth/oauth-client.ts'
 import authRoutesPlugin from '../src/routes/auth-routes.ts'
 import { MemorySessionStore } from '../src/stores/memory-session-store.ts'
+import type { TokenValidator } from '../src/auth/token-validator.ts'
 
 const originalDispatcher = getGlobalDispatcher()
 const mockAgent = new MockAgent()
@@ -96,6 +97,81 @@ describe('OAuth Routes', () => {
     const body = JSON.parse(callbackResponse.body)
     assert.strictEqual(body.access_token, 'callback-access-token')
     assert.strictEqual(body.token_type, 'Bearer')
+  })
+
+  test('should persist authorization and refresh metadata on OAuth callback', async (t) => {
+    const mockPool = mockAgent.get('https://auth.example.com')
+    mockPool.intercept({
+      path: '/oauth/token',
+      method: 'POST'
+    }).reply(200, {
+      access_token: 'callback-access-token',
+      token_type: 'Bearer',
+      expires_in: 3600,
+      refresh_token: 'callback-refresh-token',
+      scope: 'read write'
+    })
+
+    const fastify = Fastify()
+    t.after(async () => {
+      await fastify.close()
+    })
+
+    const config = {
+      clientId: 'test-client',
+      clientSecret: 'test-secret',
+      authorizationServer: 'https://auth.example.com'
+    }
+
+    const tokenValidator = {
+      validateToken: async (token: string) => {
+        assert.strictEqual(token, 'callback-access-token')
+        return {
+          valid: true,
+          payload: {
+            sub: 'user-123',
+            client_id: 'test-client',
+            scope: 'read write',
+            aud: 'https://mcp.example.com',
+            exp: Math.floor(Date.now() / 1000) + 3600,
+            iat: Math.floor(Date.now() / 1000),
+            iss: 'https://auth.example.com'
+          }
+        }
+      }
+    } as TokenValidator
+
+    await fastify.register(oauthClientPlugin, config)
+    const sessionStore = new MemorySessionStore(100)
+    await fastify.register(authRoutesPlugin, { sessionStore, tokenValidator })
+
+    const authResponse = await fastify.inject({
+      method: 'GET',
+      url: '/oauth/authorize'
+    })
+
+    const locationHeader = authResponse.headers.location
+    assert.ok(locationHeader, 'Location header should be present')
+    const location = new URL(locationHeader!)
+    const state = location.searchParams.get('state')
+    assert.ok(state, 'State should be present')
+
+    const callbackResponse = await fastify.inject({
+      method: 'GET',
+      url: `/oauth/callback?code=test-code&state=${state}`
+    })
+
+    assert.strictEqual(callbackResponse.statusCode, 200)
+
+    const persistedSession = await sessionStore.get(state!)
+    assert.ok(persistedSession)
+    assert.strictEqual(persistedSession.authorization?.userId, 'user-123')
+    assert.strictEqual(persistedSession.authorization?.clientId, 'test-client')
+    assert.deepStrictEqual(persistedSession.authorization?.scopes, ['read', 'write'])
+    assert.ok(persistedSession.authorization?.tokenHash)
+    assert.strictEqual(persistedSession.tokenRefresh?.refreshToken, 'callback-refresh-token')
+    assert.strictEqual(persistedSession.tokenRefresh?.clientId, 'test-client')
+    assert.deepStrictEqual(persistedSession.tokenRefresh?.scopes, ['read', 'write'])
   })
 
   test('should handle OAuth callback with error', async (t) => {

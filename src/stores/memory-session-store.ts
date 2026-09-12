@@ -41,6 +41,12 @@ export class MemorySessionStore implements SessionStore {
     return session ? { ...session } : null
   }
 
+  async * iterate (): AsyncIterable<SessionMetadata> {
+    for (const session of this.sessions.values()) {
+      yield { ...session }
+    }
+  }
+
   async delete (sessionId: string): Promise<void> {
     // Clean up token mappings for this session
     const session = this.sessions.get(sessionId)

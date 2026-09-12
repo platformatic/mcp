@@ -3,6 +3,21 @@ import type { JSONRPCMessage } from '../schema.ts'
 import type { SessionStore, SessionMetadata } from './session-store.ts'
 import type { AuthorizationContext, TokenRefreshInfo } from '../types/auth-types.ts'
 
+function normalizeAuthorizationContext (authorization: AuthorizationContext): AuthorizationContext {
+  return {
+    ...authorization,
+    expiresAt: authorization.expiresAt ? new Date(authorization.expiresAt) : undefined,
+    issuedAt: authorization.issuedAt ? new Date(authorization.issuedAt) : undefined,
+  }
+}
+
+function normalizeTokenRefreshInfo (tokenRefresh: TokenRefreshInfo): TokenRefreshInfo {
+  return {
+    ...tokenRefresh,
+    lastRefreshAt: tokenRefresh.lastRefreshAt ? new Date(tokenRefresh.lastRefreshAt) : undefined,
+  }
+}
+
 export class RedisSessionStore implements SessionStore {
   private redis: Redis
   private maxMessages: number
@@ -79,6 +94,10 @@ export class RedisSessionStore implements SessionStore {
     const sessionKey = `session:${sessionId}`
     const result = await this.redis.hgetall(sessionKey)
 
+    return this.deserializeSession(result)
+  }
+
+  private deserializeSession (result: Record<string, string>): SessionMetadata | null {
     if (!result.id) {
       return null
     }
@@ -95,7 +114,7 @@ export class RedisSessionStore implements SessionStore {
     // Parse authorization context if present
     if (result.authorization) {
       try {
-        metadata.authorization = JSON.parse(result.authorization)
+        metadata.authorization = normalizeAuthorizationContext(JSON.parse(result.authorization))
       } catch (error) {
         // Ignore parsing errors for authorization context
       }
@@ -103,7 +122,7 @@ export class RedisSessionStore implements SessionStore {
 
     if (result.tokenRefresh) {
       try {
-        metadata.tokenRefresh = JSON.parse(result.tokenRefresh)
+        metadata.tokenRefresh = normalizeTokenRefreshInfo(JSON.parse(result.tokenRefresh))
       } catch (error) {
         // Ignore parsing errors for token refresh
       }
@@ -118,6 +137,43 @@ export class RedisSessionStore implements SessionStore {
     }
 
     return metadata
+  }
+
+  async * iterate (): AsyncIterable<SessionMetadata> {
+    let cursor = '0'
+
+    do {
+      const [nextCursor, keys] = await this.redis.scan(cursor, 'MATCH', 'session:*', 'COUNT', 100)
+      cursor = nextCursor
+      const sessionKeys = keys.filter(key => !key.endsWith(':history'))
+
+      if (sessionKeys.length === 0) {
+        continue
+      }
+
+      // Fetch one SCAN page at a time to bound memory while avoiding one
+      // Redis round trip per session.
+      const pipeline = this.redis.pipeline()
+      for (const key of sessionKeys) {
+        pipeline.hgetall(key)
+      }
+
+      const results = await pipeline.exec()
+      if (!results) {
+        continue
+      }
+
+      for (const [error, result] of results) {
+        if (error || !result) {
+          continue
+        }
+
+        const session = this.deserializeSession(result as Record<string, string>)
+        if (session) {
+          yield session
+        }
+      }
+    } while (cursor !== '0')
   }
 
   async delete (sessionId: string): Promise<void> {

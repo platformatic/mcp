@@ -18,6 +18,8 @@ import routes from './routes/mcp.ts'
 import wellKnownRoutes from './routes/well-known.ts'
 import { TokenValidator } from './auth/token-validator.ts'
 import { createAuthPreHandler } from './auth/prehandler.ts'
+import { createSessionAuthPreHandler } from './auth/session-auth-prehandler.ts'
+import { registerTokenRefreshService } from './auth/token-refresh-service.ts'
 import oauthClientPlugin from './auth/oauth-client.ts'
 import authRoutesPlugin from './routes/auth-routes.ts'
 import { quitWithTimeout } from './redis-quit-with-timeout.ts'
@@ -139,12 +141,22 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
   if (opts.authorization?.enabled) {
     tokenValidator = new TokenValidator(opts.authorization, app)
 
-    // Register authorization preHandler for all routes
-    app.addHook('preHandler', createAuthPreHandler(opts.authorization, tokenValidator))
-
     // Register OAuth client plugin if configured
     if (opts.authorization.oauth2Client) {
       await app.register(oauthClientPlugin, opts.authorization.oauth2Client)
+
+      app.addHook(
+        'preHandler',
+        createSessionAuthPreHandler({
+          config: opts.authorization,
+          tokenValidator,
+          sessionStore,
+          oauthClient: app.oauthClient
+        })
+      )
+    } else {
+      // Register authorization preHandler for all routes
+      app.addHook('preHandler', createAuthPreHandler(opts.authorization, tokenValidator))
     }
   }
 
@@ -157,7 +169,15 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
   if (opts.authorization?.enabled && opts.authorization?.oauth2Client) {
     await app.register(authRoutesPlugin, {
       sessionStore,
+      tokenValidator: tokenValidator ?? undefined,
       dcrHooks: opts.authorization.dcrHooks
+    })
+
+    await registerTokenRefreshService(app, {
+      sessionStore,
+      messageBroker,
+      oauthClient: app.oauthClient,
+      ...(redis ? { redis } : {})
     })
   }
 
@@ -216,7 +236,9 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
       }
       streams.clear()
       // Collect unsubscribe promises for parallel execution
-      unsubscribePromises.push(messageBroker.unsubscribe(`mcp/session/${sessionId}/message`))
+      unsubscribePromises.push(
+        messageBroker.unsubscribe(`mcp/session/${sessionId}/message`)
+      )
     }
     localStreams.clear()
 
@@ -308,8 +330,8 @@ export type { HandlerDependencies } from './handlers.ts'
 // Export authorization types
 export type {
   AuthorizationConfig,
-  TokenValidationResult,
   ProtectedResourceMetadata,
+  TokenValidationResult,
   TokenIntrospectionResponse,
   IntrospectionAuthConfig,
   DCRRequest,

@@ -24,6 +24,7 @@ export interface SessionStore {
    */
   update(metadata: SessionMetadata): Promise<void>
   get(sessionId: string): Promise<SessionMetadata | null>
+  iterate(): AsyncIterable<SessionMetadata>
   delete(sessionId: string): Promise<void>
   cleanup(): Promise<void>
 
