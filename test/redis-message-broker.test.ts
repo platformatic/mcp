@@ -1,8 +1,9 @@
-import { describe } from 'node:test'
+import { describe, test } from 'node:test'
 import assert from 'node:assert'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { RedisMessageBroker } from '../src/brokers/redis-message-broker.ts'
-import { testWithRedis } from './redis-test-utils.ts'
+import { Redis } from 'ioredis'
+import { testWithRedis, defaultRedisConfig } from './redis-test-utils.ts'
 import type { JSONRPCMessage } from '../src/schema.ts'
 
 describe('RedisMessageBroker', () => {
@@ -257,5 +258,25 @@ describe('RedisMessageBroker', () => {
     await broker.publish('close-topic', testMessage)
 
     // Close should not throw - will be handled by t.after()
+  })
+
+  test('should reuse every parent connection option (including tls) for the pub/sub connections', (t) => {
+    // lazyConnect: no connection attempt is made, so a TLS option against the plain test Redis is harmless.
+    const redis = new Redis({ ...defaultRedisConfig, tls: {}, lazyConnect: true })
+    const broker = new RedisMessageBroker(redis)
+    const { subConn, pubConn } = (broker as unknown as { emitter: { subConn: Redis, pubConn: Redis } }).emitter
+    t.after(() => {
+      subConn.disconnect()
+      pubConn.disconnect()
+      redis.disconnect()
+    })
+
+    for (const conn of [subConn, pubConn]) {
+      assert.notStrictEqual(conn, redis)
+      assert.deepStrictEqual(conn.options.tls, {})
+      assert.strictEqual(conn.options.host, defaultRedisConfig.host)
+      assert.strictEqual(conn.options.port, defaultRedisConfig.port)
+      assert.strictEqual(conn.options.db, defaultRedisConfig.db)
+    }
   })
 })

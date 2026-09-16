@@ -43,18 +43,18 @@ export class RedisMessageBroker implements MessageBroker {
   private closePromise: Promise<void> | null = null
 
   /**
-   * @param redis Redis connection whose options are reused for the MQEmitter pub/sub connections.
+   * @param redis Redis connection duplicated (all ioredis options: host, port, auth, db, tls, …) for the MQEmitter pub/sub connections.
    * @param options.closeTimeoutMs Bound on how long close() waits for a graceful shutdown, in ms (default 2000).
    * @param options.onCloseTimeout Called with closeTimeoutMs when close() falls back to a forced disconnect after it elapses.
    */
   constructor (redis: Redis, options: RedisMessageBrokerOptions = {}) {
+    // Duplicate the parent connection instead of copying a subset of its options: copying dropped
+    // `tls`, `username`, etc., so the pub/sub connections could never reach a TLS-only Redis.
+    // mqemitter-redis accepts pre-built connections at runtime but its typings do not declare them.
     this.emitter = MQEmitterRedis({
-      port: redis.options.port,
-      host: redis.options.host,
-      password: redis.options.password,
-      db: redis.options.db || 0,
-      family: redis.options.family || 4
-    })
+      subConn: redis.duplicate(),
+      pubConn: redis.duplicate()
+    } as Parameters<typeof MQEmitterRedis>[0])
     this.closeTimeoutMs = options.closeTimeoutMs ?? DEFAULT_CLOSE_TIMEOUT_MS
     this.onCloseTimeout = options.onCloseTimeout
     suppressUnhandledQuitRejection(this.emitter.subConn)
