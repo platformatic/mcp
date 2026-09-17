@@ -14,6 +14,8 @@
     "test:types": "tsd",
     "test": "npm run test:types && node --experimental-strip-types --no-warnings --test --test-timeout=30000 --test-concurrency=1 test/*.test.ts",
     "ci": "npm run build && npm run lint && npm run test",
+    "prepublishOnly": "npm run build && npm run lint",
+    "postpublish": "git push origin && git push origin -f --tags",
     "start-demo": "node --watch examples/file-listing-server.ts | pino-pretty --colorize --translateTime 'SYS:standard' --ignore pid,hostname"
   },
   "repository": {
@@ -40,10 +42,12 @@
     "@opentelemetry/api": "^1.9.0",
     "@sinclair/typebox": "^0.34.37",
     "@types/node": "^24.0.10",
+    "@types/semver": "^7.7.1",
     "eslint": "^9.30.0",
     "fastify": "^5.4.0",
     "neostandard": "^0.13.0",
     "pino-pretty": "^13.0.0",
+    "semver": "^7.7.2",
     "tsd": "^0.33.0",
     "typescript": "^5.8.3",
     "undici": "^7.11.0"
