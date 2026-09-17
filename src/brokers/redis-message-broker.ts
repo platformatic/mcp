@@ -54,7 +54,7 @@ export class RedisMessageBroker implements MessageBroker {
     this.emitter = MQEmitterRedis({
       subConn: redis.duplicate(),
       pubConn: redis.duplicate()
-    } as Parameters<typeof MQEmitterRedis>[0])
+    })
     this.closeTimeoutMs = options.closeTimeoutMs ?? DEFAULT_CLOSE_TIMEOUT_MS
     this.onCloseTimeout = options.onCloseTimeout
     suppressUnhandledQuitRejection(this.emitter.subConn)
