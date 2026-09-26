@@ -4,7 +4,7 @@ import Fastify from 'fastify'
 import type { FastifyInstance } from 'fastify'
 import { Type } from '@sinclair/typebox'
 import mcpPlugin from '../src/index.ts'
-import { JSONRPC_VERSION, LATEST_PROTOCOL_VERSION } from '../src/schema.ts'
+import { JSONRPC_VERSION, LATEST_LEGACY_PROTOCOL_VERSION, LATEST_PROTOCOL_VERSION } from '../src/schema.ts'
 import type { CallToolResult } from '../src/schema.ts'
 import type { MCPPluginOptions } from '../src/types.ts'
 
@@ -29,7 +29,7 @@ async function callTool (app: FastifyInstance, name: string, args: unknown, extr
   const response = await app.inject({
     method: 'POST',
     url: '/mcp',
-    headers: { 'mcp-protocol-version': LATEST_PROTOCOL_VERSION },
+    headers: { 'mcp-protocol-version': LATEST_LEGACY_PROTOCOL_VERSION },
     payload: {
       jsonrpc: JSONRPC_VERSION,
       id: 1,
@@ -174,6 +174,31 @@ describe('JSON Schema Validation (validateJsonSchemaInputs)', () => {
     assert.ok((result.content[0] as any).text.startsWith('Invalid tool arguments:'))
   })
 
+  test('modern tools/call uses the same AJV validation path', async (t) => {
+    const app = await buildApp(t, { validateJsonSchemaInputs: {} })
+    let handlerCalled = false
+    app.mcpAddTool({
+      name: 'search',
+      description: 'Search',
+      inputSchema: SEARCH_JSON_SCHEMA
+    }, async () => {
+      handlerCalled = true
+      return { content: [{ type: 'text' as const, text: 'ok' }] }
+    })
+    await app.ready()
+
+    const client = app.mcpClient({ protocolVersion: LATEST_PROTOCOL_VERSION })
+    const response = await client.callTool('search', { query: '', limit: 500 })
+
+    assert.strictEqual(response.statusCode, 200)
+    assert.ok('result' in response.body)
+    const result = response.body.result as CallToolResult & { resultType: string }
+    assert.strictEqual(result.resultType, 'complete')
+    assert.strictEqual(result.isError, true)
+    assert.ok((result.content[0] as any).text.startsWith('Invalid tool arguments:'))
+    assert.strictEqual(handlerCalled, false)
+  })
+
   test('task-mode calls are validated too', async (t) => {
     const app = await buildApp(t, { validateJsonSchemaInputs: {}, enableTasks: true })
 
@@ -191,7 +216,7 @@ describe('JSON Schema Validation (validateJsonSchemaInputs)', () => {
     const response = await app.inject({
       method: 'POST',
       url: '/mcp',
-      headers: { 'mcp-protocol-version': LATEST_PROTOCOL_VERSION },
+      headers: { 'mcp-protocol-version': LATEST_LEGACY_PROTOCOL_VERSION },
       payload: { jsonrpc: JSONRPC_VERSION, id: 2, method: 'tasks/result', params: { taskId } }
     })
     const result = response.json().result as CallToolResult

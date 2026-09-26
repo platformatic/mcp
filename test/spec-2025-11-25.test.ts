@@ -3,7 +3,7 @@ import type { TestContext } from 'node:test'
 import Fastify from 'fastify'
 import { Type } from '@sinclair/typebox'
 import mcpPlugin from '../src/index.ts'
-import { JSONRPC_VERSION, LATEST_PROTOCOL_VERSION, URL_ELICITATION_REQUIRED } from '../src/schema.ts'
+import { JSONRPC_VERSION, LATEST_LEGACY_PROTOCOL_VERSION, URL_ELICITATION_REQUIRED } from '../src/schema.ts'
 import { validateElicitationUrl } from '../src/security.ts'
 import { findMissingScopes, extractTokenScopes } from '../src/auth/prehandler.ts'
 import { buildDiscoveryUrls, buildClientIdMetadataDocument } from '../src/auth/oauth-client.ts'
@@ -12,15 +12,15 @@ async function call (app: any, method: string, params: unknown, id = 1) {
   const response = await app.inject({
     method: 'POST',
     url: '/mcp',
-    headers: { 'mcp-protocol-version': LATEST_PROTOCOL_VERSION },
+    headers: { 'mcp-protocol-version': LATEST_LEGACY_PROTOCOL_VERSION },
     payload: { jsonrpc: JSONRPC_VERSION, id, method, params }
   })
   return response.json()
 }
 
 describe('protocol revision', () => {
-  test('the server speaks 2025-11-25', (t: TestContext) => {
-    t.assert.strictEqual(LATEST_PROTOCOL_VERSION, '2025-11-25')
+  test('2025-11-25 is the newest revision reachable through initialize', (t: TestContext) => {
+    t.assert.strictEqual(LATEST_LEGACY_PROTOCOL_VERSION, '2025-11-25')
   })
 
   test('URL_ELICITATION_REQUIRED is the code the spec assigns', (t: TestContext) => {

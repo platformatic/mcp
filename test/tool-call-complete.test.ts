@@ -4,14 +4,46 @@ import Fastify from 'fastify'
 import { Type } from '@sinclair/typebox'
 import mcpPlugin from '../src/index.ts'
 import type { MCPToolCallCompleteEvent } from '../src/index.ts'
-import { JSONRPC_VERSION, LATEST_PROTOCOL_VERSION } from '../src/schema.ts'
+import { JSONRPC_VERSION, LATEST_LEGACY_PROTOCOL_VERSION, LATEST_PROTOCOL_VERSION } from '../src/schema.ts'
+import { META_CLIENT_CAPABILITIES, META_PROTOCOL_VERSION, TASKS_EXTENSION } from '../src/schema-2026.ts'
 
 async function call (app: any, method: string, params: unknown, id = 1) {
   const response = await app.inject({
     method: 'POST',
     url: '/mcp',
-    headers: { 'mcp-protocol-version': LATEST_PROTOCOL_VERSION },
+    headers: { 'mcp-protocol-version': LATEST_LEGACY_PROTOCOL_VERSION },
     payload: { jsonrpc: JSONRPC_VERSION, id, method, params }
+  })
+  return response.json()
+}
+
+async function modernCall (
+  app: any,
+  method: string,
+  params: Record<string, unknown>,
+  capabilities: Record<string, unknown> = {},
+  id = 1
+) {
+  const response = await app.inject({
+    method: 'POST',
+    url: '/mcp',
+    headers: {
+      'mcp-protocol-version': LATEST_PROTOCOL_VERSION,
+      'mcp-method': method,
+      ...(typeof params.name === 'string' ? { 'mcp-name': params.name } : {})
+    },
+    payload: {
+      jsonrpc: JSONRPC_VERSION,
+      id,
+      method,
+      params: {
+        ...params,
+        _meta: {
+          [META_PROTOCOL_VERSION]: LATEST_PROTOCOL_VERSION,
+          [META_CLIENT_CAPABILITIES]: capabilities
+        }
+      }
+    }
   })
   return response.json()
 }
@@ -94,6 +126,27 @@ describe('onToolCallComplete', () => {
     t.assert.deepStrictEqual(events()[0].arguments, { message: 'hi' })
   })
 
+  test('a successful modern JSON-RPC call emits one event', async (t: TestContext) => {
+    const { app, events } = await buildApp(t)
+
+    await modernCall(app, 'tools/call', { name: 'echo', arguments: { message: 'modern' } })
+
+    t.assert.strictEqual(events().length, 1)
+    t.assert.strictEqual(events()[0].source, 'json-rpc')
+    t.assert.strictEqual(events()[0].toolName, 'echo')
+    t.assert.deepStrictEqual(events()[0].arguments, { message: 'modern' })
+  })
+
+  test('modern denied and unknown calls emit normalized not-found outcomes', async (t: TestContext) => {
+    const { app, events } = await buildApp(t)
+
+    await modernCall(app, 'tools/call', { name: 'denied', arguments: {} }, {}, 1)
+    await modernCall(app, 'tools/call', { name: 'missing', arguments: {} }, {}, 2)
+
+    t.assert.strictEqual(events().length, 2)
+    t.assert.ok(events().every(event => !event.outcome.ok && event.outcome.reason === 'not-found'))
+  })
+
   test('an in-process call emits one event with source: in-process', async (t: TestContext) => {
     const { app, events } = await buildApp(t)
 
@@ -152,7 +205,7 @@ describe('onToolCallComplete', () => {
     await app.inject({
       method: 'POST',
       url: '/mcp',
-      headers: { 'mcp-protocol-version': LATEST_PROTOCOL_VERSION },
+      headers: { 'mcp-protocol-version': LATEST_LEGACY_PROTOCOL_VERSION },
       payload: { jsonrpc: JSONRPC_VERSION, id: 1, method: 'tools/call', params: { name: 'echo', arguments: { message: 'hi' } } }
     })
 
@@ -250,6 +303,17 @@ describe('onToolCallComplete', () => {
     await call(app, 'tools/list', {})
 
     t.assert.strictEqual(events().length, 0)
+  })
+
+  test('a modern task emits one completion event with source task', async (t: TestContext) => {
+    const { app, events } = await buildApp(t)
+    const capabilities = { extensions: { [TASKS_EXTENSION]: {} } }
+
+    await modernCall(app, 'tools/call', { name: 'slow', arguments: {} }, capabilities)
+    await waitForTaskEvent(events)
+
+    t.assert.strictEqual(events().length, 1)
+    t.assert.strictEqual(events()[0].source, 'task')
   })
 
   test('a task emits one event, with source: task, when execution finishes', async (t: TestContext) => {

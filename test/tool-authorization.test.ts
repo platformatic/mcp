@@ -4,7 +4,7 @@ import Fastify from 'fastify'
 import mcpPlugin from '../src/index.ts'
 import type { MCPPluginOptions } from '../src/types.ts'
 import type { JSONRPCRequest, JSONRPCResultResponse, JSONRPCErrorResponse, ListToolsResult } from '../src/schema.ts'
-import { JSONRPC_VERSION, METHOD_NOT_FOUND } from '../src/schema.ts'
+import { INVALID_PARAMS, JSONRPC_VERSION, LATEST_PROTOCOL_VERSION, METHOD_NOT_FOUND } from '../src/schema.ts'
 import { createTestJWT, setupMockAgent, generateMockJWKSResponse, createTestAuthConfig } from './auth-test-utils.ts'
 
 async function buildApp (t: TestContext, opts: MCPPluginOptions = {}) {
@@ -105,6 +105,45 @@ describe('Tool Authorization (canAccessTool)', () => {
     // Same code and message shape as a genuinely unknown tool: no existence leak
     t.assert.strictEqual(unknownBody.error.code, deniedBody.error.code)
     t.assert.strictEqual(unknownBody.error.message, "Tool 'no-such-tool' not found")
+  })
+
+  test('modern tools/list and tools/call use the same authorization gate', async (t: TestContext) => {
+    let handlerInvoked = false
+    const app = Fastify({ logger: false })
+    t.after(() => app.close())
+    await app.register(mcpPlugin, {
+      canAccessTool: (toolName) => toolName !== 'restricted-tool'
+    })
+    app.mcpAddTool({
+      name: 'public-tool',
+      description: 'Public',
+      inputSchema: { type: 'object', properties: {} }
+    }, async () => ({ content: [{ type: 'text', text: 'public ok' }] }))
+    app.mcpAddTool({
+      name: 'restricted-tool',
+      description: 'Restricted',
+      inputSchema: { type: 'object', properties: {} }
+    }, async () => {
+      handlerInvoked = true
+      return { content: [{ type: 'text', text: 'restricted ok' }] }
+    })
+    await app.ready()
+
+    const client = app.mcpClient({ protocolVersion: LATEST_PROTOCOL_VERSION })
+    const listed = await client.listTools()
+    t.assert.ok('result' in listed.body)
+    const tools = (listed.body.result as { tools: Array<{ name: string }> }).tools
+    t.assert.deepStrictEqual(tools.map(tool => tool.name), ['public-tool'])
+
+    const denied = await client.callTool('restricted-tool')
+    const unknown = await client.callTool('no-such-tool')
+    t.assert.ok('error' in denied.body)
+    t.assert.ok('error' in unknown.body)
+    t.assert.strictEqual(denied.body.error.code, INVALID_PARAMS)
+    t.assert.strictEqual(unknown.body.error.code, denied.body.error.code)
+    t.assert.match(denied.body.error.message, /Unknown tool/)
+    t.assert.match(unknown.body.error.message, /Unknown tool/)
+    t.assert.strictEqual(handlerInvoked, false)
   })
 
   test('the hook is invoked for unknown tool names too, with operation call', async (t: TestContext) => {

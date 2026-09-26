@@ -4,6 +4,7 @@ import type { JSONRPCMessage } from '../schema.ts'
 import type { MessageBroker } from './message-broker.ts'
 
 const DEFAULT_CLOSE_TIMEOUT_MS = 2000
+const SUBSCRIBE_READY_TIMEOUT_MS = 500
 
 interface RedisConnLike {
   disconnect (): unknown
@@ -75,11 +76,23 @@ export class RedisMessageBroker implements MessageBroker {
 
   async subscribe (topic: string, handler: (message: JSONRPCMessage) => void): Promise<void> {
     return new Promise((resolve) => {
+      let settled = false
+      const finish = () => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        resolve()
+      }
+      // A real Redis subscription normally confirms immediately. Bound the
+      // readiness wait so a partially responsive Redis endpoint cannot hang
+      // plugin registration forever.
+      const timer = setTimeout(finish, SUBSCRIBE_READY_TIMEOUT_MS)
+      timer.unref()
+
       this.emitter.on(topic, (packet, cb) => {
         handler(packet.message)
         cb()
-      })
-      resolve()
+      }, finish)
     })
   }
 
