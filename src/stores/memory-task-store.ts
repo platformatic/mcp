@@ -1,6 +1,6 @@
 import type { TaskStatus } from '../schema.ts'
-import type { TaskStore, TaskRecord, TaskOutcome } from './task-store.ts'
-import { canTransition, isTerminal, taskHasExpired } from './task-store.ts'
+import type { TaskStore, TaskRecord, TaskUpdateOptions, TaskInputUpdate } from './task-store.ts'
+import { applyInputRequestUpdates, canTransition, isTerminal, taskHasExpired } from './task-store.ts'
 
 /**
  * In-process task store for single-instance deployments.
@@ -39,7 +39,7 @@ export class MemoryTaskStore implements TaskStore {
   async updateStatus (
     taskId: string,
     status: TaskStatus,
-    options: { statusMessage?: string, outcome?: TaskOutcome } = {}
+    options: TaskUpdateOptions = {}
   ): Promise<TaskRecord | null> {
     // Read straight from the map with no intervening await, so the terminal
     // check and the write cannot interleave with a concurrent updateStatus.
@@ -71,9 +71,115 @@ export class MemoryTaskStore implements TaskStore {
     if (options.outcome !== undefined) {
       updated.outcome = options.outcome
     }
+    applyInputRequestUpdates(updated, options)
 
     this.tasks.set(taskId, updated)
     return { ...updated }
+  }
+
+  async updateInputResponses (
+    taskId: string,
+    responses: Record<string, unknown>,
+    responseId: string
+  ): Promise<TaskInputUpdate | null> {
+    const task = this.tasks.get(taskId)
+    if (!task || taskHasExpired(task)) {
+      this.tasks.delete(taskId)
+      return null
+    }
+
+    const outstanding = { ...(task.inputRequests ?? {}) }
+    const answered = new Set(task.answeredInputKeys ?? [])
+    const pending = { ...(task.pendingInputResponses ?? {}) }
+    const pendingIds = { ...(task.pendingInputResponseIds ?? {}) }
+    const pendingRounds = { ...(task.pendingInputResponseRounds ?? {}) }
+    const currentRound = task.inputRequestRound ?? 0
+    const deliverable: Array<[string, unknown]> = []
+    const responseIds: Array<[string, string]> = []
+    let changed = false
+
+    for (const [key, value] of Object.entries(responses)) {
+      if (Object.hasOwn(pending, key) && (pendingRounds[key] ?? currentRound) === currentRound) {
+        // A prior request staged this key but did not complete broker delivery.
+        // Retry the durable value, not a changed replay.
+        deliverable.push([key, pending[key]])
+        responseIds.push([key, pendingIds[key] ?? responseId])
+      } else if (!isTerminal(task.status) && Object.hasOwn(outstanding, key) && !answered.has(key)) {
+        deliverable.push([key, value])
+        responseIds.push([key, responseId])
+        Object.defineProperty(pending, key, {
+          value,
+          enumerable: true,
+          configurable: true,
+          writable: true
+        })
+        Object.defineProperty(pendingIds, key, {
+          value: responseId,
+          enumerable: true,
+          configurable: true,
+          writable: true
+        })
+        Object.defineProperty(pendingRounds, key, {
+          value: currentRound,
+          enumerable: true,
+          configurable: true,
+          writable: true
+        })
+        delete outstanding[key]
+        answered.add(key)
+        changed = true
+      }
+    }
+
+    const updated: TaskRecord = changed
+      ? {
+          ...task,
+          lastUpdatedAt: new Date().toISOString(),
+          ...(Object.keys(outstanding).length > 0 ? { inputRequests: outstanding } : { inputRequests: undefined }),
+          answeredInputKeys: [...answered],
+          pendingInputResponses: pending,
+          pendingInputResponseIds: pendingIds,
+          pendingInputResponseRounds: pendingRounds
+        }
+      : task
+
+    if (changed) this.tasks.set(taskId, updated)
+    return {
+      task: { ...updated },
+      responses: Object.fromEntries(deliverable),
+      responseIds: Object.fromEntries(responseIds)
+    }
+  }
+
+  async acknowledgeInputResponses (taskId: string, responseIds: Record<string, string>): Promise<void> {
+    const task = this.tasks.get(taskId)
+    if (!task || !task.pendingInputResponses) return
+
+    const acknowledged = new Set(
+      Object.entries(responseIds)
+        .filter(([key, deliveryId]) => task.pendingInputResponseIds?.[key] === deliveryId)
+        .map(([key]) => key)
+    )
+    const remaining = Object.fromEntries(
+      Object.entries(task.pendingInputResponses).filter(([key]) => !acknowledged.has(key))
+    )
+    const remainingIds = Object.fromEntries(
+      Object.entries(task.pendingInputResponseIds ?? {}).filter(([key]) => !acknowledged.has(key))
+    )
+    const remainingRounds = Object.fromEntries(
+      Object.entries(task.pendingInputResponseRounds ?? {}).filter(([key]) => !acknowledged.has(key))
+    )
+    const updated = { ...task }
+    if (Object.keys(remaining).length > 0) {
+      updated.pendingInputResponses = remaining
+      updated.pendingInputResponseIds = remainingIds
+      updated.pendingInputResponseRounds = remainingRounds
+    } else {
+      delete updated.pendingInputResponses
+      delete updated.pendingInputResponseIds
+      delete updated.pendingInputResponseRounds
+    }
+    this.tasks.set(taskId, updated)
   }
 
   async list (authSubject?: string): Promise<TaskRecord[]> {

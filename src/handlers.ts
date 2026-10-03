@@ -23,6 +23,7 @@ import type {
 import {
   JSONRPC_VERSION,
   LATEST_PROTOCOL_VERSION,
+  LATEST_LEGACY_PROTOCOL_VERSION,
   SUPPORTED_PROTOCOL_VERSIONS,
   METHOD_NOT_FOUND,
   INTERNAL_ERROR,
@@ -31,11 +32,24 @@ import {
 } from './schema.ts'
 import type { RequestId } from './schema.ts'
 
-import type { MCPTool, MCPResource, MCPPrompt, MCPPluginOptions, ResourceHandlers, McpCallToolOutcome, ToolAccessOperation, MCPToolCallCompleteEvent, TracerLike } from './types.ts'
+import type {
+  MCPTool,
+  MCPResource,
+  MCPPrompt,
+  MCPPluginOptions,
+  ResourceHandlers,
+  HandlerContext,
+  McpCallToolOutcome,
+  ToolAccessOperation,
+  MCPToolCallCompleteEvent,
+  TracerLike
+} from './types.ts'
 import type { SessionStore } from './stores/session-store.ts'
 import type { TaskStore, TaskRecord, TaskWaiters } from './stores/task-store.ts'
 import { isTerminal, toWireTask } from './stores/task-store.ts'
 import type { AuthorizationContext } from './types/auth-types.ts'
+import type { TaskInputChannel } from './modern/task-inputs.ts'
+import { InputRequired } from './modern/input-required.ts'
 import {
   supportsTasks,
   supportsSchemaDialect,
@@ -74,9 +88,21 @@ export type HandlerDependencies = {
   sessionId?: string
   /** The revision this client negotiated; responses are shaped to match it */
   protocolVersion?: string
+  /**
+   * Multi round-trip state for the 2026-07-28 path: what the client sent back
+   * in answer to a previous `InputRequiredResult`. Absent on a first attempt
+   * and on the legacy path.
+   */
+  mrtr?: {
+    inputResponses?: Record<string, unknown>
+    /** The payload the handler sealed into `requestState`, already verified. */
+    requestState?: unknown
+  }
+  /** Wakes task executions when `tasks/update` delivers their input. */
+  taskInputs?: TaskInputChannel
 }
 
-type ToolCallDependencies = Pick<HandlerDependencies,
+export type ToolCallDependencies = Pick<HandlerDependencies,
   'app' |
   'opts' |
   'tools' |
@@ -84,7 +110,8 @@ type ToolCallDependencies = Pick<HandlerDependencies,
   'reply' |
   'authContext' |
   'jsonSchemaValidator' |
-  'sessionId'
+  'sessionId' |
+  'mrtr'
 >
 
 export function createResponse (id: string | number, result: any): JSONRPCResponse {
@@ -106,17 +133,48 @@ export function createError (id: string | number | null, code: number, message: 
 }
 
 /**
- * Pick the protocol revision to use for this session.
+ * The context every user handler receives.
  *
- * The spec requires that we echo back the client's requested version when we
- * support it, and otherwise respond with the newest version we do support so
- * the client can decide whether to continue or disconnect.
+ * Built in one place so the multi round-trip fields cannot be plumbed into some
+ * handler kinds and forgotten in others.
+ */
+function handlerContext (
+  dependencies: Pick<HandlerDependencies, 'request' | 'reply' | 'authContext' | 'mrtr'>,
+  sessionId: string | undefined
+): HandlerContext {
+  return {
+    sessionId,
+    request: dependencies.request,
+    reply: dependencies.reply,
+    authContext: dependencies.authContext,
+    inputResponses: dependencies.mrtr?.inputResponses,
+    requestState: dependencies.mrtr?.requestState
+  }
+}
+
+/**
+ * A handler asking for client input is a protocol outcome, not a failure, so it
+ * must escape the catch-alls that turn thrown errors into `isError` results.
+ */
+function rethrowIfInputRequired (error: unknown): void {
+  if (error instanceof InputRequired) throw error
+}
+
+/**
+ * Pick the protocol revision for a client that arrived via `initialize`.
+ *
+ * We echo back what was asked for when we implement it, and otherwise answer
+ * with the newest revision we support that still has a handshake. Answering
+ * with 2026-07-28 would be nonsense here: a client capable of it would not be
+ * sending `initialize` in the first place.
  */
 export function negotiateProtocolVersion (requested: unknown): string {
-  if (typeof requested === 'string' && (SUPPORTED_PROTOCOL_VERSIONS as readonly string[]).includes(requested)) {
+  if (typeof requested === 'string' &&
+      requested !== LATEST_PROTOCOL_VERSION &&
+      (SUPPORTED_PROTOCOL_VERSIONS as readonly string[]).includes(requested)) {
     return requested
   }
-  return LATEST_PROTOCOL_VERSION
+  return LATEST_LEGACY_PROTOCOL_VERSION
 }
 
 async function handleInitialize (
@@ -226,7 +284,7 @@ async function mapWithConcurrency<T, R> (items: T[], limit: number, fn: (item: T
   return results
 }
 
-async function handleToolsList (request: JSONRPCRequest, dependencies: HandlerDependencies): Promise<JSONRPCResponse> {
+export async function handleToolsList (request: JSONRPCRequest, dependencies: HandlerDependencies): Promise<JSONRPCResponse> {
   const { tools, protocolVersion } = dependencies
   // Per-tool checks run concurrently (bounded); order stays registration order
   const registeredTools = Array.from(tools.values())
@@ -260,7 +318,7 @@ function isTemplateUri (uri: string): boolean {
   return URI_TEMPLATE_REGEX.test(uri)
 }
 
-function handleResourcesList (request: JSONRPCRequest, dependencies: HandlerDependencies): JSONRPCResponse {
+export function handleResourcesList (request: JSONRPCRequest, dependencies: HandlerDependencies): JSONRPCResponse {
   const { resources, protocolVersion } = dependencies
   const result: ListResourcesResult = {
     resources: Array.from(resources.values())
@@ -271,7 +329,7 @@ function handleResourcesList (request: JSONRPCRequest, dependencies: HandlerDepe
   return createResponse(request.id, result)
 }
 
-function handleResourceTemplatesList (request: JSONRPCRequest, dependencies: HandlerDependencies): JSONRPCResponse {
+export function handleResourceTemplatesList (request: JSONRPCRequest, dependencies: HandlerDependencies): JSONRPCResponse {
   const { resources, protocolVersion } = dependencies
   const result: ListResourceTemplatesResult = {
     resourceTemplates: Array.from(resources.values())
@@ -285,7 +343,7 @@ function handleResourceTemplatesList (request: JSONRPCRequest, dependencies: Han
   return createResponse(request.id, result)
 }
 
-function handlePromptsList (request: JSONRPCRequest, dependencies: HandlerDependencies): JSONRPCResponse {
+export function handlePromptsList (request: JSONRPCRequest, dependencies: HandlerDependencies): JSONRPCResponse {
   const { prompts, protocolVersion } = dependencies
   const result: ListPromptsResult = {
     prompts: Array.from(prompts.values()).map(p => trimDefinitionToRevision(p.definition, protocolVersion)),
@@ -356,7 +414,7 @@ async function handleToolsCall (
 }
 
 /** An observability failure must never change the tool response. */
-async function emitToolCallComplete (
+export async function emitToolCallComplete (
   source: MCPToolCallCompleteEvent['source'],
   toolName: string,
   args: Record<string, unknown>,
@@ -403,7 +461,7 @@ type RegisteredToolResolution =
   | { ok: false, reason: 'not-found' }
   | { ok: false, reason: 'access-denied' }
 
-async function resolveRegisteredTool (
+export async function resolveRegisteredTool (
   toolName: string,
   dependencies: ToolCallDependencies
 ): Promise<RegisteredToolResolution> {
@@ -486,7 +544,7 @@ interface ToolCallObservationContext {
   startedAt: number
 }
 
-async function executeToolCall (
+export async function executeToolCall (
   request: JSONRPCRequest,
   tool: MCPTool,
   params: { name: string, arguments?: Record<string, unknown> },
@@ -567,9 +625,10 @@ async function executeRegisteredTool (
 
       // Use validated arguments
       try {
-        const result = await tool.handler(argumentsValidation.data, { sessionId, request: dependencies.request, reply: dependencies.reply, authContext: dependencies.authContext })
+        const result = await tool.handler(argumentsValidation.data, handlerContext(dependencies, sessionId))
         return { ok: true, result }
       } catch (error: any) {
+        rethrowIfInputRequired(error)
         const result: CallToolResult = {
           content: [{
             type: 'text',
@@ -590,9 +649,10 @@ async function executeRegisteredTool (
         }
       }
       try {
-        const result = await tool.handler(toolArguments, { sessionId, request: dependencies.request, reply: dependencies.reply, authContext: dependencies.authContext })
+        const result = await tool.handler(toolArguments, handlerContext(dependencies, sessionId))
         return { ok: true, result }
       } catch (error: any) {
+        rethrowIfInputRequired(error)
         const result: CallToolResult = {
           content: [{
             type: 'text',
@@ -606,14 +666,10 @@ async function executeRegisteredTool (
   } else {
     // Unsafe tool without schema - pass arguments as-is
     try {
-      const result = await tool.handler(toolArguments, {
-        sessionId,
-        request: dependencies.request,
-        reply: dependencies.reply,
-        authContext: dependencies.authContext
-      })
+      const result = await tool.handler(toolArguments, handlerContext(dependencies, sessionId))
       return { ok: true, result }
     } catch (error: any) {
+      rethrowIfInputRequired(error)
       const result: CallToolResult = {
         content: [{
           type: 'text',
@@ -626,7 +682,7 @@ async function executeRegisteredTool (
   }
 }
 
-async function handleResourcesRead (
+export async function handleResourcesRead (
   request: JSONRPCRequest,
   sessionId: string | undefined,
   dependencies: HandlerDependencies
@@ -692,14 +748,10 @@ async function handleResourcesRead (
   }
 
   try {
-    const result = await resource.handler(uri, {
-      sessionId,
-      request: dependencies.request,
-      reply: dependencies.reply,
-      authContext: dependencies.authContext
-    })
+    const result = await resource.handler(uri, handlerContext(dependencies, sessionId))
     return createResponse(request.id, result)
   } catch (error: any) {
+    rethrowIfInputRequired(error)
     const result: ReadResourceResult = {
       contents: [{
         uri,
@@ -711,7 +763,7 @@ async function handleResourcesRead (
   }
 }
 
-async function handlePromptsGet (
+export async function handlePromptsGet (
   request: JSONRPCRequest,
   sessionId: string | undefined,
   dependencies: HandlerDependencies
@@ -770,14 +822,10 @@ async function handlePromptsGet (
 
       // Use validated arguments
       try {
-        const result = await prompt.handler(promptName, argumentsValidation.data, {
-          sessionId,
-          request: dependencies.request,
-          reply: dependencies.reply,
-          authContext: dependencies.authContext
-        })
+        const result = await prompt.handler(promptName, argumentsValidation.data, handlerContext(dependencies, sessionId))
         return createResponse(request.id, result)
       } catch (error: any) {
+        rethrowIfInputRequired(error)
         const result: GetPromptResult = {
           messages: [{
             role: 'user',
@@ -792,14 +840,10 @@ async function handlePromptsGet (
     } else {
       // Regular JSON Schema - basic validation or pass through
       try {
-        const result = await prompt.handler(promptName, promptArguments, {
-          sessionId,
-          request: dependencies.request,
-          reply: dependencies.reply,
-          authContext: dependencies.authContext
-        })
+        const result = await prompt.handler(promptName, promptArguments, handlerContext(dependencies, sessionId))
         return createResponse(request.id, result)
       } catch (error: any) {
+        rethrowIfInputRequired(error)
         const result: GetPromptResult = {
           messages: [{
             role: 'user',
@@ -815,14 +859,10 @@ async function handlePromptsGet (
   } else {
     // Unsafe prompt without schema - pass arguments as-is
     try {
-      const result = await prompt.handler(promptName, promptArguments, {
-        sessionId,
-        request: dependencies.request,
-        reply: dependencies.reply,
-        authContext: dependencies.authContext
-      })
+      const result = await prompt.handler(promptName, promptArguments, handlerContext(dependencies, sessionId))
       return createResponse(request.id, result)
     } catch (error: any) {
+      rethrowIfInputRequired(error)
       const result: GetPromptResult = {
         messages: [{
           role: 'user',
@@ -879,12 +919,13 @@ function taskSubject (dependencies: HandlerDependencies): string | undefined {
  * Whether this deployment can tie a task to a requestor.
  *
  * Mirrors the gate in `index.ts` that decides whether to advertise
- * `tasks.list`. Without authorization every task shares the undefined subject,
+ * `tasks.list`. Without an identity resolver every task shares the undefined
+ * subject,
  * so listing would hand every task's id to any caller — defeating the "random
  * task id is the capability" model that protects `tasks/get|result|cancel`.
  */
 function canIdentifyRequestors (dependencies: HandlerDependencies): boolean {
-  return dependencies.opts.authorization?.enabled === true
+  return dependencies.opts.authorization?.enabled === true || dependencies.opts.resolveAuthorizationContext !== undefined
 }
 
 /**
@@ -898,15 +939,15 @@ function assertTaskAccess (task: TaskRecord | null, dependencies: HandlerDepende
   const subject = taskSubject(dependencies)
 
   if (canIdentifyRequestors(dependencies)) {
-    // Auth on: a task is reachable only by the exact subject that owns it. A
-    // token without a `sub` claim identifies no one, so an undefined subject
+    // Identity resolution on: a task is reachable only by its exact owner. A
+    // context without a `userId` identifies no one, so an undefined subject
     // must never match another subject-less task via `undefined === undefined`.
     if (subject === undefined || task.authSubject !== subject) return null
     return task
   }
 
-  // Auth off: no requestor can be identified, so the random task id is the
-  // capability and every (subject-less) task is reachable by whoever holds it.
+  // No identity resolver: the random task id is the capability and every
+  // subject-less task is reachable by whoever holds it.
   return task
 }
 
@@ -1288,12 +1329,7 @@ async function handleResourcesSubscribe (
   }
 
   try {
-    const result = await resourceHandlers.subscribeHandler(params, {
-      sessionId,
-      request: dependencies.request,
-      reply: dependencies.reply,
-      authContext: dependencies.authContext
-    })
+    const result = await resourceHandlers.subscribeHandler(params, handlerContext(dependencies, sessionId))
     return createResponse(request.id, result)
   } catch (error: any) {
     return createError(request.id, INTERNAL_ERROR, `Subscribe failed: ${error.message || error}`)
@@ -1317,12 +1353,7 @@ async function handleResourcesUnsubscribe (
   }
 
   try {
-    const result = await resourceHandlers.unsubscribeHandler(params, {
-      sessionId,
-      request: dependencies.request,
-      reply: dependencies.reply,
-      authContext: dependencies.authContext
-    })
+    const result = await resourceHandlers.unsubscribeHandler(params, handlerContext(dependencies, sessionId))
     return createResponse(request.id, result)
   } catch (error: any) {
     return createError(request.id, INTERNAL_ERROR, `Unsubscribe failed: ${error.message || error}`)
@@ -1349,7 +1380,7 @@ function normalizedNetworkProtocolVersion (version: string): string {
   return version.endsWith('.0') ? version.slice(0, -2) : version
 }
 
-async function withMcpServerSpan<T> (
+export async function withMcpServerSpan<T> (
   message: JSONRPCRequest | JSONRPCNotification,
   sessionId: string | undefined,
   dependencies: HandlerDependencies,

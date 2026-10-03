@@ -32,23 +32,55 @@ export type JSONRPCMessage =
   JSONRPCRequest | JSONRPCNotification | JSONRPCResponse
 
 /** @internal */
-export const LATEST_PROTOCOL_VERSION = '2025-11-25'
+export const LATEST_PROTOCOL_VERSION = '2026-07-28'
 /** @internal */
 export const JSONRPC_VERSION = '2.0'
 
 /**
- * All protocol revisions this server can speak, newest first. Used during the
- * `initialize` handshake: if the client asks for one of these we echo it back,
- * otherwise we answer with {@link LATEST_PROTOCOL_VERSION} and let the client
- * decide whether it can proceed.
+ * The newest revision that still uses the `initialize` handshake.
+ *
+ * `2026-07-28` dropped the handshake entirely, so a client that reaches us via
+ * `initialize` can never be answered with it. This is what we fall back to when
+ * such a client asks for a version we do not implement.
  *
  * @internal
  */
-export const SUPPORTED_PROTOCOL_VERSIONS = [
+export const LATEST_LEGACY_PROTOCOL_VERSION = '2025-11-25'
+
+/**
+ * Revisions that carry their version, identity and capabilities in each
+ * request's `_meta` rather than negotiating once up front ("modern", in the
+ * spec's terminology). Newest first.
+ *
+ * @internal
+ */
+export const MODERN_PROTOCOL_VERSIONS = [
+  '2026-07-28'
+] as const
+
+/**
+ * Revisions that establish state with an `initialize` handshake ("legacy").
+ * Newest first.
+ *
+ * @internal
+ */
+export const LEGACY_PROTOCOL_VERSIONS = [
   '2025-11-25',
   '2025-06-18',
   '2025-03-26',
   '2024-11-05'
+] as const
+
+/**
+ * All protocol revisions this server can speak, newest first. We are a
+ * "dual-era" server: modern requests are served statelessly, and an
+ * `initialize` selects legacy semantics for that session.
+ *
+ * @internal
+ */
+export const SUPPORTED_PROTOCOL_VERSIONS = [
+  ...MODERN_PROTOCOL_VERSIONS,
+  ...LEGACY_PROTOCOL_VERSIONS
 ] as const
 
 /**
@@ -231,8 +263,48 @@ export const INVALID_PARAMS = -32602
 export const INTERNAL_ERROR = -32603
 
 // Implementation-specific JSON-RPC error codes [-32000, -32099]
-/** @internal */
+//
+// The 2026-07-28 revision partitions this range: [-32000, -32019] is legacy and
+// implementation-defined, [-32020, -32099] belongs to the specification.
+
+/**
+ * Resource not found, as used by 2025-11-25 and earlier. Modern revisions use
+ * {@link INVALID_PARAMS} instead; we only emit this on the legacy path.
+ *
+ * @internal
+ */
+export const RESOURCE_NOT_FOUND = -32002
+
+/**
+ * @internal
+ * @deprecated 2025-11-25 only. The 2026-07-28 revision removed URL-elicitation
+ * completion signalling in favour of the client retrying the original request.
+ */
 export const URL_ELICITATION_REQUIRED = -32042
+
+/**
+ * The HTTP headers do not agree with the request body, or a required header is
+ * missing or malformed. HTTP status 400. (2026-07-28)
+ *
+ * @internal
+ */
+export const HEADER_MISMATCH = -32020
+
+/**
+ * Processing the request needs a client capability the request did not declare.
+ * HTTP status 400. (2026-07-28)
+ *
+ * @internal
+ */
+export const MISSING_REQUIRED_CLIENT_CAPABILITY = -32021
+
+/**
+ * The requested protocol version is unknown or unsupported. HTTP status 400.
+ * (2026-07-28)
+ *
+ * @internal
+ */
+export const UNSUPPORTED_PROTOCOL_VERSION = -32022
 
 /**
  * An error response that indicates that the server requires the client to provide additional information via an elicitation request.

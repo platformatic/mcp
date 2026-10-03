@@ -4,6 +4,8 @@ import Fastify from 'fastify'
 import { SpanKind, type Tracer, type Span } from '@opentelemetry/api'
 import mcpPlugin from '../src/index.ts'
 import { MCP_ATTR } from '../src/telemetry.ts'
+import { LATEST_PROTOCOL_VERSION } from '../src/schema.ts'
+import { META_CLIENT_CAPABILITIES, META_PROTOCOL_VERSION } from '../src/schema-2026.ts'
 
 function makeSpan (): Span & { end: ReturnType<typeof mock.fn>, setStatus: ReturnType<typeof mock.fn>, recordException: ReturnType<typeof mock.fn> } {
   return {
@@ -53,6 +55,42 @@ async function buildApp (tracer: Tracer) {
 
 describe('telemetry integration', () => {
   describe('tools/call', () => {
+    it('creates a span for a modern stateless tool call', async () => {
+      const { tracer, spanNames, spanAttrs, spans } = makeTracer()
+      const app = await buildApp(tracer)
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/mcp',
+        headers: {
+          'content-type': 'application/json',
+          'mcp-protocol-version': LATEST_PROTOCOL_VERSION,
+          'mcp-method': 'tools/call',
+          'mcp-name': 'echo'
+        },
+        payload: {
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tools/call',
+          params: {
+            name: 'echo',
+            arguments: { msg: 'modern' },
+            _meta: {
+              [META_PROTOCOL_VERSION]: LATEST_PROTOCOL_VERSION,
+              [META_CLIENT_CAPABILITIES]: {}
+            }
+          }
+        }
+      })
+
+      assert.equal(res.statusCode, 200)
+      assert.ok(spanNames.includes('tools/call echo'))
+      const idx = spanNames.indexOf('tools/call echo')
+      assert.equal(spanAttrs[idx][MCP_ATTR.PROTOCOL_VERSION], LATEST_PROTOCOL_VERSION)
+      assert.equal((spans[idx] as any).end.mock.calls.length, 1)
+      await app.close()
+    })
+
     it('creates a span with gen_ai.tool.name attribute', async () => {
       const { tracer, spanNames, spanAttrs, spanKinds, spans } = makeTracer()
       const app = await buildApp(tracer)
@@ -78,6 +116,39 @@ describe('telemetry integration', () => {
       assert.equal((spans[idx] as any).setStatus.mock.calls.length, 0)
       assert.equal((spans[idx] as any).end.mock.calls.length, 1)
 
+      await app.close()
+    })
+  })
+
+  describe('modern notifications', () => {
+    it('creates a span for a stateless notification', async () => {
+      const { tracer, spanNames, spans } = makeTracer()
+      const app = await buildApp(tracer)
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/mcp',
+        headers: {
+          'content-type': 'application/json',
+          'mcp-protocol-version': LATEST_PROTOCOL_VERSION,
+          'mcp-method': 'notifications/cancelled'
+        },
+        payload: {
+          jsonrpc: '2.0',
+          method: 'notifications/cancelled',
+          params: {
+            _meta: {
+              [META_PROTOCOL_VERSION]: LATEST_PROTOCOL_VERSION,
+              [META_CLIENT_CAPABILITIES]: {}
+            }
+          }
+        }
+      })
+
+      assert.equal(res.statusCode, 202)
+      const idx = spanNames.indexOf('notifications/cancelled')
+      assert.ok(idx >= 0)
+      assert.equal((spans[idx] as any).end.mock.calls.length, 1)
       await app.close()
     })
   })
