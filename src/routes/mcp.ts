@@ -273,6 +273,19 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     return accept ? accept.includes('text/event-stream') : false
   }
 
+  /**
+   * 2026-07-28 removed the GET stream and sessions, so neither GET nor DELETE
+   * may allocate or terminate a legacy session for a modern caller.
+   * Answers 405 as the transport spec requires and reports whether it did.
+   */
+  function rejectModernSessionMethod (request: FastifyRequest, reply: FastifyReply): boolean {
+    if (!isModern(request)) return false
+    reply.header('Allow', 'POST').type('application/json').code(405).send({
+      error: `Method Not Allowed: ${request.method} is not part of the stateless protocol revision`
+    })
+    return true
+  }
+
   function hasActiveSSESession (sessionId?: string): boolean {
     if (!sessionId) return false
     const streams = localStreams.get(sessionId)
@@ -618,6 +631,8 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
       : { onRequest: mcpOnRequest, preHandler: mcpPreHandler, schema: getSchema }
 
     app.get('/mcp', getRouteOptions, async (request: FastifyRequest, reply: FastifyReply) => {
+      if (rejectModernSessionMethod(request, reply)) return
+
       if (!supportsSSE(request)) {
         reply.type('application/json').code(405).send({ error: 'Method Not Allowed: SSE not supported' })
         return
@@ -765,6 +780,8 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
       : { onRequest: mcpOnRequest, preHandler: mcpPreHandler, schema: deleteSchema }
 
     app.delete('/mcp', deleteRouteOptions, async (request: FastifyRequest, reply: FastifyReply) => {
+      if (rejectModernSessionMethod(request, reply)) return
+
       const sessionId = request.headers['mcp-session-id'] as string
       if (!sessionId) {
         reply.code(400).send({ error: 'Missing Mcp-Session-Id header' })

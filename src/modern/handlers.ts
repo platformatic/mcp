@@ -28,6 +28,7 @@ import {
 } from '../schema.ts'
 import type {
   CacheableResult,
+  ClientCapabilities,
   DiscoverResult,
   InputRequests,
   InputRequiredResult,
@@ -195,6 +196,41 @@ function missingCapability (
 }
 
 /**
+ * The client capabilities `inputRequests` would need but the client did not
+ * declare, or `undefined` when it can answer all of them. The server must
+ * never ask for something the client cannot do.
+ */
+function missingInputCapabilities (
+  inputRequests: Record<string, unknown>,
+  clientCapabilities: ClientCapabilities
+): Record<string, unknown> | undefined {
+  const missing: Record<string, unknown> = {}
+  for (const entry of Object.values(inputRequests)) {
+    const needed = requiredCapabilityFor(entry as { method?: string, params?: { mode?: string } })
+    if (!needed) continue
+
+    if (needed === 'elicitation') {
+      // Form and URL mode are declared separately, and URL mode sends the
+      // user out of band — a client that only declared `form` must never be
+      // handed one.
+      const declared = clientCapabilities.elicitation
+      const mode = (entry as { params?: { mode?: string } }).params?.mode
+      if (declared === undefined) {
+        missing.elicitation = {}
+      } else if (mode === 'url' && declared.url === undefined) {
+        missing.elicitation = { url: {} }
+      }
+      continue
+    }
+
+    if (clientCapabilities[needed] === undefined) {
+      missing[needed] = {}
+    }
+  }
+  return Object.keys(missing).length > 0 ? missing : undefined
+}
+
+/**
  * Turn a handler's {@link InputRequired} into the wire result.
  *
  * The state is sealed here rather than by the handler so that integrity,
@@ -208,33 +244,8 @@ function inputRequired (
   const { context, sealer, serverInfo, authContext } = dependencies
 
   if (thrown.inputRequests) {
-    // Never ask for something the client did not declare it can do.
-    const missing: Record<string, unknown> = {}
-    for (const entry of Object.values(thrown.inputRequests)) {
-      const needed = requiredCapabilityFor(entry as { method?: string, params?: { mode?: string } })
-      if (!needed) continue
-
-      if (needed === 'elicitation') {
-        // Form and URL mode are declared separately, and URL mode sends the
-        // user out of band — a client that only declared `form` must never be
-        // handed one.
-        const declared = context.clientCapabilities.elicitation
-        const mode = (entry as { params?: { mode?: string } }).params?.mode
-        if (declared === undefined) {
-          missing.elicitation = {}
-        } else if (mode === 'url' && declared.url === undefined) {
-          missing.elicitation = { url: {} }
-        }
-        continue
-      }
-
-      if (context.clientCapabilities[needed] === undefined) {
-        missing[needed] = {}
-      }
-    }
-    if (Object.keys(missing).length > 0) {
-      return missingCapability(request.id, missing)
-    }
+    const missing = missingInputCapabilities(thrown.inputRequests, context.clientCapabilities)
+    if (missing) return missingCapability(request.id, missing)
   }
 
   const result: InputRequiredResult = {
@@ -511,7 +522,8 @@ async function runAsTask (
 ): Promise<JSONRPCResponse | JSONRPCError> {
   const { taskStore, taskWaiters, taskInputs, app, opts } = dependencies
 
-  const now = new Date().toISOString()
+  const createdAt = Date.now()
+  const now = new Date(createdAt).toISOString()
   const ttl = Math.min(opts.taskDefaultTtlMs ?? 60_000, opts.taskMaxTtlMs ?? 3600_000)
   const record: TaskRecord = {
     taskId: randomUUID(),
@@ -525,6 +537,7 @@ async function runAsTask (
   }
 
   await taskStore!.create(record)
+  const expiresAt = createdAt + ttl
 
   const execution = (async () => {
     let outcome: TaskRecord['outcome']
@@ -561,6 +574,25 @@ async function runAsTask (
             break
           }
 
+          // Parking a request the client cannot answer would only leave the
+          // task stuck in `input_required` until it expires.
+          const missing = missingInputCapabilities(error.inputRequests, dependencies.context.clientCapabilities)
+          if (missing) {
+            status = 'failed'
+            outcome = missingCapability(request.id, missing)
+            statusMessage = outcome.error.message
+            break
+          }
+
+          // The ttl bounds the task's whole lifetime, not each round.
+          const remaining = expiresAt - Date.now()
+          if (remaining <= 0) {
+            status = 'failed'
+            statusMessage = 'Timed out waiting for client input'
+            outcome = createError(request.id, INTERNAL_ERROR, statusMessage)
+            break
+          }
+
           try {
             const parked = await taskStore!.updateStatus(record.taskId, 'input_required', {
               statusMessage: error.message,
@@ -569,7 +601,7 @@ async function runAsTask (
             })
             if (parked) taskWaiters?.notify(parked)
 
-            const responses = await taskInputs.wait(record.taskId, AbortSignal.timeout(ttl))
+            const responses = await taskInputs.wait(record.taskId, AbortSignal.timeout(remaining))
             gathered = { ...(gathered ?? {}), ...responses }
 
             await taskStore!.updateStatus(record.taskId, 'working')

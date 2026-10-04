@@ -1201,6 +1201,105 @@ describe('2026-07-28: tasks extension', () => {
     t.assert.match(task.error.message, /keys must be unique/)
   })
 
+  test('a task fails instead of asking for a capability the client did not declare', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({
+        name: 'needs-elicitation',
+        inputSchema: Type.Object({}),
+        execution: { taskSupport: 'required' }
+      } as any, async () => {
+        throw new InputRequired({
+          inputRequests: {
+            ok: elicitForm('Confirm?', { type: 'object', properties: {} })
+          }
+        })
+      })
+    }, { enableTasks: true })
+
+    // Tasks, but no elicitation.
+    const created = (await call(app, 'tools/call', {
+      params: { name: 'needs-elicitation', arguments: {} },
+      capabilities: tasksCapable
+    })).json().result
+    t.assert.strictEqual(created.resultType, 'task')
+
+    const seen: string[] = []
+    let task: any
+    for (let attempt = 0; attempt < 40; attempt++) {
+      task = (await call(app, 'tasks/get', {
+        params: { taskId: created.taskId },
+        capabilities: tasksCapable
+      })).json().result
+      seen.push(task.status)
+      if (task.status === 'failed') break
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+
+    t.assert.strictEqual(task.status, 'failed')
+    t.assert.ok(!seen.includes('input_required'), 'the task must never park an unanswerable request')
+    t.assert.strictEqual(task.inputRequests, undefined)
+    t.assert.match(task.error.message, /client capability that was not declared/)
+  })
+
+  test('input rounds share the task ttl instead of each getting a fresh one', async (t: TestContext) => {
+    const ttl = 2000
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({
+        name: 'two-rounds',
+        inputSchema: Type.Object({}),
+        execution: { taskSupport: 'required' }
+      } as any, async (_args: any, context: any) => {
+        const key = context.inputResponses?.first ? 'second' : 'first'
+        if (context.inputResponses?.second) return { content: [{ type: 'text', text: 'done' }] }
+        throw new InputRequired({
+          inputRequests: { [key]: elicitForm('Again?', { type: 'object', properties: {} }) }
+        })
+      })
+    }, { enableTasks: true, taskDefaultTtlMs: ttl })
+    const capabilities: ClientCapabilities = {
+      extensions: { [TASKS_EXTENSION]: {} },
+      elicitation: { form: {} }
+    }
+
+    // Only the task input wait arms an AbortSignal.timeout.
+    const timeouts: number[] = []
+    const original = AbortSignal.timeout.bind(AbortSignal)
+    t.mock.method(AbortSignal, 'timeout', (ms: number) => {
+      timeouts.push(ms)
+      return original(ms)
+    })
+
+    const created = (await call(app, 'tools/call', {
+      params: { name: 'two-rounds', arguments: {} },
+      capabilities
+    })).json().result
+
+    async function waitForRequest (key: string) {
+      for (let attempt = 0; attempt < 40; attempt++) {
+        const task = (await call(app, 'tasks/get', {
+          params: { taskId: created.taskId },
+          capabilities
+        })).json().result
+        if (task.status === 'input_required' && task.inputRequests?.[key]) return
+        await new Promise(resolve => setTimeout(resolve, 10))
+      }
+      t.assert.fail(`task never asked for ${key}`)
+    }
+
+    await waitForRequest('first')
+    const elapsed = 300
+    await new Promise(resolve => setTimeout(resolve, elapsed))
+    await call(app, 'tasks/update', {
+      params: { taskId: created.taskId, inputResponses: { first: { action: 'accept', content: {} } } },
+      capabilities
+    })
+    await waitForRequest('second')
+
+    t.assert.strictEqual(timeouts.length, 2)
+    t.assert.ok(timeouts[0] <= ttl)
+    t.assert.ok(timeouts[1] <= ttl - elapsed, `second round waited ${timeouts[1]}ms, past the task expiry`)
+  })
+
   test('tasks/* are absent when tasks are not enabled', async (t: TestContext) => {
     const app = await buildServer(t)
 
@@ -1254,6 +1353,63 @@ describe('dual-era: both protocols on one endpoint', () => {
     t.assert.strictEqual(legacy.json().result.resultType, undefined)
     t.assert.strictEqual(modern.json().result.tools[0].name, 'greet')
     t.assert.strictEqual(modern.json().result.resultType, 'complete')
+  })
+
+  test('a modern GET cannot open a legacy SSE session', async (t: TestContext) => {
+    const app = await buildServer(t, undefined, { enableSSE: true })
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/mcp',
+      headers: {
+        accept: 'text/event-stream',
+        'mcp-protocol-version': LATEST_PROTOCOL_VERSION
+      }
+    })
+
+    t.assert.strictEqual(response.statusCode, 405)
+    t.assert.strictEqual(response.headers.allow, 'POST')
+    t.assert.strictEqual(response.headers['mcp-session-id'], undefined)
+  })
+
+  test('a modern DELETE cannot terminate a legacy session', async (t: TestContext) => {
+    const app = await buildServer(t, undefined, { enableSSE: true })
+
+    const initialized = await app.inject({
+      method: 'POST',
+      url: '/mcp',
+      payload: {
+        jsonrpc: JSONRPC_VERSION,
+        id: 1,
+        method: 'initialize',
+        params: {
+          protocolVersion: LATEST_LEGACY_PROTOCOL_VERSION,
+          capabilities: {},
+          clientInfo: { name: 'legacy', version: '1.0.0' }
+        }
+      }
+    })
+    const sessionId = initialized.headers['mcp-session-id'] as string
+    t.assert.ok(sessionId)
+
+    const modernDelete = await app.inject({
+      method: 'DELETE',
+      url: '/mcp',
+      headers: {
+        'mcp-session-id': sessionId,
+        'mcp-protocol-version': LATEST_PROTOCOL_VERSION
+      }
+    })
+    t.assert.strictEqual(modernDelete.statusCode, 405)
+    t.assert.strictEqual(modernDelete.headers.allow, 'POST')
+
+    // The legacy session is untouched and can still be terminated by its owner.
+    const legacyDelete = await app.inject({
+      method: 'DELETE',
+      url: '/mcp',
+      headers: { 'mcp-session-id': sessionId }
+    })
+    t.assert.strictEqual(legacyDelete.statusCode, 204)
   })
 
   test('a modern request ignores a stray Mcp-Session-Id', async (t: TestContext) => {
