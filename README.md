@@ -1284,13 +1284,6 @@ await app.register(mcpPlugin, {
     tokenValidation: {
       jwksUri: 'https://auth.example.com/.well-known/jwks.json',
       validateAudience: true
-    },
-    // OAuth 2.1 Client Configuration
-    oauth2Client: {
-      clientId: process.env.OAUTH_CLIENT_ID,
-      clientSecret: process.env.OAUTH_CLIENT_SECRET,
-      authorizationServer: 'https://auth.example.com',
-      scopes: ['read', 'write']
     }
   },
   // Redis for session persistence (recommended)
@@ -1307,22 +1300,17 @@ await app.listen({ port: 3000 })
 
 #### 1. OAuth Authorization Flow
 
-```typescript
-// Start OAuth authorization
-const authResponse = await fetch('/oauth/authorize?redirect_uri=https://yourapp.com/dashboard')
+The MCP client discovers the authorization server through the MCP server's
+protected-resource metadata. It then registers or identifies itself with that
+authorization server and performs Authorization Code with PKCE directly:
 
-// Handle callback with authorization code
-const tokenResponse = await fetch('/oauth/callback', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({
-    code: 'auth_code_from_callback',
-    state: 'csrf_state_token'
-  })
-})
+1. The MCP client sends its registered `redirect_uri` to the authorization server.
+2. The authorization server returns an authorization code to the client callback.
+3. The MCP client exchanges the code with its PKCE verifier.
+4. The MCP client sends the resulting bearer token to the MCP server.
 
-const { access_token, refresh_token } = await tokenResponse.json()
-```
+Client redirect URIs are not sent to the MCP server. The MCP server does not
+forward access tokens through browser redirects.
 
 #### 2. Authenticated MCP Requests
 
@@ -1395,6 +1383,10 @@ authorization: {
 ```
 
 #### OAuth Client Configuration
+
+This optional configuration is for server-side OAuth client operations. It is
+not required for MCP clients, which authorize directly with the advertised
+authorization server.
 
 ```typescript
 authorization: {
@@ -1633,10 +1625,10 @@ Security notes:
 
 ### OAuth Routes
 
-The plugin automatically registers OAuth management routes:
+When `oauth2Client` is configured, the plugin registers these legacy server-side OAuth client routes. They are not used by MCP clients to obtain tokens: client redirect URIs must be sent directly to the authorization server. `/oauth/authorize` rejects `redirect_uri`, and `/oauth/callback` never redirects access tokens.
 
-- `GET /oauth/authorize` - Start OAuth authorization flow
-- `POST /oauth/callback` - Handle authorization callback
+- `GET /oauth/authorize` - Start the server-side OAuth client flow
+- `GET /oauth/callback` - Handle authorization callback
 - `POST /oauth/refresh` - Refresh access tokens
 - `POST /oauth/validate` - Validate token
 - `GET /oauth/status` - Check authorization status
@@ -2173,10 +2165,12 @@ The plugin exposes the following endpoints using a dual-endpoint architecture:
   - Supports message replay with Last-Event-ID
   - Authorization-aware with user-specific session isolation
 
-### OAuth Endpoints (when authorization is enabled)
+### OAuth Endpoints (when `oauth2Client` is configured)
 
-- `GET /oauth/authorize`: Start OAuth authorization flow with PKCE
-- `POST /oauth/callback`: Handle authorization callback and exchange code for tokens
+These legacy server-side OAuth client endpoints do not proxy MCP client authorization or redirect access tokens to client callbacks.
+
+- `GET /oauth/authorize`: Start the server-side OAuth client flow with PKCE
+- `GET /oauth/callback`: Handle authorization callback and exchange code for tokens
 - `POST /oauth/refresh`: Refresh access tokens using refresh tokens
 - `POST /oauth/validate`: Validate access tokens (JWT or introspection)
 - `GET /oauth/status`: Check current authorization status

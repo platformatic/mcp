@@ -93,6 +93,8 @@ describe('OAuth Routes', () => {
     })
 
     assert.strictEqual(callbackResponse.statusCode, 200)
+    assert.strictEqual(callbackResponse.headers['cache-control'], 'no-store')
+    assert.strictEqual(callbackResponse.headers.pragma, 'no-cache')
     const body = JSON.parse(callbackResponse.body)
     assert.strictEqual(body.access_token, 'callback-access-token')
     assert.strictEqual(body.token_type, 'Bearer')
@@ -209,6 +211,8 @@ describe('OAuth Routes', () => {
     })
 
     assert.strictEqual(response.statusCode, 200)
+    assert.strictEqual(response.headers['cache-control'], 'no-store')
+    assert.strictEqual(response.headers.pragma, 'no-cache')
     const body = JSON.parse(response.body)
     assert.strictEqual(body.access_token, 'refreshed-access-token')
     assert.strictEqual(body.token_type, 'Bearer')
@@ -529,13 +533,52 @@ describe('OAuth Routes', () => {
     assert.strictEqual(body.error, 'invalid_request')
   })
 
-  test('should redirect callback with original URL', async (t) => {
+  test('should reject downstream redirect URIs before creating OAuth state', async (t) => {
+    const fastify = Fastify()
+    t.after(async () => {
+      await fastify.close()
+    })
+
+    await fastify.register(oauthClientPlugin, {
+      clientId: 'test-client',
+      authorizationServer: 'https://auth.example.com'
+    })
+
+    let authorizationRequestCreated = false
+    fastify.oauthClient.createAuthorizationRequest = async () => {
+      authorizationRequestCreated = true
+      throw new Error('must not be called')
+    }
+
+    const sessionStore = new MemorySessionStore(100)
+    let sessionCreated = false
+    sessionStore.create = async () => {
+      sessionCreated = true
+    }
+
+    await fastify.register(authRoutesPlugin, { sessionStore })
+
+    const response = await fastify.inject({
+      method: 'GET',
+      url: '/oauth/authorize?redirect_uri=https%3A%2F%2Fclient.example%2Fcallback'
+    })
+
+    assert.strictEqual(response.statusCode, 400)
+    assert.deepStrictEqual(response.json(), {
+      error: 'invalid_request',
+      error_description: 'redirect_uri is not supported'
+    })
+    assert.strictEqual(authorizationRequestCreated, false)
+    assert.strictEqual(sessionCreated, false)
+  })
+
+  test('should not redirect tokens for a session created before the fix', async (t) => {
     const mockPool = mockAgent.get('https://auth.example.com')
     mockPool.intercept({
       path: '/oauth/token',
       method: 'POST'
     }).reply(200, {
-      access_token: 'redirect-access-token',
+      access_token: 'callback-access-token',
       token_type: 'Bearer',
       expires_in: 3600,
       scope: 'read'
@@ -546,40 +589,43 @@ describe('OAuth Routes', () => {
       await fastify.close()
     })
 
-    const config = {
+    await fastify.register(oauthClientPlugin, {
       clientId: 'test-client',
       clientSecret: 'test-secret',
       authorizationServer: 'https://auth.example.com'
-    }
+    })
 
-    await fastify.register(oauthClientPlugin, config)
     const sessionStore = new MemorySessionStore(100)
+    await sessionStore.create({
+      id: 'stale-state',
+      eventId: 0,
+      createdAt: new Date(),
+      lastActivity: new Date(),
+      authSession: {
+        state: 'stale-state',
+        pkce: {
+          codeVerifier: 'verifier',
+          codeChallenge: 'challenge',
+          codeChallengeMethod: 'S256'
+        },
+        originalUrl: 'https://attacker.example/capture',
+        callbackUrl: 'https://mcp.example.com/oauth/callback'
+      }
+    })
+
     await fastify.register(authRoutesPlugin, { sessionStore })
 
-    // Initiate flow with redirect URI
-    const authResponse = await fastify.inject({
+    const response = await fastify.inject({
       method: 'GET',
-      url: '/oauth/authorize?redirect_uri=https://client.example.com/callback'
+      url: '/oauth/callback?code=test-code&state=stale-state'
     })
 
-    const authLocationHeader = authResponse.headers.location
-    assert.ok(authLocationHeader, 'Location header should be present')
-    const location = new URL(authLocationHeader!)
-    const state = location.searchParams.get('state')
-
-    // Handle callback
-    const callbackResponse = await fastify.inject({
-      method: 'GET',
-      url: `/oauth/callback?code=test-code&state=${state}`
-    })
-
-    assert.strictEqual(callbackResponse.statusCode, 302)
-    const callbackLocationHeader = callbackResponse.headers.location
-    assert.ok(callbackLocationHeader, 'Location header should be present')
-    const redirectUrl = new URL(callbackLocationHeader!)
-    assert.strictEqual(redirectUrl.origin, 'https://client.example.com')
-    assert.strictEqual(redirectUrl.pathname, '/callback')
-    assert.strictEqual(redirectUrl.searchParams.get('access_token'), 'redirect-access-token')
+    assert.strictEqual(response.statusCode, 200)
+    assert.strictEqual(response.headers.location, undefined)
+    assert.strictEqual(response.headers['cache-control'], 'no-store')
+    assert.strictEqual(response.headers.pragma, 'no-cache')
+    assert.strictEqual(response.json().access_token, 'callback-access-token')
+    assert.strictEqual(await sessionStore.get('stale-state'), null)
   })
 })
 
