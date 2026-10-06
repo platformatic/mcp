@@ -891,7 +891,8 @@ describe('2026-07-28: input requests and results are validated', () => {
     })
     const capabilities = (await call(app, 'server/discover')).json().result.capabilities
     t.assert.strictEqual(capabilities.completions, undefined)
-    t.assert.strictEqual(capabilities.logging, undefined)
+    // Logging is served on the request's own stream.
+    t.assert.deepStrictEqual(capabilities.logging, {})
   })
 
   test('a legacy request never leaks InputRequired state in error data', async (t: TestContext) => {
@@ -2278,6 +2279,66 @@ describe('2026-07-28: in-process requests', () => {
     t.assert.strictEqual(response.json().result.content[0].text, 'ok')
     await new Promise(resolve => setTimeout(resolve, 50))
     t.assert.strictEqual(signal?.aborted, false)
+  })
+})
+
+describe('2026-07-28: progress and log notifications', () => {
+  function reportingTool (app: FastifyInstance) {
+    app.mcpAddTool({ name: 'report', inputSchema: Type.Object({}) }, async (_args: any, context: any) => {
+      context.log('debug', 'too chatty')
+      context.sendProgress(1, 3, 'one')
+      context.sendProgress(1, 3, 'not an increase')
+      context.log('warning', { note: 'heads up' }, 'report')
+      context.sendProgress(3, 3)
+      return { content: [{ type: 'text', text: 'done' }] }
+    })
+  }
+
+  function frames (body: string): any[] {
+    return body.split('\n\n').map(frame => frame.replace(/^data: /, '').trim()).filter(Boolean).map(frame => JSON.parse(frame))
+  }
+
+  test('progress and logs stream before the final response', async (t: TestContext) => {
+    const app = await buildServer(t, reportingTool)
+    const body = modernBody('tools/call', { params: { name: 'report', arguments: {} } }) as any
+    body.params._meta.progressToken = 'p1'
+    body.params._meta['io.modelcontextprotocol/logLevel'] = 'info'
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/mcp',
+      headers: modernHeaders('tools/call', { params: { name: 'report' } }),
+      payload: body
+    })
+    t.assert.strictEqual(response.headers['content-type'], 'text/event-stream')
+    const messages = frames(response.body)
+    t.assert.deepStrictEqual(messages.map(m => m.method ?? 'response'), [
+      'notifications/progress', 'notifications/message', 'notifications/progress', 'response'
+    ])
+    t.assert.deepStrictEqual(messages[0].params, { progressToken: 'p1', progress: 1, total: 3, message: 'one' })
+    t.assert.deepStrictEqual(messages[1].params, { level: 'warning', data: { note: 'heads up' }, logger: 'report' })
+    t.assert.strictEqual(messages[3].result.content[0].text, 'done')
+  })
+
+  test('without a progressToken or logLevel the response stays plain JSON', async (t: TestContext) => {
+    const app = await buildServer(t, reportingTool)
+    const response = await call(app, 'tools/call', { params: { name: 'report', arguments: {} } })
+    t.assert.match(String(response.headers['content-type']), /application\/json/)
+    t.assert.strictEqual(response.json().result.content[0].text, 'done')
+  })
+
+  test('progress alone sends no log messages', async (t: TestContext) => {
+    const app = await buildServer(t, reportingTool)
+    const body = modernBody('tools/call', { params: { name: 'report', arguments: {} } }) as any
+    body.params._meta.progressToken = 7
+    const response = await app.inject({
+      method: 'POST',
+      url: '/mcp',
+      headers: modernHeaders('tools/call', { params: { name: 'report' } }),
+      payload: body
+    })
+    const methods = frames(response.body).map(m => m.method).filter(Boolean)
+    t.assert.deepStrictEqual(methods, ['notifications/progress', 'notifications/progress'])
   })
 })
 

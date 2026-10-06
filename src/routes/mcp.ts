@@ -45,6 +45,7 @@ import { DEFAULT_MAX_RESOURCE_SUBSCRIPTIONS, SubscriptionRegistry, invalidFilter
 import { principalOf } from '../principal.ts'
 import type { SubscriptionFilter } from '../schema-2026.ts'
 import { isStdioRequest, stdioRequestSignal } from '../stdio-trust.ts'
+import { RequestStream, requestNotifiers } from '../modern/request-stream.ts'
 import type { TaskInputChannel } from '../modern/task-inputs.ts'
 import type { JsonSchemaValidator } from '../validation/json-schema-validator.ts'
 
@@ -542,6 +543,12 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
       if (!handled) cancelled.abort(new Error('client disconnected'))
     })
 
+    // Progress and log notifications ride the response stream, so only open
+    // one when the client asked for them and can read it.
+    const accept = String(request.headers.accept ?? '')
+    const wantsNotifications = context.progressToken !== undefined || context.logLevel !== undefined
+    const stream = wantsNotifications && accept.includes('text/event-stream') ? new RequestStream(reply) : undefined
+
     let response: JSONRPCResponse | JSONRPCError
     try {
       response = await dispatchModern(message, {
@@ -568,10 +575,16 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         supportedVersions: SUPPORTED_PROTOCOL_VERSIONS,
         enableTasks,
         headerLayer,
-        signal: stdioCancel ? AbortSignal.any([cancelled.signal, stdioCancel]) : cancelled.signal
+        signal: stdioCancel ? AbortSignal.any([cancelled.signal, stdioCancel]) : cancelled.signal,
+        notifiers: requestNotifiers(context, stream)
       })
     } finally {
       handled = true
+    }
+
+    if (stream?.opened) {
+      stream.finish(response)
+      return reply
     }
 
     reply.type('application/json').code(statusForResponse(response))

@@ -12,7 +12,8 @@ import type {
   Resource,
   Prompt,
   ElicitRequestFormParams,
-  RequestId
+  RequestId,
+  LoggingLevel
 } from './schema.ts'
 import type { Static, TSchema, TObject, TString } from '@sinclair/typebox'
 import type { AuthorizationConfig, AuthorizationContext } from './types/auth-types.ts'
@@ -45,6 +46,19 @@ export interface HandlerContext {
    * legacy path, where a disconnect is not a cancellation.
    */
   signal: AbortSignal
+  /**
+   * Report progress on this request (`notifications/progress`). Only sent to
+   * a 2026-07-28 client that asked for it with a `progressToken`; `progress`
+   * must increase with each call, and smaller values are dropped. A no-op
+   * otherwise.
+   */
+  sendProgress: (progress: number, total?: number, message?: string) => void
+  /**
+   * Log a message to the client (`notifications/message`). Only sent to a
+   * 2026-07-28 client that set `io.modelcontextprotocol/logLevel`, and only at
+   * or above that level. A no-op otherwise.
+   */
+  log: (level: LoggingLevel, data: unknown, logger?: string) => void
 }
 
 // Resource subscription handler types

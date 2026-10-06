@@ -1220,11 +1220,10 @@ export function buildServerCapabilities (
   // The 2025-11-25 core `tasks` capability has no meaning in this revision;
   // support is advertised as an extension instead.
   delete (capabilities as Record<string, unknown>).tasks
-  // Nothing on this path answers `completion/complete` or emits
-  // `notifications/message`, so advertising either would be a promise the
-  // server cannot keep.
+  // Nothing on this path answers `completion/complete`, so advertising it
+  // would be a promise the server cannot keep. `logging` stays: handlers log
+  // to the request's stream through `context.log`.
   delete (capabilities as Record<string, unknown>).completions
-  delete (capabilities as Record<string, unknown>).logging
 
   if (options.enableTasks) {
     capabilities.extensions = { ...capabilities.extensions, [TASKS_EXTENSION]: {} }

@@ -64,6 +64,16 @@ const InvalidMcpErrorCodeError = createFastifyError(
   'MCP_ERR_INVALID_ERROR_CODE',
   'Expected error.code to be a number'
 )
+const UnrecognizedResultTypeError = createFastifyError(
+  'MCP_ERR_UNRECOGNIZED_RESULT_TYPE',
+  "Unrecognized resultType '%s'; a result whose resultType is not understood is invalid"
+)
+const MissingStreamResponseError = createFastifyError(
+  'MCP_ERR_MISSING_STREAM_RESPONSE',
+  'The response stream ended without a JSON-RPC response (status %s)'
+)
+/** The `resultType` values this client understands: core plus the tasks extension. */
+const KNOWN_RESULT_TYPES = new Set(['complete', 'input_required', 'task'])
 const ModernInitializeError = createFastifyError(
   'MCP_ERR_MODERN_INITIALIZE',
   "Protocol version '%s' is stateless and does not support initialize; call methods directly or use discover()"
@@ -91,6 +101,12 @@ export interface McpClientCallToolOptions extends McpClientRequestOptions {
   requestState?: string
   /** Client answers supplied when retrying a modern multi round-trip call. */
   inputResponses?: InputResponses
+  /**
+   * Extra `_meta` for the request, such as a `progressToken` or
+   * `io.modelcontextprotocol/logLevel`. The protocol fields are always set by
+   * the client and cannot be overridden here.
+   */
+  meta?: Record<string, unknown>
 }
 
 export interface McpClientResponse<TBody = JSONRPCResponse> {
@@ -98,6 +114,11 @@ export interface McpClientResponse<TBody = JSONRPCResponse> {
   headers: Record<string, string | string[] | undefined>
   body: TBody
   payload: string
+  /**
+   * Notifications the server sent on the response stream before the final
+   * response (2026-07-28 progress and log messages). Empty for a JSON response.
+   */
+  notifications: JSONRPCNotification[]
 }
 
 export interface McpClientInitializeOptions {
@@ -140,6 +161,30 @@ function truncateForError (payload: string): string {
   }
 
   return `${payload.slice(0, JSON_PARSE_ERROR_PAYLOAD_LIMIT)}... [truncated ${payload.length - JSON_PARSE_ERROR_PAYLOAD_LIMIT} chars]`
+}
+
+/**
+ * Split an SSE response into the notifications sent before the response and
+ * the final JSON-RPC response itself.
+ */
+function parseEventStream (payload: string, statusCode: number): { body: unknown, notifications: JSONRPCNotification[] } {
+  const notifications: JSONRPCNotification[] = []
+  let body: unknown
+  for (const frame of payload.split('\n\n')) {
+    const data = frame.split('\n')
+      .filter(line => line.startsWith('data:'))
+      .map(line => line.slice(5).trimStart())
+      .join('\n')
+    if (!data) continue
+    const message = parseJsonBody(data, statusCode)
+    if (isRecord(message) && hasOwn(message, 'id') && (hasOwn(message, 'result') || hasOwn(message, 'error'))) {
+      body = message
+    } else {
+      notifications.push(message as JSONRPCNotification)
+    }
+  }
+  if (body === undefined) throw new MissingStreamResponseError(statusCode)
+  return { body, notifications }
 }
 
 function parseJsonBody (payload: string, statusCode: number): unknown {
@@ -495,17 +540,30 @@ export function createMcpClient (
 
     const payload = response.body
     let body: JSONRPCResponse | undefined
+    let notifications: JSONRPCNotification[] = []
     if (expectJsonResponse) {
-      const parsedBody = parseJsonBody(payload, response.statusCode)
-      assertMcpResponse(parsedBody)
-      body = parsedBody
+      // A request may be answered with either JSON or an SSE stream, and a
+      // client must accept both.
+      const streamed = String(response.headers['content-type'] ?? '').startsWith('text/event-stream')
+      const parsed = streamed
+        ? parseEventStream(payload, response.statusCode)
+        : { body: parseJsonBody(payload, response.statusCode), notifications: [] }
+      assertMcpResponse(parsed.body)
+      body = parsed.body
+      notifications = parsed.notifications
+
+      const resultType = (body as { result?: { resultType?: unknown } }).result?.resultType
+      if (modern && 'result' in body && !KNOWN_RESULT_TYPES.has(resultType as string)) {
+        throw new UnrecognizedResultTypeError(String(resultType))
+      }
     }
 
     return {
       statusCode: response.statusCode,
       headers: normalizeResponseHeaders(response.headers as Record<string, unknown>),
       body,
-      payload
+      payload,
+      notifications
     }
   }
 
@@ -613,6 +671,7 @@ export function createMcpClient (
       const {
         requestState,
         inputResponses,
+        meta,
         ...baseRequestOptions
       } = requestOptions ?? {}
 
@@ -624,7 +683,8 @@ export function createMcpClient (
           name,
           arguments: args,
           ...(requestState === undefined ? {} : { requestState }),
-          ...(inputResponses === undefined ? {} : { inputResponses })
+          ...(inputResponses === undefined ? {} : { inputResponses }),
+          ...(meta === undefined ? {} : { _meta: meta })
         }
       }
 

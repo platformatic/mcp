@@ -71,7 +71,7 @@ export type RequestContextResult =
   | { ok: true, context: RequestContext }
   | { ok: false, message: string }
 
-const LOG_LEVELS: readonly string[] = [
+export const LOG_LEVELS: readonly string[] = [
   'debug', 'info', 'notice', 'warning', 'error', 'critical', 'alert', 'emergency'
 ]
 

@@ -52,6 +52,7 @@ import type { AuthorizationContext } from './types/auth-types.ts'
 import { principalOf } from './principal.ts'
 import type { TaskInputChannel } from './modern/task-inputs.ts'
 import { InputRequired } from './modern/input-required.ts'
+import type { RequestNotifiers } from './modern/request-stream.ts'
 import {
   atLeast,
   supportsTasks,
@@ -112,6 +113,8 @@ export type HandlerDependencies = {
   strictErrors?: boolean
   /** Aborts when the request is cancelled; see `HandlerContext.signal`. */
   signal?: AbortSignal
+  /** Request-scoped notifications; see `HandlerContext.sendProgress` and `log`. */
+  notifiers?: RequestNotifiers
 }
 
 export type ToolCallDependencies = Pick<HandlerDependencies,
@@ -125,7 +128,8 @@ export type ToolCallDependencies = Pick<HandlerDependencies,
   'sessionId' |
   'mrtr' |
   'signal' |
-  'protocolVersion'
+  'protocolVersion' |
+  'notifiers'
 >
 
 export function createResponse (id: string | number, result: any): JSONRPCResponse {
@@ -154,9 +158,10 @@ export function createError (id: string | number | null, code: number, message: 
  */
 /** For requests nothing can cancel. */
 const NEVER_ABORTED = new AbortController().signal
+const NO_NOTIFIERS: RequestNotifiers = { sendProgress: () => {}, log: () => {} }
 
 function handlerContext (
-  dependencies: Pick<HandlerDependencies, 'request' | 'reply' | 'authContext' | 'mrtr' | 'signal'>,
+  dependencies: Pick<HandlerDependencies, 'request' | 'reply' | 'authContext' | 'mrtr' | 'signal' | 'notifiers'>,
   sessionId: string | undefined
 ): HandlerContext {
   return {
@@ -166,7 +171,9 @@ function handlerContext (
     authContext: dependencies.authContext,
     inputResponses: dependencies.mrtr?.inputResponses,
     requestState: dependencies.mrtr?.requestState,
-    signal: dependencies.signal ?? NEVER_ABORTED
+    signal: dependencies.signal ?? NEVER_ABORTED,
+    sendProgress: (dependencies.notifiers ?? NO_NOTIFIERS).sendProgress,
+    log: (dependencies.notifiers ?? NO_NOTIFIERS).log
   }
 }
 

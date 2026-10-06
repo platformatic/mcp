@@ -559,6 +559,35 @@ describe('MCP client', () => {
     assert.equal(response.headers['content-length'], String(Buffer.byteLength(response.payload)))
   })
 
+  test('modern clients read an SSE response with its progress notifications', async (t) => {
+    const app = Fastify()
+    t.after(() => app.close())
+    await app.register(mcpPlugin)
+    app.mcpAddTool({ name: 'work', inputSchema: Type.Object({}) }, async (_args, context) => {
+      context.sendProgress(1, 2)
+      context.sendProgress(2, 2)
+      return { content: [{ type: 'text', text: 'done' }] }
+    })
+    await app.ready()
+
+    const client = createMcpClient(app, { protocolVersion: LATEST_PROTOCOL_VERSION })
+    const response = await client.callTool('work', {}, { meta: { progressToken: 'p' } })
+    assert.ok('result' in response.body)
+    assert.equal((response.body.result as any).content[0].text, 'done')
+    assert.deepEqual(response.notifications.map(n => (n.params as any).progress), [1, 2])
+  })
+
+  test('modern clients reject a result whose resultType they do not understand', async (t) => {
+    const app = Fastify()
+    t.after(() => app.close())
+    await app.register(mcpPlugin)
+    app.post('/fake-mcp', async () => ({ jsonrpc: JSONRPC_VERSION, id: 1, result: { resultType: 'mystery' } }))
+    await app.ready()
+
+    const client = createMcpClient(app, { protocolVersion: LATEST_PROTOCOL_VERSION, endpoint: '/fake-mcp' })
+    await assert.rejects(client.discover(), /Unrecognized resultType 'mystery'/)
+  })
+
   test('modern clients can complete multi round-trip tool calls', async (t) => {
     const app = Fastify()
     t.after(() => app.close())
