@@ -16,7 +16,8 @@ import {
   HEADER_MISMATCH,
   MISSING_REQUIRED_CLIENT_CAPABILITY,
   UNSUPPORTED_PROTOCOL_VERSION,
-  INVALID_REQUEST
+  INVALID_REQUEST,
+  INTERNAL_ERROR
 } from '../src/schema.ts'
 import {
   META_PROTOCOL_VERSION,
@@ -25,7 +26,7 @@ import {
   META_SERVER_INFO,
   TASKS_EXTENSION
 } from '../src/schema-2026.ts'
-import { InputRequired, elicitForm, elicitUrl } from '../src/modern/input-required.ts'
+import { InputRequired, elicitForm, elicitUrl, requestSampling } from '../src/modern/input-required.ts'
 import { encodeHeaderValue } from '../src/modern/headers.ts'
 import { TASK_INPUT_TOPIC } from '../src/modern/task-inputs.ts'
 import { MemoryMessageBroker } from '../src/brokers/memory-message-broker.ts'
@@ -598,7 +599,7 @@ describe('2026-07-28: multi round-trip requests', () => {
     })
     let resolutions = 0
     await app.register(mcpPlugin, {
-      requestStateSecret: 'shared-test-secret',
+      requestStateSecret: 'shared-test-secret'.padEnd(32, '-'),
       resolveAuthorizationContext: (request) => {
         resolutions++
         const userId = (request as any).upstreamUserId
@@ -705,8 +706,269 @@ describe('2026-07-28: multi round-trip requests', () => {
   })
 })
 
+describe('2026-07-28: input requests and results are validated', () => {
+  function askingTool (app: FastifyInstance, inputRequests: Record<string, unknown>, seen: unknown[] = []) {
+    app.mcpAddTool({ name: 'ask', inputSchema: Type.Object({}) }, async (_args: any, context: any) => {
+      if (!context.requestState) throw new InputRequired({ inputRequests: inputRequests as any, state: { step: 1 } })
+      seen.push(context.inputResponses)
+      return { content: [{ type: 'text', text: 'done' }] }
+    })
+  }
+
+  test('form elicitation is refused for a client that declared only URL mode', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => askingTool(app, {
+      q: elicitForm('Name?', { type: 'object', properties: { name: { type: 'string' } } })
+    }))
+
+    const urlOnly = await call(app, 'tools/call', {
+      params: { name: 'ask', arguments: {} },
+      capabilities: { elicitation: { url: {} } }
+    })
+    t.assert.strictEqual(urlOnly.json().error.code, MISSING_REQUIRED_CLIENT_CAPABILITY)
+    t.assert.deepStrictEqual(urlOnly.json().error.data.requiredCapabilities, { elicitation: { form: {} } })
+
+    // An empty object is the backwards-compatible declaration of form mode.
+    const legacyForm = await call(app, 'tools/call', {
+      params: { name: 'ask', arguments: {} },
+      capabilities: { elicitation: {} }
+    })
+    t.assert.strictEqual(legacyForm.json().result.resultType, 'input_required')
+  })
+
+  test('sampling with tools or context needs the matching sub-capability', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => askingTool(app, {
+      s: requestSampling({
+        messages: [{ role: 'user', content: { type: 'text', text: 'hi' } }],
+        maxTokens: 10,
+        includeContext: 'thisServer',
+        tools: [{ name: 't', inputSchema: { type: 'object' } }]
+      } as any)
+    }))
+
+    const response = await call(app, 'tools/call', {
+      params: { name: 'ask', arguments: {} },
+      capabilities: { sampling: {} }
+    })
+    t.assert.strictEqual(response.json().error.code, MISSING_REQUIRED_CLIENT_CAPABILITY)
+    t.assert.deepStrictEqual(response.json().error.data.requiredCapabilities, {
+      sampling: { tools: {}, context: {} }
+    })
+  })
+
+  test('input requests the protocol cannot carry are never forwarded', async (t: TestContext) => {
+    for (const inputRequests of [
+      { q: { method: 'tools/call', params: { name: 'x' } } },
+      { q: elicitUrl('Sign in', 'not a url') }
+    ]) {
+      const app = await buildServer(t, (app) => askingTool(app, inputRequests))
+      const response = await call(app, 'tools/call', {
+        params: { name: 'ask', arguments: {} },
+        capabilities: { elicitation: { form: {}, url: {} } }
+      })
+      t.assert.strictEqual(response.json().error.code, INTERNAL_ERROR)
+      t.assert.strictEqual(response.json().error.data, undefined)
+    }
+  })
+
+  test('only answers to keys the server asked for reach the handler', async (t: TestContext) => {
+    const seen: unknown[] = []
+    const app = await buildServer(t, (app) => askingTool(app, {
+      q: elicitForm('Name?', { type: 'object', properties: { name: { type: 'string' } } })
+    }, seen))
+    const capabilities = { elicitation: { form: {} } }
+    const params = { name: 'ask', arguments: {} }
+
+    const first = (await call(app, 'tools/call', { params, capabilities })).json().result
+    const retry = await call(app, 'tools/call', {
+      id: 2,
+      capabilities,
+      params: {
+        ...params,
+        requestState: first.requestState,
+        inputResponses: { q: { action: 'accept', content: { name: 'a' } }, unasked: { injected: true } }
+      }
+    })
+    t.assert.strictEqual(retry.json().result.resultType, 'complete')
+    t.assert.deepStrictEqual(seen, [{ q: { action: 'accept', content: { name: 'a' } } }])
+
+    // Without sealed state there is nothing the server asked for.
+    const app2 = await buildServer(t, (app) => app.mcpAddTool({ name: 'peek', inputSchema: Type.Object({}) },
+      async (_args: any, context: any) => ({ content: [{ type: 'text', text: JSON.stringify(context.inputResponses ?? null) }] })))
+    const stateless = await call(app2, 'tools/call', {
+      params: { name: 'peek', arguments: {}, inputResponses: { forged: { action: 'accept' } } }
+    })
+    t.assert.strictEqual(stateless.json().result.content[0].text, '{}')
+  })
+
+  test('inputResponses that is not an object is invalid params', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => askingTool(app, {}))
+    for (const inputResponses of ['a string', [1, 2], 42]) {
+      const response = await call(app, 'tools/call', {
+        params: { name: 'ask', arguments: {}, inputResponses }
+      })
+      t.assert.strictEqual(response.json().error.code, INVALID_PARAMS, JSON.stringify(inputResponses))
+    }
+  })
+
+  test('state is bound to the OAuth client, not just the user', async (t: TestContext) => {
+    const app = Fastify()
+    t.after(() => app.close())
+    await app.register(mcpPlugin, {
+      resolveAuthorizationContext: (request) => ({
+        userId: 'same-user',
+        clientId: request.headers['x-client'] as string
+      })
+    })
+    askingTool(app, { q: elicitForm('Name?', { type: 'object', properties: {} }) })
+    await app.ready()
+
+    const capabilities = { elicitation: { form: {} } }
+    const params = { name: 'ask', arguments: {} }
+    const first = (await call(app, 'tools/call', { params, capabilities, headers: { 'x-client': 'client-a' } })).json().result
+    const other = await call(app, 'tools/call', {
+      id: 2,
+      capabilities,
+      headers: { 'x-client': 'client-b' },
+      params: { ...params, requestState: first.requestState, inputResponses: { q: { action: 'accept', content: {} } } }
+    })
+    t.assert.strictEqual(other.json().error.code, INVALID_PARAMS)
+    t.assert.match(other.json().error.message, /different principal/)
+  })
+
+  test('an unidentified caller needing input gets a correlated error, not a bare 500', async (t: TestContext) => {
+    const app = Fastify()
+    t.after(() => app.close())
+    await app.register(mcpPlugin, { resolveAuthorizationContext: () => undefined })
+    askingTool(app, { q: elicitForm('Name?', { type: 'object', properties: {} }) })
+    await app.ready()
+
+    const response = await call(app, 'tools/call', {
+      id: 'correlated',
+      params: { name: 'ask', arguments: {} },
+      capabilities: { elicitation: { form: {} } }
+    })
+    t.assert.strictEqual(response.json().id, 'correlated')
+    t.assert.strictEqual(response.json().error.code, INVALID_REQUEST)
+  })
+
+  test('a handler cannot override the resultType envelope', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'sneaky', inputSchema: Type.Object({}) }, async () => ({
+        content: [{ type: 'text', text: 'x' }],
+        resultType: 'input_required'
+      }) as any)
+    })
+    const response = await call(app, 'tools/call', { params: { name: 'sneaky', arguments: {} } })
+    t.assert.strictEqual(response.json().result.resultType, 'complete')
+  })
+
+  test('a failed resources/read is an error, never cacheable content', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddResource({ uriPattern: 'file:///broken' }, async () => {
+        throw new Error('db down')
+      })
+    }, { caching: { resourcesRead: { ttlMs: 60000, cacheScope: 'public' } } })
+
+    const response = await call(app, 'resources/read', { params: { uri: 'file:///broken' } })
+    t.assert.strictEqual(response.json().error.code, INTERNAL_ERROR)
+    t.assert.strictEqual(response.json().result, undefined)
+  })
+
+  test('tools/call arguments must be an object', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'greet', inputSchema: Type.Object({}) }, async () => ({ content: [] }))
+    })
+    for (const args of ['str', ['x'], 5]) {
+      const response = await call(app, 'tools/call', { params: { name: 'greet', arguments: args } })
+      t.assert.strictEqual(response.json().error.code, INVALID_PARAMS, JSON.stringify(args))
+    }
+  })
+
+  test('server/discover does not advertise what this path cannot serve', async (t: TestContext) => {
+    const app = await buildServer(t, undefined, {
+      capabilities: { tools: {}, completions: {}, logging: {} }
+    })
+    const capabilities = (await call(app, 'server/discover')).json().result.capabilities
+    t.assert.strictEqual(capabilities.completions, undefined)
+    t.assert.strictEqual(capabilities.logging, undefined)
+  })
+
+  test('a legacy request never leaks InputRequired state in error data', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => askingTool(app, {
+      q: elicitForm('Name?', { type: 'object', properties: {} })
+    }))
+    const response = await app.inject({
+      method: 'POST',
+      url: '/mcp',
+      payload: { jsonrpc: JSONRPC_VERSION, id: 1, method: 'tools/call', params: { name: 'ask', arguments: {} } }
+    })
+    const body = response.json()
+    t.assert.strictEqual(body.error.code, INTERNAL_ERROR)
+    t.assert.strictEqual(body.error.data, undefined)
+    t.assert.doesNotMatch(response.body, /step/)
+  })
+})
+
+describe('tool output and configuration are validated', () => {
+  const outputSchema = {
+    type: 'object',
+    properties: { n: { type: 'number' } },
+    required: ['n']
+  }
+
+  async function outputServer (t: TestContext, result: Record<string, unknown>, schema: unknown = outputSchema) {
+    return await buildServer(t, (app) => {
+      app.mcpAddTool({
+        name: 'typed',
+        inputSchema: { type: 'object' },
+        outputSchema: schema
+      } as any, async () => result as any)
+    })
+  }
+
+  test('structuredContent that matches outputSchema is returned unchanged', async (t: TestContext) => {
+    const app = await outputServer(t, { content: [], structuredContent: { n: 1, extra: [] } })
+    const result = (await call(app, 'tools/call', { params: { name: 'typed', arguments: {} } })).json().result
+    t.assert.strictEqual(result.isError, undefined)
+    t.assert.deepStrictEqual(result.structuredContent, { n: 1, extra: [] })
+  })
+
+  test('structuredContent that violates outputSchema becomes a tool error', async (t: TestContext) => {
+    for (const result of [
+      { content: [], structuredContent: { n: 'not-a-number' } },
+      { content: [{ type: 'text', text: 'forgot it' }] }
+    ]) {
+      const app = await outputServer(t, result)
+      const response = (await call(app, 'tools/call', { params: { name: 'typed', arguments: {} } })).json().result
+      t.assert.strictEqual(response.isError, true, JSON.stringify(result))
+      t.assert.match(response.content[0].text, /does not match its output schema/)
+      t.assert.strictEqual(response.structuredContent, undefined)
+    }
+  })
+
+  test('TypeBox output schemas are enforced too, and error results are exempt', async (t: TestContext) => {
+    const bad = await outputServer(t, { content: [], structuredContent: { n: 'x' } }, Type.Object({ n: Type.Number() }))
+    t.assert.strictEqual((await call(bad, 'tools/call', { params: { name: 'typed', arguments: {} } })).json().result.isError, true)
+
+    const failed = await outputServer(t, { content: [{ type: 'text', text: 'boom' }], isError: true })
+    const result = (await call(failed, 'tools/call', { params: { name: 'typed', arguments: {} } })).json().result
+    t.assert.strictEqual(result.content[0].text, 'boom')
+  })
+
+  test('caching hints must be a non-negative integer ttl and a known scope', async (t: TestContext) => {
+    for (const hint of [{ ttlMs: 1500.5, cacheScope: 'private' }, { ttlMs: NaN, cacheScope: 'private' },
+      { ttlMs: -1, cacheScope: 'private' }, { ttlMs: 1000, cacheScope: 'shared' }]) {
+      const app = Fastify()
+      t.after(() => app.close())
+      await t.assert.rejects(async () => {
+        await app.register(mcpPlugin, { caching: { toolsList: hint as any } }).ready()
+      }, /caching\.toolsList/)
+    }
+  })
+})
+
 describe('2026-07-28: MRTR retries are not cacheable', () => {
-  test('a retry carrying requestState or inputResponses gets no caching hints', async (t: TestContext) => {
+  test('a retry carrying requestState or inputResponses is marked uncacheable', async (t: TestContext) => {
     const uri = 'file:///doc'
     const app = await buildServer(t, (app) => {
       app.mcpAddResource({ uriPattern: uri }, async (_uri: string, context: any) => {
@@ -730,9 +992,10 @@ describe('2026-07-28: MRTR retries are not cacheable', () => {
     t.assert.strictEqual(retry.resultType, 'complete')
     t.assert.strictEqual(retry.contents[0].text, 'secret')
     // The result depends on inputs outside the cache key, so it MUST NOT be
-    // cached — a `public` hint here would leak it through a shared proxy.
-    t.assert.strictEqual(retry.ttlMs, undefined)
-    t.assert.strictEqual(retry.cacheScope, undefined)
+    // cached — a `public` hint here would leak it through a shared proxy. A
+    // complete result still MUST carry hints, so they say exactly that.
+    t.assert.strictEqual(retry.ttlMs, 0)
+    t.assert.strictEqual(retry.cacheScope, 'private')
   })
 
   test('the same read without MRTR fields still carries its hints', async (t: TestContext) => {

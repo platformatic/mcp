@@ -20,9 +20,10 @@ import type { InputRequests, InputResponses } from '../schema-2026.ts'
 /**
  * Thrown by a handler that cannot finish without more input.
  *
- * `state` is anything the handler needs to resume; it is sealed (HMAC, expiry,
+ * `state` is anything the handler needs to resume; it is signed (HMAC, expiry,
  * principal- and request-bound) before it reaches the client, and handed back
- * as `context.requestState` on the retry.
+ * as `context.requestState` on the retry. It is not encrypted: the client can
+ * read it, so it must not carry secrets.
  */
 export class InputRequired extends Error {
   readonly inputRequests?: InputRequests

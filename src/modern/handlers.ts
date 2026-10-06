@@ -18,6 +18,7 @@ import type {
 } from '../schema.ts'
 import {
   INVALID_PARAMS,
+  INVALID_REQUEST,
   INTERNAL_ERROR,
   METHOD_NOT_FOUND,
   HEADER_MISMATCH,
@@ -75,6 +76,9 @@ export interface CachingConfig {
   resourcesRead: CacheHint
 }
 
+/** The hint for a result that must not be cached at all. */
+const UNCACHEABLE: CacheHint = { ttlMs: 0, cacheScope: 'private' }
+
 export interface ModernDependencies extends HandlerDependencies {
   context: RequestContext
   sealer: RequestStateSealer
@@ -109,7 +113,10 @@ function complete<T extends Record<string, unknown>> (
   body: T,
   serverInfo: Implementation | undefined
 ): Result {
-  const result: Result = { resultType: 'complete', ...body }
+  // `resultType` is the dispatcher's to set: a handler returning its own
+  // would otherwise relabel the result, or forge an `input_required` that
+  // skips the sealed-state path.
+  const result: Result = { ...body, resultType: 'complete' }
   if (serverInfo) {
     result._meta = { ...(result._meta ?? {}), [META_SERVER_INFO]: serverInfo }
   }
@@ -208,31 +215,81 @@ function missingCapability (
 function missingInputCapabilities (
   inputRequests: Record<string, unknown>,
   clientCapabilities: ClientCapabilities
-): Record<string, unknown> | undefined {
-  const missing: Record<string, unknown> = {}
+): Record<string, Record<string, unknown>> | undefined {
+  const missing: Record<string, Record<string, unknown>> = {}
+  const need = (capability: string, sub?: string) => {
+    const entry = missing[capability] ?? (missing[capability] = {})
+    if (sub) entry[sub] = {}
+  }
+
   for (const entry of Object.values(inputRequests)) {
-    const needed = requiredCapabilityFor(entry as { method?: string, params?: { mode?: string } })
+    const needed = requiredCapabilityFor(entry as { method?: string })
     if (!needed) continue
+    const params = (entry as { params?: Record<string, unknown> }).params ?? {}
 
     if (needed === 'elicitation') {
-      // Form and URL mode are declared separately, and URL mode sends the
-      // user out of band — a client that only declared `form` must never be
-      // handed one.
+      // Form and URL mode are declared separately. An empty object is the
+      // backwards-compatible way to declare form mode only, and a request
+      // without `mode` is form mode.
       const declared = clientCapabilities.elicitation
-      const mode = (entry as { params?: { mode?: string } }).params?.mode
       if (declared === undefined) {
-        missing.elicitation = {}
-      } else if (mode === 'url' && declared.url === undefined) {
-        missing.elicitation = { url: {} }
+        need('elicitation')
+      } else if (params.mode === 'url') {
+        if (declared.url === undefined) need('elicitation', 'url')
+      } else if (declared.form === undefined && Object.keys(declared).length > 0) {
+        need('elicitation', 'form')
       }
       continue
     }
 
-    if (clientCapabilities[needed] === undefined) {
-      missing[needed] = {}
+    if (needed === 'sampling') {
+      const declared = clientCapabilities.sampling
+      if (declared === undefined) {
+        need('sampling')
+        continue
+      }
+      if ((params.tools !== undefined || params.toolChoice !== undefined) && declared.tools === undefined) {
+        need('sampling', 'tools')
+      }
+      if (params.includeContext !== undefined && params.includeContext !== 'none' && declared.context === undefined) {
+        need('sampling', 'context')
+      }
+      continue
     }
+
+    if (clientCapabilities[needed] === undefined) need(needed)
   }
   return Object.keys(missing).length > 0 ? missing : undefined
+}
+
+/**
+ * What is wrong with the `inputRequests` a handler produced, or `undefined`.
+ *
+ * Each entry must be an elicitation, sampling or roots request, and a URL-mode
+ * elicitation must carry a valid URL. Anything else is a bug in the handler,
+ * never something to forward to the client.
+ */
+function invalidInputRequests (inputRequests: Record<string, unknown>): string | undefined {
+  for (const [key, entry] of Object.entries(inputRequests)) {
+    if (!requiredCapabilityFor(entry as { method?: string })) {
+      return `input request '${key}' has unsupported method '${(entry as { method?: unknown })?.method}'`
+    }
+    const params = (entry as { params?: { mode?: unknown, url?: unknown } }).params
+    if (params?.mode === 'url' && (typeof params.url !== 'string' || !URL.canParse(params.url))) {
+      return `input request '${key}' has an invalid URL`
+    }
+  }
+  return undefined
+}
+
+/**
+ * The identity sealed state is bound to: the user, and the OAuth client and
+ * issuer they came through, so state cannot move between clients or issuers
+ * that happen to share a subject.
+ */
+function principalOf (authContext: ModernDependencies['authContext']): string | undefined {
+  if (authContext?.userId === undefined) return undefined
+  return JSON.stringify([authContext.userId, authContext.clientId ?? null, authContext.authorizationServer ?? null])
 }
 
 /**
@@ -249,19 +306,35 @@ function inputRequired (
   const { context, sealer, serverInfo, authContext } = dependencies
 
   if (thrown.inputRequests) {
+    const invalid = invalidInputRequests(thrown.inputRequests)
+    if (invalid) {
+      dependencies.app.log.error({ method: request.method, reason: invalid }, 'Handler produced invalid input requests')
+      return createError(request.id, INTERNAL_ERROR, 'Internal server error')
+    }
     const missing = missingInputCapabilities(thrown.inputRequests, context.clientCapabilities)
     if (missing) return missingCapability(request.id, missing)
+  }
+
+  let requestState: string
+  try {
+    requestState = sealer.seal({
+      principal: principalOf(authContext),
+      method: request.method,
+      params: request.params,
+      payload: thrown.state ?? null,
+      inputKeys: Object.keys(thrown.inputRequests ?? {})
+    })
+  } catch (error) {
+    // Sealing refuses an unidentified caller when the deployment identifies
+    // callers. Answer this request rather than escaping to a bare 500.
+    dependencies.app.log.warn({ err: error, method: request.method }, 'Could not seal request state')
+    return createError(request.id, INVALID_REQUEST, 'This request needs additional input, which requires an authenticated caller')
   }
 
   const result: InputRequiredResult = {
     resultType: 'input_required',
     ...(thrown.inputRequests ? { inputRequests: thrown.inputRequests } : {}),
-    requestState: sealer.seal({
-      principal: authContext?.userId,
-      method: request.method,
-      params: request.params,
-      payload: thrown.state ?? null
-    })
+    requestState
   }
 
   if (serverInfo) {
@@ -281,7 +354,7 @@ function inputRequired (
 function openRequestState (
   request: JSONRPCRequest,
   dependencies: ModernDependencies
-): { ok: true, payload: unknown } | { ok: false, error: JSONRPCError } {
+): { ok: true, payload: unknown, inputKeys?: string[] } | { ok: false, error: JSONRPCError } {
   const state = (request.params as { requestState?: unknown } | undefined)?.requestState
   if (state === undefined) return { ok: true, payload: undefined }
 
@@ -290,7 +363,7 @@ function openRequestState (
   }
 
   const opened = dependencies.sealer.open(state, {
-    principal: dependencies.authContext?.userId,
+    principal: principalOf(dependencies.authContext),
     method: request.method,
     params: request.params
   })
@@ -300,7 +373,7 @@ function openRequestState (
     return { ok: false, error: createError(request.id, INVALID_PARAMS, `Invalid "requestState": ${opened.reason}`) }
   }
 
-  return { ok: true, payload: opened.claims.payload }
+  return { ok: true, payload: opened.claims.payload, inputKeys: opened.claims.inputKeys ?? [] }
 }
 
 /**
@@ -308,21 +381,39 @@ function openRequestState (
  *
  * `inputResponses` comes off the JSON-RPC params, not the HTTP request — the
  * two are easy to confuse here because `dependencies.request` is the Fastify
- * one.
+ * one. Only answers to keys the server actually asked for, as recorded in the
+ * sealed state, reach the handler; anything else is information the server
+ * does not recognise and ignores.
  */
 function withMrtrContext (
   request: JSONRPCRequest,
   dependencies: ModernDependencies,
-  payload: unknown
+  opened: { payload: unknown, inputKeys?: string[] }
 ): ModernDependencies {
   const params = request.params as { inputResponses?: Record<string, unknown> } | undefined
+  const asked = new Set(opened.inputKeys ?? [])
+  const inputResponses = params?.inputResponses === undefined
+    ? undefined
+    : Object.fromEntries(Object.entries(params.inputResponses).filter(([key]) => asked.has(key)))
+
   return {
     ...dependencies,
+    strictErrors: true,
     mrtr: {
-      inputResponses: params?.inputResponses,
-      requestState: payload
+      inputResponses,
+      requestState: opened.payload
     }
   }
+}
+
+/** Is `inputResponses`, when present, an object as `InputResponses` requires? */
+function invalidInputResponses (params: unknown): string | undefined {
+  const value = (params as { inputResponses?: unknown } | undefined)?.inputResponses
+  if (value === undefined) return undefined
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return 'Invalid "inputResponses": expected an object'
+  }
+  return undefined
 }
 
 /* ------------------------------------------------------------------ */
@@ -670,6 +761,15 @@ async function runAsTask (
             break
           }
 
+          const invalid = invalidInputRequests(error.inputRequests)
+          if (invalid) {
+            app.log.error({ taskId: record.taskId, reason: invalid }, 'Task handler produced invalid input requests')
+            status = 'failed'
+            statusMessage = 'Internal server error'
+            outcome = createError(request.id, INTERNAL_ERROR, statusMessage)
+            break
+          }
+
           // Parking a request the client cannot answer would only leave the
           // task stuck in `input_required` until it expires.
           const missing = missingInputCapabilities(error.inputRequests, dependencies.context.clientCapabilities)
@@ -763,10 +863,13 @@ async function modernToolsCall (
     return createError(request.id, INVALID_PARAMS, 'Invalid tool call parameters: "name" is required')
   }
 
+  if (params.arguments !== undefined &&
+      (!params.arguments || typeof params.arguments !== 'object' || Array.isArray(params.arguments))) {
+    return createError(request.id, INVALID_PARAMS, 'Invalid tool call parameters: "arguments" must be an object')
+  }
+
   const startedAt = performance.now()
-  const args = params.arguments && typeof params.arguments === 'object' && !Array.isArray(params.arguments)
-    ? params.arguments as Record<string, unknown>
-    : {}
+  const args = (params.arguments ?? {}) as Record<string, unknown>
 
   // Resolve through the shared authorization gate. Denied and unknown tools
   // are deliberately indistinguishable so authorization cannot leak names.
@@ -860,6 +963,11 @@ export function buildServerCapabilities (
   // The 2025-11-25 core `tasks` capability has no meaning in this revision;
   // support is advertised as an extension instead.
   delete (capabilities as Record<string, unknown>).tasks
+  // Nothing on this path answers `completion/complete` or emits
+  // `notifications/message`, so advertising either would be a promise the
+  // server cannot keep.
+  delete (capabilities as Record<string, unknown>).completions
+  delete (capabilities as Record<string, unknown>).logging
 
   if (options.enableTasks) {
     capabilities.extensions = { ...capabilities.extensions, [TASKS_EXTENSION]: {} }
@@ -926,17 +1034,19 @@ export async function dispatchModern (
     )
   }
 
+  const invalidResponses = invalidInputResponses(request.params)
+  if (invalidResponses) return createError(request.id, INVALID_PARAMS, invalidResponses)
+
   const opened = openRequestState(request, dependencies)
   if (!opened.ok) return opened.error
-  const scoped = withMrtrContext(request, dependencies, opened.payload)
+  const scoped = withMrtrContext(request, dependencies, opened)
 
   // A result produced from `inputResponses`/`requestState` depends on inputs
-  // that are not part of the cache key, so it must not carry freshness hints
-  // at all — a `public` hint here would let a shared proxy serve one user's
-  // answer to another.
-  const cacheable = !isMrtrRetry(request)
-  const hint = (which: keyof CachingConfig): CacheHint | undefined =>
-    cacheable ? scoped.caching[which] : undefined
+  // that are not part of the cache key, so it must not be cached. Complete
+  // results still must carry hints, so a retry says exactly that: stale at
+  // once and never shared.
+  const hint = (which: keyof CachingConfig): CacheHint =>
+    isMrtrRetry(request) ? UNCACHEABLE : scoped.caching[which]
 
   try {
     switch (request.method) {

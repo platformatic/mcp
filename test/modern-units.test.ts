@@ -214,7 +214,7 @@ describe('request state sealing', () => {
   const base = { method: 'tools/call', params: { name: 'greet', arguments: { a: 1 } } }
 
   test('a sealed state round-trips its payload', (t: TestContext) => {
-    const sealer = new RequestStateSealer({ secret: 'shared' })
+    const sealer = new RequestStateSealer({ secret: 'shared'.padEnd(32, '-') })
     const state = sealer.seal({ ...base, payload: { step: 2 } })
 
     const opened = sealer.open(state, base)
@@ -222,16 +222,33 @@ describe('request state sealing', () => {
     t.assert.deepStrictEqual(opened.ok && opened.claims.payload, { step: 2 })
   })
 
+  test('an empty or short configured secret is refused, not replaced', (t: TestContext) => {
+    // An unset environment variable expanded to '' must not silently become a
+    // per-process key that no other instance can verify.
+    t.assert.throws(() => new RequestStateSealer({ secret: '' }), /at least 32 bytes/)
+    t.assert.throws(() => new RequestStateSealer({ secret: 'a' }), /at least 32 bytes/)
+    t.assert.doesNotThrow(() => new RequestStateSealer({ secret: 'x'.repeat(32) }))
+    t.assert.doesNotThrow(() => new RequestStateSealer())
+  })
+
+  test('the sealed state records which input keys were asked for', (t: TestContext) => {
+    const sealer = new RequestStateSealer()
+    const state = sealer.seal({ ...base, inputKeys: ['a', 'b'] })
+    const opened = sealer.open(state, base)
+    t.assert.ok(opened.ok)
+    if (opened.ok) t.assert.deepStrictEqual(opened.claims.inputKeys, ['a', 'b'])
+  })
+
   test('a different secret cannot open it', (t: TestContext) => {
-    const state = new RequestStateSealer({ secret: 'one' }).seal(base)
-    const opened = new RequestStateSealer({ secret: 'two' }).open(state, base)
+    const state = new RequestStateSealer({ secret: 'one'.padEnd(32, '-') }).seal(base)
+    const opened = new RequestStateSealer({ secret: 'two'.padEnd(32, '-') }).open(state, base)
 
     t.assert.strictEqual(opened.ok, false)
     t.assert.match(opened.ok === false ? opened.reason : '', /integrity/)
   })
 
   test('an expired state is refused', (t: TestContext) => {
-    const sealer = new RequestStateSealer({ secret: 's', ttlMs: 1000 })
+    const sealer = new RequestStateSealer({ secret: 's'.padEnd(32, '-'), ttlMs: 1000 })
     const state = sealer.seal(base)
 
     const opened = sealer.open(state, { ...base, now: Date.now() + 5000 })
@@ -240,7 +257,7 @@ describe('request state sealing', () => {
   })
 
   test('state is bound to the principal it was issued to', (t: TestContext) => {
-    const sealer = new RequestStateSealer({ secret: 's' })
+    const sealer = new RequestStateSealer({ secret: 's'.padEnd(32, '-') })
     const state = sealer.seal({ ...base, principal: 'alice' })
 
     t.assert.strictEqual(sealer.open(state, { ...base, principal: 'bob' }).ok, false)
@@ -248,7 +265,7 @@ describe('request state sealing', () => {
   })
 
   test('state is bound to the request that produced it', (t: TestContext) => {
-    const sealer = new RequestStateSealer({ secret: 's' })
+    const sealer = new RequestStateSealer({ secret: 's'.padEnd(32, '-') })
     const state = sealer.seal(base)
 
     const other = { method: 'tools/call', params: { name: 'greet', arguments: { a: 2 } } }

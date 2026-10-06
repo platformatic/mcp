@@ -149,13 +149,26 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
   // defaults to "immediately stale, never shared" — correct for every server,
   // and something deployments opt out of knowingly.
   const noCache: CacheHint = { ttlMs: 0, cacheScope: 'private' }
+  const hintFor = (which: keyof CachingConfig): CacheHint => {
+    const hint = opts.caching?.[which]
+    if (hint === undefined) return noCache
+    // `ttlMs` goes on the wire as a non-negative integer; NaN would serialize
+    // as null and a fraction is not a valid value.
+    if (!Number.isSafeInteger(hint.ttlMs) || hint.ttlMs < 0) {
+      throw new Error(`caching.${which}.ttlMs must be a non-negative integer`)
+    }
+    if (hint.cacheScope !== 'public' && hint.cacheScope !== 'private') {
+      throw new Error(`caching.${which}.cacheScope must be "public" or "private"`)
+    }
+    return hint
+  }
   const caching: CachingConfig = {
-    discover: opts.caching?.discover ?? noCache,
-    toolsList: opts.caching?.toolsList ?? noCache,
-    promptsList: opts.caching?.promptsList ?? noCache,
-    resourcesList: opts.caching?.resourcesList ?? noCache,
-    resourceTemplatesList: opts.caching?.resourceTemplatesList ?? noCache,
-    resourcesRead: opts.caching?.resourcesRead ?? noCache
+    discover: hintFor('discover'),
+    toolsList: hintFor('toolsList'),
+    promptsList: hintFor('promptsList'),
+    resourcesList: hintFor('resourcesList'),
+    resourceTemplatesList: hintFor('resourceTemplatesList'),
+    resourcesRead: hintFor('resourcesRead')
   }
 
   const sealer = new RequestStateSealer({
@@ -168,7 +181,7 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     requirePrincipal: opts.authorization?.enabled === true || opts.resolveAuthorizationContext !== undefined
   })
 
-  if (!opts.requestStateSecret) {
+  if (opts.requestStateSecret === undefined) {
     app.log.debug('MCP: no requestStateSecret configured; multi round-trip retries will only verify on the instance that issued them')
   }
 

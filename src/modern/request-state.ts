@@ -25,6 +25,11 @@ export interface RequestStateClaims {
   expiresAt: number
   /** Whatever the server needs to resume, opaque to us. */
   payload: unknown
+  /**
+   * The `inputRequests` keys the server asked for. Only those are handed to
+   * the handler on the retry; anything else the client sends is ignored.
+   */
+  inputKeys?: string[]
 }
 
 export type VerifyResult =
@@ -32,6 +37,15 @@ export type VerifyResult =
   | { ok: false, reason: string }
 
 const DEFAULT_TTL_MS = 5 * 60 * 1000
+
+/** HMAC-SHA256 keys shorter than its output weaken it. */
+export const MIN_SECRET_BYTES = 32
+
+/**
+ * Prefixed to everything signed, so a signature over request state can never
+ * be confused with one the same secret makes over anything else.
+ */
+const SIGNATURE_DOMAIN = '@platformatic/mcp:requestState:v1\0'
 
 /**
  * Digest the parameters that identify a request, so state minted for one call
@@ -77,9 +91,18 @@ export class RequestStateSealer {
   #requirePrincipal: boolean
 
   constructor (options: { secret?: string | Buffer, ttlMs?: number, requirePrincipal?: boolean } = {}) {
-    this.#secret = options.secret
-      ? Buffer.isBuffer(options.secret) ? options.secret : Buffer.from(options.secret, 'utf8')
-      : randomBytes(32)
+    if (options.secret === undefined) {
+      this.#secret = randomBytes(MIN_SECRET_BYTES)
+    } else {
+      // A configured but empty secret (say, an unset environment variable
+      // expanded to '') must not silently fall back to a per-process key:
+      // retries would then fail on every other instance.
+      const secret = Buffer.isBuffer(options.secret) ? options.secret : Buffer.from(options.secret, 'utf8')
+      if (secret.length < MIN_SECRET_BYTES) {
+        throw new Error(`requestStateSecret must be at least ${MIN_SECRET_BYTES} bytes`)
+      }
+      this.#secret = secret
+    }
     this.#ttlMs = options.ttlMs ?? DEFAULT_TTL_MS
     this.#requirePrincipal = options.requirePrincipal ?? false
   }
@@ -90,6 +113,7 @@ export class RequestStateSealer {
     method: string
     params: unknown
     payload?: unknown
+    inputKeys?: string[]
     ttlMs?: number
   }): string {
     if (this.#requirePrincipal && input.principal === undefined) {
@@ -104,7 +128,8 @@ export class RequestStateSealer {
       method: input.method,
       requestDigest: digestRequest(input.method, input.params),
       expiresAt: Date.now() + (input.ttlMs ?? this.#ttlMs),
-      payload: input.payload ?? null
+      payload: input.payload ?? null,
+      ...(input.inputKeys ? { inputKeys: input.inputKeys } : {})
     }
 
     const body = Buffer.from(JSON.stringify(claims), 'utf8').toString('base64url')
@@ -167,7 +192,7 @@ export class RequestStateSealer {
   }
 
   #sign (body: string): string {
-    return createHmac('sha256', this.#secret).update(body).digest('base64url')
+    return createHmac('sha256', this.#secret).update(SIGNATURE_DOMAIN).update(body).digest('base64url')
   }
 
   #verify (body: string, signature: string): boolean {

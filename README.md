@@ -383,7 +383,8 @@ app.mcpAddTool({
           required: ['name']
         })
       },
-      // Anything the handler needs to resume. Sealed before it reaches the client.
+      // Anything the handler needs to resume. It is signed, not encrypted: the
+      // client cannot change it, but can read it, so keep secrets out of it.
       state: { title: args.title }
     })
   }
@@ -2801,7 +2802,8 @@ Existing deployments keep working: the handshake path is untouched, and clients 
    `context.inputResponses` on the retry — see
    [Multi Round-Trip Requests](#multi-round-trip-requests-2026-07-28).
 2. **Set `requestStateSecret`** if more than one instance can serve a retry. Without it each
-   process seals with its own random key and a retry landing elsewhere is refused.
+   process seals with its own random key and a retry landing elsewhere is refused. The
+   secret must be at least 32 bytes; a shorter or empty one is rejected at startup.
 3. **Decide your caching hints.** The default of `ttlMs: 0` is safe but means clients never
    cache. See [Result Caching](#result-caching-2026-07-28).
 4. **Sessions do not exist for modern clients.** `context.sessionId` is `undefined` on that

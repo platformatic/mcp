@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify'
 import createFastifyError from 'fastify-error'
+import type { TSchema } from '@sinclair/typebox'
 import type {
   JSONRPCMessage,
   JSONRPCRequest,
@@ -58,6 +59,7 @@ import {
 } from './protocol-version.ts'
 import { validate, CallToolRequestSchema, ReadResourceRequestSchema, GetPromptRequestSchema, isTypeBoxSchema } from './validation/index.ts'
 import type { JsonSchemaValidator } from './validation/json-schema-validator.ts'
+import { createJsonSchemaValidator } from './validation/json-schema-validator.ts'
 import { sanitizeToolParams, assessToolSecurity } from './security.ts'
 import { MCP_ATTR, type SpanAttributeValue } from './telemetry-constants.ts'
 
@@ -100,6 +102,12 @@ export type HandlerDependencies = {
   }
   /** Wakes task executions when `tasks/update` delivers their input. */
   taskInputs?: TaskInputChannel
+  /**
+   * Report failures as JSON-RPC errors rather than as successful content.
+   * Set on the 2026-07-28 path, where a successful `resources/read` carries
+   * caching hints and an error must never be cached as the resource.
+   */
+  strictErrors?: boolean
 }
 
 export type ToolCallDependencies = Pick<HandlerDependencies,
@@ -561,7 +569,71 @@ export async function executeToolCall (
   return toolCallOutcomeToJsonRpc(request.id, toolName, outcome)
 }
 
+/**
+ * Validates tool output. Unlike the input validator it must never change what
+ * it checks: the result goes to the client exactly as the tool produced it.
+ */
+let outputValidator: JsonSchemaValidator | undefined
+function getOutputValidator (): JsonSchemaValidator {
+  outputValidator ??= createJsonSchemaValidator({
+    coerceTypes: false,
+    useDefaults: false,
+    removeAdditional: false
+  })
+  return outputValidator
+}
+
+/**
+ * Hold a successful result to the tool's `outputSchema`: when one is declared,
+ * the server MUST provide structured content that conforms to it. A result
+ * that does not is the tool's bug, reported as a tool error rather than handed
+ * to a client that may trust the schema. Error results are exempt.
+ */
+function conformToOutputSchema (
+  tool: MCPTool,
+  toolName: string,
+  outcome: McpCallToolOutcome,
+  dependencies: ToolCallDependencies
+): McpCallToolOutcome {
+  const schema = (tool.definition as { outputSchema?: unknown }).outputSchema
+  if (!outcome.ok || schema === undefined || outcome.result.isError) return outcome
+
+  const structured = outcome.result.structuredContent
+  let problem: string | null = null
+  if (structured === undefined) {
+    problem = 'missing structuredContent'
+  } else if (isTypeBoxSchema(schema)) {
+    const checked = validate(schema as TSchema, structuredClone(structured))
+    if (!checked.success) problem = checked.error.message
+  } else {
+    try {
+      problem = getOutputValidator().validate(schema as Record<string, unknown>, structuredClone(structured))
+    } catch (error) {
+      problem = `output schema cannot be compiled: ${error instanceof Error ? error.message : String(error)}`
+    }
+  }
+  if (problem === null) return outcome
+
+  dependencies.app.log.error({ tool: toolName, problem }, 'Tool result does not conform to its outputSchema')
+  return {
+    ok: true,
+    result: {
+      content: [{ type: 'text', text: `Tool '${toolName}' returned a result that does not match its output schema` }],
+      isError: true
+    }
+  }
+}
+
 async function executeRegisteredTool (
+  tool: MCPTool,
+  toolName: string,
+  args: Record<string, unknown>,
+  dependencies: ToolCallDependencies
+): Promise<McpCallToolOutcome> {
+  return conformToOutputSchema(tool, toolName, await runRegisteredTool(tool, toolName, args, dependencies), dependencies)
+}
+
+async function runRegisteredTool (
   tool: MCPTool,
   toolName: string,
   args: Record<string, unknown>,
@@ -718,6 +790,9 @@ export async function handleResourcesRead (
   }
 
   if (!resource.handler) {
+    if (dependencies.strictErrors) {
+      return createError(request.id, INTERNAL_ERROR, `Resource '${uri}' has no handler implementation`)
+    }
     const result: ReadResourceResult = {
       contents: [{
         uri,
@@ -735,6 +810,9 @@ export async function handleResourcesRead (
       // TypeBox schema - use our validation
       const uriValidation = validate(schema, uri)
       if (!uriValidation.success) {
+        if (dependencies.strictErrors) {
+          return createError(request.id, INVALID_PARAMS, `Invalid resource URI: ${uriValidation.error.message}`)
+        }
         const result: ReadResourceResult = {
           contents: [{
             uri,
@@ -752,6 +830,10 @@ export async function handleResourcesRead (
     return createResponse(request.id, result)
   } catch (error: any) {
     rethrowIfInputRequired(error)
+    if (dependencies.strictErrors) {
+      dependencies.app.log.error({ err: error, uri }, 'Resource read failed')
+      return createError(request.id, INTERNAL_ERROR, `Resource read failed: ${error.message || error}`)
+    }
     const result: ReadResourceResult = {
       contents: [{
         uri,
@@ -1498,7 +1580,17 @@ export async function handleRequest (
       }
     })
   } catch (error) {
-    return createError(request.id, INTERNAL_ERROR, 'Internal server error', error)
+    // Never serialize the thrown value: an `InputRequired` carries the
+    // handler's private state, and any other error may carry internals.
+    if (error instanceof InputRequired) {
+      return createError(
+        request.id,
+        INTERNAL_ERROR,
+        'This request needs additional client input, which requires protocol version 2026-07-28'
+      )
+    }
+    app.log.error({ err: error, method: request.method }, 'Unhandled error in MCP request')
+    return createError(request.id, INTERNAL_ERROR, 'Internal server error')
   }
 }
 
