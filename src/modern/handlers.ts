@@ -451,15 +451,12 @@ async function handleTasksUpdate (
     const keys = Object.keys(responses)
     dependencies.app.log.debug({ taskId: params.taskId, keys, deliveryId }, 'Publishing task input responses')
 
-    // Publish the durable values, then acknowledge the outbox. Under the broker
-    // contract, successful publication is confirmation that the intended
-    // consumer accepted delivery. A failure retains the original values and
-    // delivery id for an identical retry; receivers deduplicate that retry.
+    // Publish the durable values but leave them in the outbox: the broker
+    // accepting a message does not mean the waiting worker received it. The
+    // worker acknowledges once it has the answers, and reads the outbox itself
+    // if a publication goes missing. A retry republishes with the same
+    // delivery id, which receivers deduplicate.
     await dependencies.taskInputs?.publish(params.taskId, responses, deliveryId)
-    await dependencies.taskStore!.acknowledgeInputResponses(
-      params.taskId,
-      Object.fromEntries(keys.map(key => [key, deliveryId]))
-    )
   }
 
   return createResponse(request.id, complete({}, dependencies.serverInfo))
@@ -509,6 +506,97 @@ async function handleTasksCancel (
   return createResponse(request.id, complete({}, dependencies.serverInfo))
 }
 
+/** What a task's handler resumes with after an input round. */
+interface TaskResume {
+  inputResponses: Record<string, unknown>
+  requestState: unknown
+}
+
+/**
+ * Wait for the answers to a parked task's current input round.
+ *
+ * The broker is the fast path, but a resolved publication only means the
+ * broker took the message: it can still be lost on the way here, say while this
+ * instance's subscriber is reconnecting. `tasks/update` therefore leaves the
+ * answers in the task store's outbox, and this reads that outbox every poll
+ * interval as well. Whichever source supplies them, the outbox entries are
+ * acknowledged only once they are in hand.
+ */
+async function awaitTaskInput (
+  taskId: string,
+  timeoutMs: number,
+  dependencies: ModernDependencies
+): Promise<Record<string, unknown>> {
+  const taskStore = dependencies.taskStore!
+  const taskInputs = dependencies.taskInputs!
+  const settled = new AbortController()
+  const signal = AbortSignal.any([AbortSignal.timeout(timeoutMs), settled.signal])
+
+  let timer: NodeJS.Timeout | undefined
+  const fromOutbox = new Promise<Record<string, unknown>>((resolve, reject) => {
+    const check = async () => {
+      try {
+        const pending = currentRoundResponses(await taskStore.get(taskId))
+        if (pending) {
+          // A late broker copy of these must not reach a later round.
+          for (const deliveryId of new Set(Object.values(pending.ids))) {
+            taskInputs.markConsumed(taskId, deliveryId)
+          }
+          resolve(pending.responses)
+          return
+        }
+      } catch (error) {
+        dependencies.app.log.debug({ err: error, taskId }, 'Could not read the task input outbox')
+      }
+      if (!signal.aborted) timer = setTimeout(check, DEFAULT_POLL_INTERVAL_MS)
+    }
+    timer = setTimeout(check, DEFAULT_POLL_INTERVAL_MS)
+    signal.addEventListener('abort', () => {
+      clearTimeout(timer)
+      reject(new Error('aborted'))
+    }, { once: true })
+  })
+
+  let responses: Record<string, unknown>
+  try {
+    responses = await Promise.race([taskInputs.wait(taskId, signal), fromOutbox])
+  } finally {
+    settled.abort()
+  }
+
+  try {
+    const ids = currentRoundResponses(await taskStore.get(taskId))?.ids ?? {}
+    const received = Object.fromEntries(Object.keys(responses)
+      .filter(key => ids[key] !== undefined)
+      .map(key => [key, ids[key]]))
+    await taskStore.acknowledgeInputResponses(taskId, received)
+  } catch (error) {
+    // The entries stay in the outbox, scoped to a round that is now over.
+    dependencies.app.log.debug({ err: error, taskId }, 'Could not acknowledge task input responses')
+  }
+
+  return responses
+}
+
+/** The outbox entries answering the task's current input round, if any. */
+function currentRoundResponses (
+  task: TaskRecord | null
+): { responses: Record<string, unknown>, ids: Record<string, string> } | undefined {
+  if (!task?.pendingInputResponses) return undefined
+
+  const round = task.inputRequestRound ?? 0
+  const responses: Record<string, unknown> = {}
+  const ids: Record<string, string> = {}
+  for (const [key, value] of Object.entries(task.pendingInputResponses)) {
+    const id = task.pendingInputResponseIds?.[key]
+    if (id === undefined) continue
+    if ((task.pendingInputResponseRounds?.[key] ?? round) !== round) continue
+    responses[key] = value
+    ids[key] = id
+  }
+  return Object.keys(responses).length > 0 ? { responses, ids } : undefined
+}
+
 /**
  * Run a tool call as a task and answer immediately with a `CreateTaskResult`.
  *
@@ -517,7 +605,7 @@ async function handleTasksCancel (
  */
 async function runAsTask (
   request: JSONRPCRequest,
-  execute: (inputResponses?: Record<string, unknown>) => Promise<JSONRPCResponse | JSONRPCError>,
+  execute: (resume?: TaskResume) => Promise<JSONRPCResponse | JSONRPCError>,
   dependencies: ModernDependencies
 ): Promise<JSONRPCResponse | JSONRPCError> {
   const { taskStore, taskWaiters, taskInputs, app, opts } = dependencies
@@ -547,12 +635,15 @@ async function runAsTask (
     // Answers gathered so far. A handler may ask more than once, so responses
     // accumulate across rounds rather than replacing each other.
     let gathered: Record<string, unknown> | undefined
+    // What the handler saved in `InputRequired.state` before its last round,
+    // handed back as `context.requestState` exactly as an MRTR retry would.
+    let state: unknown
 
     // Bound the number of rounds: a handler that asks for the same thing
     // forever would otherwise pin the task until its ttl elapses.
     for (let round = 0; round <= MAX_TASK_INPUT_ROUNDS; round++) {
       try {
-        const response = await execute(gathered)
+        const response = await execute(gathered && { inputResponses: gathered, requestState: state })
         outcome = response
         if ('error' in response) {
           status = 'failed'
@@ -601,8 +692,9 @@ async function runAsTask (
             })
             if (parked) taskWaiters?.notify(parked)
 
-            const responses = await taskInputs.wait(record.taskId, AbortSignal.timeout(remaining))
+            const responses = await awaitTaskInput(record.taskId, remaining, dependencies)
             gathered = { ...(gathered ?? {}), ...responses }
+            state = error.state
 
             await taskStore!.updateStatus(record.taskId, 'working')
             continue
@@ -716,18 +808,17 @@ async function modernToolsCall (
   }
 
   const run = (
-    inputResponses: Record<string, unknown> | undefined,
+    resume: TaskResume | undefined,
     observation: { source: 'json-rpc' | 'task', startedAt: number }
   ) => executeToolCall(
     request,
     tool,
     { name: params.name as string, arguments: params.arguments as Record<string, unknown> | undefined },
     undefined,
-    // On a task's later rounds the answers come from `tasks/update`, not from
-    // the original request, so the handler context is rebuilt around them.
-    inputResponses
-      ? { ...dependencies, mrtr: { ...dependencies.mrtr, inputResponses } }
-      : dependencies,
+    // On a task's later rounds the answers come from `tasks/update` and the
+    // state from the handler's last `InputRequired`, not from the original
+    // request, so the handler context is rebuilt around them.
+    resume ? { ...dependencies, mrtr: resume } : dependencies,
     observation
   )
 
@@ -736,7 +827,7 @@ async function modernToolsCall (
   if (tasksAvailable && clientHasTasks && taskSupport !== 'forbidden') {
     return await runAsTask(
       request,
-      inputResponses => run(inputResponses, { source: 'task', startedAt: performance.now() }),
+      resume => run(resume, { source: 'task', startedAt: performance.now() }),
       dependencies
     )
   }

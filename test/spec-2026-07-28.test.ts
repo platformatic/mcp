@@ -24,6 +24,8 @@ import {
 } from '../src/schema-2026.ts'
 import { InputRequired, elicitForm, elicitUrl } from '../src/modern/input-required.ts'
 import { encodeHeaderValue } from '../src/modern/headers.ts'
+import { TASK_INPUT_TOPIC } from '../src/modern/task-inputs.ts'
+import { MemoryMessageBroker } from '../src/brokers/memory-message-broker.ts'
 import type { ClientCapabilities } from '../src/schema-2026.ts'
 
 /* ------------------------------------------------------------------ */
@@ -1298,6 +1300,115 @@ describe('2026-07-28: tasks extension', () => {
     t.assert.strictEqual(timeouts.length, 2)
     t.assert.ok(timeouts[0] <= ttl)
     t.assert.ok(timeouts[1] <= ttl - elapsed, `second round waited ${timeouts[1]}ms, past the task expiry`)
+  })
+
+  test('a resumed task gets back the state it saved before asking for input', async (t: TestContext) => {
+    const seen: unknown[] = []
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({
+        name: 'stateful',
+        inputSchema: Type.Object({}),
+        execution: { taskSupport: 'required' }
+      } as any, async (_args: any, context: any) => {
+        seen.push(context.requestState)
+        if (!context.inputResponses?.ok) {
+          throw new InputRequired({
+            inputRequests: { ok: elicitForm('Confirm?', { type: 'object', properties: {} }) },
+            state: { step: 2, cart: [] }
+          })
+        }
+        return { content: [{ type: 'text', text: 'done' }] }
+      })
+    }, { enableTasks: true })
+    const capabilities: ClientCapabilities = {
+      extensions: { [TASKS_EXTENSION]: {} },
+      elicitation: { form: {} }
+    }
+
+    const created = (await call(app, 'tools/call', {
+      params: { name: 'stateful', arguments: {} },
+      capabilities
+    })).json().result
+
+    let task: any
+    for (let attempt = 0; attempt < 40; attempt++) {
+      task = (await call(app, 'tasks/get', { params: { taskId: created.taskId }, capabilities })).json().result
+      if (task.status === 'input_required') break
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+    await call(app, 'tasks/update', {
+      params: { taskId: created.taskId, inputResponses: { ok: { action: 'accept', content: {} } } },
+      capabilities
+    })
+    for (let attempt = 0; attempt < 40; attempt++) {
+      task = (await call(app, 'tasks/get', { params: { taskId: created.taskId }, capabilities })).json().result
+      if (task.status === 'completed') break
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+
+    t.assert.strictEqual(task.status, 'completed')
+    t.assert.deepStrictEqual(seen, [undefined, { step: 2, cart: [] }])
+  })
+
+  test('task input survives a broker publication that never reaches the worker', async (t: TestContext) => {
+    // The broker accepts the first publication but drops it, as it would if
+    // the owning instance's subscriber were reconnecting.
+    const originalPublish = MemoryMessageBroker.prototype.publish
+    let dropped = 0
+    t.mock.method(MemoryMessageBroker.prototype, 'publish', async function (this: MemoryMessageBroker, topic: string, message: any) {
+      if (topic === TASK_INPUT_TOPIC && dropped === 0) {
+        dropped++
+        return
+      }
+      return await originalPublish.call(this, topic, message)
+    })
+
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({
+        name: 'confirm',
+        inputSchema: Type.Object({}),
+        execution: { taskSupport: 'required' }
+      } as any, async (_args: any, context: any) => {
+        if (!context.inputResponses?.ok) {
+          throw new InputRequired({
+            inputRequests: { ok: elicitForm('Confirm?', { type: 'object', properties: {} }) }
+          })
+        }
+        return { content: [{ type: 'text', text: 'confirmed' }] }
+      })
+    }, { enableTasks: true })
+    const capabilities: ClientCapabilities = {
+      extensions: { [TASKS_EXTENSION]: {} },
+      elicitation: { form: {} }
+    }
+
+    const created = (await call(app, 'tools/call', {
+      params: { name: 'confirm', arguments: {} },
+      capabilities
+    })).json().result
+
+    let task: any
+    for (let attempt = 0; attempt < 40; attempt++) {
+      task = (await call(app, 'tasks/get', { params: { taskId: created.taskId }, capabilities })).json().result
+      if (task.status === 'input_required') break
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+
+    const updated = await call(app, 'tasks/update', {
+      params: { taskId: created.taskId, inputResponses: { ok: { action: 'accept', content: {} } } },
+      capabilities
+    })
+    t.assert.strictEqual(updated.json().result.resultType, 'complete')
+    t.assert.strictEqual(dropped, 1)
+
+    // No client retry: the worker finds the answer in the task store.
+    for (let attempt = 0; attempt < 60; attempt++) {
+      task = (await call(app, 'tasks/get', { params: { taskId: created.taskId }, capabilities })).json().result
+      if (task.status === 'completed') break
+      await new Promise(resolve => setTimeout(resolve, 50))
+    }
+    t.assert.strictEqual(task.status, 'completed')
+    t.assert.strictEqual(task.result.content[0].text, 'confirmed')
   })
 
   test('tasks/* are absent when tasks are not enabled', async (t: TestContext) => {

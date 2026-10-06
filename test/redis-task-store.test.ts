@@ -94,6 +94,31 @@ describe('RedisTaskStore', () => {
     t.assert.strictEqual((await store.get('task-1'))?.status, 'cancelled')
   })
 
+  test('tool and client data survive status and input updates unchanged', async (t: TestContext) => {
+    // Lua's cjson would turn [] into {} and round past 14 significant digits.
+    const data = { items: [], nested: { list: [[]] }, big: 1234567890123456, small: 0.1 + 0.2 }
+    await store.create(record({ status: 'working' }))
+
+    const parked = await store.updateStatus('task-1', 'input_required', {
+      inputRequests: { pick: { method: 'elicitation/create', params: { requestedSchema: { required: [] } } } },
+      incrementInputRequestRound: true
+    })
+    t.assert.deepStrictEqual(parked?.inputRequests, {
+      pick: { method: 'elicitation/create', params: { requestedSchema: { required: [] } } }
+    })
+
+    const staged = await store.updateInputResponses('task-1', { pick: { action: 'accept', content: data } }, 'delivery-1')
+    t.assert.deepStrictEqual(staged?.responses, { pick: { action: 'accept', content: data } })
+    t.assert.deepStrictEqual((await store.get('task-1'))?.pendingInputResponses, {
+      pick: { action: 'accept', content: data }
+    })
+
+    const outcome = { jsonrpc: '2.0', id: 1, result: { content: [], structuredContent: data } } as any
+    const completed = await store.updateStatus('task-1', 'completed', { outcome })
+    t.assert.deepStrictEqual(completed?.outcome, outcome)
+    t.assert.deepStrictEqual((await store.get('task-1'))?.outcome, outcome)
+  })
+
   test('retries staged input until broker publication is accepted', async (t: TestContext) => {
     await store.create(record({
       status: 'input_required',

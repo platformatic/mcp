@@ -1,10 +1,10 @@
 /**
  * Cross-instance delivery of `tasks/update` input responses.
  *
- * The message-broker contract treats a resolved publication as confirmation
- * that the intended consumer accepted delivery. The task store keeps each
- * response in a durable outbox until publication resolves, so failures remain
- * safely retryable without acknowledging queued work early.
+ * A resolved publication only means the broker accepted the message, not that
+ * the waiting worker received it. The task store therefore keeps each response
+ * in a durable outbox until the worker that consumes it acknowledges it, and
+ * the worker also reads that outbox directly in case a publication is lost.
  */
 
 import type { InputResponses } from '../schema-2026.ts'
@@ -113,7 +113,7 @@ export class TaskInputChannel {
       for (const [key, entry] of early) {
         this.#pending.delete(key)
         Object.assign(responses, entry.responses)
-        this.#markConsumed(entry.taskId, entry.deliveryId)
+        this.markConsumed(entry.taskId, entry.deliveryId)
       }
       this.#scheduleExpiry()
       return Promise.resolve(responses)
@@ -166,7 +166,7 @@ export class TaskInputChannel {
       return
     }
 
-    this.#markConsumed(taskId, id)
+    this.markConsumed(taskId, id)
     for (const waiter of [...set]) {
       this.#resolveWaiter(taskId, waiter, responses as InputResponses)
     }
@@ -219,7 +219,11 @@ export class TaskInputChannel {
     for (const taskId of [...this.#waiters.keys()]) this.forget(taskId)
   }
 
-  #markConsumed (taskId: string, deliveryId: string): void {
+  /**
+   * Record a delivery as consumed, so a late broker copy of responses the
+   * worker already took from the task store is not handed to a later round.
+   */
+  markConsumed (taskId: string, deliveryId: string): void {
     const key = this.#deliveryKey(taskId, deliveryId)
     this.#seenDeliveries.delete(key)
     this.#seenDeliveries.set(key, Date.now() + this.#retentionMs)

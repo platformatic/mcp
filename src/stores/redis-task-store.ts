@@ -7,6 +7,48 @@ const TASK_KEY_PREFIX = 'mcp:task:'
 const TASK_INDEX_KEY = 'mcp:tasks'
 
 /**
+ * Lua's cjson cannot round-trip arbitrary JSON: it turns empty arrays into
+ * objects and keeps only 14 significant digits. The scripts below rewrite
+ * records in place, so every field carrying tool or client data is stored as a
+ * JSON string they pass through without decoding.
+ */
+function encodeOpaqueMap (map: Record<string, unknown> | undefined): Record<string, string> | undefined {
+  if (map === undefined) return undefined
+  return Object.fromEntries(Object.entries(map).map(([key, value]) => [key, JSON.stringify(value)]))
+}
+
+function decodeOpaqueMap (map: unknown): Record<string, unknown> | undefined {
+  if (!map || typeof map !== 'object' || Array.isArray(map)) return undefined
+  return Object.fromEntries(Object.entries(map).map(([key, value]) =>
+    [key, typeof value === 'string' ? JSON.parse(value) : value]
+  ))
+}
+
+function encodeTask (task: TaskRecord): string {
+  return JSON.stringify({
+    ...task,
+    outcome: task.outcome === undefined ? undefined : JSON.stringify(task.outcome),
+    inputRequests: encodeOpaqueMap(task.inputRequests),
+    pendingInputResponses: encodeOpaqueMap(task.pendingInputResponses)
+  })
+}
+
+function decodeTask (raw: string): TaskRecord {
+  return fromStored(JSON.parse(raw))
+}
+
+function fromStored (stored: any): TaskRecord {
+  const task: TaskRecord = { ...stored }
+  // Records written before this encoding hold the outcome as an object.
+  if (typeof stored.outcome === 'string') task.outcome = JSON.parse(stored.outcome)
+  if (stored.inputRequests !== undefined) task.inputRequests = decodeOpaqueMap(stored.inputRequests)
+  if (stored.pendingInputResponses !== undefined) {
+    task.pendingInputResponses = decodeOpaqueMap(stored.pendingInputResponses)
+  }
+  return task
+}
+
+/**
  * Redis-backed task store, so tasks created on one instance can be polled from
  * any other. Task retention is enforced with Redis key expiry, which means an
  * expired task disappears without us having to sweep it.
@@ -35,9 +77,9 @@ export class RedisTaskStore implements TaskStore {
     // memory store), so write the key without an expiry rather than falling back
     // to the default and silently expiring it.
     if (task.ttl === null) {
-      await this.redis.set(key, JSON.stringify(task))
+      await this.redis.set(key, encodeTask(task))
     } else {
-      await this.redis.set(key, JSON.stringify(task), 'EX', this.expirySeconds(task))
+      await this.redis.set(key, encodeTask(task), 'EX', this.expirySeconds(task))
     }
     // Index membership lets `list` enumerate without a keyspace scan; stale ids
     // are pruned on read, since the task keys expire independently.
@@ -53,7 +95,7 @@ export class RedisTaskStore implements TaskStore {
 
     let task: TaskRecord
     try {
-      task = JSON.parse(raw)
+      task = decodeTask(raw)
     } catch {
       return null
     }
@@ -132,7 +174,7 @@ export class RedisTaskStore implements TaskStore {
        return encoded`,
       1,
       this.key(taskId),
-      JSON.stringify(updated),
+      encodeTask(updated),
       preserveInputRequests ? '1' : '0',
       preservePendingResponses ? '1' : '0',
       options.incrementInputRequestRound ? '1' : '0'
@@ -144,7 +186,7 @@ export class RedisTaskStore implements TaskStore {
       throw new Error(`Task ${taskId} is already in terminal status '${result}'`)
     }
     if (typeof result !== 'string') return null
-    return JSON.parse(result) as TaskRecord
+    return decodeTask(result)
   }
 
   async updateInputResponses (
@@ -207,20 +249,20 @@ export class RedisTaskStore implements TaskStore {
        return cjson.encode({ task = task, responses = deliverable, responseIds = responseIds })`,
       1,
       this.key(taskId),
-      JSON.stringify(responses),
+      JSON.stringify(encodeOpaqueMap(responses)),
       new Date().toISOString(),
       responseId
     )
 
     if (typeof result !== 'string') return null
     const parsed = JSON.parse(result) as {
-      task: TaskRecord
-      responses: Record<string, unknown> | unknown[]
+      task: unknown
+      responses: Record<string, string> | unknown[]
       responseIds: Record<string, string> | unknown[]
     }
     return {
-      task: parsed.task,
-      responses: Array.isArray(parsed.responses) ? {} : parsed.responses,
+      task: fromStored(parsed.task),
+      responses: decodeOpaqueMap(parsed.responses) ?? {},
       responseIds: Array.isArray(parsed.responseIds) ? {} : parsed.responseIds
     }
   }
