@@ -2338,6 +2338,10 @@ All handlers receive a consistent context object containing:
 - `context.reply`: Fastify reply object for setting response headers
 - `context.sessionId`: Session identifier (when using SSE)
 - `context.authContext`: Authorization context (when OAuth is enabled)
+- `context.signal`: `AbortSignal` that aborts when the request is cancelled: a 2026-07-28 client
+  disconnecting before the response, or `tasks/cancel` for a handler running as a task. Pass it
+  to `fetch` or check it between steps to stop work early. It never aborts on the legacy path,
+  where a disconnect is not a cancellation.
 
 #### Backward Compatibility
 

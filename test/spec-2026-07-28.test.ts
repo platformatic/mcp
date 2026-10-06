@@ -1728,6 +1728,38 @@ describe('2026-07-28: tasks extension', () => {
     t.assert.strictEqual(second.resultType, 'complete')
   })
 
+  test('tasks/cancel aborts the signal of the handler running the task', async (t: TestContext) => {
+    let aborted: Promise<boolean> | undefined
+    let started: () => void = () => {}
+    const handlerStarted = new Promise<void>(resolve => { started = resolve })
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({
+        name: 'long',
+        inputSchema: Type.Object({}),
+        execution: { taskSupport: 'required' }
+      } as any, async (_args: any, context: any) => {
+        started()
+        aborted = new Promise<boolean>(resolve => {
+          context.signal.addEventListener('abort', () => resolve(true), { once: true })
+          setTimeout(() => resolve(false), 2000).unref()
+        })
+        await aborted
+        return { content: [] }
+      })
+    }, { enableTasks: true })
+
+    const created = (await call(app, 'tools/call', {
+      params: { name: 'long', arguments: {} },
+      capabilities: tasksCapable
+    })).json().result
+    // The request that created the task has completed; that must not abort it.
+    await handlerStarted
+    await new Promise(resolve => setTimeout(resolve, 20))
+
+    await call(app, 'tasks/cancel', { params: { taskId: created.taskId }, capabilities: tasksCapable })
+    t.assert.strictEqual(await aborted, true)
+  })
+
   test('tools/list does not show execution.taskSupport to 2026-07-28 clients', async (t: TestContext) => {
     const app = await taskServer(t, async () => 'done')
     const tools = (await call(app, 'tools/list')).json().result.tools

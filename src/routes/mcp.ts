@@ -509,6 +509,14 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
       return reply
     }
 
+    // On this revision closing the response stream is the client's way to
+    // cancel, so a close before the response has been written aborts the
+    // handler. A close after it is just the connection ending.
+    const cancelled = new AbortController()
+    reply.raw.once('close', () => {
+      if (!reply.raw.writableFinished) cancelled.abort(new Error('client disconnected'))
+    })
+
     const response = await dispatchModern(message, {
       app,
       opts,
@@ -532,7 +540,8 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
       caching,
       supportedVersions: SUPPORTED_PROTOCOL_VERSIONS,
       enableTasks,
-      headerLayer
+      headerLayer,
+      signal: cancelled.signal
     })
 
     reply.type('application/json').code(statusForResponse(response))

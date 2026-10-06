@@ -38,6 +38,13 @@ export interface HandlerContext {
    * verified and unsealed. Absent unless the client is retrying.
    */
   requestState?: unknown
+  /**
+   * Aborts when the request is cancelled, so the handler can stop work early:
+   * a 2026-07-28 client that disconnects before the response, or the
+   * cancellation of the task the handler is running in. Never aborts on the
+   * legacy path, where a disconnect is not a cancellation.
+   */
+  signal: AbortSignal
 }
 
 // Resource subscription handler types

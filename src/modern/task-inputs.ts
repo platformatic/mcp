@@ -37,6 +37,7 @@ export class TaskInputChannel {
   #pending = new Map<string, PendingDelivery>()
   #seenDeliveries = new Map<string, number>()
   #cancellations = new Map<string, { expiresAt: number }>()
+  #cancelListeners = new Map<string, Set<() => void>>()
   #publish?: Publisher
   #publishCancellation?: CancellationPublisher
   #expiryTimer?: NodeJS.Timeout
@@ -172,8 +173,31 @@ export class TaskInputChannel {
     }
   }
 
+  /**
+   * Run `listener` when the task is cancelled, on whichever instance the
+   * cancellation arrives. Returns a function that removes the listener.
+   */
+  onCancel (taskId: string, listener: () => void): () => void {
+    let listeners = this.#cancelListeners.get(taskId)
+    if (!listeners) {
+      listeners = new Set()
+      this.#cancelListeners.set(taskId, listeners)
+    }
+    listeners.add(listener)
+    return () => {
+      listeners.delete(listener)
+      if (listeners.size === 0) this.#cancelListeners.delete(taskId)
+    }
+  }
+
   /** Reject current and future waits for a recently cancelled task. */
   abort (taskId: string, reason: string = 'cancelled'): void {
+    const listeners = this.#cancelListeners.get(taskId)
+    if (listeners) {
+      this.#cancelListeners.delete(taskId)
+      for (const listener of listeners) listener()
+    }
+
     const cancellation = {
       expiresAt: Date.now() + this.#retentionMs
     }
@@ -215,6 +239,7 @@ export class TaskInputChannel {
     this.#pending.clear()
     this.#seenDeliveries.clear()
     this.#cancellations.clear()
+    this.#cancelListeners.clear()
 
     for (const taskId of [...this.#waiters.keys()]) this.forget(taskId)
   }

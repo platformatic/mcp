@@ -766,7 +766,7 @@ function assignWireKeys (
  */
 async function runAsTask (
   request: JSONRPCRequest,
-  execute: (resume?: TaskResume) => Promise<JSONRPCResponse | JSONRPCError>,
+  execute: (resume: TaskResume | undefined, signal: AbortSignal) => Promise<JSONRPCResponse | JSONRPCError>,
   dependencies: ModernDependencies
 ): Promise<JSONRPCResponse | JSONRPCError | undefined> {
   const { taskStore, taskWaiters, taskInputs, app, opts } = dependencies
@@ -806,6 +806,11 @@ async function runAsTask (
   const expiresAt = createdAt + ttl
   runningTasks.set(taskStore!, (runningTasks.get(taskStore!) ?? 0) + 1)
 
+  // A task outlives the request that created it, so its handler must not see
+  // that request's disconnect. It is cancelled by tasks/cancel instead.
+  const cancelled = new AbortController()
+  const stopListening = taskInputs?.onCancel(record.taskId, () => cancelled.abort(new Error('task cancelled')))
+
   const execution = (async () => {
     let outcome: TaskRecord['outcome']
     let status: 'completed' | 'failed' = 'completed'
@@ -833,7 +838,10 @@ async function runAsTask (
         // A completed task's `result` is what the call would have returned
         // synchronously, envelope included.
         const response = adapt(
-          await execute((gathered || state !== undefined) ? { inputResponses: gathered ?? {}, requestState: state } : undefined),
+          await execute(
+            (gathered || state !== undefined) ? { inputResponses: gathered ?? {}, requestState: state } : undefined,
+            cancelled.signal
+          ),
           dependencies.serverInfo
         )
         outcome = response
@@ -921,6 +929,7 @@ async function runAsTask (
     } catch (error) {
       app.log.debug({ err: error, taskId: record.taskId }, 'Could not record task outcome')
     } finally {
+      stopListening?.()
       taskInputs?.forget(record.taskId)
     }
   })()
@@ -1018,7 +1027,8 @@ async function modernToolsCall (
 
   const run = (
     resume: TaskResume | undefined,
-    observation: { source: 'json-rpc' | 'task', startedAt: number }
+    observation: { source: 'json-rpc' | 'task', startedAt: number },
+    signal?: AbortSignal
   ) => executeToolCall(
     request,
     tool,
@@ -1026,8 +1036,13 @@ async function modernToolsCall (
     undefined,
     // On a task's later rounds the answers come from `tasks/update` and the
     // state from the handler's last `InputRequired`, not from the original
-    // request, so the handler context is rebuilt around them.
-    resume ? { ...dependencies, mrtr: resume } : dependencies,
+    // request, so the handler context is rebuilt around them. A task also
+    // brings its own cancellation signal.
+    {
+      ...dependencies,
+      ...(resume ? { mrtr: resume } : {}),
+      ...(signal ? { signal } : {})
+    },
     observation
   )
 
@@ -1036,7 +1051,7 @@ async function modernToolsCall (
   if (tasksAvailable && clientHasTasks && taskSupport !== 'forbidden') {
     const task = await runAsTask(
       request,
-      resume => run(resume, { source: 'task', startedAt: performance.now() }),
+      (resume, signal) => run(resume, { source: 'task', startedAt: performance.now() }, signal),
       dependencies
     )
     if (task) return task

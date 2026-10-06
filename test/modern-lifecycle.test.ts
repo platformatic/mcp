@@ -179,3 +179,79 @@ describe('2026-07-28: subscription stream lifecycle over a real socket', () => {
     t.assert.strictEqual(notification.params._meta[META_SUBSCRIPTION_ID], 'sub')
   })
 })
+
+describe('2026-07-28: cancellation reaches handlers', () => {
+  function toolCallInit (name: string, signal?: AbortSignal): RequestInit {
+    return {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json, text/event-stream',
+        'mcp-protocol-version': LATEST_PROTOCOL_VERSION,
+        'mcp-method': 'tools/call',
+        'mcp-name': name
+      },
+      body: JSON.stringify({
+        jsonrpc: JSONRPC_VERSION,
+        id: 1,
+        method: 'tools/call',
+        params: {
+          name,
+          arguments: {},
+          _meta: { [META_PROTOCOL_VERSION]: LATEST_PROTOCOL_VERSION, [META_CLIENT_CAPABILITIES]: {} }
+        }
+      }),
+      signal
+    }
+  }
+
+  async function serverWith (t: TestContext, register: (app: any) => void) {
+    const app = Fastify()
+    await app.register(mcpPlugin, { serverInfo: { name: 'test-server', version: '1.0.0' } })
+    register(app)
+    await app.listen({ port: 0, host: '127.0.0.1' })
+    t.after(() => app.close())
+    return `http://127.0.0.1:${(app.server.address() as any).port}`
+  }
+
+  test('a client disconnect aborts the handler signal', async (t: TestContext) => {
+    let aborted: Promise<boolean> | undefined
+    let started: () => void = () => {}
+    const handlerStarted = new Promise<void>(resolve => { started = resolve })
+    const url = await serverWith(t, (app) => {
+      app.mcpAddTool({ name: 'slow', inputSchema: { type: 'object' } }, async (_args: any, context: any) => {
+        started()
+        aborted = new Promise<boolean>(resolve => {
+          if (context.signal.aborted) resolve(true)
+          context.signal.addEventListener('abort', () => resolve(true), { once: true })
+          setTimeout(() => resolve(false), 2000).unref()
+        })
+        await aborted
+        return { content: [] }
+      })
+    })
+
+    const client = new AbortController()
+    const pending = fetch(`${url}/mcp`, toolCallInit('slow', client.signal)).catch(() => undefined)
+    await handlerStarted
+    client.abort()
+    await pending
+
+    t.assert.strictEqual(await aborted, true, 'the handler must see the disconnect as cancellation')
+  })
+
+  test('a completed response does not abort the handler signal afterwards', async (t: TestContext) => {
+    let signal: AbortSignal | undefined
+    const url = await serverWith(t, (app) => {
+      app.mcpAddTool({ name: 'quick', inputSchema: { type: 'object' } }, async (_args: any, context: any) => {
+        signal = context.signal
+        return { content: [{ type: 'text', text: 'ok' }] }
+      })
+    })
+
+    const response = await fetch(`${url}/mcp`, toolCallInit('quick'))
+    t.assert.strictEqual(((await response.json()) as any).result.content[0].text, 'ok')
+    await delay(50)
+    t.assert.strictEqual(signal?.aborted, false)
+  })
+})

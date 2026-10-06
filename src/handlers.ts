@@ -108,6 +108,8 @@ export type HandlerDependencies = {
    * caching hints and an error must never be cached as the resource.
    */
   strictErrors?: boolean
+  /** Aborts when the request is cancelled; see `HandlerContext.signal`. */
+  signal?: AbortSignal
 }
 
 export type ToolCallDependencies = Pick<HandlerDependencies,
@@ -119,7 +121,8 @@ export type ToolCallDependencies = Pick<HandlerDependencies,
   'authContext' |
   'jsonSchemaValidator' |
   'sessionId' |
-  'mrtr'
+  'mrtr' |
+  'signal'
 >
 
 export function createResponse (id: string | number, result: any): JSONRPCResponse {
@@ -146,8 +149,11 @@ export function createError (id: string | number | null, code: number, message: 
  * Built in one place so the multi round-trip fields cannot be plumbed into some
  * handler kinds and forgotten in others.
  */
+/** For requests nothing can cancel. */
+const NEVER_ABORTED = new AbortController().signal
+
 function handlerContext (
-  dependencies: Pick<HandlerDependencies, 'request' | 'reply' | 'authContext' | 'mrtr'>,
+  dependencies: Pick<HandlerDependencies, 'request' | 'reply' | 'authContext' | 'mrtr' | 'signal'>,
   sessionId: string | undefined
 ): HandlerContext {
   return {
@@ -156,7 +162,8 @@ function handlerContext (
     reply: dependencies.reply,
     authContext: dependencies.authContext,
     inputResponses: dependencies.mrtr?.inputResponses,
-    requestState: dependencies.mrtr?.requestState
+    requestState: dependencies.mrtr?.requestState,
+    signal: dependencies.signal ?? NEVER_ABORTED
   }
 }
 
