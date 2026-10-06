@@ -78,13 +78,17 @@ function single (headers: IncomingHttpHeaders, name: string): string | undefined
 function readMirroredHeader (
   headers: IncomingHttpHeaders,
   headerName: string,
-  label: string
+  label: string,
+  allowBase64: boolean = true
 ): { ok: true, value: string | undefined } | { ok: false, message: string } {
   const raw = single(headers, headerName)
   if (raw === undefined) return { ok: true, value: undefined }
   if (!SAFE_HEADER_VALUE.test(raw)) {
     return { ok: false, message: `Header mismatch: ${label} header value contains invalid characters` }
   }
+  // Only `Mcp-Name` and `Mcp-Param-*` may use the sentinel. Decoding anything
+  // else would let a request route on an encoded method a gateway never sees.
+  if (!allowBase64) return { ok: true, value: raw }
   const decoded = decodeHeaderValue(raw)
   if (decoded === null) {
     return { ok: false, message: `Header mismatch: ${label} header value is not valid Base64` }
@@ -135,7 +139,7 @@ export function validateStandardHeaders (
   method: string,
   params: unknown
 ): HeaderCheck {
-  const methodHeader = readMirroredHeader(headers, 'mcp-method', 'Mcp-Method')
+  const methodHeader = readMirroredHeader(headers, 'mcp-method', 'Mcp-Method', false)
   if (!methodHeader.ok) return methodHeader
   const mcpMethod = methodHeader.value
   if (mcpMethod === undefined) {

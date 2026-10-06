@@ -52,6 +52,7 @@ import type { AuthorizationContext } from './types/auth-types.ts'
 import type { TaskInputChannel } from './modern/task-inputs.ts'
 import { InputRequired } from './modern/input-required.ts'
 import {
+  atLeast,
   supportsTasks,
   supportsSchemaDialect,
   trimDefinitionToRevision,
@@ -122,7 +123,8 @@ export type ToolCallDependencies = Pick<HandlerDependencies,
   'jsonSchemaValidator' |
   'sessionId' |
   'mrtr' |
-  'signal'
+  'signal' |
+  'protocolVersion'
 >
 
 export function createResponse (id: string | number, result: any): JSONRPCResponse {
@@ -576,6 +578,9 @@ export async function executeToolCall (
   return toolCallOutcomeToJsonRpc(request.id, toolName, outcome)
 }
 
+/** The revision that introduced `outputSchema` and `structuredContent`. */
+const OUTPUT_SCHEMA_REVISION = '2025-06-18'
+
 /**
  * Validates tool output. Unlike the input validator it must never change what
  * it checks: the result goes to the client exactly as the tool produced it.
@@ -604,19 +609,29 @@ function conformToOutputSchema (
 ): McpCallToolOutcome {
   const schema = (tool.definition as { outputSchema?: unknown }).outputSchema
   if (!outcome.ok || schema === undefined || outcome.result.isError) return outcome
+  // Revisions before 2025-06-18 have no `structuredContent`, so a text-only
+  // result is correct there. An in-process call has no revision and is held
+  // to the current rules.
+  const version = dependencies.protocolVersion
+  if (version !== undefined && !atLeast(version, OUTPUT_SCHEMA_REVISION)) return outcome
 
   const structured = outcome.result.structuredContent
   let problem: string | null = null
   if (structured === undefined) {
     problem = 'missing structuredContent'
-  } else if (isTypeBoxSchema(schema)) {
-    const checked = validate(schema as TSchema, structuredClone(structured))
-    if (!checked.success) problem = checked.error.message
   } else {
     try {
-      problem = getOutputValidator().validate(schema as Record<string, unknown>, structuredClone(structured))
+      // Validate what the client will receive: a Date or anything with
+      // `toJSON` conforms by its serialized form, not its in-memory one.
+      const wire = JSON.parse(JSON.stringify(structured))
+      if (isTypeBoxSchema(schema)) {
+        const checked = validate(schema as TSchema, wire)
+        if (!checked.success) problem = checked.error.message
+      } else {
+        problem = getOutputValidator().validate(schema as Record<string, unknown>, wire)
+      }
     } catch (error) {
-      problem = `output schema cannot be compiled: ${error instanceof Error ? error.message : String(error)}`
+      problem = `structured content cannot be validated: ${error instanceof Error ? error.message : String(error)}`
     }
   }
   if (problem === null) return outcome

@@ -23,6 +23,11 @@ interface MCPDecoratorsOptions {
   jsonSchemaValidator?: JsonSchemaValidator
 }
 
+const SUPPORTED_OUTPUT_DIALECTS = new Set([
+  'https://json-schema.org/draft/2020-12/schema',
+  'https://json-schema.org/draft/2020-12/schema#'
+])
+
 const mcpDecoratorsPlugin: FastifyPluginAsync<MCPDecoratorsOptions> = async (app, options) => {
   const { tools, resources, prompts, resourceHandlers, opts, jsonSchemaValidator } = options
 
@@ -52,6 +57,14 @@ const mcpDecoratorsPlugin: FastifyPluginAsync<MCPDecoratorsOptions> = async (app
           throw new Error(`Invalid tool schema for '${name}': ${error instanceof Error ? error.message : String(error)}`)
         }
       }
+    }
+
+    // Structured results are validated with JSON Schema 2020-12, the dialect
+    // MCP specifies. A schema declaring another dialect could never validate,
+    // so say so now rather than fail every call with a misleading mismatch.
+    const outputDialect = (definition.outputSchema as { $schema?: unknown } | undefined)?.$schema
+    if (outputDialect !== undefined && !SUPPORTED_OUTPUT_DIALECTS.has(String(outputDialect))) {
+      throw new Error(`Invalid output schema for '${name}': dialect '${outputDialect}' is not supported; use JSON Schema 2020-12`)
     }
 
     // TypeBox schemas are already JSON Schema compatible

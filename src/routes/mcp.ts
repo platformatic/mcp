@@ -510,39 +510,47 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     }
 
     // On this revision closing the response stream is the client's way to
-    // cancel, so a close before the response has been written aborts the
-    // handler. A close after it is just the connection ending.
+    // cancel, so a close while the request is still being handled aborts the
+    // handler. A close after that is just the connection ending: in-process
+    // injection (stdio, mcpClient) emits it before `writableFinished` is set,
+    // so the response state alone cannot tell the two apart.
     const cancelled = new AbortController()
+    let handled = false
     reply.raw.once('close', () => {
-      if (!reply.raw.writableFinished) cancelled.abort(new Error('client disconnected'))
+      if (!handled) cancelled.abort(new Error('client disconnected'))
     })
 
-    const response = await dispatchModern(message, {
-      app,
-      opts,
-      capabilities,
-      serverInfo,
-      tools,
-      resources,
-      prompts,
-      resourceHandlers,
-      request,
-      reply,
-      authContext,
-      tracer: opts.telemetry?.tracer,
-      taskStore,
-      taskWaiters,
-      jsonSchemaValidator,
-      taskInputs,
-      protocolVersion: context.protocolVersion,
-      context,
-      sealer,
-      caching,
-      supportedVersions: SUPPORTED_PROTOCOL_VERSIONS,
-      enableTasks,
-      headerLayer,
-      signal: cancelled.signal
-    })
+    let response: JSONRPCResponse | JSONRPCError
+    try {
+      response = await dispatchModern(message, {
+        app,
+        opts,
+        capabilities,
+        serverInfo,
+        tools,
+        resources,
+        prompts,
+        resourceHandlers,
+        request,
+        reply,
+        authContext,
+        tracer: opts.telemetry?.tracer,
+        taskStore,
+        taskWaiters,
+        jsonSchemaValidator,
+        taskInputs,
+        protocolVersion: context.protocolVersion,
+        context,
+        sealer,
+        caching,
+        supportedVersions: SUPPORTED_PROTOCOL_VERSIONS,
+        enableTasks,
+        headerLayer,
+        signal: cancelled.signal
+      })
+    } finally {
+      handled = true
+    }
 
     reply.type('application/json').code(statusForResponse(response))
     return response

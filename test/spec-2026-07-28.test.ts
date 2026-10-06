@@ -955,6 +955,55 @@ describe('tool output and configuration are validated', () => {
     t.assert.strictEqual(result.content[0].text, 'boom')
   })
 
+  test('structuredContent is validated as the JSON the client receives', async (t: TestContext) => {
+    const when = new Date('2026-10-06T00:00:00Z')
+    const app = await outputServer(t, { content: [], structuredContent: { when } }, {
+      type: 'object',
+      properties: { when: { type: 'string' } },
+      required: ['when']
+    })
+    const result = (await call(app, 'tools/call', { params: { name: 'typed', arguments: {} } })).json().result
+    t.assert.strictEqual(result.isError, undefined)
+    t.assert.strictEqual(result.structuredContent.when, when.toISOString())
+  })
+
+  test('outputSchema is not enforced on revisions without structuredContent', async (t: TestContext) => {
+    const app = await outputServer(t, { content: [{ type: 'text', text: 'plain' }] })
+    for (const protocolVersion of ['2025-03-26', '2024-11-05']) {
+      const init = await app.inject({
+        method: 'POST',
+        url: '/mcp',
+        payload: {
+          jsonrpc: JSONRPC_VERSION,
+          id: 1,
+          method: 'initialize',
+          params: { protocolVersion, capabilities: {}, clientInfo: { name: 'old', version: '1' } }
+        }
+      })
+      t.assert.strictEqual(init.json().result.protocolVersion, protocolVersion)
+      const response = await app.inject({
+        method: 'POST',
+        url: '/mcp',
+        headers: protocolVersion === '2024-11-05' ? {} : { 'mcp-protocol-version': protocolVersion },
+        payload: { jsonrpc: JSONRPC_VERSION, id: 2, method: 'tools/call', params: { name: 'typed', arguments: {} } }
+      })
+      const result = response.json().result
+      t.assert.strictEqual(result.isError, undefined, protocolVersion)
+      t.assert.strictEqual(result.content[0].text, 'plain', protocolVersion)
+    }
+  })
+
+  test('an outputSchema in an unsupported dialect is refused at registration', async (t: TestContext) => {
+    const app = Fastify()
+    t.after(() => app.close())
+    await app.register(mcpPlugin)
+    t.assert.throws(() => app.mcpAddTool({
+      name: 'draft7',
+      inputSchema: { type: 'object' },
+      outputSchema: { $schema: 'http://json-schema.org/draft-07/schema#', type: 'object' }
+    } as any, async () => ({ content: [] })), /dialect .* is not supported/)
+  })
+
   test('caching hints must be a non-negative integer ttl and a known scope', async (t: TestContext) => {
     for (const hint of [{ ttlMs: 1500.5, cacheScope: 'private' }, { ttlMs: NaN, cacheScope: 'private' },
       { ttlMs: -1, cacheScope: 'private' }, { ttlMs: 1000, cacheScope: 'shared' }]) {
@@ -1985,6 +2034,23 @@ describe('2026-07-28: tasks extension', () => {
   })
 })
 
+describe('2026-07-28: in-process requests', () => {
+  test('a completed in-process request does not abort the handler signal', async (t: TestContext) => {
+    let signal: AbortSignal | undefined
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'quick', inputSchema: Type.Object({}) }, async (_args: any, context: any) => {
+        signal = context.signal
+        await new Promise(resolve => setTimeout(resolve, 20))
+        return { content: [{ type: 'text', text: 'ok' }] }
+      })
+    })
+    const response = await call(app, 'tools/call', { params: { name: 'quick', arguments: {} } })
+    t.assert.strictEqual(response.json().result.content[0].text, 'ok')
+    await new Promise(resolve => setTimeout(resolve, 50))
+    t.assert.strictEqual(signal?.aborted, false)
+  })
+})
+
 describe('2026-07-28: message and transport validation', () => {
   test('a modern batch body is rejected, not accepted as a notification', async (t: TestContext) => {
     const app = await buildServer(t)
@@ -2085,6 +2151,24 @@ describe('2026-07-28: message and transport validation', () => {
     })
     t.assert.strictEqual(param.statusCode, 400)
     t.assert.match(param.json().error.message, /invalid characters/)
+  })
+
+  test('Mcp-Method is compared literally, never Base64-decoded', async (t: TestContext) => {
+    let ran = false
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'greet', inputSchema: Type.Object({}) }, async () => {
+        ran = true
+        return { content: [] }
+      })
+    })
+    // A gateway routing on the literal header never sees 'tools/call'.
+    const response = await call(app, 'tools/call', {
+      params: { name: 'greet', arguments: {} },
+      headers: { 'mcp-method': '=?base64?dG9vbHMvY2FsbA==?=' }
+    })
+    t.assert.strictEqual(response.statusCode, 400)
+    t.assert.strictEqual(response.json().error.code, HEADER_MISMATCH)
+    t.assert.strictEqual(ran, false)
   })
 
   test('integer header values must be plain decimal', async (t: TestContext) => {
