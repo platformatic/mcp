@@ -312,6 +312,12 @@ export interface MCPPluginOptions {
    */
   taskMaxTtlMs?: number
   /**
+   * Most 2026-07-28 tasks one instance runs in the background at once
+   * (default 1000). Past it, a tool that only optionally supports tasks runs
+   * synchronously, and one that requires a task is refused.
+   */
+  taskMaxConcurrent?: number
+  /**
    * Freshness hints for the operations 2026-07-28 makes cacheable. Every
    * cacheable result must carry `ttlMs` and `cacheScope`, so anything omitted
    * here falls back to `{ ttlMs: 0, cacheScope: 'private' }` — immediately

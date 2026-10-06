@@ -129,7 +129,9 @@ export class RedisTaskStore implements TaskStore {
       status,
       lastUpdatedAt: new Date().toISOString()
     }
-    if (options.statusMessage !== undefined) {
+    if (options.statusMessage === null) {
+      delete updated.statusMessage
+    } else if (options.statusMessage !== undefined) {
       updated.statusMessage = options.statusMessage
     }
     if (options.outcome !== undefined) {
@@ -235,6 +237,8 @@ export class RedisTaskStore implements TaskStore {
        if changed then
          if next(outstanding) == nil then
            task.inputRequests = nil
+           -- Fully answered: stop reporting input_required with nothing to ask.
+           if task.status == 'input_required' then task.status = 'working' end
          else
            task.inputRequests = outstanding
          end

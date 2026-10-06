@@ -60,7 +60,11 @@ export function supportsUrlElicitation (version: string | undefined): boolean {
  * field the revision it negotiated has no meaning for.
  */
 export function trimDefinitionToRevision<T extends Record<string, any>> (definition: T, version: string | undefined): T {
-  if (supportsIcons(version) && supportsToolExecutionMetadata(version)) {
+  // `execution.taskSupport` exists only in 2025-11-25: 2026-07-28 moved tasks
+  // to an extension in which the server decides per request, with no per-tool
+  // flag for the client to read.
+  const hasExecution = supportsToolExecutionMetadata(version) && !isModernRevision(version)
+  if (supportsIcons(version) && hasExecution) {
     return definition
   }
 
@@ -68,7 +72,7 @@ export function trimDefinitionToRevision<T extends Record<string, any>> (definit
   if (!supportsIcons(version)) {
     delete trimmed.icons
   }
-  if (!supportsToolExecutionMetadata(version)) {
+  if (!hasExecution) {
     delete trimmed.execution
   }
   return trimmed as T

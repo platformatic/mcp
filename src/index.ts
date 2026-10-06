@@ -64,6 +64,7 @@ import type {
 } from './schema.ts'
 
 const REDIS_QUIT_TIMEOUT_MS = 2000
+const TASK_CLEANUP_INTERVAL_MS = 10 * 60 * 1000
 
 declare module 'fastify' {
   interface FastifyInstance {
@@ -323,8 +324,17 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     }
   })
 
+  // Expired task keys vanish on their own in Redis, but their ids linger in
+  // the index until something prunes it, so prune it on a schedule.
+  const taskCleanup = taskStore
+    ? setInterval(() => {
+      taskStore.cleanup().catch((error) => app.log.debug({ err: error }, 'Task store cleanup failed'))
+    }, TASK_CLEANUP_INTERVAL_MS).unref()
+    : undefined
+
   // Add close hook to clean up Redis connections and authorization components
   app.addHook('onClose', async () => {
+    if (taskCleanup) clearInterval(taskCleanup)
     // Clean up all SSE streams and sessions
     const unsubscribePromises: Promise<void>[] = []
     for (const [sessionId, streams] of localStreams.entries()) {

@@ -65,7 +65,9 @@ export class MemoryTaskStore implements TaskStore {
       status,
       lastUpdatedAt: new Date().toISOString()
     }
-    if (options.statusMessage !== undefined) {
+    if (options.statusMessage === null) {
+      delete updated.statusMessage
+    } else if (options.statusMessage !== undefined) {
       updated.statusMessage = options.statusMessage
     }
     if (options.outcome !== undefined) {
@@ -135,7 +137,11 @@ export class MemoryTaskStore implements TaskStore {
       ? {
           ...task,
           lastUpdatedAt: new Date().toISOString(),
-          ...(Object.keys(outstanding).length > 0 ? { inputRequests: outstanding } : { inputRequests: undefined }),
+          ...(Object.keys(outstanding).length > 0
+            ? { inputRequests: outstanding }
+            // Fully answered: the task is no longer waiting on the client, so
+            // it must not keep reporting `input_required` with nothing to ask.
+            : { inputRequests: undefined, ...(task.status === 'input_required' ? { status: 'working' as const } : {}) }),
           answeredInputKeys: [...answered],
           pendingInputResponses: pending,
           pendingInputResponseIds: pendingIds,

@@ -1292,7 +1292,9 @@ async function handleTasksCancel (
   try {
     cancelled = await taskStore.updateStatus(taskId, 'cancelled', {
       statusMessage: 'The task was cancelled by request.',
-      outcome: createError(request.id, INTERNAL_ERROR, 'Task was cancelled')
+      outcome: createError(request.id, INTERNAL_ERROR, 'Task was cancelled'),
+      inputRequests: null,
+      clearPendingInputResponses: true
     })
   } catch {
     // The task reached a terminal status between our check above and the write
@@ -1306,6 +1308,13 @@ async function handleTasksCancel (
   }
 
   dependencies.taskWaiters?.notify(cancelled)
+  // A 2026-07-28 task parked for input lives in the same store; wake its
+  // worker wherever it runs instead of leaving it blocked until its ttl.
+  try {
+    await dependencies.taskInputs?.cancel(taskId)
+  } catch (error) {
+    dependencies.app.log.debug({ err: error, taskId }, 'Could not publish task input cancellation')
+  }
   await notifyTaskStatus(cancelled, dependencies)
 
   return createResponse(request.id, toWireTask(cancelled))

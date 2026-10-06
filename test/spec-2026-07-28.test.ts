@@ -1425,21 +1425,34 @@ describe('2026-07-28: tasks extension', () => {
     t.assert.strictEqual(task.status, 'cancelled')
   })
 
-  test('a task fails rather than ambiguously reusing an input key', async (t: TestContext) => {
+  async function pollTask (app: FastifyInstance, taskId: string, capabilities: ClientCapabilities,
+    until: (task: any) => boolean): Promise<any> {
+    let task: any
+    for (let attempt = 0; attempt < 100; attempt++) {
+      task = (await call(app, 'tasks/get', { params: { taskId }, capabilities })).json().result
+      if (until(task)) return task
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+    return task
+  }
+
+  test('a handler re-asking under the same key gets a fresh wire key', async (t: TestContext) => {
+    const seen: unknown[] = []
     const app = await buildServer(t, (app) => {
       app.mcpAddTool({
-        name: 'repeat-key',
+        name: 'insist',
         inputSchema: Type.Object({}),
         execution: { taskSupport: 'required' }
-      } as any, async () => {
-        throw new InputRequired({
-          inputRequests: {
-            confirmation: elicitForm('Confirm?', {
-              type: 'object',
-              properties: { value: { type: 'string' } }
-            })
-          }
-        })
+      } as any, async (_args: any, context: any) => {
+        const answer = context.inputResponses?.confirmation as { action?: string } | undefined
+        seen.push(answer?.action)
+        // Re-prompt under the same key until the user accepts.
+        if (answer?.action !== 'accept') {
+          throw new InputRequired({
+            inputRequests: { confirmation: elicitForm('Confirm?', { type: 'object', properties: {} }) }
+          })
+        }
+        return { content: [{ type: 'text', text: 'accepted' }] }
       })
     }, { enableTasks: true })
     const capabilities: ClientCapabilities = {
@@ -1448,38 +1461,277 @@ describe('2026-07-28: tasks extension', () => {
     }
 
     const created = (await call(app, 'tools/call', {
-      params: { name: 'repeat-key', arguments: {} },
+      params: { name: 'insist', arguments: {} },
       capabilities
     })).json().result
 
-    let task: any
-    for (let attempt = 0; attempt < 40; attempt++) {
-      task = (await call(app, 'tasks/get', {
-        params: { taskId: created.taskId },
-        capabilities
-      })).json().result
-      if (task.status === 'input_required') break
-      await new Promise(resolve => setTimeout(resolve, 10))
-    }
-
+    let task = await pollTask(app, created.taskId, capabilities, t => t.status === 'input_required')
+    t.assert.deepStrictEqual(Object.keys(task.inputRequests), ['confirmation'])
     await call(app, 'tasks/update', {
-      params: {
-        taskId: created.taskId,
-        inputResponses: { confirmation: { action: 'accept', content: { value: 'yes' } } }
-      },
+      params: { taskId: created.taskId, inputResponses: { confirmation: { action: 'decline' } } },
       capabilities
     })
 
-    for (let attempt = 0; attempt < 40; attempt++) {
-      task = (await call(app, 'tasks/get', {
-        params: { taskId: created.taskId },
-        capabilities
-      })).json().result
-      if (task.status === 'failed') break
-      await new Promise(resolve => setTimeout(resolve, 10))
+    // Same question again, under a key the client has never answered.
+    task = await pollTask(app, created.taskId, capabilities,
+      t => t.status === 'input_required' && !t.inputRequests.confirmation)
+    const [retryKey] = Object.keys(task.inputRequests)
+    t.assert.notStrictEqual(retryKey, 'confirmation')
+    await call(app, 'tasks/update', {
+      params: { taskId: created.taskId, inputResponses: { [retryKey]: { action: 'accept' } } },
+      capabilities
+    })
+
+    task = await pollTask(app, created.taskId, capabilities, t => t.status === 'completed')
+    t.assert.strictEqual(task.status, 'completed')
+    t.assert.strictEqual(task.result.content[0].text, 'accepted')
+    t.assert.deepStrictEqual(seen, [undefined, 'decline', 'accept'])
+  })
+
+  test('a task resumes only once every key of the round is answered', async (t: TestContext) => {
+    const seen: string[][] = []
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({
+        name: 'pair',
+        inputSchema: Type.Object({}),
+        execution: { taskSupport: 'required' }
+      } as any, async (_args: any, context: any) => {
+        const responses = context.inputResponses ?? {}
+        seen.push(Object.keys(responses).sort())
+        if (!responses.a || !responses.b) {
+          throw new InputRequired({
+            inputRequests: {
+              a: elicitForm('A?', { type: 'object', properties: {} }),
+              b: elicitForm('B?', { type: 'object', properties: {} })
+            }
+          })
+        }
+        return { content: [{ type: 'text', text: 'both' }] }
+      })
+    }, { enableTasks: true })
+    const capabilities: ClientCapabilities = {
+      extensions: { [TASKS_EXTENSION]: {} },
+      elicitation: { form: {} }
     }
-    t.assert.strictEqual(task.status, 'failed')
-    t.assert.match(task.error.message, /keys must be unique/)
+
+    const created = (await call(app, 'tools/call', {
+      params: { name: 'pair', arguments: {} },
+      capabilities
+    })).json().result
+    await pollTask(app, created.taskId, capabilities, t => t.status === 'input_required')
+
+    await call(app, 'tasks/update', {
+      params: { taskId: created.taskId, inputResponses: { a: { action: 'accept', content: {} } } },
+      capabilities
+    })
+    // Still waiting for b, which is all it now asks for.
+    let task = await pollTask(app, created.taskId, capabilities, t => t.status === 'input_required')
+    t.assert.deepStrictEqual(Object.keys(task.inputRequests), ['b'])
+    t.assert.deepStrictEqual(seen, [[]])
+
+    await call(app, 'tasks/update', {
+      params: { taskId: created.taskId, inputResponses: { b: { action: 'accept', content: {} } } },
+      capabilities
+    })
+    task = await pollTask(app, created.taskId, capabilities, t => t.status === 'completed')
+    t.assert.strictEqual(task.status, 'completed')
+    t.assert.deepStrictEqual(seen, [[], ['a', 'b']])
+    // The prompt of the last round does not linger on the finished task.
+    t.assert.strictEqual(task.statusMessage, undefined)
+    // The result carries the same envelope a synchronous call returns.
+    t.assert.strictEqual(task.result.resultType, 'complete')
+    t.assert.ok(task.result._meta['io.modelcontextprotocol/serverInfo'])
+  })
+
+  test('a fully answered task reports working, not input_required with nothing to ask', async (t: TestContext) => {
+    let release: () => void = () => {}
+    const blocked = new Promise<void>(resolve => { release = resolve })
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({
+        name: 'slow-after-input',
+        inputSchema: Type.Object({}),
+        execution: { taskSupport: 'required' }
+      } as any, async (_args: any, context: any) => {
+        if (!context.inputResponses?.ok) {
+          throw new InputRequired({ inputRequests: { ok: elicitForm('Ok?', { type: 'object', properties: {} }) } })
+        }
+        await blocked
+        return { content: [] }
+      })
+    }, { enableTasks: true })
+    t.after(() => release())
+    const capabilities: ClientCapabilities = {
+      extensions: { [TASKS_EXTENSION]: {} },
+      elicitation: { form: {} }
+    }
+
+    const created = (await call(app, 'tools/call', {
+      params: { name: 'slow-after-input', arguments: {} },
+      capabilities
+    })).json().result
+    await pollTask(app, created.taskId, capabilities, t => t.status === 'input_required')
+    await call(app, 'tasks/update', {
+      params: { taskId: created.taskId, inputResponses: { ok: { action: 'accept', content: {} } } },
+      capabilities
+    })
+
+    const task = (await call(app, 'tasks/get', { params: { taskId: created.taskId }, capabilities })).json().result
+    t.assert.strictEqual(task.status, 'working')
+    t.assert.strictEqual(task.inputRequests, undefined)
+  })
+
+  test('a state-only InputRequired resumes the task at once with its state', async (t: TestContext) => {
+    const seen: unknown[] = []
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({
+        name: 'stepper',
+        inputSchema: Type.Object({}),
+        execution: { taskSupport: 'required' }
+      } as any, async (_args: any, context: any) => {
+        seen.push(context.requestState)
+        const step = (context.requestState as { step?: number } | undefined)?.step ?? 0
+        if (step < 2) throw new InputRequired({ state: { step: step + 1 } })
+        return { content: [{ type: 'text', text: `step ${step}` }] }
+      })
+    }, { enableTasks: true })
+
+    const created = (await call(app, 'tools/call', {
+      params: { name: 'stepper', arguments: {} },
+      capabilities: tasksCapable
+    })).json().result
+    const task = await pollTask(app, created.taskId, tasksCapable, t => t.status === 'completed')
+    t.assert.strictEqual(task.result.content[0].text, 'step 2')
+    t.assert.deepStrictEqual(seen, [undefined, { step: 1 }, { step: 2 }])
+  })
+
+  test('a legacy tasks/cancel releases a modern task parked for input', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({
+        name: 'parked',
+        inputSchema: Type.Object({}),
+        execution: { taskSupport: 'required' }
+      } as any, async () => {
+        throw new InputRequired({ inputRequests: { ok: elicitForm('Ok?', { type: 'object', properties: {} }) } })
+      })
+      app.mcpAddTool({
+        name: 'probe',
+        inputSchema: Type.Object({}),
+        execution: { taskSupport: 'optional' }
+      } as any, async () => ({ content: [] }))
+    }, { enableTasks: true, enableSSE: true, taskDefaultTtlMs: 60_000, taskMaxConcurrent: 1 })
+    const capabilities: ClientCapabilities = {
+      extensions: { [TASKS_EXTENSION]: {} },
+      elicitation: { form: {} }
+    }
+
+    const created = (await call(app, 'tools/call', {
+      params: { name: 'parked', arguments: {} },
+      capabilities
+    })).json().result
+    await pollTask(app, created.taskId, capabilities, t => t.status === 'input_required')
+    // The parked task holds the only slot, so this runs synchronously.
+    t.assert.strictEqual((await call(app, 'tools/call', {
+      id: 2, params: { name: 'probe', arguments: {} }, capabilities
+    })).json().result.resultType, 'complete')
+
+    const init = await app.inject({
+      method: 'POST',
+      url: '/mcp',
+      payload: {
+        jsonrpc: JSONRPC_VERSION,
+        id: 1,
+        method: 'initialize',
+        params: { protocolVersion: LATEST_LEGACY_PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: 'l', version: '1' } }
+      }
+    })
+    const cancel = await app.inject({
+      method: 'POST',
+      url: '/mcp',
+      headers: {
+        'mcp-session-id': init.headers['mcp-session-id'] as string,
+        'mcp-protocol-version': LATEST_LEGACY_PROTOCOL_VERSION
+      },
+      payload: { jsonrpc: JSONRPC_VERSION, id: 2, method: 'tasks/cancel', params: { taskId: created.taskId } }
+    })
+    t.assert.strictEqual(cancel.json().result.status, 'cancelled')
+
+    // The cancellation wakes the worker at once (not via the 1s outbox poll,
+    // let alone the 60s ttl), freeing its slot.
+    let resultType: string | undefined
+    for (let attempt = 0; attempt < 30 && resultType !== 'task'; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 10))
+      resultType = (await call(app, 'tools/call', {
+        id: 3, params: { name: 'probe', arguments: {} }, capabilities
+      })).json().result.resultType
+    }
+    t.assert.strictEqual(resultType, 'task')
+  })
+
+  test('with identity resolution, an unidentified caller gets no unreachable task', async (t: TestContext) => {
+    let ran = 0
+    const app = Fastify()
+    t.after(() => app.close())
+    await app.register(mcpPlugin, { enableTasks: true, resolveAuthorizationContext: () => undefined })
+    app.mcpAddTool({
+      name: 'maybe-task',
+      inputSchema: Type.Object({}),
+      execution: { taskSupport: 'optional' }
+    } as any, async () => { ran++; return { content: [{ type: 'text', text: 'sync' }] } })
+    app.mcpAddTool({
+      name: 'must-task',
+      inputSchema: Type.Object({}),
+      execution: { taskSupport: 'required' }
+    } as any, async () => ({ content: [] }))
+    await app.ready()
+
+    const optional = (await call(app, 'tools/call', {
+      params: { name: 'maybe-task', arguments: {} },
+      capabilities: tasksCapable
+    })).json()
+    t.assert.strictEqual(optional.result.resultType, 'complete')
+    t.assert.strictEqual(optional.result.content[0].text, 'sync')
+    t.assert.strictEqual(ran, 1)
+
+    const required = (await call(app, 'tools/call', {
+      params: { name: 'must-task', arguments: {} },
+      capabilities: tasksCapable
+    })).json()
+    t.assert.strictEqual(required.error.code, INVALID_REQUEST)
+  })
+
+  test('past taskMaxConcurrent, an optional task runs synchronously', async (t: TestContext) => {
+    let release: () => void = () => {}
+    const blocked = new Promise<void>(resolve => { release = resolve })
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({
+        name: 'busy',
+        inputSchema: Type.Object({}),
+        execution: { taskSupport: 'optional' }
+      } as any, async (args: any) => {
+        if (args.block) await blocked
+        return { content: [{ type: 'text', text: 'done' }] }
+      })
+    }, { enableTasks: true, taskMaxConcurrent: 1 })
+    t.after(() => release())
+
+    const first = (await call(app, 'tools/call', {
+      params: { name: 'busy', arguments: { block: true } },
+      capabilities: tasksCapable
+    })).json().result
+    t.assert.strictEqual(first.resultType, 'task')
+
+    const second = (await call(app, 'tools/call', {
+      id: 2,
+      params: { name: 'busy', arguments: {} },
+      capabilities: tasksCapable
+    })).json().result
+    t.assert.strictEqual(second.resultType, 'complete')
+  })
+
+  test('tools/list does not show execution.taskSupport to 2026-07-28 clients', async (t: TestContext) => {
+    const app = await taskServer(t, async () => 'done')
+    const tools = (await call(app, 'tools/list')).json().result.tools
+    t.assert.strictEqual(tools[0].execution, undefined)
   })
 
   test('a task fails instead of asking for a capability the client did not declare', async (t: TestContext) => {

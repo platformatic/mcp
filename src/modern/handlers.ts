@@ -608,15 +608,48 @@ interface TaskResume {
   requestState: unknown
 }
 
+/** Background tasks currently running, per task store (one per plugin instance). */
+const runningTasks = new WeakMap<object, number>()
+const DEFAULT_TASK_MAX_CONCURRENT = 1000
+
 /**
- * Wait for the answers to a parked task's current input round.
+ * Wait until every key of a parked task's current input round is answered.
+ *
+ * A client may answer the outstanding requests in pieces, and resuming the
+ * handler on the first piece would leave it to re-ask for the rest. So the
+ * answers accumulate here until the round is complete, the task ends, or its
+ * time runs out.
+ */
+async function awaitTaskRound (
+  taskId: string,
+  keys: string[],
+  timeoutMs: number,
+  dependencies: ModernDependencies
+): Promise<Record<string, unknown>> {
+  const deadline = Date.now() + timeoutMs
+  const received: Record<string, unknown> = {}
+  while (!keys.every(key => Object.hasOwn(received, key))) {
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) throw new Error('timed out waiting for client input')
+    const batch = await awaitTaskInput(taskId, remaining, dependencies)
+    for (const [key, value] of Object.entries(batch)) {
+      Object.defineProperty(received, key, { value, enumerable: true, configurable: true, writable: true })
+    }
+  }
+  return received
+}
+
+/**
+ * Wait for the next answers to a parked task's current input round.
  *
  * The broker is the fast path, but a resolved publication only means the
  * broker took the message: it can still be lost on the way here, say while this
  * instance's subscriber is reconnecting. `tasks/update` therefore leaves the
  * answers in the task store's outbox, and this reads that outbox every poll
- * interval as well. Whichever source supplies them, the outbox entries are
- * acknowledged only once they are in hand.
+ * interval as well. The same read notices a task that ended while parked, so a
+ * cancellation whose broker message was lost (or that came through the legacy
+ * `tasks/cancel`) still releases the worker. Whichever source supplies the
+ * answers, the outbox entries are acknowledged only once they are in hand.
  */
 async function awaitTaskInput (
   taskId: string,
@@ -632,7 +665,12 @@ async function awaitTaskInput (
   const fromOutbox = new Promise<Record<string, unknown>>((resolve, reject) => {
     const check = async () => {
       try {
-        const pending = currentRoundResponses(await taskStore.get(taskId))
+        const task = await taskStore.get(taskId)
+        if (!task || isTerminal(task.status)) {
+          reject(new Error('task ended while waiting for input'))
+          return
+        }
+        const pending = currentRoundResponses(task)
         if (pending) {
           // A late broker copy of these must not reach a later round.
           for (const deliveryId of new Set(Object.values(pending.ids))) {
@@ -694,17 +732,56 @@ function currentRoundResponses (
 }
 
 /**
+ * Give each of a handler's input requests a key not yet used on this task.
+ *
+ * Keys on the wire must stay unique for the task's lifetime, so a client can
+ * tell a new question from a replay. A handler, though, may reasonably ask
+ * again under the same key (a re-prompt after a declined answer, or an
+ * MRTR-style handler re-asking for everything it still lacks), so a reused key
+ * gets a fresh wire key and its answer is mapped back.
+ */
+function assignWireKeys (
+  inputRequests: Record<string, unknown>,
+  used: Set<string>
+): { wire: Record<string, unknown>, handlerKeys: Map<string, string> } {
+  const wire: Record<string, unknown> = {}
+  const handlerKeys = new Map<string, string>()
+  for (const [key, value] of Object.entries(inputRequests)) {
+    let wireKey = key
+    for (let attempt = 2; used.has(wireKey); attempt++) wireKey = `${key}~${attempt}`
+    used.add(wireKey)
+    handlerKeys.set(wireKey, key)
+    Object.defineProperty(wire, wireKey, { value, enumerable: true, configurable: true, writable: true })
+  }
+  return { wire, handlerKeys }
+}
+
+/**
  * Run a tool call as a task and answer immediately with a `CreateTaskResult`.
  *
  * The task is created before we respond, so the `tasks/get` the client makes
- * next always resolves.
+ * next always resolves. Returns `undefined` when no task can be created right
+ * now (the instance is at its task limit, the store is full, or the caller
+ * cannot own one), leaving the caller to run the call synchronously or refuse.
  */
 async function runAsTask (
   request: JSONRPCRequest,
   execute: (resume?: TaskResume) => Promise<JSONRPCResponse | JSONRPCError>,
   dependencies: ModernDependencies
-): Promise<JSONRPCResponse | JSONRPCError> {
+): Promise<JSONRPCResponse | JSONRPCError | undefined> {
   const { taskStore, taskWaiters, taskInputs, app, opts } = dependencies
+
+  // When the deployment identifies callers, a task is visible only to its
+  // creator. One created for an unidentified caller would be unreachable.
+  const identifiesCallers = opts.authorization?.enabled === true || opts.resolveAuthorizationContext !== undefined
+  if (identifiesCallers && dependencies.authContext?.userId === undefined) return undefined
+
+  const maxConcurrent = opts.taskMaxConcurrent ?? DEFAULT_TASK_MAX_CONCURRENT
+  const running = runningTasks.get(taskStore!) ?? 0
+  if (running >= maxConcurrent) {
+    app.log.warn({ running, maxConcurrent }, 'Task limit reached; not creating another task')
+    return undefined
+  }
 
   const createdAt = Date.now()
   const now = new Date(createdAt).toISOString()
@@ -720,26 +797,45 @@ async function runAsTask (
     authSubject: dependencies.authContext?.userId
   }
 
-  await taskStore!.create(record)
+  try {
+    await taskStore!.create(record)
+  } catch (error) {
+    app.log.warn({ err: error }, 'Could not create task')
+    return undefined
+  }
   const expiresAt = createdAt + ttl
+  runningTasks.set(taskStore!, (runningTasks.get(taskStore!) ?? 0) + 1)
 
   const execution = (async () => {
     let outcome: TaskRecord['outcome']
     let status: 'completed' | 'failed' = 'completed'
     let statusMessage: string | undefined
 
-    // Answers gathered so far. A handler may ask more than once, so responses
-    // accumulate across rounds rather than replacing each other.
+    // Answers gathered so far, keyed as the handler asked for them. A handler
+    // may ask more than once, so they accumulate across rounds, and a later
+    // answer to a key the handler asked again replaces the earlier one.
     let gathered: Record<string, unknown> | undefined
     // What the handler saved in `InputRequired.state` before its last round,
     // handed back as `context.requestState` exactly as an MRTR retry would.
     let state: unknown
+    const usedWireKeys = new Set<string>()
+
+    const fail = (message: string, error?: JSONRPCError) => {
+      status = 'failed'
+      statusMessage = message
+      outcome = error ?? createError(request.id, INTERNAL_ERROR, message)
+    }
 
     // Bound the number of rounds: a handler that asks for the same thing
     // forever would otherwise pin the task until its ttl elapses.
     for (let round = 0; round <= MAX_TASK_INPUT_ROUNDS; round++) {
       try {
-        const response = await execute(gathered && { inputResponses: gathered, requestState: state })
+        // A completed task's `result` is what the call would have returned
+        // synchronously, envelope included.
+        const response = adapt(
+          await execute((gathered || state !== undefined) ? { inputResponses: gathered ?? {}, requestState: state } : undefined),
+          dependencies.serverInfo
+        )
         outcome = response
         if ('error' in response) {
           status = 'failed'
@@ -747,82 +843,76 @@ async function runAsTask (
         }
         break
       } catch (error: any) {
-        // The handler cannot continue without something from the client. Park
-        // the task in `input_required` and let `tasks/update` deliver it —
-        // this is the extension's equivalent of an `InputRequiredResult`.
-        if (error instanceof InputRequired && error.inputRequests && taskInputs && round < MAX_TASK_INPUT_ROUNDS) {
-          const current = await taskStore!.get(record.taskId)
-          const answered = new Set(current?.answeredInputKeys ?? [])
-          const reusedKeys = Object.keys(error.inputRequests).filter(key => answered.has(key))
-          if (reusedKeys.length > 0) {
-            status = 'failed'
-            statusMessage = `Task input request keys must be unique; reused: ${reusedKeys.join(', ')}`
-            outcome = createError(request.id, INTERNAL_ERROR, statusMessage)
-            break
-          }
-
-          const invalid = invalidInputRequests(error.inputRequests)
-          if (invalid) {
-            app.log.error({ taskId: record.taskId, reason: invalid }, 'Task handler produced invalid input requests')
-            status = 'failed'
-            statusMessage = 'Internal server error'
-            outcome = createError(request.id, INTERNAL_ERROR, statusMessage)
-            break
-          }
-
-          // Parking a request the client cannot answer would only leave the
-          // task stuck in `input_required` until it expires.
-          const missing = missingInputCapabilities(error.inputRequests, dependencies.context.clientCapabilities)
-          if (missing) {
-            status = 'failed'
-            outcome = missingCapability(request.id, missing)
-            statusMessage = outcome.error.message
-            break
-          }
-
-          // The ttl bounds the task's whole lifetime, not each round.
-          const remaining = expiresAt - Date.now()
-          if (remaining <= 0) {
-            status = 'failed'
-            statusMessage = 'Timed out waiting for client input'
-            outcome = createError(request.id, INTERNAL_ERROR, statusMessage)
-            break
-          }
-
-          try {
-            const parked = await taskStore!.updateStatus(record.taskId, 'input_required', {
-              statusMessage: error.message,
-              inputRequests: error.inputRequests as Record<string, unknown>,
-              incrementInputRequestRound: true
-            })
-            if (parked) taskWaiters?.notify(parked)
-
-            const responses = await awaitTaskInput(record.taskId, remaining, dependencies)
-            gathered = { ...(gathered ?? {}), ...responses }
-            state = error.state
-
-            await taskStore!.updateStatus(record.taskId, 'working')
-            continue
-          } catch (waitError) {
-            // Cancelled, expired, or the wait timed out.
-            status = 'failed'
-            statusMessage = 'Timed out waiting for client input'
-            outcome = createError(request.id, INTERNAL_ERROR, statusMessage)
-            app.log.debug({ err: waitError, taskId: record.taskId }, 'Task input wait ended without responses')
-            break
-          }
+        if (!(error instanceof InputRequired) || !taskInputs || round >= MAX_TASK_INPUT_ROUNDS) {
+          fail(`Tool execution failed: ${error?.message ?? error}`)
+          break
         }
 
-        status = 'failed'
-        statusMessage = `Tool execution failed: ${error?.message ?? error}`
-        outcome = createError(request.id, INTERNAL_ERROR, statusMessage)
-        break
+        // Nothing to ask the client: the handler only wants to resume with
+        // its state, which a task can do at once, like an immediate MRTR retry.
+        const requests = error.inputRequests ?? {}
+        if (Object.keys(requests).length === 0) {
+          state = error.state
+          continue
+        }
+
+        const invalid = invalidInputRequests(requests)
+        if (invalid) {
+          app.log.error({ taskId: record.taskId, reason: invalid }, 'Task handler produced invalid input requests')
+          fail('Internal server error')
+          break
+        }
+
+        // Parking a request the client cannot answer would only leave the
+        // task stuck in `input_required` until it expires.
+        const missing = missingInputCapabilities(requests, dependencies.context.clientCapabilities)
+        if (missing) {
+          const refused = missingCapability(request.id, missing)
+          fail(refused.error.message, refused)
+          break
+        }
+
+        // The ttl bounds the task's whole lifetime, not each round.
+        const remaining = expiresAt - Date.now()
+        if (remaining <= 0) {
+          fail('Timed out waiting for client input')
+          break
+        }
+
+        const { wire, handlerKeys } = assignWireKeys(requests as Record<string, unknown>, usedWireKeys)
+        try {
+          const parked = await taskStore!.updateStatus(record.taskId, 'input_required', {
+            statusMessage: error.message,
+            inputRequests: wire,
+            incrementInputRequestRound: true
+          })
+          if (parked) taskWaiters?.notify(parked)
+
+          const responses = await awaitTaskRound(record.taskId, [...handlerKeys.keys()], remaining, dependencies)
+          gathered = { ...(gathered ?? {}) }
+          for (const [wireKey, value] of Object.entries(responses)) {
+            const handlerKey = handlerKeys.get(wireKey)
+            if (handlerKey === undefined) continue
+            Object.defineProperty(gathered, handlerKey, { value, enumerable: true, configurable: true, writable: true })
+          }
+          state = error.state
+
+          // Nothing is outstanding now, so nothing may be answered while the
+          // handler runs, and the round's prompt no longer describes the task.
+          await taskStore!.updateStatus(record.taskId, 'working', { inputRequests: null, statusMessage: null })
+          continue
+        } catch (waitError) {
+          // Cancelled, expired, or the wait timed out.
+          fail('Timed out waiting for client input')
+          app.log.debug({ err: waitError, taskId: record.taskId }, 'Task input wait ended without responses')
+          break
+        }
       }
     }
 
     try {
       const updated = await taskStore!.updateStatus(record.taskId, status, {
-        statusMessage,
+        statusMessage: statusMessage ?? null,
         outcome,
         inputRequests: null,
         clearPendingInputResponses: true
@@ -835,9 +925,13 @@ async function runAsTask (
     }
   })()
 
-  execution.catch((error) => {
-    app.log.error({ err: error, taskId: record.taskId }, 'Task execution failed unexpectedly')
-  })
+  execution
+    .catch((error) => {
+      app.log.error({ err: error, taskId: record.taskId }, 'Task execution failed unexpectedly')
+    })
+    .finally(() => {
+      runningTasks.set(taskStore!, Math.max(0, (runningTasks.get(taskStore!) ?? 1) - 1))
+    })
 
   const result: Result = {
     resultType: 'task',
@@ -940,11 +1034,18 @@ async function modernToolsCall (
   // 2026-07-28 lets the server decide: a client that declared the extension may
   // get a task handle back without having asked for one per request.
   if (tasksAvailable && clientHasTasks && taskSupport !== 'forbidden') {
-    return await runAsTask(
+    const task = await runAsTask(
       request,
       resume => run(resume, { source: 'task', startedAt: performance.now() }),
       dependencies
     )
+    if (task) return task
+    // No task could be created right now. A tool that merely supports tasks
+    // still works synchronously; one that requires a task cannot run.
+    if (taskSupport === 'required') {
+      await emitToolCallComplete('json-rpc', params.name, args, { ok: false, reason: 'task-required' }, startedAt, dependencies)
+      return createError(request.id, INVALID_REQUEST, `Tool '${params.name}' requires a task, and none can be created for this request`)
+    }
   }
 
   return adapt(await run(undefined, { source: 'json-rpc', startedAt }), dependencies.serverInfo)

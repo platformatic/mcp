@@ -119,6 +119,28 @@ describe('RedisTaskStore', () => {
     t.assert.deepStrictEqual((await store.get('task-1'))?.outcome, outcome)
   })
 
+  test('answering the last outstanding key moves the task to working', async (t: TestContext) => {
+    await store.create(record({
+      status: 'input_required',
+      inputRequests: { a: { method: 'elicitation/create' }, b: { method: 'elicitation/create' } }
+    }))
+
+    await store.updateInputResponses('task-1', { a: 'yes' }, 'delivery-1')
+    t.assert.strictEqual((await store.get('task-1'))?.status, 'input_required')
+
+    await store.updateInputResponses('task-1', { b: 'yes' }, 'delivery-2')
+    const task = await store.get('task-1')
+    t.assert.strictEqual(task?.status, 'working')
+    t.assert.strictEqual(task?.inputRequests, undefined)
+  })
+
+  test('a null statusMessage clears the stale one', async (t: TestContext) => {
+    await store.create(record({ status: 'working', statusMessage: 'Confirm?' }))
+    const updated = await store.updateStatus('task-1', 'completed', { statusMessage: null })
+    t.assert.strictEqual(updated?.statusMessage, undefined)
+    t.assert.strictEqual((await store.get('task-1'))?.statusMessage, undefined)
+  })
+
   test('retries staged input until broker publication is accepted', async (t: TestContext) => {
     await store.create(record({
       status: 'input_required',

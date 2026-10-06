@@ -621,6 +621,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         sessionStore,
         taskStore,
         taskWaiters,
+        taskInputs,
         jsonSchemaValidator,
         sessionId,
         protocolVersion: (request as any).mcpProtocolVersion ?? DEFAULT_NEGOTIATED_PROTOCOL_VERSION

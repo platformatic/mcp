@@ -63,7 +63,8 @@ export function canTransition (from: TaskStatus, to: TaskStatus): boolean {
 
 /** Fields a status transition may set alongside the new status. */
 export interface TaskUpdateOptions {
-  statusMessage?: string
+  /** A new status message, or `null` to clear a stale one. */
+  statusMessage?: string | null
   outcome?: TaskOutcome
   /** Replaces the outstanding input requests; `null` clears them. */
   inputRequests?: Record<string, unknown> | null
