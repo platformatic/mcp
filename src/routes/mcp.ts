@@ -6,6 +6,7 @@ import {
   JSONRPC_VERSION,
   INTERNAL_ERROR,
   INVALID_PARAMS,
+  INVALID_REQUEST,
   METHOD_NOT_FOUND,
   HEADER_MISMATCH,
   MISSING_REQUIRED_CLIENT_CAPABILITY,
@@ -31,10 +32,18 @@ import type { AuthorizationContext } from '../types/auth-types.ts'
 import { processMessage, createError, withMcpServerSpan } from '../handlers.ts'
 import type { CachingConfig } from '../modern/handlers.ts'
 import { dispatchModern } from '../modern/handlers.ts'
-import { isModernRequest, parseRequestContext } from '../modern/request-meta.ts'
+import {
+  invalidModernMessage,
+  isModernRequest,
+  parseRequestContext,
+  requestedProtocolVersion,
+  requestIdOf
+} from '../modern/request-meta.ts'
 import { validateStandardHeaders } from '../modern/headers.ts'
 import type { RequestStateSealer } from '../modern/request-state.ts'
-import { SubscriptionRegistry, negotiateFilter } from '../modern/subscriptions.ts'
+import { SubscriptionRegistry, invalidFilter, negotiateFilter } from '../modern/subscriptions.ts'
+import type { SubscriptionFilter } from '../schema-2026.ts'
+import { isStdioRequest } from '../stdio-trust.ts'
 import type { TaskInputChannel } from '../modern/task-inputs.ts'
 import type { JsonSchemaValidator } from '../validation/json-schema-validator.ts'
 
@@ -413,16 +422,39 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     reply: FastifyReply,
     authContext: AuthorizationContext | undefined
   ): Promise<unknown> {
-    const body = request.body as JSONRPCRequest | JSONRPCNotification
+    const body = request.body as unknown
+
+    // The transport carries exactly one JSON-RPC request or notification. A
+    // batch must not be mistaken for a notification and silently dropped.
+    const invalid = invalidModernMessage(body)
+    if (invalid !== undefined) {
+      reply.code(400).type('application/json')
+      return createError(requestIdOf(body), INVALID_REQUEST, invalid)
+    }
 
     // A notification has no id and gets no body back.
-    if (!('id' in body)) {
-      request.log.debug({ method: body.method }, 'Accepted modern notification')
+    if (!('id' in (body as object))) {
+      request.log.debug({ method: (body as JSONRPCNotification).method }, 'Accepted modern notification')
       reply.code(202)
       return undefined
     }
 
     const message = body as JSONRPCRequest
+
+    // The version decides which rules apply, so check it before anything this
+    // revision requires: a client on a version we do not implement must learn
+    // which ones we do, rather than fail a requirement it never signed up for.
+    // A legacy version named in `_meta` gets the same answer, so the client
+    // falls back to the handshake.
+    const requestedVersion = requestedProtocolVersion(message.params)
+    if (requestedVersion !== undefined &&
+        !(MODERN_PROTOCOL_VERSIONS as readonly string[]).includes(requestedVersion)) {
+      reply.code(400).type('application/json')
+      return createError(message.id, UNSUPPORTED_PROTOCOL_VERSION, 'Unsupported protocol version', {
+        supported: [...SUPPORTED_PROTOCOL_VERSIONS],
+        requested: requestedVersion
+      })
+    }
 
     const parsed = parseRequestContext(message.params)
     if (!parsed.ok) {
@@ -431,47 +463,44 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     }
     const context = parsed.context
 
-    // The mirrored header and the body must agree, or a gateway routing on one
-    // and this server acting on the other could be made to disagree.
-    const headerVersion = request.headers['mcp-protocol-version']
-    const sentVersion = Array.isArray(headerVersion) ? headerVersion[0] : headerVersion
-    if (sentVersion === undefined) {
-      reply.code(400).type('application/json')
-      return createError(message.id, HEADER_MISMATCH, 'Missing required MCP-Protocol-Version header')
-    }
-    if (sentVersion !== context.protocolVersion) {
-      reply.code(400).type('application/json')
-      return createError(
-        message.id,
-        HEADER_MISMATCH,
-        `Header mismatch: MCP-Protocol-Version header value '${sentVersion}' does not match body value '${context.protocolVersion}'`
-      )
-    }
+    // stdio has no header layer, so there is nothing to reconcile there.
+    const headerLayer = !isStdioRequest(request.headers)
+    if (headerLayer) {
+      // The mirrored header and the body must agree, or a gateway routing on
+      // one and this server acting on the other could be made to disagree.
+      const headerVersion = request.headers['mcp-protocol-version']
+      const sentVersion = Array.isArray(headerVersion) ? headerVersion[0] : headerVersion
+      if (sentVersion === undefined) {
+        reply.code(400).type('application/json')
+        return createError(message.id, HEADER_MISMATCH, 'Missing required MCP-Protocol-Version header')
+      }
+      if (sentVersion !== context.protocolVersion) {
+        reply.code(400).type('application/json')
+        return createError(
+          message.id,
+          HEADER_MISMATCH,
+          `Header mismatch: MCP-Protocol-Version header value '${sentVersion}' does not match body value '${context.protocolVersion}'`
+        )
+      }
 
-    if (!(SUPPORTED_PROTOCOL_VERSIONS as readonly string[]).includes(context.protocolVersion)) {
-      reply.code(400).type('application/json')
-      return createError(message.id, UNSUPPORTED_PROTOCOL_VERSION, 'Unsupported protocol version', {
-        supported: [...SUPPORTED_PROTOCOL_VERSIONS],
-        requested: context.protocolVersion
-      })
-    }
-
-    const headerCheck = validateStandardHeaders(request.headers, message.method, message.params)
-    if (!headerCheck.ok) {
-      reply.code(400).type('application/json')
-      return createError(message.id, HEADER_MISMATCH, headerCheck.message)
+      const headerCheck = validateStandardHeaders(request.headers, message.method, message.params)
+      if (!headerCheck.ok) {
+        reply.code(400).type('application/json')
+        return createError(message.id, HEADER_MISMATCH, headerCheck.message)
+      }
     }
 
     // `subscriptions/listen` answers with a stream rather than a value, so it
     // never reaches the dispatcher.
     if (message.method === 'subscriptions/listen') {
       const requested = (message.params as { notifications?: unknown } | undefined)?.notifications
-      if (!requested || typeof requested !== 'object' || Array.isArray(requested)) {
+      const invalidListen = invalidFilter(requested)
+      if (invalidListen !== undefined) {
         reply.code(400).type('application/json')
-        return createError(message.id, INVALID_PARAMS, 'Invalid "notifications": expected a subscription filter')
+        return createError(message.id, INVALID_PARAMS, invalidListen)
       }
 
-      const filter = negotiateFilter(requested, capabilities)
+      const filter = negotiateFilter(requested as SubscriptionFilter, capabilities)
       request.log.info({ subscriptionId: message.id, filter }, 'Opening subscription stream')
       if (!subscriptions.open(reply, message.id, filter) && !reply.sent) {
         reply.code(503).type('application/json')
@@ -502,7 +531,8 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
       sealer,
       caching,
       supportedVersions: SUPPORTED_PROTOCOL_VERSIONS,
-      enableTasks
+      enableTasks,
+      headerLayer
     })
 
     reply.type('application/json').code(statusForResponse(response))

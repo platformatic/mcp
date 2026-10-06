@@ -82,6 +82,11 @@ export interface ModernDependencies extends HandlerDependencies {
   /** Advertised on `server/discover` and in version errors. */
   supportedVersions: readonly string[]
   enableTasks: boolean
+  /**
+   * Whether the transport mirrors body fields into headers. False for stdio,
+   * which has no header layer, so there is nothing to reconcile.
+   */
+  headerLayer: boolean
 }
 
 /**
@@ -777,11 +782,18 @@ async function modernToolsCall (
 
   // Any parameter the tool mirrors into a header must agree with the body.
   if ('inputSchema' in tool.definition) {
-    const headerCheck = validateToolParamHeaders(
-      dependencies.request.headers,
-      tool.definition.inputSchema,
-      params.arguments
-    )
+    // A malformed `x-mcp-header` annotation is the server's own bug, not a
+    // client header mismatch. `tools/list` already hides such a tool, so
+    // calling it looks the same as calling any other unknown tool.
+    if (!collectHeaderParams(tool.definition.inputSchema).ok) {
+      dependencies.app.log.warn({ tool: params.name }, 'Refusing call to tool with an invalid x-mcp-header annotation')
+      await emitToolCallComplete('json-rpc', params.name, args, { ok: false, reason: 'not-found' }, startedAt, dependencies)
+      return createError(request.id, INVALID_PARAMS, `Unknown tool: ${params.name}`)
+    }
+
+    const headerCheck = dependencies.headerLayer
+      ? validateToolParamHeaders(dependencies.request.headers, tool.definition.inputSchema, params.arguments)
+      : { ok: true as const }
     if (!headerCheck.ok) {
       await emitToolCallComplete('json-rpc', params.name, args, {
         ok: false,

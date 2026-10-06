@@ -9,10 +9,10 @@
  */
 
 import type { FastifyBaseLogger, FastifyReply } from 'fastify'
-import type { JSONRPCMessage, JSONRPCNotification, RequestId } from '../schema.ts'
+import type { Implementation, JSONRPCMessage, JSONRPCNotification, RequestId } from '../schema.ts'
 import { JSONRPC_VERSION } from '../schema.ts'
 import type { ServerCapabilities, SubscriptionFilter } from '../schema-2026.ts'
-import { META_SUBSCRIPTION_ID } from '../schema-2026.ts'
+import { META_SERVER_INFO, META_SUBSCRIPTION_ID } from '../schema-2026.ts'
 
 /** How often a quiet stream emits an SSE comment to stay open through proxies. */
 const KEEPALIVE_MS = 30_000
@@ -32,6 +32,29 @@ interface Subscription {
   onClose?: () => void
 }
 
+const BOOLEAN_FILTER_FIELDS = ['toolsListChanged', 'promptsListChanged', 'resourcesListChanged'] as const
+
+/**
+ * Check a requested filter against the `subscriptions/listen` schema, returning
+ * what is wrong with it, or `undefined` when it is well formed.
+ */
+export function invalidFilter (requested: unknown): string | undefined {
+  if (!requested || typeof requested !== 'object' || Array.isArray(requested)) {
+    return 'Invalid "notifications": expected a subscription filter'
+  }
+  const filter = requested as Record<string, unknown>
+  for (const field of BOOLEAN_FILTER_FIELDS) {
+    if (filter[field] !== undefined && typeof filter[field] !== 'boolean') {
+      return `Invalid "notifications.${field}": expected a boolean`
+    }
+  }
+  const uris = filter.resourceSubscriptions
+  if (uris !== undefined && (!Array.isArray(uris) || !uris.every(uri => typeof uri === 'string'))) {
+    return 'Invalid "notifications.resourceSubscriptions": expected an array of strings'
+  }
+  return undefined
+}
+
 /**
  * Narrow a requested filter to what this server can actually honour.
  *
@@ -44,16 +67,18 @@ export function negotiateFilter (
 ): SubscriptionFilter {
   const agreed: SubscriptionFilter = {}
 
-  if (requested.toolsListChanged && capabilities.tools !== undefined) {
+  // A type is supported only when the matching capability says the server
+  // emits it: `listChanged` for the list types, `subscribe` for updates.
+  if (requested.toolsListChanged && capabilities.tools?.listChanged) {
     agreed.toolsListChanged = true
   }
-  if (requested.promptsListChanged && capabilities.prompts !== undefined) {
+  if (requested.promptsListChanged && capabilities.prompts?.listChanged) {
     agreed.promptsListChanged = true
   }
-  if (requested.resourcesListChanged && capabilities.resources !== undefined) {
+  if (requested.resourcesListChanged && capabilities.resources?.listChanged) {
     agreed.resourcesListChanged = true
   }
-  if (requested.resourceSubscriptions?.length && capabilities.resources !== undefined) {
+  if (requested.resourceSubscriptions?.length && capabilities.resources?.subscribe) {
     agreed.resourceSubscriptions = [...new Set(requested.resourceSubscriptions)]
   }
 
@@ -94,13 +119,16 @@ export class SubscriptionRegistry {
   #maxBufferedBytes: number
   #closeDrainTimeoutMs: number
   #closing = false
+  #serverInfo?: Implementation
 
   constructor (
     log: FastifyBaseLogger,
     maxBufferedBytes: number = DEFAULT_MAX_BUFFERED_BYTES,
-    closeDrainTimeoutMs: number = DEFAULT_CLOSE_DRAIN_TIMEOUT_MS
+    closeDrainTimeoutMs: number = DEFAULT_CLOSE_DRAIN_TIMEOUT_MS,
+    serverInfo?: Implementation
   ) {
     this.#log = log
+    this.#serverInfo = serverInfo
     this.#maxBufferedBytes = Math.max(1, maxBufferedBytes)
     this.#closeDrainTimeoutMs = Math.max(1, closeDrainTimeoutMs)
   }
@@ -195,19 +223,41 @@ export class SubscriptionRegistry {
   closeAll (): void {
     this.#closing = true
     for (const subscription of [...this.#subscriptions]) {
-      const completion = {
-        jsonrpc: JSONRPC_VERSION,
-        id: subscription.id,
-        result: {
-          resultType: 'complete',
-          _meta: { [META_SUBSCRIPTION_ID]: subscription.id }
-        }
-      } as JSONRPCMessage
-      // `end(frame)` appends the completion after Node's existing writable
+      // `end(frame)` appends the final frames after Node's existing writable
       // buffer even when write() previously returned false. Queuing and then
-      // clearing it would silently drop the protocol's graceful completion.
-      this.#close(subscription, `data: ${JSON.stringify(completion)}\n\n`)
+      // clearing them would silently drop the protocol's graceful completion.
+      this.#close(subscription, this.#teardownFrames(subscription, 'Server is shutting down'))
     }
+  }
+
+  /**
+   * What the server sends when it ends a subscription on its own initiative.
+   *
+   * Cancellation says the server MUST send `notifications/cancelled` for the
+   * listen request it tears down; Subscriptions says it SHOULD then answer that
+   * request with the empty result that marks a graceful end. Both are sent,
+   * in that order, so the client can tell this from a dropped connection.
+   */
+  #teardownFrames (subscription: Subscription, reason: string): string {
+    const meta = {
+      [META_SUBSCRIPTION_ID]: subscription.id,
+      ...(this.#serverInfo ? { [META_SERVER_INFO]: this.#serverInfo } : {})
+    }
+    const cancelled = {
+      jsonrpc: JSONRPC_VERSION,
+      method: 'notifications/cancelled',
+      params: {
+        requestId: subscription.id,
+        reason,
+        _meta: { [META_SUBSCRIPTION_ID]: subscription.id }
+      }
+    } as JSONRPCMessage
+    const completion = {
+      jsonrpc: JSONRPC_VERSION,
+      id: subscription.id,
+      result: { resultType: 'complete', _meta: meta }
+    } as JSONRPCMessage
+    return `data: ${JSON.stringify(cancelled)}\n\ndata: ${JSON.stringify(completion)}\n\n`
   }
 
   #write (subscription: Subscription, message: JSONRPCMessage): void {
@@ -237,7 +287,7 @@ export class SubscriptionRegistry {
         subscriptionId: subscription.id,
         maxBufferedBytes: this.#maxBufferedBytes
       }, 'Closing slow subscription after its buffer limit was exceeded')
-      this.#close(subscription)
+      this.#close(subscription, this.#teardownFrames(subscription, 'Subscription buffer limit exceeded'))
       return
     }
 

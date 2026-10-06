@@ -92,7 +92,7 @@ describe('2026-07-28: subscription stream lifecycle over a real socket', () => {
     const app = Fastify()
     await app.register(mcpPlugin, {
       serverInfo: { name: 'test-server', version: '1.0.0' },
-      capabilities: { tools: {} }
+      capabilities: { tools: { listChanged: true } }
     })
     await app.listen({ port: 0, host: '127.0.0.1' })
     const url = `http://127.0.0.1:${(app.server.address() as any).port}`
@@ -119,7 +119,7 @@ describe('2026-07-28: subscription stream lifecycle over a real socket', () => {
     const app = Fastify()
     await app.register(mcpPlugin, {
       serverInfo: { name: 'test-server', version: '1.0.0' },
-      capabilities: { tools: {} }
+      capabilities: { tools: { listChanged: true } }
     })
     await app.listen({ port: 0, host: '127.0.0.1' })
     const url = `http://127.0.0.1:${(app.server.address() as any).port}`
@@ -138,13 +138,24 @@ describe('2026-07-28: subscription stream lifecycle over a real socket', () => {
     t.assert.strictEqual(closure.id, 42)
     t.assert.strictEqual(closure.result.resultType, 'complete')
     t.assert.strictEqual(closure.result._meta[META_SUBSCRIPTION_ID], 42)
+    t.assert.deepStrictEqual(closure.result._meta['io.modelcontextprotocol/serverInfo'], {
+      name: 'test-server',
+      version: '1.0.0'
+    })
+
+    // Tearing down a subscription also requires notifications/cancelled for
+    // the listen request, sent before the response that ends it.
+    const cancelled = frames.findIndex(f => f.method === 'notifications/cancelled')
+    t.assert.ok(cancelled !== -1, 'expected notifications/cancelled for the listen request')
+    t.assert.strictEqual(frames[cancelled].params.requestId, 42)
+    t.assert.ok(cancelled < frames.indexOf(closure))
   })
 
   test('a broadcast reaches a real client, then the stream closes cleanly', async (t: TestContext) => {
     const app = Fastify()
     await app.register(mcpPlugin, {
       serverInfo: { name: 'test-server', version: '1.0.0' },
-      capabilities: { tools: {} }
+      capabilities: { tools: { listChanged: true } }
     })
     await app.listen({ port: 0, host: '127.0.0.1' })
     t.after(() => app.close())

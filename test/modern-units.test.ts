@@ -11,7 +11,7 @@ import {
   validateToolParamHeaders
 } from '../src/modern/headers.ts'
 import { RequestStateSealer, digestRequest } from '../src/modern/request-state.ts'
-import { SubscriptionRegistry, negotiateFilter, matchesFilter } from '../src/modern/subscriptions.ts'
+import { SubscriptionRegistry, invalidFilter, negotiateFilter, matchesFilter } from '../src/modern/subscriptions.ts'
 import { TaskInputChannel } from '../src/modern/task-inputs.ts'
 import { parseRequestContext, bodyClaimsModern, isModernRequest } from '../src/modern/request-meta.ts'
 import { isModernRevision } from '../src/protocol-version.ts'
@@ -274,14 +274,34 @@ describe('request state sealing', () => {
 })
 
 describe('subscription filters', () => {
-  const capabilities = { tools: {}, resources: {}, prompts: {} }
+  const capabilities = {
+    tools: { listChanged: true },
+    resources: { listChanged: true, subscribe: true },
+    prompts: { listChanged: true }
+  }
 
   test('the acknowledged filter drops what the server cannot honour', (t: TestContext) => {
     const agreed = negotiateFilter(
       { toolsListChanged: true, promptsListChanged: true },
-      { tools: {} }
+      { tools: { listChanged: true } }
     )
     t.assert.deepStrictEqual(agreed, { toolsListChanged: true })
+  })
+
+  test('a capability without listChanged or subscribe agrees to nothing', (t: TestContext) => {
+    const agreed = negotiateFilter(
+      { toolsListChanged: true, resourcesListChanged: true, resourceSubscriptions: ['file:///a'] },
+      { tools: {}, resources: {} }
+    )
+    t.assert.deepStrictEqual(agreed, {})
+  })
+
+  test('a malformed filter is rejected', (t: TestContext) => {
+    t.assert.strictEqual(invalidFilter({ toolsListChanged: true, resourceSubscriptions: ['file:///a'] }), undefined)
+    t.assert.match(invalidFilter('all') ?? '', /expected a subscription filter/)
+    t.assert.match(invalidFilter({ toolsListChanged: 'yes' }) ?? '', /toolsListChanged/)
+    t.assert.match(invalidFilter({ resourceSubscriptions: 'file:///a' }) ?? '', /array of strings/)
+    t.assert.match(invalidFilter({ resourceSubscriptions: [1, { x: 1 }] }) ?? '', /array of strings/)
   })
 
   test('duplicate resource subscriptions are collapsed', (t: TestContext) => {
@@ -532,7 +552,16 @@ describe('subscription backpressure', () => {
     registry.deliver(changed)
     t.assert.strictEqual(raw.ended, true)
     t.assert.strictEqual(registry.size, 0)
-    t.assert.strictEqual(raw.writes.length, 1)
+    // The acknowledgement, then the teardown: cancellation and the graceful
+    // empty response, never the notification that overflowed the queue.
+    t.assert.strictEqual(raw.writes.length, 2)
+    const teardown = raw.writes[1].split('\n\n').filter(Boolean).map(frame => JSON.parse(frame.slice('data: '.length)))
+    t.assert.strictEqual(teardown[0].method, 'notifications/cancelled')
+    t.assert.strictEqual(teardown[0].params.requestId, 1)
+    t.assert.deepStrictEqual(teardown[1].result, {
+      resultType: 'complete',
+      _meta: { 'io.modelcontextprotocol/subscriptionId': 1 }
+    })
   })
 })
 

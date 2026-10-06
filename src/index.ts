@@ -172,7 +172,7 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     app.log.debug('MCP: no requestStateSecret configured; multi round-trip retries will only verify on the instance that issued them')
   }
 
-  const subscriptions = new SubscriptionRegistry(app.log)
+  const subscriptions = new SubscriptionRegistry(app.log, undefined, undefined, serverInfo)
 
   // A `tasks/update` can land on any instance, but the execution waiting for
   // those answers lives on exactly one. Route the wake-up through the broker so

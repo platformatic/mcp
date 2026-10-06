@@ -7,7 +7,8 @@
  * for each message independently.
  */
 
-import type { Implementation, LoggingLevel } from '../schema.ts'
+import type { Implementation, LoggingLevel, RequestId } from '../schema.ts'
+import { JSONRPC_VERSION } from '../schema.ts'
 import type { ClientCapabilities, RequestMetaObject } from '../schema-2026.ts'
 import {
   META_CLIENT_CAPABILITIES,
@@ -16,6 +17,45 @@ import {
   META_PROTOCOL_VERSION,
   TASKS_EXTENSION
 } from '../schema-2026.ts'
+
+/**
+ * What is wrong with a modern POST body at the JSON-RPC level, or `undefined`
+ * when it is a well-formed request or notification.
+ *
+ * The transport carries exactly one message per POST, and a request id must be
+ * a string or an integer: never null.
+ */
+export function invalidModernMessage (body: unknown): string | undefined {
+  if (Array.isArray(body)) return 'Batch requests are not supported'
+  if (!body || typeof body !== 'object') return 'Invalid request: expected a JSON-RPC object'
+
+  const message = body as { jsonrpc?: unknown, method?: unknown, id?: unknown }
+  if (message.jsonrpc !== JSONRPC_VERSION) return 'Invalid request: "jsonrpc" must be "2.0"'
+  if (typeof message.method !== 'string') return 'Invalid request: "method" must be a string'
+  if ('id' in message && typeof message.id !== 'string' && !Number.isInteger(message.id)) {
+    return 'Invalid request: "id" must be a string or an integer'
+  }
+  return undefined
+}
+
+/**
+ * The id to answer an invalid message with: its own id when usable, otherwise
+ * the explicit null JSON-RPC requires when the id cannot be determined.
+ */
+export function requestIdOf (body: unknown): RequestId | null {
+  const id = (body && typeof body === 'object' && !Array.isArray(body))
+    ? (body as { id?: unknown }).id
+    : undefined
+  return typeof id === 'string' || Number.isInteger(id) ? id as RequestId : null
+}
+
+/** The protocol version a request names in `_meta`, if it names one. */
+export function requestedProtocolVersion (params: unknown): string | undefined {
+  const meta = (params as { _meta?: unknown } | undefined)?._meta
+  if (!meta || typeof meta !== 'object' || Array.isArray(meta)) return undefined
+  const version = (meta as Record<string, unknown>)[META_PROTOCOL_VERSION]
+  return typeof version === 'string' && version.length > 0 ? version : undefined
+}
 
 /** Everything the modern dispatch needs to know about who is calling. */
 export interface RequestContext {

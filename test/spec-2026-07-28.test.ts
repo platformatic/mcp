@@ -1,9 +1,11 @@
 import { test, describe } from 'node:test'
+import { PassThrough } from 'node:stream'
 import type { TestContext } from 'node:test'
 import Fastify from 'fastify'
 import type { FastifyInstance } from 'fastify'
 import { Type } from '@sinclair/typebox'
 import mcpPlugin from '../src/index.ts'
+import { createStdioTransport } from '../src/stdio.ts'
 import {
   JSONRPC_VERSION,
   LATEST_PROTOCOL_VERSION,
@@ -13,7 +15,8 @@ import {
   INVALID_PARAMS,
   HEADER_MISMATCH,
   MISSING_REQUIRED_CLIENT_CAPABILITY,
-  UNSUPPORTED_PROTOCOL_VERSION
+  UNSUPPORTED_PROTOCOL_VERSION,
+  INVALID_REQUEST
 } from '../src/schema.ts'
 import {
   META_PROTOCOL_VERSION,
@@ -409,11 +412,13 @@ describe('2026-07-28: header validation', () => {
     const listed = await call(app, 'tools/list')
     t.assert.deepStrictEqual(listed.json().result.tools, [])
 
+    // The broken annotation is the server's bug, not a client header mismatch:
+    // the hidden tool is reported exactly like any other unknown tool.
     const called = await call(app, 'tools/call', {
       params: { name: 'invalid-header-tool', arguments: {} }
     })
-    t.assert.strictEqual(called.statusCode, 400)
-    t.assert.strictEqual(called.json().error.code, HEADER_MISMATCH)
+    t.assert.strictEqual(called.json().error.code, INVALID_PARAMS)
+    t.assert.match(called.json().error.message, /Unknown tool/)
   })
 
   test('a tool parameter marked x-mcp-header must be mirrored and must match', async (t: TestContext) => {
@@ -745,8 +750,16 @@ describe('2026-07-28: MRTR retries are not cacheable', () => {
 })
 
 describe('2026-07-28: subscriptions', () => {
+  // Each notification type is only supported when the capability says the
+  // server emits it.
+  const emitting = {
+    tools: { listChanged: true },
+    resources: { listChanged: true, subscribe: true },
+    prompts: { listChanged: true }
+  }
+
   test('listen acknowledges with the filter the server agreed to', async (t: TestContext) => {
-    const app = await buildServer(t)
+    const app = await buildServer(t, undefined, { capabilities: emitting })
 
     const response = await app.inject({
       method: 'POST',
@@ -779,7 +792,7 @@ describe('2026-07-28: subscriptions', () => {
   })
 
   test('a notification type the server cannot honour is dropped from the acknowledgement', async (t: TestContext) => {
-    const app = await buildServer(t, undefined, { capabilities: { tools: {} } })
+    const app = await buildServer(t, undefined, { capabilities: { tools: { listChanged: true }, resources: {} } })
 
     const response = await app.inject({
       method: 'POST',
@@ -788,7 +801,9 @@ describe('2026-07-28: subscriptions', () => {
       headers: modernHeaders('subscriptions/listen'),
       payload: modernBody('subscriptions/listen', {
         id: 1,
-        params: { notifications: { toolsListChanged: true, promptsListChanged: true } }
+        params: {
+          notifications: { toolsListChanged: true, promptsListChanged: true, resourceSubscriptions: ['file:///a'] }
+        }
       })
     })
 
@@ -799,12 +814,13 @@ describe('2026-07-28: subscriptions', () => {
     stream.destroy()
 
     const message = JSON.parse(first.replace(/^data: /, '').trim())
-    // No prompts capability, so that opt-in is not acknowledged.
+    // No prompts capability, and resources without `subscribe`, so neither
+    // opt-in is acknowledged.
     t.assert.deepStrictEqual(message.params.notifications, { toolsListChanged: true })
   })
 
   test('a broadcast reaches a subscribed stream, tagged with its subscription id', async (t: TestContext) => {
-    const app = await buildServer(t)
+    const app = await buildServer(t, undefined, { capabilities: emitting })
 
     const response = await app.inject({
       method: 'POST',
@@ -841,7 +857,7 @@ describe('2026-07-28: subscriptions', () => {
   })
 
   test('a notification the stream did not opt into is not delivered', async (t: TestContext) => {
-    const app = await buildServer(t)
+    const app = await buildServer(t, undefined, { capabilities: emitting })
 
     const response = await app.inject({
       method: 'POST',
@@ -1419,6 +1435,171 @@ describe('2026-07-28: tasks extension', () => {
       capabilities: tasksCapable
     })
     t.assert.strictEqual(response.json().error.code, METHOD_NOT_FOUND)
+  })
+})
+
+describe('2026-07-28: message and transport validation', () => {
+  test('a modern batch body is rejected, not accepted as a notification', async (t: TestContext) => {
+    const app = await buildServer(t)
+    const response = await app.inject({
+      method: 'POST',
+      url: '/mcp',
+      headers: modernHeaders('tools/list'),
+      payload: [modernBody('tools/list')]
+    })
+    t.assert.strictEqual(response.statusCode, 400)
+    t.assert.strictEqual(response.json().error.code, INVALID_REQUEST)
+    t.assert.match(response.json().error.message, /Batch/)
+  })
+
+  test('malformed JSON-RPC messages are invalid requests', async (t: TestContext) => {
+    const app = await buildServer(t)
+    const cases: Array<[string, unknown]> = [
+      ['null id', { ...modernBody('tools/list'), id: null }],
+      ['object id', { ...modernBody('tools/list'), id: { a: 1 } }],
+      ['fractional id', { ...modernBody('tools/list'), id: 1.5 }],
+      ['missing jsonrpc', { ...modernBody('tools/list'), jsonrpc: undefined }],
+      ['missing method', { ...modernBody('tools/list'), method: undefined }],
+      ['response-shaped body', { jsonrpc: JSONRPC_VERSION, result: {} }],
+      ['null body', null]
+    ]
+    for (const [label, payload] of cases) {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/mcp',
+        headers: modernHeaders('tools/list'),
+        payload: JSON.stringify(payload)
+      })
+      t.assert.strictEqual(response.statusCode, 400, label)
+      t.assert.strictEqual(response.json().error.code, INVALID_REQUEST, label)
+    }
+  })
+
+  test('an unknown version is reported before the 2026 required fields', async (t: TestContext) => {
+    const app = await buildServer(t)
+    const body = modernBody('tools/list', { protocolVersion: '2099-01-01' }) as any
+    delete body.params._meta[META_CLIENT_CAPABILITIES]
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/mcp',
+      headers: modernHeaders('tools/list', { protocolVersion: '2099-01-01' }),
+      payload: body
+    })
+    t.assert.strictEqual(response.statusCode, 400)
+    t.assert.strictEqual(response.json().error.code, UNSUPPORTED_PROTOCOL_VERSION)
+    t.assert.deepStrictEqual(response.json().error.data.supported, SUPPORTED_PROTOCOL_VERSIONS)
+  })
+
+  test('subscriptions/listen refuses a legacy version like every other method', async (t: TestContext) => {
+    const app = await buildServer(t)
+    const response = await call(app, 'subscriptions/listen', {
+      protocolVersion: LATEST_LEGACY_PROTOCOL_VERSION,
+      params: { notifications: { toolsListChanged: true } }
+    })
+    t.assert.strictEqual(response.statusCode, 400)
+    t.assert.strictEqual(response.json().error.code, UNSUPPORTED_PROTOCOL_VERSION)
+  })
+
+  test('a malformed listen filter is invalid params', async (t: TestContext) => {
+    const app = await buildServer(t)
+    const response = await call(app, 'subscriptions/listen', {
+      params: { notifications: { resourceSubscriptions: 'file:///a' } }
+    })
+    t.assert.strictEqual(response.statusCode, 400)
+    t.assert.strictEqual(response.json().error.code, INVALID_PARAMS)
+  })
+
+  test('raw non-ASCII bytes in mirrored headers are rejected', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({
+        name: 'café',
+        inputSchema: Type.Object({ s: Type.String({ 'x-mcp-header': 'S' } as any) })
+      }, async () => ({ content: [{ type: 'text', text: 'must not run' }] }))
+      app.mcpAddTool({
+        name: 'echo',
+        inputSchema: Type.Object({ s: Type.String({ 'x-mcp-header': 'S' } as any) })
+      }, async () => ({ content: [{ type: 'text', text: 'must not run' }] }))
+    })
+
+    // Node hands bytes 0x80-0xFF through as latin1, so 'caf\xe9' would
+    // otherwise compare equal to 'café'.
+    const name = await call(app, 'tools/call', {
+      params: { name: 'café', arguments: { s: 'x' } },
+      headers: { 'mcp-name': 'caf\xe9', 'mcp-param-s': 'x' }
+    })
+    t.assert.strictEqual(name.statusCode, 400)
+    t.assert.strictEqual(name.json().error.code, HEADER_MISMATCH)
+    t.assert.match(name.json().error.message, /invalid characters/)
+
+    const param = await call(app, 'tools/call', {
+      params: { name: 'echo', arguments: { s: 'naïve' } },
+      headers: { 'mcp-param-s': 'na\xefve' }
+    })
+    t.assert.strictEqual(param.statusCode, 400)
+    t.assert.match(param.json().error.message, /invalid characters/)
+  })
+
+  test('integer header values must be plain decimal', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({
+        name: 'count',
+        inputSchema: Type.Object({ n: Type.Integer({ 'x-mcp-header': 'N' } as any) })
+      }, async () => ({ content: [{ type: 'text', text: 'ran' }] }))
+    })
+    const send = (n: number, header: string) => call(app, 'tools/call', {
+      params: { name: 'count', arguments: { n } },
+      headers: { 'mcp-param-n': header }
+    })
+
+    for (const header of ['0x2A', '4.2e1', ' 42', '+42']) {
+      t.assert.strictEqual((await send(42, header)).json().error?.code, HEADER_MISMATCH, header)
+    }
+    t.assert.strictEqual((await send(0, '')).json().error?.code, HEADER_MISMATCH)
+    t.assert.strictEqual((await send(42, '42')).json().result.content[0].text, 'ran')
+    t.assert.strictEqual((await send(42, '42.0')).json().result.content[0].text, 'ran')
+  })
+
+  test('a forged stdio marker does not skip header validation over HTTP', async (t: TestContext) => {
+    const app = await buildServer(t)
+    const response = await call(app, 'tools/list', {
+      headers: { 'mcp-protocol-version': undefined, 'x-platformatic-mcp-stdio-trust': 'guess' }
+    })
+    t.assert.strictEqual(response.statusCode, 400)
+    t.assert.strictEqual(response.json().error.code, HEADER_MISMATCH)
+  })
+
+  test('2026-07-28 works over stdio, which has no header layer', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'greet', inputSchema: Type.Object({}) }, async () => ({
+        content: [{ type: 'text', text: 'hi' }]
+      }))
+    })
+    const input = new PassThrough()
+    const output = new PassThrough()
+    const transport = createStdioTransport(app, { input, output, error: new PassThrough() })
+    transport.start()
+    t.after(() => transport.stop())
+
+    const lines: any[] = []
+    output.on('data', (chunk: Buffer) => {
+      for (const line of chunk.toString().split('\n')) if (line.trim()) lines.push(JSON.parse(line))
+    })
+    async function send (body: unknown) {
+      const before = lines.length
+      input.write(JSON.stringify(body) + '\n')
+      for (let attempt = 0; attempt < 100 && lines.length === before; attempt++) {
+        await new Promise(resolve => setTimeout(resolve, 10))
+      }
+      return lines[before]
+    }
+
+    const discovered = await send(modernBody('server/discover', { id: 1 }))
+    t.assert.strictEqual(discovered.result.resultType, 'complete')
+    t.assert.ok(discovered.result.supportedVersions.includes(LATEST_PROTOCOL_VERSION))
+
+    const called = await send(modernBody('tools/call', { id: 2, params: { name: 'greet', arguments: {} } }))
+    t.assert.strictEqual(called.result.content[0].text, 'hi')
   })
 })
 

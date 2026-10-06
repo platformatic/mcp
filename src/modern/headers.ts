@@ -67,6 +67,34 @@ function single (headers: IncomingHttpHeaders, name: string): string | undefined
   return Array.isArray(value) ? value[0] : value
 }
 
+/**
+ * Read a mirrored header and decode it.
+ *
+ * The raw value must already be safe to carry literally: Node hands bytes
+ * 0x80-0xFF through as latin1, so a gateway reading them as UTF-8 would see a
+ * different value from the one compared here. Anything else must use the
+ * Base64 sentinel.
+ */
+function readMirroredHeader (
+  headers: IncomingHttpHeaders,
+  headerName: string,
+  label: string
+): { ok: true, value: string | undefined } | { ok: false, message: string } {
+  const raw = single(headers, headerName)
+  if (raw === undefined) return { ok: true, value: undefined }
+  if (!SAFE_HEADER_VALUE.test(raw)) {
+    return { ok: false, message: `Header mismatch: ${label} header value contains invalid characters` }
+  }
+  const decoded = decodeHeaderValue(raw)
+  if (decoded === null) {
+    return { ok: false, message: `Header mismatch: ${label} header value is not valid Base64` }
+  }
+  return { ok: true, value: decoded }
+}
+
+/** An integer header value: plain decimal, optionally with a zero fraction. */
+const INTEGER_HEADER_VALUE = /^-?(0|[1-9][0-9]*)(\.0+)?$/
+
 /** Methods for which `Mcp-Name` is REQUIRED, and the body field it mirrors. */
 const NAME_SOURCE: Record<string, 'name' | 'uri'> = {
   'tools/call': 'name',
@@ -107,7 +135,9 @@ export function validateStandardHeaders (
   method: string,
   params: unknown
 ): HeaderCheck {
-  const mcpMethod = single(headers, 'mcp-method')
+  const methodHeader = readMirroredHeader(headers, 'mcp-method', 'Mcp-Method')
+  if (!methodHeader.ok) return methodHeader
+  const mcpMethod = methodHeader.value
   if (mcpMethod === undefined) {
     return { ok: false, message: 'Missing required Mcp-Method header' }
   }
@@ -124,8 +154,10 @@ export function validateStandardHeaders (
     return { ok: true }
   }
 
-  const rawName = single(headers, 'mcp-name')
-  if (rawName === undefined) {
+  const nameHeader = readMirroredHeader(headers, 'mcp-name', 'Mcp-Name')
+  if (!nameHeader.ok) return nameHeader
+  const decoded = nameHeader.value
+  if (decoded === undefined) {
     // Required for this method regardless of what the body contains — a body
     // that omits `name`/`uri` is malformed, but that is a separate failure and
     // must not excuse the missing header.
@@ -140,10 +172,6 @@ export function validateStandardHeaders (
     }
   }
 
-  const decoded = decodeHeaderValue(rawName)
-  if (decoded === null) {
-    return { ok: false, message: 'Header mismatch: Mcp-Name header value is not valid Base64' }
-  }
   if (decoded !== expectedName) {
     return {
       ok: false,
@@ -370,12 +398,13 @@ export function validateToolParamHeaders (
   }
 
   for (const [name, path] of collected.params) {
-    const headerName = `mcp-param-${name}`
-    const raw = single(headers, headerName)
+    const header = readMirroredHeader(headers, `mcp-param-${name}`, `Mcp-Param-${name}`)
+    if (!header.ok) return header
+    const decoded = header.value
     const value = valueAtPath(args, path)
 
     if (value === undefined || value === null) {
-      if (raw !== undefined) {
+      if (decoded !== undefined) {
         return {
           ok: false,
           message: `Header mismatch: Mcp-Param-${name} was sent but '${path.join('.')}' is absent from the request body`
@@ -384,23 +413,20 @@ export function validateToolParamHeaders (
       continue
     }
 
-    if (raw === undefined) {
+    if (decoded === undefined) {
       return {
         ok: false,
         message: `Missing required Mcp-Param-${name} header for '${path.join('.')}'`
       }
     }
 
-    const decoded = decodeHeaderValue(raw)
-    if (decoded === null) {
-      return { ok: false, message: `Header mismatch: Mcp-Param-${name} is not valid Base64` }
-    }
-
     if (typeof value === 'number') {
       // Compare numerically as the transport recommends (`42.0` equals `42`),
-      // but require both representations to resolve to safe integers first so
-      // distinct large values cannot collapse through Number rounding.
-      const headerValue = Number(decoded)
+      // but only for plain decimal integers: `Number()` would also accept
+      // `0x2A`, `4.2e1` or an empty string, which a gateway routing on the
+      // literal header would not treat as 42. Both sides must also be safe
+      // integers so distinct large values cannot collapse through rounding.
+      const headerValue = INTEGER_HEADER_VALUE.test(decoded) ? Number(decoded) : NaN
       if (!Number.isSafeInteger(value) || !Number.isSafeInteger(headerValue) || headerValue !== value) {
         return {
           ok: false,

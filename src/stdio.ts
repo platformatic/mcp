@@ -1,6 +1,7 @@
 import { stdin, stdout, stderr } from 'process'
 import { createInterface } from 'readline'
 import type { FastifyInstance } from 'fastify'
+import { STDIO_TRUST_HEADER, STDIO_TRUST_TOKEN } from './stdio-trust.ts'
 import type {
   JSONRPCMessage,
   JSONRPCResponse,
@@ -212,7 +213,8 @@ export class StdioTransport {
         headers: {
           'content-type': 'application/json',
           accept: 'application/json', // Explicitly request JSON, not SSE
-          'x-platformatic-mcp-transport': 'stdio'
+          'x-platformatic-mcp-transport': 'stdio',
+          [STDIO_TRUST_HEADER]: STDIO_TRUST_TOKEN
         },
         payload: message
       })
