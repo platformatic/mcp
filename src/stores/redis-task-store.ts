@@ -1,10 +1,13 @@
 import type { Redis } from 'ioredis'
 import type { TaskStatus } from '../schema.ts'
-import type { TaskStore, TaskRecord, TaskUpdateOptions, TaskInputUpdate } from './task-store.ts'
+import type { TaskStore, TaskRecord, TaskUpdateOptions, TaskInputUpdate, TaskOutcome } from './task-store.ts'
 import { applyInputRequestUpdates, canTransition, isTerminal, taskHasExpired } from './task-store.ts'
 
-const TASK_KEY_PREFIX = 'mcp:task:'
-const TASK_INDEX_KEY = 'mcp:tasks'
+// Versioned: records here store opaque fields as JSON strings, which earlier
+// releases cannot read. A separate keyspace keeps old and new instances from
+// misreading each other's tasks during a rolling deploy or a rollback.
+const TASK_KEY_PREFIX = 'mcp:task:v2:'
+const TASK_INDEX_KEY = 'mcp:tasks:v2'
 
 /**
  * Lua's cjson cannot round-trip arbitrary JSON: it turns empty arrays into
@@ -24,9 +27,19 @@ function decodeOpaqueMap (map: unknown): Record<string, unknown> | undefined {
   ))
 }
 
+/**
+ * Replace lone UTF-16 surrogates, which JSON.stringify escapes as `\udXXX`
+ * and Lua's cjson then refuses to decode, failing every script on the record.
+ */
+function toWellFormed (value: string): string {
+  return value.toWellFormed()
+}
+
 function encodeTask (task: TaskRecord): string {
   return JSON.stringify({
     ...task,
+    ...(task.statusMessage !== undefined ? { statusMessage: toWellFormed(task.statusMessage) } : {}),
+    ...(task.authSubject !== undefined ? { authSubject: toWellFormed(task.authSubject) } : {}),
     outcome: task.outcome === undefined ? undefined : JSON.stringify(task.outcome),
     inputRequests: encodeOpaqueMap(task.inputRequests),
     pendingInputResponses: encodeOpaqueMap(task.pendingInputResponses)
@@ -269,6 +282,60 @@ export class RedisTaskStore implements TaskStore {
       responses: decodeOpaqueMap(parsed.responses) ?? {},
       responseIds: Array.isArray(parsed.responseIds) ? {} : parsed.responseIds
     }
+  }
+
+  // Leases are timed by Redis's own clock (TIME), so instances whose clocks
+  // disagree still agree on whether a worker is alive.
+
+  async renewLease (taskId: string, leaseMs: number): Promise<TaskStatus | null> {
+    const result = await this.redis.eval(
+      `local raw = redis.call('GET', KEYS[1])
+       if not raw then return false end
+       local ok, task = pcall(cjson.decode, raw)
+       if not ok then return false end
+       local s = task.status
+       if s == 'completed' or s == 'failed' or s == 'cancelled' then return s end
+       local now = redis.call('TIME')
+       task.leaseExpiresAt = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000) + tonumber(ARGV[1])
+       redis.call('SET', KEYS[1], cjson.encode(task), 'KEEPTTL')
+       return s`,
+      1,
+      this.key(taskId),
+      String(leaseMs)
+    )
+    return typeof result === 'string' ? result as TaskStatus : null
+  }
+
+  async expireStaleLease (taskId: string, statusMessage: string, outcome: TaskOutcome): Promise<TaskRecord | null> {
+    const result = await this.redis.eval(
+      `local raw = redis.call('GET', KEYS[1])
+       if not raw then return false end
+       local ok, task = pcall(cjson.decode, raw)
+       if not ok then return false end
+       local s = task.status
+       if s == 'completed' or s == 'failed' or s == 'cancelled' then return false end
+       if type(task.leaseExpiresAt) ~= 'number' then return false end
+       local now = redis.call('TIME')
+       local nowMs = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
+       if nowMs <= task.leaseExpiresAt then return false end
+       task.status = 'failed'
+       task.statusMessage = ARGV[1]
+       task.outcome = ARGV[2]
+       task.lastUpdatedAt = ARGV[3]
+       task.inputRequests = nil
+       task.pendingInputResponses = nil
+       task.pendingInputResponseIds = nil
+       task.pendingInputResponseRounds = nil
+       local encoded = cjson.encode(task)
+       redis.call('SET', KEYS[1], encoded, 'KEEPTTL')
+       return encoded`,
+      1,
+      this.key(taskId),
+      toWellFormed(statusMessage),
+      JSON.stringify(outcome),
+      new Date().toISOString()
+    )
+    return typeof result === 'string' ? decodeTask(result) : null
   }
 
   async acknowledgeInputResponses (taskId: string, responseIds: Record<string, string>): Promise<void> {

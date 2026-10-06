@@ -40,6 +40,18 @@ export interface TaskRecord extends Task {
   pendingInputResponseIds?: Record<string, string>
   /** Input generation each pending response belongs to. */
   pendingInputResponseRounds?: Record<string, number>
+  /**
+   * Which protocol era created the task. The 2025-11-25 core tasks and the
+   * 2026-07-28 extension have different shapes and lifecycles, so each era
+   * only sees its own tasks. Absent on records written before this field.
+   */
+  era?: 'legacy' | 'modern'
+  /**
+   * Epoch ms until which the instance running the task is known to be alive.
+   * The worker renews it while it runs; once it lapses, any instance may mark
+   * the task failed, so a crashed worker cannot leave it non-terminal.
+   */
+  leaseExpiresAt?: number
 }
 
 /**
@@ -113,6 +125,18 @@ export interface TaskStore {
    * still match, so delayed publication completion cannot delete a later round.
    */
   acknowledgeInputResponses(taskId: string, responseIds: Record<string, string>): Promise<void>
+  /**
+   * Extend the running worker's lease to `leaseMs` from now, by the store's
+   * clock. Returns the task's current status, so a worker whose cancellation
+   * was lost in transit still learns it ended, or null if the task is gone.
+   */
+  renewLease(taskId: string, leaseMs: number): Promise<TaskStatus | null>
+  /**
+   * Atomically fail a non-terminal task whose lease has lapsed by the store's
+   * clock, recording `outcome`. Returns the failed record, or null when the
+   * task is gone, terminal, unleased, or its lease is still live.
+   */
+  expireStaleLease(taskId: string, statusMessage: string, outcome: TaskOutcome): Promise<TaskRecord | null>
   /** Tasks visible to the given authorization subject, newest first */
   list(authSubject?: string): Promise<TaskRecord[]>
   delete(taskId: string): Promise<void>

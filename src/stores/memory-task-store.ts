@@ -1,5 +1,5 @@
 import type { TaskStatus } from '../schema.ts'
-import type { TaskStore, TaskRecord, TaskUpdateOptions, TaskInputUpdate } from './task-store.ts'
+import type { TaskStore, TaskRecord, TaskUpdateOptions, TaskInputUpdate, TaskOutcome } from './task-store.ts'
 import { applyInputRequestUpdates, canTransition, isTerminal, taskHasExpired } from './task-store.ts'
 
 /**
@@ -155,6 +155,32 @@ export class MemoryTaskStore implements TaskStore {
       responses: Object.fromEntries(deliverable),
       responseIds: Object.fromEntries(responseIds)
     }
+  }
+
+  async renewLease (taskId: string, leaseMs: number): Promise<TaskStatus | null> {
+    const task = this.tasks.get(taskId)
+    if (!task || taskHasExpired(task)) return null
+    if (!isTerminal(task.status)) {
+      this.tasks.set(taskId, { ...task, leaseExpiresAt: Date.now() + leaseMs })
+    }
+    return task.status
+  }
+
+  async expireStaleLease (taskId: string, statusMessage: string, outcome: TaskOutcome): Promise<TaskRecord | null> {
+    const task = this.tasks.get(taskId)
+    if (!task || taskHasExpired(task) || isTerminal(task.status)) return null
+    if (task.leaseExpiresAt === undefined || Date.now() <= task.leaseExpiresAt) return null
+
+    const failed: TaskRecord = {
+      ...task,
+      status: 'failed',
+      statusMessage,
+      outcome,
+      lastUpdatedAt: new Date().toISOString()
+    }
+    applyInputRequestUpdates(failed, { inputRequests: null, clearPendingInputResponses: true })
+    this.tasks.set(taskId, failed)
+    return { ...failed }
   }
 
   async acknowledgeInputResponses (taskId: string, responseIds: Record<string, string>): Promise<void> {

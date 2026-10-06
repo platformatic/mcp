@@ -58,8 +58,9 @@ import { supportsTasksExtension } from './request-meta.ts'
 import { InputRequired, requiredCapabilityFor } from './input-required.ts'
 import type { RequestStateSealer } from './request-state.ts'
 import { collectHeaderParams, validateToolParamHeaders } from './headers.ts'
-import type { TaskRecord } from '../stores/task-store.ts'
+import type { TaskRecord, TaskStore } from '../stores/task-store.ts'
 import { isTerminal } from '../stores/task-store.ts'
+import { principalOf } from '../principal.ts'
 
 /** Freshness hints applied to one cacheable operation. */
 export interface CacheHint {
@@ -283,16 +284,6 @@ function invalidInputRequests (inputRequests: Record<string, unknown>): string |
 }
 
 /**
- * The identity sealed state is bound to: the user, and the OAuth client and
- * issuer they came through, so state cannot move between clients or issuers
- * that happen to share a subject.
- */
-function principalOf (authContext: ModernDependencies['authContext']): string | undefined {
-  if (authContext?.userId === undefined) return undefined
-  return JSON.stringify([authContext.userId, authContext.clientId ?? null, authContext.authorizationServer ?? null])
-}
-
-/**
  * Turn a handler's {@link InputRequired} into the wire result.
  *
  * The state is sealed here rather than by the handler so that integrity,
@@ -474,14 +465,40 @@ function toDetailedTask (record: TaskRecord): Record<string, unknown> {
  */
 function taskVisibleTo (record: TaskRecord | null, dependencies: ModernDependencies): TaskRecord | null {
   if (!record) return null
+  // 2025-11-25 core tasks share the store but not the protocol.
+  if (record.era !== 'modern') return null
   const identifiesRequestors = dependencies.opts.authorization?.enabled === true ||
     dependencies.opts.resolveAuthorizationContext !== undefined
   if (!identifiesRequestors) return record
 
-  const subject = dependencies.authContext?.userId
+  const subject = principalOf(dependencies.authContext)
   if (subject === undefined || record.authSubject !== subject) return null
   return record
 }
+
+/**
+ * Load a task for a `tasks/*` request, failing it first if the instance that
+ * was running it has stopped renewing its lease. A crashed worker would
+ * otherwise leave the task `working` until its ttl, and then just vanish.
+ */
+async function loadTask (taskId: string, dependencies: ModernDependencies): Promise<TaskRecord | null> {
+  const store = dependencies.taskStore!
+  const record = await store.get(taskId)
+  if (!record || isTerminal(record.status) || record.leaseExpiresAt === undefined) return record
+  const failed = await store.expireStaleLease(
+    taskId,
+    WORKER_LOST,
+    createError(null, INTERNAL_ERROR, WORKER_LOST)
+  )
+  if (failed) {
+    dependencies.app.log.warn({ taskId }, 'Task failed: the instance running it stopped renewing its lease')
+    dependencies.taskWaiters?.notify(failed)
+    return failed
+  }
+  return record
+}
+
+const WORKER_LOST = 'The server running this task stopped before it finished'
 
 async function handleTasksGet (
   request: JSONRPCRequest,
@@ -492,7 +509,7 @@ async function handleTasksGet (
     return createError(request.id, INVALID_PARAMS, 'Invalid "taskId": expected a string')
   }
 
-  const record = taskVisibleTo(await dependencies.taskStore!.get(taskId), dependencies)
+  const record = taskVisibleTo(await loadTask(taskId, dependencies), dependencies)
   if (!record) {
     return createError(request.id, INVALID_PARAMS, `Task '${taskId}' not found`)
   }
@@ -512,7 +529,7 @@ async function handleTasksUpdate (
     return createError(request.id, INVALID_PARAMS, 'Invalid "inputResponses": expected an object')
   }
 
-  const record = taskVisibleTo(await dependencies.taskStore!.get(params.taskId), dependencies)
+  const record = taskVisibleTo(await loadTask(params.taskId, dependencies), dependencies)
   if (!record) {
     return createError(request.id, INVALID_PARAMS, `Task '${params.taskId}' not found`)
   }
@@ -567,7 +584,7 @@ async function handleTasksCancel (
     return createError(request.id, INVALID_PARAMS, 'Invalid "taskId": expected a string')
   }
 
-  const record = taskVisibleTo(await dependencies.taskStore!.get(taskId), dependencies)
+  const record = taskVisibleTo(await loadTask(taskId, dependencies), dependencies)
   if (!record) {
     return createError(request.id, INVALID_PARAMS, `Task '${taskId}' not found`)
   }
@@ -608,9 +625,71 @@ interface TaskResume {
   requestState: unknown
 }
 
-/** Background tasks currently running, per task store (one per plugin instance). */
-const runningTasks = new WeakMap<object, number>()
 const DEFAULT_TASK_MAX_CONCURRENT = 1000
+const DEFAULT_TASK_LEASE_MS = 15_000
+const TASK_SHUTDOWN_GRACE_MS = 1000
+const SHUTTING_DOWN = 'The server shut down before this task finished'
+
+/** Why a running task was stopped, recorded as its failure. */
+class TaskStopped extends Error {}
+
+interface LiveTask {
+  stop: (reason: TaskStopped) => void
+  done: Promise<void>
+}
+
+/** The background tasks one plugin instance is running, keyed by its task store. */
+interface TaskRegistry {
+  live: Map<string, LiveTask>
+  closing: boolean
+}
+
+const registries = new WeakMap<object, TaskRegistry>()
+
+function registryFor (store: object): TaskRegistry {
+  let registry = registries.get(store)
+  if (!registry) {
+    registry = { live: new Map(), closing: false }
+    registries.set(store, registry)
+  }
+  return registry
+}
+
+function sleep (ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms).unref())
+}
+
+/**
+ * Stop taking new tasks and let running ones finish, for up to `timeoutMs`.
+ * Whatever is still running then is aborted through its signal and recorded
+ * as failed, so a restart never leaves a task `working` until its ttl.
+ */
+export async function drainModernTasks (store: TaskStore, timeoutMs: number): Promise<void> {
+  const registry = registries.get(store)
+  if (!registry) return
+  registry.closing = true
+
+  const running = () => [...registry.live.values()]
+  await Promise.race([Promise.allSettled(running().map(task => task.done)), sleep(timeoutMs)])
+
+  const remaining = [...registry.live.entries()]
+  for (const [, task] of remaining) task.stop(new TaskStopped(SHUTTING_DOWN))
+  await Promise.race([Promise.allSettled(remaining.map(([, task]) => task.done)), sleep(TASK_SHUTDOWN_GRACE_MS)])
+
+  // A handler that ignores its signal is still running; record the outcome for it.
+  for (const taskId of registry.live.keys()) {
+    try {
+      await store.updateStatus(taskId, 'failed', {
+        statusMessage: SHUTTING_DOWN,
+        outcome: createError(null, INTERNAL_ERROR, SHUTTING_DOWN),
+        inputRequests: null,
+        clearPendingInputResponses: true
+      })
+    } catch {
+      // already terminal
+    }
+  }
+}
 
 /**
  * Wait until every key of a parked task's current input round is answered.
@@ -624,6 +703,7 @@ async function awaitTaskRound (
   taskId: string,
   keys: string[],
   timeoutMs: number,
+  stopped: AbortSignal,
   dependencies: ModernDependencies
 ): Promise<Record<string, unknown>> {
   const deadline = Date.now() + timeoutMs
@@ -631,7 +711,7 @@ async function awaitTaskRound (
   while (!keys.every(key => Object.hasOwn(received, key))) {
     const remaining = deadline - Date.now()
     if (remaining <= 0) throw new Error('timed out waiting for client input')
-    const batch = await awaitTaskInput(taskId, remaining, dependencies)
+    const batch = await awaitTaskInput(taskId, remaining, stopped, dependencies)
     for (const [key, value] of Object.entries(batch)) {
       Object.defineProperty(received, key, { value, enumerable: true, configurable: true, writable: true })
     }
@@ -654,12 +734,13 @@ async function awaitTaskRound (
 async function awaitTaskInput (
   taskId: string,
   timeoutMs: number,
+  stopped: AbortSignal,
   dependencies: ModernDependencies
 ): Promise<Record<string, unknown>> {
   const taskStore = dependencies.taskStore!
   const taskInputs = dependencies.taskInputs!
   const settled = new AbortController()
-  const signal = AbortSignal.any([AbortSignal.timeout(timeoutMs), settled.signal])
+  const signal = AbortSignal.any([AbortSignal.timeout(timeoutMs), settled.signal, stopped])
 
   let timer: NodeJS.Timeout | undefined
   const fromOutbox = new Promise<Record<string, unknown>>((resolve, reject) => {
@@ -776,10 +857,11 @@ async function runAsTask (
   const identifiesCallers = opts.authorization?.enabled === true || opts.resolveAuthorizationContext !== undefined
   if (identifiesCallers && dependencies.authContext?.userId === undefined) return undefined
 
+  const registry = registryFor(taskStore!)
+  if (registry.closing) return undefined
   const maxConcurrent = opts.taskMaxConcurrent ?? DEFAULT_TASK_MAX_CONCURRENT
-  const running = runningTasks.get(taskStore!) ?? 0
-  if (running >= maxConcurrent) {
-    app.log.warn({ running, maxConcurrent }, 'Task limit reached; not creating another task')
+  if (registry.live.size >= maxConcurrent) {
+    app.log.warn({ running: registry.live.size, maxConcurrent }, 'Task limit reached; not creating another task')
     return undefined
   }
 
@@ -794,22 +876,59 @@ async function runAsTask (
     ttl,
     pollInterval: DEFAULT_POLL_INTERVAL_MS,
     method: request.method,
-    authSubject: dependencies.authContext?.userId
+    authSubject: principalOf(dependencies.authContext),
+    era: 'modern'
   }
+
+  // A task outlives the request that created it, so its handler must not see
+  // that request's disconnect. It is stopped by tasks/cancel, by its ttl, or
+  // by a shutdown, and the reason becomes its recorded failure.
+  const stopController = new AbortController()
+  const stop = (reason: TaskStopped) => {
+    if (!stopController.signal.aborted) stopController.abort(reason)
+  }
+  const stopped = stopController.signal
+  const stopMessage = () => stopped.reason instanceof TaskStopped ? stopped.reason.message : 'Task stopped'
+
+  // Reserve the slot before the first await, so concurrent requests cannot all
+  // pass the limit check before any of them is counted.
+  const live: LiveTask = { stop, done: Promise.resolve() }
+  registry.live.set(record.taskId, live)
 
   try {
     await taskStore!.create(record)
   } catch (error) {
+    registry.live.delete(record.taskId)
     app.log.warn({ err: error }, 'Could not create task')
     return undefined
   }
   const expiresAt = createdAt + ttl
-  runningTasks.set(taskStore!, (runningTasks.get(taskStore!) ?? 0) + 1)
 
-  // A task outlives the request that created it, so its handler must not see
-  // that request's disconnect. It is cancelled by tasks/cancel instead.
-  const cancelled = new AbortController()
-  const stopListening = taskInputs?.onCancel(record.taskId, () => cancelled.abort(new Error('task cancelled')))
+  // The lease lets any instance tell a crashed worker from a slow one. Each
+  // renewal also reports the task's status, catching a cancellation whose
+  // broker message was lost.
+  const leaseMs = opts.taskLeaseMs ?? DEFAULT_TASK_LEASE_MS
+  const renew = async () => {
+    try {
+      const current = await taskStore!.renewLease(record.taskId, leaseMs)
+      if (current === null || isTerminal(current)) {
+        stop(new TaskStopped(current === 'cancelled' ? 'Task cancelled' : 'Task ended'))
+      }
+    } catch (error) {
+      app.log.debug({ err: error, taskId: record.taskId }, 'Could not renew task lease')
+    }
+  }
+  await renew()
+  const leaseTimer = setInterval(renew, Math.max(1, Math.floor(leaseMs / 3))).unref()
+
+  // Past its ttl the task is gone for the client; stop the handler and free
+  // the slot even if the handler ignores the signal.
+  const ttlTimer = setTimeout(() => {
+    stop(new TaskStopped('Task expired before it finished'))
+    registry.live.delete(record.taskId)
+  }, ttl).unref()
+
+  const stopListening = taskInputs?.onCancel(record.taskId, () => stop(new TaskStopped('Task cancelled')))
 
   const execution = (async () => {
     let outcome: TaskRecord['outcome']
@@ -840,7 +959,7 @@ async function runAsTask (
         const response = adapt(
           await execute(
             (gathered || state !== undefined) ? { inputResponses: gathered ?? {}, requestState: state } : undefined,
-            cancelled.signal
+            stopped
           ),
           dependencies.serverInfo
         )
@@ -849,8 +968,15 @@ async function runAsTask (
           status = 'failed'
           statusMessage = response.error.message
         }
+        // Whatever a stopped handler returned (often an error it caught from
+        // the aborted signal), the task ends for the reason it was stopped.
+        if (stopped.aborted) fail(stopMessage())
         break
       } catch (error: any) {
+        if (stopped.aborted) {
+          fail(stopMessage())
+          break
+        }
         if (!(error instanceof InputRequired) || !taskInputs || round >= MAX_TASK_INPUT_ROUNDS) {
           fail(`Tool execution failed: ${error?.message ?? error}`)
           break
@@ -896,7 +1022,7 @@ async function runAsTask (
           })
           if (parked) taskWaiters?.notify(parked)
 
-          const responses = await awaitTaskRound(record.taskId, [...handlerKeys.keys()], remaining, dependencies)
+          const responses = await awaitTaskRound(record.taskId, [...handlerKeys.keys()], remaining, stopped, dependencies)
           gathered = { ...(gathered ?? {}) }
           for (const [wireKey, value] of Object.entries(responses)) {
             const handlerKey = handlerKeys.get(wireKey)
@@ -910,8 +1036,8 @@ async function runAsTask (
           await taskStore!.updateStatus(record.taskId, 'working', { inputRequests: null, statusMessage: null })
           continue
         } catch (waitError) {
-          // Cancelled, expired, or the wait timed out.
-          fail('Timed out waiting for client input')
+          // Stopped (cancelled, expired, shutting down) or the wait timed out.
+          fail(stopped.aborted ? stopMessage() : 'Timed out waiting for client input')
           app.log.debug({ err: waitError, taskId: record.taskId }, 'Task input wait ended without responses')
           break
         }
@@ -929,17 +1055,19 @@ async function runAsTask (
     } catch (error) {
       app.log.debug({ err: error, taskId: record.taskId }, 'Could not record task outcome')
     } finally {
+      clearInterval(leaseTimer)
+      clearTimeout(ttlTimer)
       stopListening?.()
       taskInputs?.forget(record.taskId)
     }
   })()
 
-  execution
+  live.done = execution
     .catch((error) => {
       app.log.error({ err: error, taskId: record.taskId }, 'Task execution failed unexpectedly')
     })
     .finally(() => {
-      runningTasks.set(taskStore!, Math.max(0, (runningTasks.get(taskStore!) ?? 1) - 1))
+      registry.live.delete(record.taskId)
     })
 
   const result: Result = {

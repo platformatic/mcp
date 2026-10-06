@@ -325,6 +325,19 @@ export interface MCPPluginOptions {
    */
   taskMaxConcurrent?: number
   /**
+   * How long a running 2026-07-28 task's worker lease lasts, in milliseconds
+   * (default 15000; renewed every third of it). When an instance dies, its
+   * tasks are reported failed this long after its last renewal.
+   */
+  taskLeaseMs?: number
+  /**
+   * On close, how long to wait for running 2026-07-28 tasks to finish before
+   * aborting them and recording them as failed, in milliseconds (default
+   * 5000). Fastify bounds close hooks by its `pluginTimeout` (10s by default),
+   * so keep this comfortably below it.
+   */
+  taskShutdownTimeoutMs?: number
+  /**
    * Freshness hints for the operations 2026-07-28 makes cacheable. Every
    * cacheable result must carry `ttlMs` and `cacheScope`, so anything omitted
    * here falls back to `{ ttlMs: 0, cacheScope: 'private' }` — immediately

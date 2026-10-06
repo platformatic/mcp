@@ -49,6 +49,7 @@ import type { SessionStore } from './stores/session-store.ts'
 import type { TaskStore, TaskRecord, TaskWaiters } from './stores/task-store.ts'
 import { isTerminal, toWireTask } from './stores/task-store.ts'
 import type { AuthorizationContext } from './types/auth-types.ts'
+import { principalOf } from './principal.ts'
 import type { TaskInputChannel } from './modern/task-inputs.ts'
 import { InputRequired } from './modern/input-required.ts'
 import {
@@ -1009,14 +1010,15 @@ function taskTtlBounds (dependencies: HandlerDependencies): { defaultTtl: number
 }
 
 /**
- * The authorization subject a task belongs to.
+ * The principal a task belongs to: user, OAuth client and issuer, so another
+ * app acting for the same user cannot read or cancel the task.
  *
  * When the deployment cannot identify requestors this is undefined, and tasks
  * are reachable by anyone holding the (cryptographically random) task id. That
  * limitation is why `tasks/list` is only advertised when auth is in play.
  */
 function taskSubject (dependencies: HandlerDependencies): string | undefined {
-  return dependencies.authContext?.userId
+  return principalOf(dependencies.authContext)
 }
 
 /**
@@ -1039,6 +1041,9 @@ function canIdentifyRequestors (dependencies: HandlerDependencies): boolean {
  */
 function assertTaskAccess (task: TaskRecord | null, dependencies: HandlerDependencies): TaskRecord | null {
   if (!task) return null
+  // 2026-07-28 tasks have a different shape and lifecycle (input rounds
+  // answered through `tasks/update`), which a 2025-11-25 client cannot use.
+  if (task.era === 'modern') return null
 
   const subject = taskSubject(dependencies)
 
@@ -1097,7 +1102,8 @@ function newTaskRecord (
     ttl: Math.min(requested, bounds.maxTtl),
     pollInterval: DEFAULT_POLL_INTERVAL,
     method,
-    authSubject: subject
+    authSubject: subject,
+    era: 'legacy'
   }
 }
 
@@ -1279,7 +1285,7 @@ async function handleTasksList (
     return createResponse(request.id, { tasks: [], nextCursor: undefined } as ListTasksResult)
   }
 
-  const tasks = await taskStore.list(subject)
+  const tasks = (await taskStore.list(subject)).filter(task => task.era !== 'modern')
   const result: ListTasksResult = {
     tasks: tasks.map(toWireTask),
     nextCursor: undefined

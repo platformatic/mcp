@@ -6,6 +6,7 @@ import type { FastifyInstance } from 'fastify'
 import { Type } from '@sinclair/typebox'
 import mcpPlugin from '../src/index.ts'
 import { createStdioTransport } from '../src/stdio.ts'
+import { MemoryTaskStore } from '../src/stores/memory-task-store.ts'
 import {
   JSONRPC_VERSION,
   LATEST_PROTOCOL_VERSION,
@@ -1607,7 +1608,7 @@ describe('2026-07-28: tasks extension', () => {
         await blocked
         return { content: [] }
       })
-    }, { enableTasks: true })
+    }, { enableTasks: true, taskShutdownTimeoutMs: 10 })
     t.after(() => release())
     const capabilities: ClientCapabilities = {
       extensions: { [TASKS_EXTENSION]: {} },
@@ -1653,7 +1654,7 @@ describe('2026-07-28: tasks extension', () => {
     t.assert.deepStrictEqual(seen, [undefined, { step: 1 }, { step: 2 }])
   })
 
-  test('a legacy tasks/cancel releases a modern task parked for input', async (t: TestContext) => {
+  test('legacy and modern tasks/* only see tasks of their own era', async (t: TestContext) => {
     const app = await buildServer(t, (app) => {
       app.mcpAddTool({
         name: 'parked',
@@ -1662,26 +1663,16 @@ describe('2026-07-28: tasks extension', () => {
       } as any, async () => {
         throw new InputRequired({ inputRequests: { ok: elicitForm('Ok?', { type: 'object', properties: {} }) } })
       })
-      app.mcpAddTool({
-        name: 'probe',
-        inputSchema: Type.Object({}),
-        execution: { taskSupport: 'optional' }
-      } as any, async () => ({ content: [] }))
-    }, { enableTasks: true, enableSSE: true, taskDefaultTtlMs: 60_000, taskMaxConcurrent: 1 })
+    }, { enableTasks: true, enableSSE: true, taskShutdownTimeoutMs: 10 })
     const capabilities: ClientCapabilities = {
       extensions: { [TASKS_EXTENSION]: {} },
       elicitation: { form: {} }
     }
-
     const created = (await call(app, 'tools/call', {
       params: { name: 'parked', arguments: {} },
       capabilities
     })).json().result
     await pollTask(app, created.taskId, capabilities, t => t.status === 'input_required')
-    // The parked task holds the only slot, so this runs synchronously.
-    t.assert.strictEqual((await call(app, 'tools/call', {
-      id: 2, params: { name: 'probe', arguments: {} }, capabilities
-    })).json().result.resultType, 'complete')
 
     const init = await app.inject({
       method: 'POST',
@@ -1693,27 +1684,187 @@ describe('2026-07-28: tasks extension', () => {
         params: { protocolVersion: LATEST_LEGACY_PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: 'l', version: '1' } }
       }
     })
-    const cancel = await app.inject({
+    const legacy = (method: string) => app.inject({
       method: 'POST',
       url: '/mcp',
       headers: {
         'mcp-session-id': init.headers['mcp-session-id'] as string,
         'mcp-protocol-version': LATEST_LEGACY_PROTOCOL_VERSION
       },
-      payload: { jsonrpc: JSONRPC_VERSION, id: 2, method: 'tasks/cancel', params: { taskId: created.taskId } }
+      payload: { jsonrpc: JSONRPC_VERSION, id: 2, method, params: { taskId: created.taskId } }
     })
-    t.assert.strictEqual(cancel.json().result.status, 'cancelled')
-
-    // The cancellation wakes the worker at once (not via the 1s outbox poll,
-    // let alone the 60s ttl), freeing its slot.
-    let resultType: string | undefined
-    for (let attempt = 0; attempt < 30 && resultType !== 'task'; attempt++) {
-      await new Promise(resolve => setTimeout(resolve, 10))
-      resultType = (await call(app, 'tools/call', {
-        id: 3, params: { name: 'probe', arguments: {} }, capabilities
-      })).json().result.resultType
+    for (const method of ['tasks/get', 'tasks/cancel']) {
+      t.assert.strictEqual((await legacy(method)).json().error.code, INVALID_PARAMS, method)
     }
-    t.assert.strictEqual(resultType, 'task')
+    // Still running and answerable on its own era.
+    const task = (await call(app, 'tasks/get', { params: { taskId: created.taskId }, capabilities })).json().result
+    t.assert.strictEqual(task.status, 'input_required')
+  })
+
+  test('another OAuth client of the same user cannot see or answer the task', async (t: TestContext) => {
+    const app = Fastify()
+    t.after(() => app.close())
+    await app.register(mcpPlugin, {
+      enableTasks: true,
+      taskShutdownTimeoutMs: 10,
+      resolveAuthorizationContext: (request) => ({ userId: 'alice', clientId: request.headers['x-client'] as string })
+    })
+    app.mcpAddTool({
+      name: 'approve',
+      inputSchema: Type.Object({}),
+      execution: { taskSupport: 'required' }
+    } as any, async () => {
+      throw new InputRequired({ inputRequests: { ok: elicitForm('Approve?', { type: 'object', properties: {} }) } })
+    })
+    await app.ready()
+    const capabilities: ClientCapabilities = {
+      extensions: { [TASKS_EXTENSION]: {} },
+      elicitation: { form: {} }
+    }
+    const as = (client: string) => ({ capabilities, headers: { 'x-client': client } })
+
+    const created = (await call(app, 'tools/call', {
+      params: { name: 'approve', arguments: {} }, ...as('trusted-app')
+    })).json().result
+    for (let attempt = 0; attempt < 50; attempt++) {
+      const task = (await call(app, 'tasks/get', { params: { taskId: created.taskId }, ...as('trusted-app') })).json().result
+      if (task.status === 'input_required') break
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+
+    const read = await call(app, 'tasks/get', { params: { taskId: created.taskId }, ...as('evil-app') })
+    t.assert.strictEqual(read.json().error.code, INVALID_PARAMS)
+    const answer = await call(app, 'tasks/update', {
+      params: { taskId: created.taskId, inputResponses: { ok: { action: 'accept', content: {} } } },
+      ...as('evil-app')
+    })
+    t.assert.strictEqual(answer.json().error.code, INVALID_PARAMS)
+    const still = (await call(app, 'tasks/get', { params: { taskId: created.taskId }, ...as('trusted-app') })).json().result
+    t.assert.strictEqual(still.status, 'input_required')
+  })
+
+  test('a task whose worker stops renewing its lease is reported failed', async (t: TestContext) => {
+    let release: () => void = () => {}
+    const blocked = new Promise<void>(resolve => { release = resolve })
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({
+        name: 'orphan',
+        inputSchema: Type.Object({}),
+        execution: { taskSupport: 'required' }
+      } as any, async () => {
+        await blocked
+        return { content: [] }
+      })
+    }, { enableTasks: true, taskLeaseMs: 60, taskShutdownTimeoutMs: 10 })
+    t.after(() => release())
+
+    const created = (await call(app, 'tools/call', {
+      params: { name: 'orphan', arguments: {} },
+      capabilities: tasksCapable
+    })).json().result
+    // The worker "dies": it stops renewing, as a crashed instance would.
+    t.mock.method(MemoryTaskStore.prototype, 'renewLease', async () => 'working')
+
+    const task = await pollTask(app, created.taskId, tasksCapable, t => t.status === 'failed')
+    t.assert.strictEqual(task.status, 'failed')
+    t.assert.match(task.error.message, /stopped before it finished/)
+  })
+
+  test('closing the server records running and parked tasks as failed, not timed out', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({
+        name: 'long',
+        inputSchema: Type.Object({}),
+        execution: { taskSupport: 'required' }
+      } as any, async (_args: any, context: any) => {
+        await new Promise((_resolve, reject) => {
+          context.signal.addEventListener('abort', () => reject(context.signal.reason), { once: true })
+        })
+        return { content: [] }
+      })
+      app.mcpAddTool({
+        name: 'parked',
+        inputSchema: Type.Object({}),
+        execution: { taskSupport: 'required' }
+      } as any, async () => {
+        throw new InputRequired({ inputRequests: { ok: elicitForm('Ok?', { type: 'object', properties: {} }) } })
+      })
+    }, { enableTasks: true, taskShutdownTimeoutMs: 50 })
+    const capabilities: ClientCapabilities = {
+      extensions: { [TASKS_EXTENSION]: {} },
+      elicitation: { form: {} }
+    }
+
+    const recorded = new Map<string, string | null | undefined>()
+    const original = MemoryTaskStore.prototype.updateStatus
+    t.mock.method(MemoryTaskStore.prototype, 'updateStatus', async function (this: MemoryTaskStore, taskId: string, status: any, options: any) {
+      if (status === 'failed') recorded.set(taskId, options?.statusMessage)
+      return await original.call(this, taskId, status, options)
+    })
+
+    const running = (await call(app, 'tools/call', { params: { name: 'long', arguments: {} }, capabilities })).json().result
+    const parked = (await call(app, 'tools/call', { id: 2, params: { name: 'parked', arguments: {} }, capabilities })).json().result
+    await pollTask(app, parked.taskId, capabilities, t => t.status === 'input_required')
+
+    await app.close()
+    t.assert.match(recorded.get(running.taskId) ?? '', /shut down/)
+    t.assert.match(recorded.get(parked.taskId) ?? '', /shut down/)
+  })
+
+  test('a handler still running at its ttl is aborted and frees its slot', async (t: TestContext) => {
+    let reason: unknown
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({
+        name: 'hang',
+        inputSchema: Type.Object({}),
+        execution: { taskSupport: 'optional' }
+      } as any, async (args: any, context: any) => {
+        if (!args.hang) return { content: [] }
+        await new Promise(resolve => context.signal.addEventListener('abort', resolve, { once: true }))
+        reason = context.signal.reason
+        return { content: [] }
+      })
+    }, { enableTasks: true, taskMaxConcurrent: 1, taskDefaultTtlMs: 100, taskShutdownTimeoutMs: 10 })
+
+    const first = (await call(app, 'tools/call', {
+      params: { name: 'hang', arguments: { hang: true } }, capabilities: tasksCapable
+    })).json().result
+    t.assert.strictEqual(first.resultType, 'task')
+    await new Promise(resolve => setTimeout(resolve, 200))
+    t.assert.match(String((reason as Error)?.message), /expired/)
+
+    const next = (await call(app, 'tools/call', {
+      id: 2, params: { name: 'hang', arguments: {} }, capabilities: tasksCapable
+    })).json().result
+    t.assert.strictEqual(next.resultType, 'task')
+  })
+
+  test('concurrent calls cannot exceed taskMaxConcurrent while the store is slow', async (t: TestContext) => {
+    let release: () => void = () => {}
+    const blocked = new Promise<void>(resolve => { release = resolve })
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({
+        name: 'busy',
+        inputSchema: Type.Object({}),
+        execution: { taskSupport: 'required' }
+      } as any, async () => {
+        await blocked
+        return { content: [] }
+      })
+    }, { enableTasks: true, taskMaxConcurrent: 2, taskShutdownTimeoutMs: 10 })
+    t.after(() => release())
+    const original = MemoryTaskStore.prototype.create
+    t.mock.method(MemoryTaskStore.prototype, 'create', async function (this: MemoryTaskStore, task: any) {
+      await new Promise(resolve => setTimeout(resolve, 5))
+      return await original.call(this, task)
+    })
+
+    const results = await Promise.all(Array.from({ length: 10 }, (_, i) => call(app, 'tools/call', {
+      id: i + 1, params: { name: 'busy', arguments: {} }, capabilities: tasksCapable
+    }).then(r => r.json().result?.resultType)))
+    // Calls over the cap are refused at once, since this tool cannot run
+    // synchronously; exactly the cap's worth become tasks.
+    t.assert.strictEqual(results.filter(type => type === 'task').length, 2)
   })
 
   test('with identity resolution, an unidentified caller gets no unreachable task', async (t: TestContext) => {
@@ -1760,7 +1911,7 @@ describe('2026-07-28: tasks extension', () => {
         if (args.block) await blocked
         return { content: [{ type: 'text', text: 'done' }] }
       })
-    }, { enableTasks: true, taskMaxConcurrent: 1 })
+    }, { enableTasks: true, taskMaxConcurrent: 1, taskShutdownTimeoutMs: 10 })
     t.after(() => release())
 
     const first = (await call(app, 'tools/call', {
