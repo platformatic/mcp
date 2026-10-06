@@ -13,6 +13,7 @@ import type {
 import { callRegisteredTool } from '../handlers.ts'
 import { schemaToArguments, validateToolSchema, isTypeBoxSchema } from '../validation/index.ts'
 import type { JsonSchemaValidator } from '../validation/json-schema-validator.ts'
+import type { ServerCapabilities } from '../schema.ts'
 
 interface MCPDecoratorsOptions {
   tools: Map<string, MCPTool>
@@ -21,6 +22,7 @@ interface MCPDecoratorsOptions {
   resourceHandlers: ResourceHandlers
   opts: MCPPluginOptions
   jsonSchemaValidator?: JsonSchemaValidator
+  capabilities: ServerCapabilities
 }
 
 const SUPPORTED_OUTPUT_DIALECTS = new Set([
@@ -29,7 +31,7 @@ const SUPPORTED_OUTPUT_DIALECTS = new Set([
 ])
 
 const mcpDecoratorsPlugin: FastifyPluginAsync<MCPDecoratorsOptions> = async (app, options) => {
-  const { tools, resources, prompts, resourceHandlers, opts, jsonSchemaValidator } = options
+  const { tools, resources, prompts, resourceHandlers, opts, jsonSchemaValidator, capabilities } = options
 
   // Enhanced tool decorator with TypeBox schema support
   app.decorate('mcpAddTool', (
@@ -150,6 +152,10 @@ const mcpDecoratorsPlugin: FastifyPluginAsync<MCPDecoratorsOptions> = async (app
   // Resource subscription handler setters
   app.decorate('mcpSetResourceSubscribeHandler', (handler: ResourceSubscribeHandler) => {
     resourceHandlers.subscribeHandler = handler
+    // Default capabilities only: an explicit configuration is used as given.
+    if (opts.capabilities === undefined && capabilities.resources) {
+      capabilities.resources.subscribe = true
+    }
   })
 
   app.decorate('mcpSetResourceUnsubscribeHandler', (handler: ResourceUnsubscribeHandler) => {

@@ -567,9 +567,15 @@ async function handleTasksUpdate (
     // Publish the durable values but leave them in the outbox: the broker
     // accepting a message does not mean the waiting worker received it. The
     // worker acknowledges once it has the answers, and reads the outbox itself
-    // if a publication goes missing. A retry republishes with the same
-    // delivery id, which receivers deduplicate.
-    await dependencies.taskInputs?.publish(params.taskId, responses, deliveryId)
+    // if a publication goes missing, so a failed publish (a broker outage, or
+    // this instance shutting down) loses nothing and the update has succeeded.
+    // A retry republishes with the same delivery id, which receivers
+    // deduplicate.
+    try {
+      await dependencies.taskInputs?.publish(params.taskId, responses, deliveryId)
+    } catch (error) {
+      dependencies.app.log.debug({ err: error, taskId: params.taskId }, 'Could not publish task input; the worker will read it from the store')
+    }
   }
 
   return createResponse(request.id, complete({}, dependencies.serverInfo))
@@ -614,7 +620,15 @@ async function handleTasksCancel (
       publishCancellation = current?.status === 'cancelled'
     }
   }
-  if (publishCancellation) await dependencies.taskInputs?.cancel(taskId)
+  if (publishCancellation) {
+    // The cancellation is already durable; a worker that misses this message
+    // still learns of it when it next renews its lease.
+    try {
+      await dependencies.taskInputs?.cancel(taskId)
+    } catch (error) {
+      dependencies.app.log.debug({ err: error, taskId }, 'Could not publish task cancellation; the worker will read it from the store')
+    }
+  }
 
   return createResponse(request.id, complete({}, dependencies.serverInfo))
 }
@@ -1119,10 +1133,7 @@ async function modernToolsCall (
   // are deliberately indistinguishable so authorization cannot leak names.
   const resolved = await resolveRegisteredTool(params.name, dependencies)
   if (!resolved.ok) {
-    const observed = resolved.reason === 'access-denied'
-      ? { ok: false as const, reason: 'not-found' as const }
-      : resolved
-    await emitToolCallComplete('json-rpc', params.name, args, observed, startedAt, dependencies)
+    await emitToolCallComplete('json-rpc', params.name, args, resolved, startedAt, dependencies)
     return createError(request.id, INVALID_PARAMS, `Unknown tool: ${params.name}`)
   }
   const tool = resolved.tool

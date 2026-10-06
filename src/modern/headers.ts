@@ -186,6 +186,27 @@ export function validateStandardHeaders (
   return { ok: true }
 }
 
+const MIRRORABLE_TYPES = new Set(['string', 'integer', 'boolean'])
+
+/**
+ * The primitive type an annotated parameter carries, or `undefined` when it
+ * cannot be mirrored into a header. A nullable parameter qualifies: the
+ * transport has a rule for null (the client omits the header), so
+ * `type: ["string", "null"]` and an `anyOf`/`oneOf` of a primitive and null
+ * (what TypeBox's `Type.Union([..., Type.Null()])` produces) are accepted.
+ */
+function mirroredType (schema: Record<string, unknown>): string | undefined {
+  const alternatives = schema.anyOf ?? schema.oneOf
+  const types: unknown[] = Array.isArray(schema.type)
+    ? schema.type
+    : Array.isArray(alternatives)
+      ? alternatives.map((entry: unknown) => (entry as { type?: unknown } | undefined)?.type)
+      : [schema.type]
+  const nonNull = types.filter(type => type !== 'null')
+  if (nonNull.length !== 1 || typeof nonNull[0] !== 'string') return undefined
+  return MIRRORABLE_TYPES.has(nonNull[0]) ? nonNull[0] : undefined
+}
+
 /**
  * Read the `x-mcp-header` annotations off a tool's `inputSchema`.
  *
@@ -305,8 +326,8 @@ export function collectHeaderParams (
       if (seen.has(lower)) {
         return { ok: false, message: `x-mcp-header '${annotation}' is declared more than once` }
       }
-      const type = record.type
-      if (type !== 'string' && type !== 'integer' && type !== 'boolean') {
+      const type = mirroredType(record)
+      if (type === undefined) {
         return {
           ok: false,
           message: `x-mcp-header '${annotation}' may only annotate string, integer or boolean parameters`

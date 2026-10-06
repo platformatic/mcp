@@ -1205,6 +1205,115 @@ describe('2026-07-28: subscriptions', () => {
   })
 })
 
+describe('defaults, startup checks and smaller fixes', () => {
+  test('default capabilities declare listChanged, so listen acknowledges list changes', async (t: TestContext) => {
+    const app = Fastify()
+    t.after(() => app.close())
+    await app.register(mcpPlugin)
+    app.mcpSetResourceSubscribeHandler(async () => ({}))
+    await app.ready()
+
+    const capabilities = (await call(app, 'server/discover')).json().result.capabilities
+    t.assert.strictEqual(capabilities.tools.listChanged, true)
+    t.assert.strictEqual(capabilities.prompts.listChanged, true)
+    t.assert.strictEqual(capabilities.resources.listChanged, true)
+    t.assert.strictEqual(capabilities.resources.subscribe, true)
+  })
+
+  test('redis without requestStateSecret is refused at startup', async (t: TestContext) => {
+    const app = Fastify()
+    t.after(() => app.close())
+    await t.assert.rejects(async () => {
+      await app.register(mcpPlugin, { redis: { host: '127.0.0.1', port: 1, lazyConnect: true } as any }).ready()
+    }, /requestStateSecret is required/)
+  })
+
+  test('a public cache hint with per-caller results logs a warning', async (t: TestContext) => {
+    const lines: string[] = []
+    const app = Fastify({ logger: { level: 'warn', stream: { write: (line: string) => { lines.push(line) } } } })
+    t.after(() => app.close())
+    await app.register(mcpPlugin, {
+      canAccessTool: () => true,
+      caching: { toolsList: { ttlMs: 1000, cacheScope: 'public' } }
+    })
+    await app.ready()
+    t.assert.ok(lines.some(line => line.includes('cacheScope') && line.includes('toolsList')))
+  })
+
+  test('a nullable x-mcp-header parameter keeps the tool available', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({
+        name: 'regional',
+        inputSchema: {
+          type: 'object',
+          properties: { region: { type: ['string', 'null'], 'x-mcp-header': 'Region' } }
+        }
+      } as any, async (args: any) => ({ content: [{ type: 'text', text: String(args.region) }] }))
+    })
+    const listed = (await call(app, 'tools/list')).json().result.tools
+    t.assert.deepStrictEqual(listed.map((tool: any) => tool.name), ['regional'])
+
+    const withValue = await call(app, 'tools/call', {
+      params: { name: 'regional', arguments: { region: 'eu' } },
+      headers: { 'mcp-param-region': 'eu' }
+    })
+    t.assert.strictEqual(withValue.json().result.content[0].text, 'eu')
+    // A null value carries no header.
+    const withNull = await call(app, 'tools/call', { id: 2, params: { name: 'regional', arguments: { region: null } } })
+    t.assert.strictEqual(withNull.json().result.content[0].text, 'null')
+  })
+
+  test('a failed resources/read does not reveal the handler error', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddResource({ uriPattern: 'file:///secret' }, async () => {
+        throw new Error('connection to db.internal:5432 refused')
+      })
+    })
+    const response = await call(app, 'resources/read', { params: { uri: 'file:///secret' } })
+    t.assert.strictEqual(response.json().error.message, 'Resource read failed')
+  })
+
+  test('tasks/update succeeds once stored, even when its publication fails', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({
+        name: 'confirm',
+        inputSchema: Type.Object({}),
+        execution: { taskSupport: 'required' }
+      } as any, async (_args: any, context: any) => {
+        if (!context.inputResponses?.ok) {
+          throw new InputRequired({ inputRequests: { ok: elicitForm('Ok?', { type: 'object', properties: {} }) } })
+        }
+        return { content: [{ type: 'text', text: 'confirmed' }] }
+      })
+    }, { enableTasks: true })
+    const capabilities: ClientCapabilities = { extensions: { [TASKS_EXTENSION]: {} }, elicitation: { form: {} } }
+    t.mock.method(MemoryMessageBroker.prototype, 'publish', async function (this: MemoryMessageBroker, topic: string, message: any) {
+      if (topic === TASK_INPUT_TOPIC) throw new Error('broker down')
+      return await (MemoryMessageBroker.prototype.publish as any).mock.original.call(this, topic, message)
+    })
+
+    const created = (await call(app, 'tools/call', { params: { name: 'confirm', arguments: {} }, capabilities })).json().result
+    for (let attempt = 0; attempt < 50; attempt++) {
+      const task = (await call(app, 'tasks/get', { params: { taskId: created.taskId }, capabilities })).json().result
+      if (task.status === 'input_required') break
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+    const updated = await call(app, 'tasks/update', {
+      params: { taskId: created.taskId, inputResponses: { ok: { action: 'accept', content: {} } } },
+      capabilities
+    })
+    t.assert.strictEqual(updated.json().result.resultType, 'complete')
+
+    let task: any
+    for (let attempt = 0; attempt < 60; attempt++) {
+      task = (await call(app, 'tasks/get', { params: { taskId: created.taskId }, capabilities })).json().result
+      if (task.status === 'completed') break
+      await new Promise(resolve => setTimeout(resolve, 50))
+    }
+    t.assert.strictEqual(task.status, 'completed')
+  })
+})
+
 describe('2026-07-28: per-caller and global limits', () => {
   const tasksCapable: ClientCapabilities = { extensions: { [TASKS_EXTENSION]: {} } }
 

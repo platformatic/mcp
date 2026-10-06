@@ -239,6 +239,27 @@ describe('request state sealing', () => {
     if (opened.ok) t.assert.deepStrictEqual(opened.claims.inputKeys, ['a', 'b'])
   })
 
+  test('state from another server sharing the secret is refused', (t: TestContext) => {
+    const secret = 'shared'.padEnd(32, '-')
+    const state = new RequestStateSealer({ secret, audience: 'server-a' }).seal(base)
+    const opened = new RequestStateSealer({ secret, audience: 'server-b' }).open(state, base)
+    t.assert.deepStrictEqual(opened, { ok: false, reason: 'request state was issued by a different server' })
+  })
+
+  test('deeply nested parameters fail verification instead of overflowing', (t: TestContext) => {
+    const sealer = new RequestStateSealer()
+    const state = sealer.seal(base)
+    let nested: Record<string, unknown> = {}
+    const params = { name: 'x', arguments: nested }
+    for (let depth = 0; depth < 10_000; depth++) {
+      const next = {}
+      nested.n = next
+      nested = next
+    }
+    const opened = sealer.open(state, { ...base, params })
+    t.assert.strictEqual(opened.ok, false)
+  })
+
   test('a different secret cannot open it', (t: TestContext) => {
     const state = new RequestStateSealer({ secret: 'one'.padEnd(32, '-') }).seal(base)
     const opened = new RequestStateSealer({ secret: 'two'.padEnd(32, '-') }).open(state, base)

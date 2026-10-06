@@ -23,6 +23,8 @@ export interface RequestStateClaims {
   requestDigest: string
   /** Epoch milliseconds after which the state is refused. */
   expiresAt: number
+  /** The server the state was issued by, so servers sharing a secret cannot accept each other's. */
+  audience?: string
   /** Whatever the server needs to resume, opaque to us. */
   payload: unknown
   /**
@@ -65,14 +67,24 @@ export function digestRequest (method: string, params: unknown): string {
     .digest('base64url')
 }
 
+/** Deeper than any legitimate request; bounds the digest's recursion. */
+const MAX_DIGEST_DEPTH = 64
+
+export class RequestTooDeepError extends Error {
+  constructor () {
+    super(`request parameters are nested more than ${MAX_DIGEST_DEPTH} levels deep`)
+  }
+}
+
 /** Deterministic JSON so key order cannot change the digest. */
-function stableStringify (value: unknown): string {
+function stableStringify (value: unknown, depth: number = 0): string {
   if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null'
-  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`
+  if (depth >= MAX_DIGEST_DEPTH) throw new RequestTooDeepError()
+  if (Array.isArray(value)) return `[${value.map(item => stableStringify(item, depth + 1)).join(',')}]`
   const entries = Object.entries(value as Record<string, unknown>)
     .filter(([, v]) => v !== undefined)
     .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
-    .map(([k, v]) => `${JSON.stringify(k)}:${stableStringify(v)}`)
+    .map(([k, v]) => `${JSON.stringify(k)}:${stableStringify(v, depth + 1)}`)
   return `{${entries.join(',')}}`
 }
 
@@ -89,8 +101,10 @@ export class RequestStateSealer {
   #ttlMs: number
 
   #requirePrincipal: boolean
+  #audience?: string
 
-  constructor (options: { secret?: string | Buffer, ttlMs?: number, requirePrincipal?: boolean } = {}) {
+  constructor (options: { secret?: string | Buffer, ttlMs?: number, requirePrincipal?: boolean, audience?: string } = {}) {
+    this.#audience = options.audience
     if (options.secret === undefined) {
       this.#secret = randomBytes(MIN_SECRET_BYTES)
     } else {
@@ -128,6 +142,7 @@ export class RequestStateSealer {
       method: input.method,
       requestDigest: digestRequest(input.method, input.params),
       expiresAt: Date.now() + (input.ttlMs ?? this.#ttlMs),
+      ...(this.#audience !== undefined ? { audience: this.#audience } : {}),
       payload: input.payload ?? null,
       ...(input.inputKeys ? { inputKeys: input.inputKeys } : {})
     }
@@ -175,6 +190,10 @@ export class RequestStateSealer {
       return { ok: false, reason: 'request state requires an authenticated principal' }
     }
 
+    if (claims.audience !== this.#audience) {
+      return { ok: false, reason: 'request state was issued by a different server' }
+    }
+
     if (claims.principal !== expected.principal) {
       return { ok: false, reason: 'request state was issued to a different principal' }
     }
@@ -183,7 +202,13 @@ export class RequestStateSealer {
       return { ok: false, reason: 'request state was issued for a different method' }
     }
 
-    const digest = digestRequest(expected.method, expected.params)
+    let digest: string
+    try {
+      digest = digestRequest(expected.method, expected.params)
+    } catch (error) {
+      if (error instanceof RequestTooDeepError) return { ok: false, reason: error.message }
+      throw error
+    }
     if (claims.requestDigest !== digest) {
       return { ok: false, reason: 'request state was issued for a different request' }
     }

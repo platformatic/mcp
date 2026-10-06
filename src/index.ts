@@ -79,10 +79,20 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     version: '1.0.0'
   }
 
+  // The plugin can always broadcast list changes (mcpBroadcastNotification),
+  // so by default it says so; without it, 2026-07-28 subscriptions/listen
+  // could acknowledge nothing. `resources.subscribe` is declared once a
+  // subscribe handler is registered. Explicit capabilities are used as given.
   const capabilities: ServerCapabilities = opts.capabilities ?? {
-    tools: {},
-    resources: {},
-    prompts: {}
+    tools: { listChanged: true },
+    resources: { listChanged: true },
+    prompts: { listChanged: true }
+  }
+
+  // Several instances serve each other's MRTR retries, so they must share the
+  // key that seals request state; without one each would refuse the others'.
+  if (opts.redis && opts.requestStateSecret === undefined) {
+    throw new Error('requestStateSecret is required when redis is configured: every instance must verify the request state the others seal')
   }
 
   app.decorate('mcpClient', (clientOptions?: McpClientOptions) => {
@@ -173,8 +183,19 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     resourcesRead: hintFor('resourcesRead')
   }
 
+  // A `public` hint lets shared caches serve one caller's result to another,
+  // which is wrong when results depend on who asks.
+  const perCaller = opts.authorization?.enabled === true || opts.resolveAuthorizationContext !== undefined || opts.canAccessTool !== undefined
+  if (perCaller) {
+    const shared = (Object.keys(caching) as Array<keyof CachingConfig>).filter(which => caching[which].cacheScope === 'public')
+    if (shared.length > 0) {
+      app.log.warn({ operations: shared }, 'MCP: cacheScope "public" is configured while results may differ per caller (authorization, resolveAuthorizationContext or canAccessTool); shared caches could serve one caller\'s result to another')
+    }
+  }
+
   const sealer = new RequestStateSealer({
     secret: opts.requestStateSecret,
+    audience: serverInfo.name,
     ttlMs: opts.requestStateTtlMs,
     // With identity resolution on, a request carrying no `userId` identifies
     // nobody, and two such callers would share the undefined principal — so state
@@ -273,7 +294,8 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     prompts,
     resourceHandlers,
     opts,
-    jsonSchemaValidator
+    jsonSchemaValidator,
+    capabilities
   })
   app.register(pubsubDecorators, {
     enableSSE,
@@ -333,10 +355,12 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
 
   // Expired task keys vanish on their own in Redis, but their ids linger in
   // the index until something prunes it, so prune it on a schedule.
+  // Each instance runs it at a jittered interval, so instances deployed
+  // together do not all sweep the shared index at the same moment.
   const taskCleanup = taskStore
     ? setInterval(() => {
       taskStore.cleanup().catch((error) => app.log.debug({ err: error }, 'Task store cleanup failed'))
-    }, TASK_CLEANUP_INTERVAL_MS).unref()
+    }, Math.round(TASK_CLEANUP_INTERVAL_MS * (0.5 + Math.random()))).unref()
     : undefined
 
   // Add close hook to clean up Redis connections and authorization components

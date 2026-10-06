@@ -53,6 +53,7 @@ import { principalOf } from './principal.ts'
 import type { TaskInputChannel } from './modern/task-inputs.ts'
 import { InputRequired } from './modern/input-required.ts'
 import type { RequestNotifiers } from './modern/request-stream.ts'
+import { isStdioRequest } from './stdio-trust.ts'
 import {
   atLeast,
   supportsTasks,
@@ -403,12 +404,7 @@ async function handleToolsCall (
   // the model cannot correct itself out of missing access.
   const resolved = await resolveRegisteredTool(toolName, dependencies)
   if (!resolved.ok) {
-    // Keep the JSON-RPC observer aligned with the privacy-preserving protocol
-    // response: denied registered tools are indistinguishable from unknown ones.
-    const observedOutcome: McpCallToolOutcome = resolved.reason === 'access-denied'
-      ? { ok: false, reason: 'not-found' }
-      : resolved
-    await emitToolCallComplete('json-rpc', toolName, params.arguments || {}, observedOutcome, startedAt, dependencies)
+    await emitToolCallComplete('json-rpc', toolName, params.arguments || {}, resolved, startedAt, dependencies)
     return toolCallOutcomeToJsonRpc(request.id, toolName, resolved)
   }
 
@@ -484,7 +480,6 @@ export async function emitToolCallComplete (
 type RegisteredToolResolution =
   | { ok: true, tool: MCPTool }
   | { ok: false, reason: 'not-found' }
-  | { ok: false, reason: 'access-denied' }
 
 export async function resolveRegisteredTool (
   toolName: string,
@@ -498,7 +493,10 @@ export async function resolveRegisteredTool (
   }
 
   if (!isAllowed) {
-    return { ok: false, reason: 'access-denied' }
+    // Indistinguishable from an unknown tool for every caller, in-process
+    // ones included, so a relayed outcome cannot reveal that it exists.
+    dependencies.app.log.debug({ tool: toolName }, 'Tool call denied by canAccessTool')
+    return { ok: false, reason: 'not-found' }
   }
 
   return { ok: true, tool }
@@ -525,7 +523,6 @@ function toolCallOutcomeToJsonRpc (
       return createResponse(id, result)
     }
     case 'not-found':
-    case 'access-denied':
       return createError(id, METHOD_NOT_FOUND, `Tool '${toolName}' not found`)
     // Unreachable from the JSON-RPC path today (handleToolsCall resolves task
     // augmentation itself), but kept in the mapping so the two paths stay
@@ -861,8 +858,9 @@ export async function handleResourcesRead (
   } catch (error: any) {
     rethrowIfInputRequired(error)
     if (dependencies.strictErrors) {
+      // The handler's error may carry internals; it goes to the log only.
       dependencies.app.log.error({ err: error, uri }, 'Resource read failed')
-      return createError(request.id, INTERNAL_ERROR, `Resource read failed: ${error.message || error}`)
+      return createError(request.id, INTERNAL_ERROR, 'Resource read failed')
     }
     const result: ReadResourceResult = {
       contents: [{
@@ -1486,8 +1484,6 @@ async function handleResourcesUnsubscribe (
   }
 }
 
-const STDIO_TRANSPORT_HEADER = 'x-platformatic-mcp-transport'
-
 function mcpContextCarrier (params: unknown): Record<string, string | string[]> | undefined {
   if (typeof params !== 'object' || params === null || !('_meta' in params)) return undefined
   const meta = params._meta
@@ -1541,7 +1537,9 @@ export async function withMcpServerSpan<T> (
     : dependencies.protocolVersion
   if (protocolVersion) extraAttrs[MCP_ATTR.PROTOCOL_VERSION] = protocolVersion
 
-  const isStdio = request.headers[STDIO_TRANSPORT_HEADER] === 'stdio'
+  // The plain transport header is only a hint any HTTP client could send;
+  // trusting it would let a caller drop its address from the span.
+  const isStdio = isStdioRequest(request.headers)
   if (isStdio) {
     extraAttrs[MCP_ATTR.NETWORK_TRANSPORT] = 'pipe'
   } else {

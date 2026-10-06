@@ -625,7 +625,8 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
           taskWaiters,
           jsonSchemaValidator,
           taskInputs,
-          protocolVersion: (request as any).mcpProtocolVersion
+          // The body is authoritative on this path (stdio sends no header).
+          protocolVersion: requestedProtocolVersion((message as { params?: unknown } | null)?.params)
         }, async () => await handleModernPost(request, reply, resolvedAuthContext))
       }
 

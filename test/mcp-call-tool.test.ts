@@ -260,7 +260,7 @@ describe('mcpCallTool', () => {
     t.assert.strictEqual(getHandlerInvocations(), 0)
   })
 
-  test('reports access-denied for an unauthorized registered tool without invoking its handler', async (t: TestContext) => {
+  test('reports not-found for an unauthorized registered tool without invoking its handler', async (t: TestContext) => {
     const { app, getHandlerInvocations } = await buildApp(t)
 
     const response = await app.inject({
@@ -269,11 +269,11 @@ describe('mcpCallTool', () => {
       payload: { name: 'restricted', args: {} }
     })
 
-    t.assert.deepStrictEqual(response.json(), { ok: false, reason: 'access-denied' })
+    t.assert.deepStrictEqual(response.json(), { ok: false, reason: 'not-found' })
     t.assert.strictEqual(getHandlerInvocations(), 0)
   })
 
-  test('reports access-denied when the access hook throws for an existing tool', async (t: TestContext) => {
+  test('reports not-found when the access hook throws for an existing tool', async (t: TestContext) => {
     const { app, getHandlerInvocations } = await buildApp(t)
 
     const response = await app.inject({
@@ -282,11 +282,11 @@ describe('mcpCallTool', () => {
       payload: { name: 'throws-access-check', args: {} }
     })
 
-    t.assert.deepStrictEqual(response.json(), { ok: false, reason: 'access-denied' })
+    t.assert.deepStrictEqual(response.json(), { ok: false, reason: 'not-found' })
     t.assert.strictEqual(getHandlerInvocations(), 0)
   })
 
-  test('reports not-found, not access-denied, for an unknown tool the hook also denies', async (t: TestContext) => {
+  test('reports not-found for an unknown tool the hook also denies', async (t: TestContext) => {
     const { app } = await buildApp(t)
 
     // canAccessTool denies everything except 'echo' and the explicitly
@@ -384,7 +384,7 @@ describe('mcpCallTool', () => {
     // mcpCallTool() reports the precise reason; the JSON-RPC wire protocol
     // still masks it as `not-found` so remote clients can't tell denied
     // tools apart from unknown ones.
-    t.assert.deepStrictEqual(directDenied.json(), { ok: false, reason: 'access-denied' })
+    t.assert.deepStrictEqual(directDenied.json(), { ok: false, reason: 'not-found' })
     const deniedError = (rpcDenied.json() as JSONRPCErrorResponse).error
     t.assert.strictEqual(deniedError.code, METHOD_NOT_FOUND)
     t.assert.strictEqual(deniedError.message, "Tool 'restricted' not found")
@@ -548,7 +548,7 @@ describe('mcpCallTool', () => {
       url: '/direct-tool-call',
       payload: { name: 'wallet-summary', args: {}, authScopes: ['profile:read'] }
     })
-    t.assert.deepStrictEqual(deniedResponse.json(), { ok: false, reason: 'access-denied' })
+    t.assert.deepStrictEqual(deniedResponse.json(), { ok: false, reason: 'not-found' })
 
     const allowedResponse = await app.inject({
       method: 'POST',
@@ -569,7 +569,7 @@ describe('mcpCallTool', () => {
       url: '/direct-tool-call',
       payload: { name: 'restricted', args: {}, spoofContextOverrides: true }
     })
-    t.assert.deepStrictEqual(deniedResponse.json(), { ok: false, reason: 'access-denied' })
+    t.assert.deepStrictEqual(deniedResponse.json(), { ok: false, reason: 'not-found' })
 
     const allowedResponse = await app.inject({
       method: 'POST',

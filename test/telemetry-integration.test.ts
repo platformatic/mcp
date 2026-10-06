@@ -3,6 +3,8 @@ import assert from 'node:assert/strict'
 import Fastify from 'fastify'
 import { SpanKind, type Tracer, type Span } from '@opentelemetry/api'
 import mcpPlugin from '../src/index.ts'
+import { PassThrough } from 'node:stream'
+import { createStdioTransport } from '../src/stdio.ts'
 import { MCP_ATTR } from '../src/telemetry.ts'
 import { LATEST_PROTOCOL_VERSION } from '../src/schema.ts'
 import { META_CLIENT_CAPABILITIES, META_PROTOCOL_VERSION } from '../src/schema-2026.ts'
@@ -191,6 +193,47 @@ describe('telemetry integration', () => {
 
       assert.equal(res.statusCode, 200)
       await app.close()
+    })
+  })
+
+  describe('transport attribution', () => {
+    it('does not trust a spoofed stdio transport header over HTTP', async () => {
+      const { tracer, spanNames, spanAttrs } = makeTracer()
+      const app = await buildApp(tracer)
+      await app.inject({
+        method: 'POST',
+        url: '/mcp',
+        headers: { 'content-type': 'application/json', 'x-platformatic-mcp-transport': 'stdio' },
+        payload: { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'echo', arguments: { msg: 'hi' } } }
+      })
+      const idx = spanNames.indexOf('tools/call echo')
+      assert.equal(spanAttrs[idx][MCP_ATTR.NETWORK_TRANSPORT], 'tcp')
+      await app.close()
+    })
+
+    it('records the protocol version a stdio request states in _meta', async () => {
+      const { tracer, spanNames, spanAttrs } = makeTracer()
+      const app = await buildApp(tracer)
+      const input = new PassThrough()
+      const output = new PassThrough()
+      const transport = createStdioTransport(app, { input, output, error: new PassThrough() })
+      transport.start()
+      const answered = new Promise(resolve => output.once('data', resolve))
+      input.write(JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: {
+          name: 'echo',
+          arguments: { msg: 'hi' },
+          _meta: { [META_PROTOCOL_VERSION]: LATEST_PROTOCOL_VERSION, [META_CLIENT_CAPABILITIES]: {} }
+        }
+      }) + '\n')
+      await answered
+      const idx = spanNames.indexOf('tools/call echo')
+      assert.equal(spanAttrs[idx][MCP_ATTR.PROTOCOL_VERSION], LATEST_PROTOCOL_VERSION)
+      assert.equal(spanAttrs[idx][MCP_ATTR.NETWORK_TRANSPORT], 'pipe')
+      await transport.stop()
     })
   })
 })

@@ -8,6 +8,7 @@ import { applyInputRequestUpdates, canTransition, isTerminal, taskHasExpired } f
 // misreading each other's tasks during a rolling deploy or a rollback.
 const TASK_KEY_PREFIX = 'mcp:task:v2:'
 const TASK_INDEX_KEY = 'mcp:tasks:v2'
+const CLEANUP_BATCH = 500
 
 /**
  * Lua's cjson cannot round-trip arbitrary JSON: it turns empty arrays into
@@ -390,11 +391,16 @@ export class RedisTaskStore implements TaskStore {
   async cleanup (): Promise<void> {
     // Task keys expire on their own; this only prunes the index of ids whose
     // task key is already gone.
+    // Check existence in pipelined batches: one round trip per batch rather
+    // than two per indexed task.
     const ids = await this.redis.zrange(TASK_INDEX_KEY, 0, -1)
-    for (const id of ids) {
-      if (await this.redis.exists(this.key(id)) === 0) {
-        await this.redis.zrem(TASK_INDEX_KEY, id)
-      }
+    for (let start = 0; start < ids.length; start += CLEANUP_BATCH) {
+      const batch = ids.slice(start, start + CLEANUP_BATCH)
+      const pipeline = this.redis.pipeline()
+      for (const id of batch) pipeline.exists(this.key(id))
+      const results = await pipeline.exec()
+      const gone = batch.filter((_, index) => results?.[index]?.[1] === 0)
+      if (gone.length > 0) await this.redis.zrem(TASK_INDEX_KEY, ...gone)
     }
   }
 }

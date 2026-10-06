@@ -130,7 +130,13 @@ await app.listen({ port: 3000 })
 
 The plugin decorates the Fastify instance with `mcpClient()`, a client that talks to the
 server through `app.inject()` — no port binding, so it's equally useful for tests or for
-driving the server from other in-process code:
+driving the server from other in-process code.
+
+It accepts both JSON and `text/event-stream` responses; notifications streamed before the
+result are returned in `response.notifications`. Pass extra `_meta` (such as a
+`progressToken`) with `callTool(name, args, { meta })`. A result with a `resultType` it does
+not understand is rejected. It does not retry on its own: on `-32022` pick a version from
+`error.data.supported`, and on `-32020` re-run `listTools()` before retrying.
 
 ```typescript
 import { test } from 'node:test'
@@ -307,6 +313,8 @@ dual-era client uses on stdio:
 
 ```bash
 curl -X POST http://localhost:3000/mcp \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
   -H 'MCP-Protocol-Version: 2026-07-28' \
   -H 'Mcp-Method: server/discover' \
   -d '{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{
@@ -465,8 +473,45 @@ it agreed to honour — an opt-in for something the server has no capability for
 Every message on the stream carries `io.modelcontextprotocol/subscriptionId`, and
 `app.mcpBroadcastNotification()` feeds both these streams and legacy SSE sessions.
 
+A notification type is only acknowledged when the server's capabilities say it is emitted:
+`listChanged` for the list types, `resources.subscribe` for `resourceSubscriptions`. The default
+capabilities declare `listChanged: true` for tools, prompts and resources, and
+`resources.subscribe` once `app.mcpSetResourceSubscribeHandler()` is called; an explicit
+`capabilities` option is used exactly as given.
+
+Each stream holds a socket and buffers, so streams are bounded:
+`subscriptionMaxStreamsPerPrincipal` per caller (default 10, refused with HTTP `429`),
+`subscriptionMaxStreams` per instance (default 1000), and `subscriptionMaxResourceUris` per
+stream (default 1000).
+
 Request-scoped notifications (`notifications/progress`, `notifications/message`) are never
 delivered here; they belong on the response stream of the request they relate to.
+
+## Progress and Logging (2026-07-28)
+
+Handlers report progress and log messages through their context:
+
+```typescript
+app.mcpAddTool({ name: 'import', inputSchema: Type.Object({}) }, async (_args, context) => {
+  context.sendProgress(0, 3, 'Reading')
+  context.log('info', { step: 'read' }, 'importer')
+  // ...
+  context.sendProgress(3, 3, 'Done')
+  return { content: [{ type: 'text', text: 'imported' }] }
+})
+```
+
+Both are sent only when the client asked for them, on the response stream of that request:
+
+- `context.sendProgress(progress, total?, message?)` emits `notifications/progress` when the
+  request carries `_meta.progressToken`. `progress` must increase; a value that does not is
+  dropped.
+- `context.log(level, data, logger?)` emits `notifications/message` when the request sets
+  `io.modelcontextprotocol/logLevel`, and only at or above that level.
+
+The response switches to `text/event-stream` only when the first notification is sent, so a
+handler that never reports still answers with plain JSON. Both are no-ops on the legacy path
+and for tasks, whose creating request has already been answered.
 
 ## Result Caching (2026-07-28)
 
@@ -1400,10 +1445,15 @@ The plugin includes a built-in stdio transport utility for MCP communication ove
 
 ### Key Features
 
-- **Complete MCP stdio transport implementation** following the official specification
+- **MCP stdio transport** following the official specification, for both the handshake
+  revisions and 2026-07-28
 - **Fastify integration** using the `.inject()` method for consistency with HTTP routes
+- **Streaming**: `subscriptions/listen` and request-scoped progress or log notifications are
+  written to stdout as they happen
+- **Cancellation**: `notifications/cancelled` aborts the request's `context.signal`, and
+  nothing more is written for it
 - **Comprehensive error handling** with proper JSON-RPC error responses
-- **Batch request support** for processing multiple messages at once
+- **Batch request support** for the legacy revisions that allow it
 - **Debug logging** to stderr without interfering with the stdio protocol
 
 ### Quick Start
@@ -1507,13 +1557,15 @@ The stdio transport follows the MCP stdio transport specification:
 - Messages are delimited by newlines
 - Messages must NOT contain embedded newlines
 - Server logs can be written to stderr
-- Supports both single messages and batch requests
+- 2026-07-28 messages are always sent one per line; a batch containing one is refused with
+  `-32600`. Legacy revisions may still send batches.
+- 2026-07-28 has no header layer on stdio: everything travels in the body's `_meta`
 
 ### Error Handling
 
 The stdio transport provides comprehensive error handling:
 
-- JSON parsing errors return appropriate JSON-RPC error responses
+- Unparseable lines are answered with a `-32700` parse error whose `id` is `null`
 - Invalid method calls return "Method not found" errors
 - Tool execution errors are captured and returned in the response
 - Connection errors are logged to stderr
@@ -2159,6 +2211,20 @@ await app.register(import('@fastify/bearer-auth'), {
     - `checkIntervalMs`: Token refresh check interval
     - `refreshBufferMinutes`: Minutes before expiry to refresh tokens
     - `maxRetries`: Maximum refresh attempts
+- `requestStateSecret`: Secret (at least 32 bytes) that seals multi round-trip
+  `requestState`. Required when `redis` is configured, since any instance may serve a retry
+- `requestStateTtlMs`: How long sealed state stays valid (default 5 minutes)
+- `caching`: Freshness hints per cacheable operation (default `{ ttlMs: 0, cacheScope: 'private' }`)
+- `enableTasks`: Enable tasks (the 2025-11-25 core tasks and the 2026-07-28 extension)
+- `taskDefaultTtlMs` / `taskMaxTtlMs`: Task retention (defaults 60000 / 3600000)
+- `taskMaxConcurrent`: Most 2026-07-28 tasks one instance runs at once (default 1000)
+- `taskMaxPerPrincipal`: Most 2026-07-28 tasks one caller runs on an instance (default 100)
+- `taskLeaseMs`: Worker lease; a task whose worker stops renewing it is reported failed
+  (default 15000)
+- `taskShutdownTimeoutMs`: How long `close()` waits for running tasks before failing them
+  (default 5000; keep it below Fastify's `pluginTimeout`)
+- `subscriptionMaxStreams` / `subscriptionMaxStreamsPerPrincipal` /
+  `subscriptionMaxResourceUris`: Bounds on `subscriptions/listen` (defaults 1000 / 10 / 1000)
 - `redis`: Redis configuration for horizontal scaling (optional)
   - `host`: Redis server hostname
   - `port`: Redis server port
@@ -2784,6 +2850,34 @@ Set up alerts for:
 Remember: Security is a layered approach. No single measure provides complete protection.
 
 ## Migration from Earlier Versions
+
+### Breaking changes in 3.0.0
+
+The 2026-07-28 support ships as a major release. Legacy clients need no changes; these are
+the changes to the plugin's own API and defaults:
+
+- **`LATEST_PROTOCOL_VERSION` is `2026-07-28`**, and `SUPPORTED_PROTOCOL_VERSIONS` includes it.
+  Use `LATEST_LEGACY_PROTOCOL_VERSION` for the newest handshake revision (see below).
+- **`HandlerContext` gained required members**: `signal`, `sendProgress` and `log`. Code that
+  builds a context by hand (for example to unit-test a handler) must provide them.
+- **`ToolAccessContext.operation` is required**: `'list'` or `'call'`.
+- **`TaskStore` gained methods**: `updateInputResponses`, `acknowledgeInputResponses`,
+  `renewLease` and `expireStaleLease`. Custom stores must implement them.
+- **Redis task records moved** to the `mcp:task:v2:` keyspace, so instances of different
+  versions never misread each other's tasks. Tasks in flight during an upgrade are only
+  visible to instances of the version that created them.
+- **Tasks are bound to user, OAuth client and issuer**, not the user alone, in both eras.
+- **`requestStateSecret` is required with `redis`**, and must be at least 32 bytes.
+- **Default capabilities declare `listChanged: true`** for tools, prompts and resources.
+- **`outputSchema` is enforced** (2025-06-18 and later): a result without conforming
+  `structuredContent` becomes a tool error, and an `outputSchema` declaring a dialect other
+  than JSON Schema 2020-12 is refused at registration.
+- **Invalid `caching` values throw at startup** instead of being clamped.
+- **An argument sanitization failure** is reported by `mcpCallTool()` as
+  `{ ok: false, reason: 'invalid-arguments' }`.
+- **Era detection**: a request whose `_meta` carries `io.modelcontextprotocol/protocolVersion`,
+  or whose `MCP-Protocol-Version` header names 2026-07-28, takes the modern path. With
+  authorization enabled, a POST with a bad version header now gets `401` before `400`.
 
 ### Upgrading to MCP 2026-07-28
 

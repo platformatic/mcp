@@ -59,7 +59,7 @@ describe('Redis task integration (multi-instance)', () => {
     // Instance A owns the tool and will execute the task.
     const a = fastify()
     t.after(() => a.close())
-    await a.register(mcpPlugin, { enableTasks: true, redis: redisOpts })
+    await a.register(mcpPlugin, { enableTasks: true, redis: redisOpts, requestStateSecret: 'test-request-state-secret-32-bytes!!' })
     a.mcpAddTool({
       name: 'slow-add',
       description: 'Adds two numbers, slowly',
@@ -74,7 +74,7 @@ describe('Redis task integration (multi-instance)', () => {
     // Instance B shares the same Redis but has no tool; it only reads the store.
     const b = fastify()
     t.after(() => b.close())
-    await b.register(mcpPlugin, { enableTasks: true, redis: redisOpts })
+    await b.register(mcpPlugin, { enableTasks: true, redis: redisOpts, requestStateSecret: 'test-request-state-secret-32-bytes!!' })
     await b.ready()
 
     // Create the task on A
@@ -101,7 +101,7 @@ describe('Redis task integration (multi-instance)', () => {
 
     const a = fastify()
     t.after(() => a.close())
-    await a.register(mcpPlugin, { enableTasks: true, redis: redisOpts })
+    await a.register(mcpPlugin, { enableTasks: true, redis: redisOpts, requestStateSecret: 'test-request-state-secret-32-bytes!!' })
     a.mcpAddTool({
       name: 'confirm',
       inputSchema: Type.Object({}),
@@ -125,7 +125,7 @@ describe('Redis task integration (multi-instance)', () => {
 
     const b = fastify()
     t.after(() => b.close())
-    await b.register(mcpPlugin, { enableTasks: true, redis: redisOpts })
+    await b.register(mcpPlugin, { enableTasks: true, redis: redisOpts, requestStateSecret: 'test-request-state-secret-32-bytes!!' })
     await b.ready()
 
     const created = await modernCall(a, 'tools/call', { name: 'confirm', arguments: {} })
@@ -163,7 +163,7 @@ describe('Redis task integration (multi-instance)', () => {
 
     const a = fastify()
     t.after(() => a.close())
-    await a.register(mcpPlugin, { enableTasks: true, redis: redisOpts })
+    await a.register(mcpPlugin, { enableTasks: true, redis: redisOpts, requestStateSecret: 'test-request-state-secret-32-bytes!!' })
     a.mcpAddTool({
       name: 'quick',
       description: 'Returns at once',
@@ -176,7 +176,7 @@ describe('Redis task integration (multi-instance)', () => {
 
     const b = fastify()
     t.after(() => b.close())
-    await b.register(mcpPlugin, { enableTasks: true, redis: redisOpts })
+    await b.register(mcpPlugin, { enableTasks: true, redis: redisOpts, requestStateSecret: 'test-request-state-secret-32-bytes!!' })
     await b.ready()
 
     const created = await call(a, 'tools/call', { name: 'quick', arguments: {}, task: {} })
