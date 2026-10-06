@@ -44,7 +44,7 @@ import type { RequestStateSealer } from '../modern/request-state.ts'
 import { DEFAULT_MAX_RESOURCE_SUBSCRIPTIONS, SubscriptionRegistry, invalidFilter, negotiateFilter } from '../modern/subscriptions.ts'
 import { principalOf } from '../principal.ts'
 import type { SubscriptionFilter } from '../schema-2026.ts'
-import { isStdioRequest } from '../stdio-trust.ts'
+import { isStdioRequest, stdioRequestSignal } from '../stdio-trust.ts'
 import type { TaskInputChannel } from '../modern/task-inputs.ts'
 import type { JsonSchemaValidator } from '../validation/json-schema-validator.ts'
 
@@ -522,7 +522,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         types: Object.keys(filter).filter(key => key !== 'resourceSubscriptions'),
         resourceSubscriptions: filter.resourceSubscriptions?.length ?? 0
       }, 'Opening subscription stream')
-      if (!subscriptions.open(reply, message.id, filter, principal) && !reply.sent) {
+      if (!subscriptions.open(reply, message.id, filter, principal, stdioRequestSignal(request.headers)) && !reply.sent) {
         reply.code(503).type('application/json')
         return createError(message.id, INTERNAL_ERROR, 'Server is shutting down')
       }
@@ -535,6 +535,8 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     // injection (stdio, mcpClient) emits it before `writableFinished` is set,
     // so the response state alone cannot tell the two apart.
     const cancelled = new AbortController()
+    // On stdio there is no stream to close: `notifications/cancelled` does it.
+    const stdioCancel = stdioRequestSignal(request.headers)
     let handled = false
     reply.raw.once('close', () => {
       if (!handled) cancelled.abort(new Error('client disconnected'))
@@ -566,7 +568,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         supportedVersions: SUPPORTED_PROTOCOL_VERSIONS,
         enableTasks,
         headerLayer,
-        signal: cancelled.signal
+        signal: stdioCancel ? AbortSignal.any([cancelled.signal, stdioCancel]) : cancelled.signal
       })
     } finally {
       handled = true

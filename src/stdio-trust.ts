@@ -20,3 +20,24 @@ export function isStdioRequest (headers: IncomingHttpHeaders): boolean {
   const received = Buffer.from(value)
   return received.length === expected.length && timingSafeEqual(received, expected)
 }
+
+/**
+ * Carries a stdio request's cancellation into the route. On stdio the client
+ * cancels with `notifications/cancelled` rather than by closing a stream, so
+ * the transport registers a signal per request and passes its token along.
+ */
+export const STDIO_REQUEST_HEADER = 'x-platformatic-mcp-stdio-request'
+const requestSignals = new Map<string, AbortSignal>()
+
+export function registerStdioRequest (signal: AbortSignal): { token: string, release: () => void } {
+  const token = randomBytes(16).toString('hex')
+  requestSignals.set(token, signal)
+  return { token, release: () => requestSignals.delete(token) }
+}
+
+/** The cancellation signal of a stdio-injected request, if it has one. */
+export function stdioRequestSignal (headers: IncomingHttpHeaders): AbortSignal | undefined {
+  if (!isStdioRequest(headers)) return undefined
+  const token = headers[STDIO_REQUEST_HEADER]
+  return typeof token === 'string' ? requestSignals.get(token) : undefined
+}

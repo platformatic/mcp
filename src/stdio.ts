@@ -1,7 +1,8 @@
 import { stdin, stdout, stderr } from 'process'
 import { createInterface } from 'readline'
 import type { FastifyInstance } from 'fastify'
-import { STDIO_TRUST_HEADER, STDIO_TRUST_TOKEN } from './stdio-trust.ts'
+import { STDIO_REQUEST_HEADER, STDIO_TRUST_HEADER, STDIO_TRUST_TOKEN, registerStdioRequest } from './stdio-trust.ts'
+import { bodyClaimsModern } from './modern/request-meta.ts'
 import type {
   JSONRPCMessage,
   JSONRPCResponse,
@@ -36,6 +37,11 @@ export interface StdioTransportOptions {
   error?: NodeJS.WritableStream
 }
 
+/** A request id as a map key: `1` and `"1"` are different requests. */
+function requestKey (id: string | number): string {
+  return `${typeof id}:${id}`
+}
+
 /**
  * Stdio transport for MCP over stdin/stdout
  */
@@ -44,6 +50,8 @@ export class StdioTransport {
   private readline: any
   private transportOpts: StdioTransportOptions
   private isShuttingDown = false
+  /** Requests still being served, by JSON-RPC id, so a client can cancel them. */
+  private inFlight = new Map<string, AbortController>()
 
   constructor (
     app: FastifyInstance,
@@ -142,43 +150,48 @@ export class StdioTransport {
   private async handleIncomingMessage (line: string): Promise<void> {
     if (!line) return
 
+    let message: JSONRPCMessage
     try {
-      const message: JSONRPCMessage = JSON.parse(line)
-      this.log('Received message:', message)
+      message = JSON.parse(line)
+    } catch (error) {
+      // JSON-RPC answers unparseable input with a parse error and a null id.
+      this.logError('Could not parse message:', error)
+      this.sendMessage({
+        jsonrpc: '2.0',
+        id: null as unknown as string,
+        error: { code: -32700, message: 'Parse error' }
+      })
+      return
+    }
+    this.log('Received message:', message)
 
-      // Handle batch requests
-      if (Array.isArray(message)) {
-        await this.handleBatchMessage(message as JSONRPCBatchRequest)
+    if (Array.isArray(message)) {
+      // 2026-07-28 carries exactly one message per line; only the legacy
+      // revisions that predate the batch removal may still send arrays.
+      if ((message as unknown[]).some(entry => bodyClaimsModern(entry))) {
+        this.sendMessage({
+          jsonrpc: '2.0',
+          id: null as unknown as string,
+          error: { code: -32600, message: 'Batch requests are not supported' }
+        })
         return
       }
+      await this.handleBatchMessage(message as JSONRPCBatchRequest)
+      return
+    }
 
-      // Handle single message
-      const response = await this.processMessage(message)
-      if (response) {
-        this.sendMessage(response)
+    // On stdio there is no response stream to close: the client cancels with
+    // a notification, after which nothing more may be sent for that request.
+    if ((message as { method?: string }).method === 'notifications/cancelled') {
+      const requestId = (message as { params?: { requestId?: unknown } }).params?.requestId
+      if (typeof requestId === 'string' || typeof requestId === 'number') {
+        this.inFlight.get(requestKey(requestId))?.abort(new Error('cancelled by the client'))
       }
-    } catch (error) {
-      this.logError('Error processing message:', error)
+    }
 
-      // Try to send error response if we can extract an ID
-      try {
-        const parsed = JSON.parse(line)
-        if (parsed.id) {
-          const errorResponse: JSONRPCError = {
-            jsonrpc: '2.0',
-            id: parsed.id,
-            error: {
-              code: -32700, // Parse error
-              message: 'Parse error',
-              data: error instanceof Error ? error.message : String(error)
-            }
-          }
-          this.sendMessage(errorResponse)
-        }
-      } catch {
-        // If we can't even parse to get an ID, just log and continue
-        this.logError('Could not send error response due to parse failure')
-      }
+    const response = await this.processMessage(message)
+    if (response) {
+      this.sendMessage(response)
     }
   }
 
@@ -202,9 +215,19 @@ export class StdioTransport {
   }
 
   /**
-   * Process a single JSON-RPC message using Fastify's inject method
+   * Process a single JSON-RPC message using Fastify's inject method.
+   *
+   * A streamed response (`subscriptions/listen`) is forwarded frame by frame
+   * as it arrives, rather than after it ends, which a subscription never does
+   * on its own.
    */
   private async processMessage (message: JSONRPCMessage): Promise<JSONRPCResponse | JSONRPCError | null> {
+    const id = 'id' in message ? (message as { id: string | number }).id : undefined
+    const key = id === undefined ? undefined : requestKey(id)
+    const cancel = new AbortController()
+    if (key !== undefined) this.inFlight.set(key, cancel)
+    const registration = registerStdioRequest(cancel.signal)
+
     try {
       // Use Fastify's inject method to simulate an HTTP request to the /mcp endpoint
       const response = await this.app.inject({
@@ -212,31 +235,35 @@ export class StdioTransport {
         url: '/mcp',
         headers: {
           'content-type': 'application/json',
-          accept: 'application/json', // Explicitly request JSON, not SSE
+          accept: 'application/json, text/event-stream',
           'x-platformatic-mcp-transport': 'stdio',
-          [STDIO_TRUST_HEADER]: STDIO_TRUST_TOKEN
+          [STDIO_TRUST_HEADER]: STDIO_TRUST_TOKEN,
+          [STDIO_REQUEST_HEADER]: registration.token
         },
-        payload: message
+        payload: message,
+        payloadAsStream: true
       })
 
-      // Parse the response
-      if (response.statusCode === 200) {
-        return JSON.parse(response.body)
-      } else if (response.statusCode === 202) {
-        // No content - this is for notifications that don't expect a response
+      const stream = response.stream()
+      if (String(response.headers['content-type'] ?? '').startsWith('text/event-stream')) {
+        cancel.signal.addEventListener('abort', () => stream.destroy(), { once: true })
+        await this.forwardEvents(stream, cancel.signal)
         return null
-      } else {
-        // Error response
-        const errorBody = JSON.parse(response.body)
-        return errorBody
       }
+
+      let body = ''
+      for await (const chunk of stream) body += chunk
+      if (cancel.signal.aborted) return null
+      if (response.statusCode === 202 || body === '') return null
+      return JSON.parse(body)
     } catch (error) {
+      if (cancel.signal.aborted) return null
       this.logError('Error processing message via inject:', error)
 
       // Return a generic error response
       const errorResponse: JSONRPCError = {
         jsonrpc: '2.0',
-        id: ('id' in message) ? message.id : 0,
+        id: id ?? 0,
         error: {
           code: -32603, // Internal error
           message: 'Internal server error',
@@ -244,13 +271,43 @@ export class StdioTransport {
         }
       }
       return errorResponse
+    } finally {
+      registration.release()
+      if (key !== undefined && this.inFlight.get(key) === cancel) this.inFlight.delete(key)
+    }
+  }
+
+  /**
+   * Write each `data:` frame of an SSE response to stdout as its own line, as
+   * it arrives. Stops writing as soon as the request is cancelled.
+   */
+  private async forwardEvents (stream: AsyncIterable<Buffer | string>, cancelled: AbortSignal): Promise<void> {
+    let buffered = ''
+    try {
+      for await (const chunk of stream) {
+        buffered += chunk.toString()
+        let boundary = buffered.indexOf('\n\n')
+        while (boundary !== -1) {
+          const frame = buffered.slice(0, boundary)
+          buffered = buffered.slice(boundary + 2)
+          boundary = buffered.indexOf('\n\n')
+          if (cancelled.aborted) continue
+          const data = frame.split('\n')
+            .filter(line => line.startsWith('data:'))
+            .map(line => line.slice(5).trimStart())
+            .join('\n')
+          if (data) this.sendMessage(JSON.parse(data))
+        }
+      }
+    } catch (error) {
+      if (!cancelled.aborted) this.logError('Error forwarding streamed response:', error)
     }
   }
 
   /**
    * Send a JSON-RPC message to stdout
    */
-  private sendMessage (message: JSONRPCResponse | JSONRPCError | JSONRPCBatchResponse): void {
+  private sendMessage (message: JSONRPCMessage | JSONRPCBatchResponse): void {
     try {
       const serialized = JSON.stringify(message)
       this.log('Sending message:', message)

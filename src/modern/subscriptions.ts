@@ -38,6 +38,9 @@ interface Subscription {
   queuedBytes: number
   onDrain?: () => void
   onClose?: () => void
+  /** Ends the stream when the client cancels it without closing a socket (stdio). */
+  cancelSignal?: AbortSignal
+  onCancel?: () => void
 }
 
 const BOOLEAN_FILTER_FIELDS = ['toolsListChanged', 'promptsListChanged', 'resourcesListChanged'] as const
@@ -171,7 +174,8 @@ export class SubscriptionRegistry {
     reply: FastifyReply,
     id: RequestId,
     filter: SubscriptionFilter,
-    principal: string = ''
+    principal: string = '',
+    cancelSignal?: AbortSignal
   ): boolean {
     const raw = reply.raw
     if (this.#closing || raw.destroyed || raw.closed || raw.writableEnded) return false
@@ -201,6 +205,14 @@ export class SubscriptionRegistry {
       this.#log.debug({ subscriptionId: id }, 'Subscription stream closed by client')
     }
     raw.once('close', subscription.onClose)
+
+    // A client-initiated cancellation gets no further messages, not even the
+    // graceful-closure response.
+    if (cancelSignal) {
+      subscription.cancelSignal = cancelSignal
+      subscription.onCancel = () => this.#close(subscription)
+      cancelSignal.addEventListener('abort', subscription.onCancel, { once: true })
+    }
 
     subscription.keepAlive = setInterval(() => {
       // Keepalives are disposable. Do not queue them behind real messages when
@@ -366,6 +378,7 @@ export class SubscriptionRegistry {
     if (subscription.keepAlive) clearInterval(subscription.keepAlive)
     if (subscription.onDrain) subscription.reply.raw.off('drain', subscription.onDrain)
     if (subscription.onClose) subscription.reply.raw.off('close', subscription.onClose)
+    if (subscription.onCancel) subscription.cancelSignal?.removeEventListener('abort', subscription.onCancel)
     subscription.onDrain = undefined
     subscription.onClose = undefined
     subscription.queue.length = 0

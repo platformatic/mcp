@@ -2281,6 +2281,91 @@ describe('2026-07-28: in-process requests', () => {
   })
 })
 
+describe('2026-07-28 over stdio', () => {
+  function stdio (t: TestContext, app: FastifyInstance) {
+    const input = new PassThrough()
+    const output = new PassThrough()
+    const transport = createStdioTransport(app, { input, output, error: new PassThrough() })
+    transport.start()
+    t.after(() => transport.stop())
+    const lines: any[] = []
+    let buffered = ''
+    output.on('data', (chunk: Buffer) => {
+      buffered += chunk.toString()
+      const parts = buffered.split('\n')
+      buffered = parts.pop() ?? ''
+      for (const line of parts) if (line.trim()) lines.push(JSON.parse(line))
+    })
+    const send = (body: unknown) => input.write(JSON.stringify(body) + '\n')
+    const waitFor = async (match: (line: any) => boolean) => {
+      for (let attempt = 0; attempt < 200; attempt++) {
+        const found = lines.find(match)
+        if (found) return found
+        await new Promise(resolve => setTimeout(resolve, 10))
+      }
+      return undefined
+    }
+    return { input, lines, send, waitFor }
+  }
+
+  test('subscriptions/listen streams its acknowledgement and notifications, until cancelled', async (t: TestContext) => {
+    const app = await buildServer(t, undefined, { capabilities: { tools: { listChanged: true } } })
+    const { lines, send, waitFor } = stdio(t, app)
+
+    send(modernBody('subscriptions/listen', { id: 'L1', params: { notifications: { toolsListChanged: true } } }))
+    const ack = await waitFor(line => line.method === 'notifications/subscriptions/acknowledged')
+    t.assert.strictEqual(ack?.params._meta['io.modelcontextprotocol/subscriptionId'], 'L1')
+
+    await app.mcpBroadcastNotification({ jsonrpc: JSONRPC_VERSION, method: 'notifications/tools/list_changed' })
+    const changed = await waitFor(line => line.method === 'notifications/tools/list_changed')
+    t.assert.strictEqual(changed?.params._meta['io.modelcontextprotocol/subscriptionId'], 'L1')
+
+    send({ jsonrpc: JSONRPC_VERSION, method: 'notifications/cancelled', params: { requestId: 'L1' } })
+    await new Promise(resolve => setTimeout(resolve, 50))
+    const count = lines.length
+    await app.mcpBroadcastNotification({ jsonrpc: JSONRPC_VERSION, method: 'notifications/tools/list_changed' })
+    await new Promise(resolve => setTimeout(resolve, 50))
+    t.assert.strictEqual(lines.length, count, 'nothing more is sent for a cancelled subscription')
+    t.assert.ok(!lines.some(line => line.id === 'L1' && line.error), 'no bogus error for the listen request')
+  })
+
+  test('notifications/cancelled aborts the handler and suppresses its response', async (t: TestContext) => {
+    let aborted = false
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'slow', inputSchema: Type.Object({}) }, async (_args: any, context: any) => {
+        await new Promise(resolve => {
+          context.signal.addEventListener('abort', resolve, { once: true })
+          setTimeout(resolve, 1000).unref()
+        })
+        aborted = context.signal.aborted
+        return { content: [{ type: 'text', text: 'done' }] }
+      })
+    })
+    const { lines, send } = stdio(t, app)
+
+    send(modernBody('tools/call', { id: 7, params: { name: 'slow', arguments: {} } }))
+    await new Promise(resolve => setTimeout(resolve, 50))
+    send({ jsonrpc: JSONRPC_VERSION, method: 'notifications/cancelled', params: { requestId: 7 } })
+    await new Promise(resolve => setTimeout(resolve, 100))
+
+    t.assert.strictEqual(aborted, true)
+    t.assert.ok(!lines.some(line => line.id === 7), 'no response for a cancelled request')
+  })
+
+  test('a modern batch is refused and an unparseable line gets a parse error', async (t: TestContext) => {
+    const app = await buildServer(t)
+    const { input, send, waitFor } = stdio(t, app)
+
+    send([modernBody('server/discover', { id: 1 }), modernBody('tools/list', { id: 2 })])
+    const batch = await waitFor(line => line.error?.code === INVALID_REQUEST)
+    t.assert.strictEqual(batch?.id, null)
+
+    input.write('{not json\n')
+    const parse = await waitFor(line => line.error?.code === -32700)
+    t.assert.strictEqual(parse?.id, null)
+  })
+})
+
 describe('2026-07-28: message and transport validation', () => {
   test('a modern batch body is rejected, not accepted as a notification', async (t: TestContext) => {
     const app = await buildServer(t)
