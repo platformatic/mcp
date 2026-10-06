@@ -1204,6 +1204,85 @@ describe('2026-07-28: subscriptions', () => {
   })
 })
 
+describe('2026-07-28: per-caller and global limits', () => {
+  const tasksCapable: ClientCapabilities = { extensions: { [TASKS_EXTENSION]: {} } }
+
+  test('one caller cannot take every task slot', async (t: TestContext) => {
+    let release: () => void = () => {}
+    const blocked = new Promise<void>(resolve => { release = resolve })
+    const app = Fastify()
+    t.after(() => app.close())
+    await app.register(mcpPlugin, {
+      enableTasks: true,
+      taskMaxPerPrincipal: 1,
+      taskShutdownTimeoutMs: 10,
+      resolveAuthorizationContext: (request) => ({ userId: request.headers['x-user'] as string })
+    })
+    app.mcpAddTool({
+      name: 'busy',
+      inputSchema: Type.Object({}),
+      execution: { taskSupport: 'required' }
+    } as any, async () => {
+      await blocked
+      return { content: [] }
+    })
+    await app.ready()
+    t.after(() => release())
+
+    const as = (user: string, id: number) => call(app, 'tools/call', {
+      id, params: { name: 'busy', arguments: {} }, capabilities: tasksCapable, headers: { 'x-user': user }
+    })
+    t.assert.strictEqual((await as('mallory', 1)).json().result.resultType, 'task')
+    t.assert.strictEqual((await as('mallory', 2)).json().error.code, INVALID_REQUEST)
+    t.assert.strictEqual((await as('alice', 3)).json().result.resultType, 'task')
+  })
+
+  test('listen streams are limited per caller, with HTTP 429', async (t: TestContext) => {
+    const app = await buildServer(t, undefined, {
+      capabilities: { tools: { listChanged: true } },
+      subscriptionMaxStreamsPerPrincipal: 1
+    })
+    const open = (id: number) => app.inject({
+      method: 'POST',
+      url: '/mcp',
+      payloadAsStream: true,
+      headers: modernHeaders('subscriptions/listen'),
+      payload: modernBody('subscriptions/listen', { id, params: { notifications: { toolsListChanged: true } } })
+    })
+    const first = await open(1)
+    t.assert.strictEqual(first.statusCode, 200)
+    const second = await open(2)
+    t.assert.strictEqual(second.statusCode, 429)
+    second.stream().destroy()
+    first.stream().destroy()
+  })
+
+  test('a listen stream may name only so many resource URIs', async (t: TestContext) => {
+    const app = await buildServer(t, undefined, {
+      capabilities: { resources: { subscribe: true } },
+      subscriptionMaxResourceUris: 2
+    })
+    const response = await call(app, 'subscriptions/listen', {
+      params: { notifications: { resourceSubscriptions: ['a:1', 'a:2', 'a:3'] } }
+    })
+    t.assert.strictEqual(response.statusCode, 400)
+    t.assert.strictEqual(response.json().error.code, INVALID_PARAMS)
+  })
+
+  test('finished tasks do not lock others out of a full memory store', async (t: TestContext) => {
+    const store = new MemoryTaskStore(2)
+    const now = new Date().toISOString()
+    const base = { createdAt: now, lastUpdatedAt: now, ttl: 60_000, method: 'tools/call' }
+    await store.create({ ...base, taskId: 'done', status: 'completed' })
+    await store.create({ ...base, taskId: 'running', status: 'working' })
+    await store.create({ ...base, taskId: 'new', status: 'working' })
+    t.assert.strictEqual(await store.get('done'), null)
+    t.assert.ok(await store.get('running'))
+    t.assert.ok(await store.get('new'))
+    await t.assert.rejects(store.create({ ...base, taskId: 'full', status: 'working' }), /Task limit reached/)
+  })
+})
+
 describe('2026-07-28: tasks extension', () => {
   const tasksCapable: ClientCapabilities = { extensions: { [TASKS_EXTENSION]: {} } }
 

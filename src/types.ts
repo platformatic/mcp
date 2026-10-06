@@ -325,11 +325,27 @@ export interface MCPPluginOptions {
    */
   taskMaxConcurrent?: number
   /**
+   * Most 2026-07-28 tasks one caller (user, client and issuer; unidentified
+   * callers share one allowance) may run on an instance at once (default 100).
+   * Past it, the same fallback as `taskMaxConcurrent` applies.
+   */
+  taskMaxPerPrincipal?: number
+  /**
    * How long a running 2026-07-28 task's worker lease lasts, in milliseconds
    * (default 15000; renewed every third of it). When an instance dies, its
    * tasks are reported failed this long after its last renewal.
    */
   taskLeaseMs?: number
+  /** Most `subscriptions/listen` streams one instance holds open (default 1000). */
+  subscriptionMaxStreams?: number
+  /**
+   * Most `subscriptions/listen` streams one caller (user, client and issuer;
+   * unidentified callers share one allowance) may hold open on an instance
+   * (default 10). Further streams are refused with HTTP 429.
+   */
+  subscriptionMaxStreamsPerPrincipal?: number
+  /** Most `resourceSubscriptions` URIs one stream may name (default 1000). */
+  subscriptionMaxResourceUris?: number
   /**
    * On close, how long to wait for running 2026-07-28 tasks to finish before
    * aborting them and recording them as failed, in milliseconds (default

@@ -41,7 +41,8 @@ import {
 } from '../modern/request-meta.ts'
 import { validateStandardHeaders } from '../modern/headers.ts'
 import type { RequestStateSealer } from '../modern/request-state.ts'
-import { SubscriptionRegistry, invalidFilter, negotiateFilter } from '../modern/subscriptions.ts'
+import { DEFAULT_MAX_RESOURCE_SUBSCRIPTIONS, SubscriptionRegistry, invalidFilter, negotiateFilter } from '../modern/subscriptions.ts'
+import { principalOf } from '../principal.ts'
 import type { SubscriptionFilter } from '../schema-2026.ts'
 import { isStdioRequest } from '../stdio-trust.ts'
 import type { TaskInputChannel } from '../modern/task-inputs.ts'
@@ -500,9 +501,28 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         return createError(message.id, INVALID_PARAMS, invalidListen)
       }
 
+      const maxUris = opts.subscriptionMaxResourceUris ?? DEFAULT_MAX_RESOURCE_SUBSCRIPTIONS
+      const uriCount = (requested as SubscriptionFilter).resourceSubscriptions?.length ?? 0
+      if (uriCount > maxUris) {
+        reply.code(400).type('application/json')
+        return createError(message.id, INVALID_PARAMS, `Too many resourceSubscriptions: at most ${maxUris} per stream`)
+      }
+
+      const principal = principalOf(authContext) ?? ''
+      const refused = subscriptions.refusal(principal)
+      if (refused) {
+        reply.code(429).type('application/json')
+        return createError(message.id, INVALID_REQUEST, refused)
+      }
+
       const filter = negotiateFilter(requested as SubscriptionFilter, capabilities)
-      request.log.info({ subscriptionId: message.id, filter }, 'Opening subscription stream')
-      if (!subscriptions.open(reply, message.id, filter) && !reply.sent) {
+      // The filter can be large and is the client's to choose: log its shape.
+      request.log.info({
+        subscriptionId: message.id,
+        types: Object.keys(filter).filter(key => key !== 'resourceSubscriptions'),
+        resourceSubscriptions: filter.resourceSubscriptions?.length ?? 0
+      }, 'Opening subscription stream')
+      if (!subscriptions.open(reply, message.id, filter, principal) && !reply.sent) {
         reply.code(503).type('application/json')
         return createError(message.id, INTERNAL_ERROR, 'Server is shutting down')
       }

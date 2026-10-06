@@ -38,6 +38,7 @@ export class TaskInputChannel {
   #seenDeliveries = new Map<string, number>()
   #cancellations = new Map<string, { expiresAt: number }>()
   #cancelListeners = new Map<string, Set<() => void>>()
+  #owned = new Set<string>()
   #publish?: Publisher
   #publishCancellation?: CancellationPublisher
   #expiryTimer?: NodeJS.Timeout
@@ -154,6 +155,9 @@ export class TaskInputChannel {
 
     const set = this.#waiters.get(taskId)
     if (!set || set.size === 0) {
+      // Not running here: the durable outbox is the source of truth for the
+      // instance that is.
+      if (!this.#owned.has(taskId)) return
       if (!this.#pending.has(deliveryKey)) {
         this.#pending.set(deliveryKey, {
           taskId,
@@ -171,6 +175,16 @@ export class TaskInputChannel {
     for (const waiter of [...set]) {
       this.#resolveWaiter(taskId, waiter, responses as InputResponses)
     }
+  }
+
+  /**
+   * Mark a task as run by this instance until `forget()`. Every instance
+   * receives every published answer, but only the one running the task may
+   * hold on to answers that arrive before its worker starts waiting; anyone
+   * else would buffer other instances' client data for nothing.
+   */
+  claim (taskId: string): void {
+    this.#owned.add(taskId)
   }
 
   /**
@@ -220,6 +234,7 @@ export class TaskInputChannel {
 
   /** Drop transient data for a completed task without creating a tombstone. */
   forget (taskId: string): void {
+    this.#owned.delete(taskId)
     for (const [key, entry] of this.#pending) {
       if (entry.taskId === taskId) this.#pending.delete(key)
     }
@@ -240,6 +255,7 @@ export class TaskInputChannel {
     this.#seenDeliveries.clear()
     this.#cancellations.clear()
     this.#cancelListeners.clear()
+    this.#owned.clear()
 
     for (const taskId of [...this.#waiters.keys()]) this.forget(taskId)
   }

@@ -19,11 +19,19 @@ const KEEPALIVE_MS = 30_000
 /** Per-client application queue beyond Node's own writable buffer. */
 const DEFAULT_MAX_BUFFERED_BYTES = 1024 * 1024
 const DEFAULT_CLOSE_DRAIN_TIMEOUT_MS = 1000
+const DEFAULT_MAX_STREAMS = 1000
+const DEFAULT_MAX_STREAMS_PER_PRINCIPAL = 10
+/** Most resource URIs one stream may subscribe to, by default. */
+export const DEFAULT_MAX_RESOURCE_SUBSCRIPTIONS = 1000
 
 interface Subscription {
   id: RequestId
   reply: FastifyReply
   filter: SubscriptionFilter
+  /** The filter's resource URIs, for constant-time matching. */
+  uris: Set<string>
+  /** Who opened it, for the per-principal limit. */
+  principal: string
   keepAlive?: NodeJS.Timeout
   blocked: boolean
   queue: string[]
@@ -120,15 +128,20 @@ export class SubscriptionRegistry {
   #closeDrainTimeoutMs: number
   #closing = false
   #serverInfo?: Implementation
+  #maxStreams: number
+  #maxStreamsPerPrincipal: number
 
   constructor (
     log: FastifyBaseLogger,
     maxBufferedBytes: number = DEFAULT_MAX_BUFFERED_BYTES,
     closeDrainTimeoutMs: number = DEFAULT_CLOSE_DRAIN_TIMEOUT_MS,
-    serverInfo?: Implementation
+    serverInfo?: Implementation,
+    limits: { maxStreams?: number, maxStreamsPerPrincipal?: number } = {}
   ) {
     this.#log = log
     this.#serverInfo = serverInfo
+    this.#maxStreams = limits.maxStreams ?? DEFAULT_MAX_STREAMS
+    this.#maxStreamsPerPrincipal = limits.maxStreamsPerPrincipal ?? DEFAULT_MAX_STREAMS_PER_PRINCIPAL
     this.#maxBufferedBytes = Math.max(1, maxBufferedBytes)
     this.#closeDrainTimeoutMs = Math.max(1, closeDrainTimeoutMs)
   }
@@ -138,13 +151,27 @@ export class SubscriptionRegistry {
   }
 
   /**
+   * Why another stream cannot be opened for `principal`, or `undefined` when
+   * it can. Each stream holds a socket, timers and up to the buffer limit in
+   * memory, so neither one caller nor everyone together may open unboundedly.
+   */
+  refusal (principal: string): string | undefined {
+    if (this.#subscriptions.size >= this.#maxStreams) return 'Too many open subscription streams'
+    let mine = 0
+    for (const subscription of this.#subscriptions) if (subscription.principal === principal) mine++
+    if (mine >= this.#maxStreamsPerPrincipal) return 'Too many open subscription streams for this caller'
+    return undefined
+  }
+
+  /**
    * Take over the reply, acknowledge the subscription, and keep the stream
    * open until either side closes it.
    */
   open (
     reply: FastifyReply,
     id: RequestId,
-    filter: SubscriptionFilter
+    filter: SubscriptionFilter,
+    principal: string = ''
   ): boolean {
     const raw = reply.raw
     if (this.#closing || raw.destroyed || raw.closed || raw.writableEnded) return false
@@ -162,6 +189,8 @@ export class SubscriptionRegistry {
       id,
       reply,
       filter,
+      uris: new Set(filter.resourceSubscriptions ?? []),
+      principal,
       blocked: false,
       queue: [],
       queuedBytes: 0
@@ -198,7 +227,7 @@ export class SubscriptionRegistry {
   /** Fan a notification out to every subscription that asked for it. */
   deliver (notification: JSONRPCNotification): void {
     for (const subscription of [...this.#subscriptions]) {
-      if (!matchesFilter(notification, subscription.filter)) continue
+      if (!this.#matches(notification, subscription)) continue
 
       this.#write(subscription, {
         ...notification,
@@ -258,6 +287,14 @@ export class SubscriptionRegistry {
       result: { resultType: 'complete', _meta: meta }
     } as JSONRPCMessage
     return `data: ${JSON.stringify(cancelled)}\n\ndata: ${JSON.stringify(completion)}\n\n`
+  }
+
+  #matches (notification: JSONRPCNotification, subscription: Subscription): boolean {
+    if (notification.method === 'notifications/resources/updated') {
+      const uri = (notification.params as { uri?: unknown } | undefined)?.uri
+      return typeof uri === 'string' && subscription.uris.has(uri)
+    }
+    return matchesFilter(notification, subscription.filter)
   }
 
   #write (subscription: Subscription, message: JSONRPCMessage): void {

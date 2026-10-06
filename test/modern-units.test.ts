@@ -446,12 +446,25 @@ describe('task input channel lifecycle', () => {
   test('a burst of unmatched answers expires autonomously and remains bounded', async (t: TestContext) => {
     const channel = new TaskInputChannel(20, 32)
     for (let index = 0; index < 1000; index++) {
+      channel.claim(`task-${index}`)
       channel.deliver(`task-${index}`, { value: index }, `delivery-${index}`)
     }
 
     t.assert.strictEqual(channel.pendingSize, 32)
     await delay(60)
     t.assert.strictEqual(channel.pendingSize, 0)
+    channel.close()
+  })
+
+  test('answers for tasks another instance runs are not buffered here', async (t: TestContext) => {
+    const channel = new TaskInputChannel()
+    channel.deliver('elsewhere', { value: 'x'.repeat(1024) }, 'delivery-1')
+    t.assert.strictEqual(channel.pendingSize, 0)
+
+    // An early answer for a task this instance runs is still kept for its worker.
+    channel.claim('here')
+    channel.deliver('here', { value: 1 }, 'delivery-2')
+    t.assert.deepStrictEqual(await channel.wait('here'), { value: 1 })
     channel.close()
   })
 })

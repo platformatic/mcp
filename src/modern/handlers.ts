@@ -626,6 +626,7 @@ interface TaskResume {
 }
 
 const DEFAULT_TASK_MAX_CONCURRENT = 1000
+const DEFAULT_TASK_MAX_PER_PRINCIPAL = 100
 const DEFAULT_TASK_LEASE_MS = 15_000
 const TASK_SHUTDOWN_GRACE_MS = 1000
 const SHUTTING_DOWN = 'The server shut down before this task finished'
@@ -634,6 +635,8 @@ const SHUTTING_DOWN = 'The server shut down before this task finished'
 class TaskStopped extends Error {}
 
 interface LiveTask {
+  /** Whose task it is, for the per-principal limit. Unidentified callers share ''. */
+  principal: string
   stop: (reason: TaskStopped) => void
   done: Promise<void>
 }
@@ -864,6 +867,15 @@ async function runAsTask (
     app.log.warn({ running: registry.live.size, maxConcurrent }, 'Task limit reached; not creating another task')
     return undefined
   }
+  // One caller must not be able to take every slot from everyone else.
+  const principal = principalOf(dependencies.authContext) ?? ''
+  const maxPerPrincipal = opts.taskMaxPerPrincipal ?? DEFAULT_TASK_MAX_PER_PRINCIPAL
+  let mine = 0
+  for (const task of registry.live.values()) if (task.principal === principal) mine++
+  if (mine >= maxPerPrincipal) {
+    app.log.warn({ running: mine, maxPerPrincipal }, 'Per-caller task limit reached; not creating another task')
+    return undefined
+  }
 
   const createdAt = Date.now()
   const now = new Date(createdAt).toISOString()
@@ -892,7 +904,7 @@ async function runAsTask (
 
   // Reserve the slot before the first await, so concurrent requests cannot all
   // pass the limit check before any of them is counted.
-  const live: LiveTask = { stop, done: Promise.resolve() }
+  const live: LiveTask = { principal, stop, done: Promise.resolve() }
   registry.live.set(record.taskId, live)
 
   try {
@@ -929,6 +941,7 @@ async function runAsTask (
   }, ttl).unref()
 
   const stopListening = taskInputs?.onCancel(record.taskId, () => stop(new TaskStopped('Task cancelled')))
+  taskInputs?.claim(record.taskId)
 
   const execution = (async () => {
     let outcome: TaskRecord['outcome']

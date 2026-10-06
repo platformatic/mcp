@@ -21,6 +21,16 @@ export class MemoryTaskStore implements TaskStore {
       await this.cleanup()
     }
     if (this.tasks.size >= this.maxTasks) {
+      // Finished tasks are only kept so their outcome can still be polled;
+      // they must not lock everyone out of creating new ones. Drop the oldest.
+      for (const [taskId, existing] of this.tasks) {
+        if (isTerminal(existing.status)) {
+          this.tasks.delete(taskId)
+          break
+        }
+      }
+    }
+    if (this.tasks.size >= this.maxTasks) {
       throw new Error(`Task limit reached (${this.maxTasks})`)
     }
     this.tasks.set(task.taskId, { ...task })
