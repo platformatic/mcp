@@ -43,6 +43,35 @@ describe('Authorization Integration Tests', () => {
       t.assert.ok(app.hasPlugin('@platformatic/mcp'))
     })
 
+    test('should reject downstream OAuth redirect URIs', async (t: TestContext) => {
+      restoreMock = setupMockAgent({
+        'https://auth.example.com/.well-known/oauth-authorization-server': {
+          authorization_endpoint: 'https://auth.example.com/oauth/authorize',
+          token_endpoint: 'https://auth.example.com/oauth/token',
+          introspection_endpoint: 'https://auth.example.com/oauth/introspect',
+          registration_endpoint: 'https://auth.example.com/oauth/register'
+        }
+      })
+
+      await app.register(mcpPlugin, {
+        authorization: createTestAuthConfig({
+          oauth2Client: {
+            clientId: 'test-client',
+            authorizationServer: 'https://auth.example.com'
+          }
+        })
+      })
+      await app.ready()
+
+      const response = await app.inject({
+        method: 'GET',
+        url: '/oauth/authorize?redirect_uri=https%3A%2F%2Fclient.example%2Fcallback'
+      })
+
+      t.assert.strictEqual(response.statusCode, 400)
+      t.assert.strictEqual(response.json().error_description, 'redirect_uri is not supported')
+    })
+
     test('should register plugin with authorization disabled', async (t: TestContext) => {
       await app.register(mcpPlugin, {
         serverInfo: { name: 'test-server', version: '1.0.0' },

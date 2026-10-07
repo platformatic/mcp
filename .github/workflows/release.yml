@@ -1,0 +1,49 @@
+name: Publish release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'The version number or release type to tag and release'
+        required: true
+        type: string
+      prerelease:
+        description: 'Release as pre-release'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  release-npm:
+    runs-on: ubuntu-latest
+    environment: main
+    permissions:
+      id-token: write
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Use supported Node.js Version
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          registry-url: 'https://registry.npmjs.org'
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Bump Version
+        id: bump
+        run: node scripts/bump-version.ts "${{ inputs.version }}" "${{ github.actor }}"
+        env:
+          GITHUB_ACTIONS: 'true'
+      - name: Push changes
+        run: git push origin HEAD:${{ github.ref }}
+      - name: Update npm
+        run: npm install -g npm@11.16.0
+      - name: Publish to NPM
+        run: npm publish --access public --tag ${{ inputs.prerelease == true && 'next' || 'latest' }} --provenance
+      - name: Create release notes
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          npx --yes @matteo.collina/release-notes -t v${{ steps.bump.outputs.version }} -r fastify-mcp -o platformatic ${{ inputs.prerelease == true && '-p' || '' }} -c ${{ github.ref }}

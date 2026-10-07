@@ -9,7 +9,6 @@ export interface AuthSession {
   state: string
   pkce: PKCEChallenge
   resourceUri?: string
-  originalUrl?: string
   callbackUrl?: string // The redirect_uri used in authorization request (required for OIDC token exchange)
 }
 
@@ -102,6 +101,7 @@ const LogoutResponse = Type.Object({
 
 const authRoutesPlugin: FastifyPluginAsync<AuthRoutesOptions> = async (fastify: FastifyInstance, opts) => {
   const { sessionStore } = opts
+
   // Initiate OAuth authorization flow
   fastify.get('/oauth/authorize', {
     schema: {
@@ -109,8 +109,16 @@ const authRoutesPlugin: FastifyPluginAsync<AuthRoutesOptions> = async (fastify: 
     }
   }, async (request, reply) => {
     try {
-      // eslint-disable-next-line camelcase
-      const { resource, redirect_uri } = request.query as { resource?: string; redirect_uri?: string }
+      const { resource, redirect_uri: redirectUri } = request.query as { resource?: string; redirect_uri?: string }
+
+      // MCP clients authorize directly with the advertised authorization
+      // server. This endpoint must not proxy tokens to a client callback.
+      if (redirectUri) {
+        return reply.status(400).send({
+          error: 'invalid_request',
+          error_description: 'redirect_uri is not supported'
+        })
+      }
 
       // Build the callback URL for this server (required for OIDC compliance)
       const callbackUrl = `${request.protocol}://${request.host}/oauth/callback`
@@ -126,8 +134,6 @@ const authRoutesPlugin: FastifyPluginAsync<AuthRoutesOptions> = async (fastify: 
         state: authRequest.state,
         pkce: authRequest.pkce,
         resourceUri: resource,
-        // eslint-disable-next-line camelcase
-        originalUrl: redirect_uri,
         callbackUrl // Store for token exchange (must match)
       }
 
@@ -159,12 +165,14 @@ const authRoutesPlugin: FastifyPluginAsync<AuthRoutesOptions> = async (fastify: 
       querystring: CallbackQuerystring,
       response: {
         200: TokenResponse,
-        302: {},
         400: ErrorResponse,
         500: ErrorResponse
       }
     }
   }, async (request, reply) => {
+    reply.header('Cache-Control', 'no-store')
+    reply.header('Pragma', 'no-cache')
+
     try {
       // eslint-disable-next-line camelcase
       const { code, state, error, error_description } = request.query as { code?: string; state?: string; error?: string; error_description?: string }
@@ -211,21 +219,9 @@ const authRoutesPlugin: FastifyPluginAsync<AuthRoutesOptions> = async (fastify: 
         sessionData.callbackUrl
       )
 
-      // Return tokens to client or redirect with tokens
-      if (sessionData.originalUrl) {
-        const redirectUrl = new URL(sessionData.originalUrl)
-        redirectUrl.searchParams.set('access_token', tokens.access_token)
-        redirectUrl.searchParams.set('token_type', tokens.token_type)
-        if (tokens.expires_in) {
-          redirectUrl.searchParams.set('expires_in', tokens.expires_in.toString())
-        }
-        if (tokens.scope) {
-          redirectUrl.searchParams.set('scope', tokens.scope)
-        }
-        return reply.redirect(redirectUrl.toString())
-      }
-
-      // Return JSON response with tokens
+      // Never place access tokens in redirect URIs. Keep the legacy JSON
+      // response for server-side OAuth client callers; MCP clients obtain their
+      // own tokens directly from the authorization server.
       return reply.send({
         access_token: tokens.access_token,
         token_type: tokens.token_type,
@@ -252,6 +248,9 @@ const authRoutesPlugin: FastifyPluginAsync<AuthRoutesOptions> = async (fastify: 
       }
     }
   }, async (request, reply) => {
+    reply.header('Cache-Control', 'no-store')
+    reply.header('Pragma', 'no-cache')
+
     try {
       // eslint-disable-next-line camelcase
       const { refresh_token } = request.body as { refresh_token: string }
