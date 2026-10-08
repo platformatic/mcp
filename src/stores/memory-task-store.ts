@@ -20,16 +20,9 @@ export class MemoryTaskStore implements TaskStore {
     if (this.tasks.size >= this.maxTasks) {
       await this.cleanup()
     }
-    if (this.tasks.size >= this.maxTasks) {
-      // Finished tasks are only kept so their outcome can still be polled;
-      // they must not lock everyone out of creating new ones. Drop the oldest.
-      for (const [taskId, existing] of this.tasks) {
-        if (isTerminal(existing.status)) {
-          this.tasks.delete(taskId)
-          break
-        }
-      }
-    }
+    // Only expired tasks are dropped to make room: a finished task is kept
+    // until its ttl so its owner can still read the outcome, whoever else is
+    // creating tasks. A full store refuses new tasks instead.
     if (this.tasks.size >= this.maxTasks) {
       throw new Error(`Task limit reached (${this.maxTasks})`)
     }

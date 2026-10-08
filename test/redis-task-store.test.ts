@@ -250,9 +250,14 @@ describe('RedisTaskStore', () => {
     t.assert.strictEqual((await store.get('task-1'))?.ttl, null)
   })
 
-  test('treats a task past its ttl as absent', async (t: TestContext) => {
+  test('retention follows the Redis key expiry, not the reading instance\'s clock', async (t: TestContext) => {
+    // As seen by an instance whose clock runs 10s ahead of the creator's.
     await store.create(record({ createdAt: new Date(Date.now() - 10_000).toISOString(), ttl: 1_000 }))
-    t.assert.strictEqual(await store.get('task-1'), null)
+    t.assert.ok(await store.get('task-1'), 'a skewed clock must not delete a live task')
+    t.assert.ok(await redis.exists('mcp:task:v2:task-1'))
+
+    await new Promise(resolve => setTimeout(resolve, 1_100))
+    t.assert.strictEqual(await store.get('task-1'), null, 'gone once Redis expires the key')
   })
 
   test('list is scoped to the authorization subject', async (t: TestContext) => {

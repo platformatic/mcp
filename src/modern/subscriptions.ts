@@ -30,8 +30,8 @@ interface Subscription {
   filter: SubscriptionFilter
   /** The filter's resource URIs, for constant-time matching. */
   uris: Set<string>
-  /** Who opened it, for the per-principal limit. */
-  principal: string
+  /** Whose allowance it counts against; absent for unidentified callers. */
+  quotaKey?: string
   keepAlive?: NodeJS.Timeout
   blocked: boolean
   queue: string[]
@@ -158,10 +158,13 @@ export class SubscriptionRegistry {
    * it can. Each stream holds a socket, timers and up to the buffer limit in
    * memory, so neither one caller nor everyone together may open unboundedly.
    */
-  refusal (principal: string): string | undefined {
+  refusal (quotaKey: string | undefined): string | undefined {
     if (this.#subscriptions.size >= this.#maxStreams) return 'Too many open subscription streams'
+    // Unidentified callers are bounded by the global limit only: one shared
+    // allowance would let any of them lock out all the others.
+    if (quotaKey === undefined) return undefined
     let mine = 0
-    for (const subscription of this.#subscriptions) if (subscription.principal === principal) mine++
+    for (const subscription of this.#subscriptions) if (subscription.quotaKey === quotaKey) mine++
     if (mine >= this.#maxStreamsPerPrincipal) return 'Too many open subscription streams for this caller'
     return undefined
   }
@@ -174,7 +177,7 @@ export class SubscriptionRegistry {
     reply: FastifyReply,
     id: RequestId,
     filter: SubscriptionFilter,
-    principal: string = '',
+    quotaKey?: string,
     cancelSignal?: AbortSignal
   ): boolean {
     const raw = reply.raw
@@ -200,7 +203,7 @@ export class SubscriptionRegistry {
       reply,
       filter,
       uris: new Set(filter.resourceSubscriptions ?? []),
-      principal,
+      quotaKey,
       blocked: false,
       queue: [],
       queuedBytes: 0

@@ -13,7 +13,7 @@ import { MemoryTaskStore } from './stores/memory-task-store.ts'
 import { RedisTaskStore } from './stores/redis-task-store.ts'
 import type { MCPPluginOptions, MCPTool, MCPResource, MCPPrompt, ResourceHandlers } from './types.ts'
 import type { CacheHint, CachingConfig } from './modern/handlers.ts'
-import { drainModernTasks } from './modern/handlers.ts'
+import { drainTasks } from './task-registry.ts'
 import { RequestStateSealer } from './modern/request-state.ts'
 import { SubscriptionRegistry } from './modern/subscriptions.ts'
 import {
@@ -130,7 +130,7 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     sessionStore = new MemorySessionStore(100)
     messageBroker = new MemoryMessageBroker()
     if (enableTasks) {
-      taskStore = new MemoryTaskStore()
+      taskStore = new MemoryTaskStore(opts.taskStoreMaxTasks)
     }
   }
 
@@ -337,7 +337,7 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     subscriptions.closeAll()
     // Let running tasks finish (or record them as failed) while the task
     // channel and Redis are still up to carry their outcome.
-    if (taskStore) await drainModernTasks(taskStore, opts.taskShutdownTimeoutMs ?? 5_000)
+    if (taskStore) await drainTasks(taskStore, opts.taskShutdownTimeoutMs ?? 5_000)
     taskInputs.close()
 
     for (const streams of localStreams.values()) {

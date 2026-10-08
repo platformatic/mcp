@@ -59,10 +59,11 @@ import { InputRequired, requiredCapabilityFor } from './input-required.ts'
 import type { RequestStateSealer } from './request-state.ts'
 import { RequestTooDeepError } from './request-state.ts'
 import { collectHeaderParams, validateToolParamHeaders } from './headers.ts'
-import type { TaskRecord, TaskStore } from '../stores/task-store.ts'
+import type { TaskRecord } from '../stores/task-store.ts'
 import { isTerminal } from '../stores/task-store.ts'
 import { principalOf } from '../principal.ts'
 import { NO_NOTIFIERS } from './request-stream.ts'
+import { MAX_TIMER_MS, TaskStopped, quotaKeyOf, reserveTask } from '../task-registry.ts'
 
 /** Freshness hints applied to one cacheable operation. */
 export interface CacheHint {
@@ -644,76 +645,7 @@ interface TaskResume {
   requestState: unknown
 }
 
-const DEFAULT_TASK_MAX_CONCURRENT = 1000
-const DEFAULT_TASK_MAX_PER_PRINCIPAL = 100
 const DEFAULT_TASK_LEASE_MS = 15_000
-/** Node's timers cap at 2^31-1 ms; longer delays fire after 1ms instead. */
-const MAX_TIMER_MS = 2 ** 31 - 1
-const TASK_SHUTDOWN_GRACE_MS = 1000
-const SHUTTING_DOWN = 'The server shut down before this task finished'
-
-/** Why a running task was stopped, recorded as its failure. */
-class TaskStopped extends Error {}
-
-interface LiveTask {
-  /** Whose task it is, for the per-principal limit. Unidentified callers share ''. */
-  principal: string
-  stop: (reason: TaskStopped) => void
-  done: Promise<void>
-}
-
-/** The background tasks one plugin instance is running, keyed by its task store. */
-interface TaskRegistry {
-  live: Map<string, LiveTask>
-  closing: boolean
-}
-
-const registries = new WeakMap<object, TaskRegistry>()
-
-function registryFor (store: object): TaskRegistry {
-  let registry = registries.get(store)
-  if (!registry) {
-    registry = { live: new Map(), closing: false }
-    registries.set(store, registry)
-  }
-  return registry
-}
-
-function sleep (ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms).unref())
-}
-
-/**
- * Stop taking new tasks and let running ones finish, for up to `timeoutMs`.
- * Whatever is still running then is aborted through its signal and recorded
- * as failed, so a restart never leaves a task `working` until its ttl.
- */
-export async function drainModernTasks (store: TaskStore, timeoutMs: number): Promise<void> {
-  const registry = registries.get(store)
-  if (!registry) return
-  registry.closing = true
-
-  const running = () => [...registry.live.values()]
-  await Promise.race([Promise.allSettled(running().map(task => task.done)), sleep(timeoutMs)])
-
-  const remaining = [...registry.live.entries()]
-  for (const [, task] of remaining) task.stop(new TaskStopped(SHUTTING_DOWN))
-  await Promise.race([Promise.allSettled(remaining.map(([, task]) => task.done)), sleep(TASK_SHUTDOWN_GRACE_MS)])
-
-  // A handler that ignores its signal is still running; record the outcome for it.
-  for (const taskId of registry.live.keys()) {
-    try {
-      await store.updateStatus(taskId, 'failed', {
-        statusMessage: SHUTTING_DOWN,
-        outcome: createError(null, INTERNAL_ERROR, SHUTTING_DOWN),
-        inputRequests: null,
-        clearPendingInputResponses: true
-      })
-    } catch {
-      // already terminal
-    }
-  }
-}
 
 /**
  * Wait until every key of a parked task's current input round is answered.
@@ -881,23 +813,6 @@ async function runAsTask (
   const identifiesCallers = opts.authorization?.enabled === true || opts.resolveAuthorizationContext !== undefined
   if (identifiesCallers && dependencies.authContext?.userId === undefined) return undefined
 
-  const registry = registryFor(taskStore!)
-  if (registry.closing) return undefined
-  const maxConcurrent = opts.taskMaxConcurrent ?? DEFAULT_TASK_MAX_CONCURRENT
-  if (registry.live.size >= maxConcurrent) {
-    app.log.warn({ running: registry.live.size, maxConcurrent }, 'Task limit reached; not creating another task')
-    return undefined
-  }
-  // One caller must not be able to take every slot from everyone else.
-  const principal = principalOf(dependencies.authContext) ?? ''
-  const maxPerPrincipal = opts.taskMaxPerPrincipal ?? DEFAULT_TASK_MAX_PER_PRINCIPAL
-  let mine = 0
-  for (const task of registry.live.values()) if (task.principal === principal) mine++
-  if (mine >= maxPerPrincipal) {
-    app.log.warn({ running: mine, maxPerPrincipal }, 'Per-caller task limit reached; not creating another task')
-    return undefined
-  }
-
   const createdAt = Date.now()
   const now = new Date(createdAt).toISOString()
   const ttl = Math.min(opts.taskDefaultTtlMs ?? 60_000, opts.taskMaxTtlMs ?? 3600_000)
@@ -928,13 +843,18 @@ async function runAsTask (
 
   // Reserve the slot before the first await, so concurrent requests cannot all
   // pass the limit check before any of them is counted.
-  const live: LiveTask = { principal, stop, done: Promise.resolve() }
-  registry.live.set(record.taskId, live)
+  const reservation = reserveTask(taskStore!, record.taskId, quotaKeyOf(dependencies.authContext), opts)
+  if (!reservation.ok) {
+    app.log.warn({ reason: reservation.reason }, 'Not creating a task')
+    return undefined
+  }
+  const live = reservation.live
+  live.stop = stop
 
   try {
     await taskStore!.create(record)
   } catch (error) {
-    registry.live.delete(record.taskId)
+    reservation.release()
     app.log.warn({ err: error }, 'Could not create task')
     return undefined
   }
@@ -966,7 +886,7 @@ async function runAsTask (
   const ttlTimer = ttl <= MAX_TIMER_MS
     ? setTimeout(() => {
       stop(new TaskStopped('Task expired before it finished'))
-      registry.live.delete(record.taskId)
+      reservation.release()
       clearInterval(leaseTimer)
       stopListening?.()
       taskInputs?.forget(record.taskId)
@@ -1111,7 +1031,7 @@ async function runAsTask (
       app.log.error({ err: error, taskId: record.taskId }, 'Task execution failed unexpectedly')
     })
     .finally(() => {
-      registry.live.delete(record.taskId)
+      reservation.release()
     })
 
   const result: Result = {

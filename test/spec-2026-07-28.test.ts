@@ -1350,7 +1350,31 @@ describe('2026-07-28: per-caller and global limits', () => {
   test('listen streams are limited per caller, with HTTP 429', async (t: TestContext) => {
     const app = await buildServer(t, undefined, {
       capabilities: { tools: { listChanged: true } },
-      subscriptionMaxStreamsPerPrincipal: 1
+      subscriptionMaxStreamsPerPrincipal: 1,
+      resolveAuthorizationContext: (request: any) => ({ userId: request.headers['x-user'], clientId: request.headers['x-client'] })
+    })
+    const open = (id: number, user: string, client: string) => app.inject({
+      method: 'POST',
+      url: '/mcp',
+      payloadAsStream: true,
+      headers: { ...modernHeaders('subscriptions/listen'), 'x-user': user, 'x-client': client },
+      payload: modernBody('subscriptions/listen', { id, params: { notifications: { toolsListChanged: true } } })
+    })
+    const first = await open(1, 'mallory', 'app-1')
+    t.assert.strictEqual(first.statusCode, 200)
+    // Another OAuth client of the same user shares the same allowance.
+    const second = await open(2, 'mallory', 'app-2')
+    t.assert.strictEqual(second.statusCode, 429)
+    const other = await open(3, 'alice', 'app-1')
+    t.assert.strictEqual(other.statusCode, 200)
+    for (const response of [first, second, other]) response.stream().destroy()
+  })
+
+  test('unidentified callers are bounded by the global stream limit only', async (t: TestContext) => {
+    const app = await buildServer(t, undefined, {
+      capabilities: { tools: { listChanged: true } },
+      subscriptionMaxStreamsPerPrincipal: 1,
+      subscriptionMaxStreams: 2
     })
     const open = (id: number) => app.inject({
       method: 'POST',
@@ -1359,12 +1383,9 @@ describe('2026-07-28: per-caller and global limits', () => {
       headers: modernHeaders('subscriptions/listen'),
       payload: modernBody('subscriptions/listen', { id, params: { notifications: { toolsListChanged: true } } })
     })
-    const first = await open(1)
-    t.assert.strictEqual(first.statusCode, 200)
-    const second = await open(2)
-    t.assert.strictEqual(second.statusCode, 429)
-    second.stream().destroy()
-    first.stream().destroy()
+    const responses = [await open(1), await open(2), await open(3)]
+    t.assert.deepStrictEqual(responses.map(response => response.statusCode), [200, 200, 429])
+    for (const response of responses) response.stream().destroy()
   })
 
   test('a listen stream may name only so many resource URIs', async (t: TestContext) => {
@@ -1379,17 +1400,60 @@ describe('2026-07-28: per-caller and global limits', () => {
     t.assert.strictEqual(response.json().error.code, INVALID_PARAMS)
   })
 
-  test('finished tasks do not lock others out of a full memory store', async (t: TestContext) => {
+  test('a full memory store keeps unread results and refuses new tasks', async (t: TestContext) => {
     const store = new MemoryTaskStore(2)
     const now = new Date().toISOString()
     const base = { createdAt: now, lastUpdatedAt: now, ttl: 60_000, method: 'tools/call' }
     await store.create({ ...base, taskId: 'done', status: 'completed' })
     await store.create({ ...base, taskId: 'running', status: 'working' })
-    await store.create({ ...base, taskId: 'new', status: 'working' })
-    t.assert.strictEqual(await store.get('done'), null)
-    t.assert.ok(await store.get('running'))
-    t.assert.ok(await store.get('new'))
-    await t.assert.rejects(store.create({ ...base, taskId: 'full', status: 'working' }), /Task limit reached/)
+    await t.assert.rejects(store.create({ ...base, taskId: 'new', status: 'working' }), /Task limit reached/)
+    // Nobody else's task creation can delete a finished result before its ttl.
+    t.assert.strictEqual((await store.get('done'))?.status, 'completed')
+
+    // Expired tasks still make room.
+    const old = new Date(Date.now() - 120_000).toISOString()
+    const expiring = new MemoryTaskStore(1)
+    await expiring.create({ ...base, createdAt: old, taskId: 'stale', status: 'completed' })
+    await expiring.create({ ...base, taskId: 'fresh', status: 'working' })
+    t.assert.ok(await expiring.get('fresh'))
+  })
+
+  test('legacy tasks count against the same limits', async (t: TestContext) => {
+    let release: () => void = () => {}
+    const blocked = new Promise<void>(resolve => { release = resolve })
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({
+        name: 'slow',
+        inputSchema: Type.Object({}),
+        execution: { taskSupport: 'optional' }
+      } as any, async () => {
+        await blocked
+        return { content: [] }
+      })
+    }, { enableTasks: true, enableSSE: true, taskMaxConcurrent: 1, taskShutdownTimeoutMs: 10 })
+    t.after(() => release())
+
+    const init = await app.inject({
+      method: 'POST',
+      url: '/mcp',
+      payload: {
+        jsonrpc: JSONRPC_VERSION,
+        id: 1,
+        method: 'initialize',
+        params: { protocolVersion: LATEST_LEGACY_PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: 'l', version: '1' } }
+      }
+    })
+    const legacyTask = (id: number) => app.inject({
+      method: 'POST',
+      url: '/mcp',
+      headers: {
+        'mcp-session-id': init.headers['mcp-session-id'] as string,
+        'mcp-protocol-version': LATEST_LEGACY_PROTOCOL_VERSION
+      },
+      payload: { jsonrpc: JSONRPC_VERSION, id, method: 'tools/call', params: { name: 'slow', arguments: {}, task: { ttl: 60_000 } } }
+    })
+    t.assert.ok((await legacyTask(2)).json().result.task, 'the first legacy task is created')
+    t.assert.match((await legacyTask(3)).json().error.message, /Task limit reached/)
   })
 })
 

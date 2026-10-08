@@ -345,6 +345,12 @@ export interface MCPPluginOptions {
    */
   taskMaxPerPrincipal?: number
   /**
+   * Most tasks the in-memory task store holds, finished ones included until
+   * their ttl (default 1000). A full store refuses new tasks rather than
+   * dropping results their owners have not read yet.
+   */
+  taskStoreMaxTasks?: number
+  /**
    * How long a running 2026-07-28 task's worker lease lasts, in milliseconds
    * (default 15000; renewed every third of it). When an instance dies, its
    * tasks are reported failed this long after its last renewal.

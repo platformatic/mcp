@@ -50,6 +50,7 @@ import type { TaskStore, TaskRecord, TaskWaiters } from './stores/task-store.ts'
 import { isTerminal, toWireTask } from './stores/task-store.ts'
 import type { AuthorizationContext } from './types/auth-types.ts'
 import { principalOf } from './principal.ts'
+import { MAX_TIMER_MS, TaskStopped, quotaKeyOf, reserveTask } from './task-registry.ts'
 import type { TaskInputChannel } from './modern/task-inputs.ts'
 import { InputRequired } from './modern/input-required.ts'
 import type { RequestNotifiers } from './modern/request-stream.ts'
@@ -431,7 +432,7 @@ async function handleToolsCall (
       taskParams?.ttl,
       // Timed from when the task actually starts executing, not from when it
       // was queued, so `durationMs` reflects work done rather than wait time.
-      () => executeToolCall(request, resolved.tool, params, sessionId, dependencies, { source: 'task', startedAt: performance.now() }),
+      (signal) => executeToolCall(request, resolved.tool, params, sessionId, { ...dependencies, signal }, { source: 'task', startedAt: performance.now() }),
       dependencies
     )
   }
@@ -1384,7 +1385,7 @@ async function notifyTaskStatus (task: TaskRecord, dependencies: HandlerDependen
 async function runToolCallAsTask (
   request: JSONRPCRequest,
   ttl: number | undefined,
-  execute: () => Promise<JSONRPCResponse | JSONRPCError>,
+  execute: (signal: AbortSignal) => Promise<JSONRPCResponse | JSONRPCError>,
   dependencies: HandlerDependencies
 ): Promise<JSONRPCResponse | JSONRPCError> {
   const { taskStore, taskWaiters, app } = dependencies
@@ -1393,7 +1394,32 @@ async function runToolCallAsTask (
   }
 
   const task = newTaskRecord('tools/call', ttl, taskSubject(dependencies), taskTtlBounds(dependencies))
-  await taskStore.create(task)
+
+  // Legacy tasks share the limits, ttl abort and shutdown drain of the
+  // 2026-07-28 ones, so neither era can starve the other.
+  const reservation = reserveTask(taskStore, task.taskId, quotaKeyOf(dependencies.authContext), dependencies.opts)
+  if (!reservation.ok) {
+    return createError(request.id, INTERNAL_ERROR, `Cannot create a task: ${reservation.reason}`)
+  }
+  try {
+    await taskStore.create(task)
+  } catch (error) {
+    reservation.release()
+    throw error
+  }
+
+  const stopController = new AbortController()
+  const stopped = stopController.signal
+  reservation.live.stop = (reason: TaskStopped) => {
+    if (!stopped.aborted) stopController.abort(reason)
+  }
+  const taskTtl = task.ttl ?? undefined
+  const ttlTimer = taskTtl !== undefined && taskTtl <= MAX_TIMER_MS
+    ? setTimeout(() => {
+      reservation.live.stop(new TaskStopped('Task expired before it finished'))
+      reservation.release()
+    }, taskTtl).unref()
+    : undefined
 
   // Deliberately not awaited: the point of a task is to return control now.
   const execution = (async () => {
@@ -1402,7 +1428,7 @@ async function runToolCallAsTask (
     let statusMessage: string | undefined
 
     try {
-      const result = await execute()
+      const result = await execute(stopped)
       outcome = result
       // A tool result carrying isError counts as a failed task
       if ('result' in result && (result.result as CallToolResult)?.isError === true) {
@@ -1415,6 +1441,12 @@ async function runToolCallAsTask (
     } catch (error: any) {
       status = 'failed'
       statusMessage = `Tool execution failed: ${error?.message || error}`
+      outcome = createError(request.id, INTERNAL_ERROR, statusMessage)
+    }
+    // A stopped task ends for the reason it was stopped.
+    if (stopped.aborted && stopped.reason instanceof TaskStopped) {
+      status = 'failed'
+      statusMessage = stopped.reason.message
       outcome = createError(request.id, INTERNAL_ERROR, statusMessage)
     }
 
@@ -1432,9 +1464,14 @@ async function runToolCallAsTask (
 
   // Nothing awaits `execution`; keep an explicit rejection guard so an
   // unexpected throw can never become an unhandled rejection.
-  execution.catch((error) => {
-    app.log.error({ err: error, taskId: task.taskId }, 'Task execution failed unexpectedly')
-  })
+  reservation.live.done = execution
+    .catch((error) => {
+      app.log.error({ err: error, taskId: task.taskId }, 'Task execution failed unexpectedly')
+    })
+    .finally(() => {
+      if (ttlTimer) clearTimeout(ttlTimer)
+      reservation.release()
+    })
 
   const result: CreateTaskResult = { task: toWireTask(task) }
   return createResponse(request.id, result)

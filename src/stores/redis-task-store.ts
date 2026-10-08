@@ -1,7 +1,7 @@
 import type { Redis } from 'ioredis'
 import type { TaskStatus } from '../schema.ts'
 import type { TaskStore, TaskRecord, TaskUpdateOptions, TaskInputUpdate, TaskOutcome } from './task-store.ts'
-import { applyInputRequestUpdates, canTransition, isTerminal, taskHasExpired } from './task-store.ts'
+import { applyInputRequestUpdates, canTransition, isTerminal } from './task-store.ts'
 
 // Versioned: records here store opaque fields as JSON strings, which earlier
 // releases cannot read. A separate keyspace keeps old and new instances from
@@ -114,10 +114,9 @@ export class RedisTaskStore implements TaskStore {
       return null
     }
 
-    if (taskHasExpired(task)) {
-      await this.delete(taskId)
-      return null
-    }
+    // Retention is the key's own expiry (SET … EX), timed by Redis. Judging it
+    // again by this instance's clock would let one instance whose clock runs
+    // ahead delete tasks that are still running, for every instance.
     return task
   }
 

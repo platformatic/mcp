@@ -42,7 +42,7 @@ import {
 import { validateStandardHeaders } from '../modern/headers.ts'
 import type { RequestStateSealer } from '../modern/request-state.ts'
 import { DEFAULT_MAX_RESOURCE_SUBSCRIPTIONS, SubscriptionRegistry, invalidFilter, negotiateFilter } from '../modern/subscriptions.ts'
-import { principalOf } from '../principal.ts'
+import { quotaKeyOf } from '../task-registry.ts'
 import type { SubscriptionFilter } from '../schema-2026.ts'
 import { isStdioRequest, stdioRequestSignal } from '../stdio-trust.ts'
 import { RequestStream, requestNotifiers } from '../modern/request-stream.ts'
@@ -517,8 +517,8 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         return undefined
       }
 
-      const principal = principalOf(authContext) ?? ''
-      const refused = subscriptions.refusal(principal)
+      const quotaKey = quotaKeyOf(authContext)
+      const refused = subscriptions.refusal(quotaKey)
       if (refused) {
         reply.code(429).type('application/json')
         return createError(message.id, INVALID_REQUEST, refused)
@@ -531,7 +531,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         types: Object.keys(filter).filter(key => key !== 'resourceSubscriptions'),
         resourceSubscriptions: filter.resourceSubscriptions?.length ?? 0
       }, 'Opening subscription stream')
-      if (!subscriptions.open(reply, message.id, filter, principal, listenCancel) && !reply.sent) {
+      if (!subscriptions.open(reply, message.id, filter, quotaKey, listenCancel) && !reply.sent) {
         reply.code(503).type('application/json')
         return createError(message.id, INTERNAL_ERROR, 'Server is shutting down')
       }
