@@ -1,6 +1,7 @@
 import type { FastifyRequest, FastifyReply, preHandlerHookHandler } from 'fastify'
 import type { AuthorizationConfig } from '../types/auth-types.ts'
 import { TokenValidator } from './token-validator.ts'
+import { isStdioRequest } from '../stdio-trust.ts'
 
 export function createAuthPreHandler (
   config: AuthorizationConfig,
@@ -9,6 +10,13 @@ export function createAuthPreHandler (
   return async function authPreHandler (request: FastifyRequest, reply: FastifyReply) {
     // Skip authorization if disabled
     if (!config.enabled) {
+      return
+    }
+
+    // stdio is a local transport: the spec has it take credentials from the
+    // environment, not from HTTP bearer tokens, and only the in-process stdio
+    // transport can present this token.
+    if (isStdioRequest(request.headers)) {
       return
     }
 

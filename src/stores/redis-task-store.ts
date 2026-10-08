@@ -252,7 +252,10 @@ export class RedisTaskStore implements TaskStore {
          if next(outstanding) == nil then
            task.inputRequests = nil
            -- Fully answered: stop reporting input_required with nothing to ask.
-           if task.status == 'input_required' then task.status = 'working' end
+           if task.status == 'input_required' then
+             task.status = 'working'
+             task.statusMessage = nil
+           end
          else
            task.inputRequests = outstanding
          end

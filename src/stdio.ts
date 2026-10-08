@@ -37,6 +37,20 @@ export interface StdioTransportOptions {
   error?: NodeJS.WritableStream
 }
 
+function isJsonRpcObject (value: unknown): value is JSONRPCMessage {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function isJsonRpcResponse (value: unknown): value is JSONRPCResponse | JSONRPCError {
+  if (!isJsonRpcObject(value)) return false
+  const record = value as unknown as Record<string, unknown>
+  return record.jsonrpc === '2.0' && 'id' in record && ('result' in record || 'error' in record)
+}
+
+function invalidRequest (): JSONRPCError {
+  return { jsonrpc: '2.0', id: null as unknown as string, error: { code: -32600, message: 'Invalid Request' } }
+}
+
 /** A request id as a map key: `1` and `"1"` are different requests. */
 function requestKey (id: string | number): string {
   return `${typeof id}:${id}`
@@ -82,7 +96,10 @@ export class StdioTransport {
 
     // Handle each line as a JSON-RPC message
     this.readline.on('line', (line: string) => {
-      this.handleIncomingMessage(line.trim())
+      // One bad line must never take the server down with an unhandled rejection.
+      this.handleIncomingMessage(line.trim()).catch((error) => {
+        this.logError('Error handling message:', error)
+      })
     })
 
     // Handle close/error events
@@ -165,6 +182,14 @@ export class StdioTransport {
     }
     this.log('Received message:', message)
 
+    // Valid JSON is not necessarily a JSON-RPC message: anything but an object
+    // (or, for the legacy revisions, a non-empty array) is an invalid request.
+    const parsed: unknown = message
+    if (!isJsonRpcObject(parsed) && !(Array.isArray(parsed) && parsed.length > 0)) {
+      this.sendMessage(invalidRequest())
+      return
+    }
+
     if (Array.isArray(message)) {
       // 2026-07-28 carries exactly one message per line; only the legacy
       // revisions that predate the batch removal may still send arrays.
@@ -202,6 +227,10 @@ export class StdioTransport {
     const responses: JSONRPCBatchResponse = []
 
     for (const message of batch) {
+      if (!isJsonRpcObject(message)) {
+        responses.push(invalidRequest())
+        continue
+      }
       const response = await this.processMessage(message)
       if (response) {
         responses.push(response)
@@ -246,6 +275,12 @@ export class StdioTransport {
 
       const stream = response.stream()
       if (String(response.headers['content-type'] ?? '').startsWith('text/event-stream')) {
+        // Cancelled before the stream even arrived: the listener below would
+        // never fire on an already-aborted signal, so close it now.
+        if (cancel.signal.aborted) {
+          stream.destroy()
+          return null
+        }
         cancel.signal.addEventListener('abort', () => stream.destroy(), { once: true })
         await this.forwardEvents(stream, cancel.signal)
         return null
@@ -253,21 +288,38 @@ export class StdioTransport {
 
       let body = ''
       for await (const chunk of stream) body += chunk
-      if (cancel.signal.aborted) return null
+      if (cancel.signal.aborted || id === undefined) return null
       if (response.statusCode === 202 || body === '') return null
-      return JSON.parse(body)
+
+      // Only JSON-RPC goes to stdout. A plain HTTP error from Fastify or a
+      // plugin (a body over the size limit, say) still answers this id.
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(body)
+      } catch {
+        parsed = undefined
+      }
+      if (isJsonRpcResponse(parsed)) return parsed
+      this.logError(`Non-JSON-RPC response (status ${response.statusCode}):`, body)
+      return {
+        jsonrpc: '2.0',
+        id,
+        error: {
+          code: response.statusCode === 413 ? -32600 : -32603,
+          message: response.statusCode === 413 ? 'Request too large' : 'Internal server error'
+        }
+      }
     } catch (error) {
-      if (cancel.signal.aborted) return null
+      if (cancel.signal.aborted || id === undefined) return null
       this.logError('Error processing message via inject:', error)
 
       // Return a generic error response
       const errorResponse: JSONRPCError = {
         jsonrpc: '2.0',
-        id: id ?? 0,
+        id,
         error: {
           code: -32603, // Internal error
-          message: 'Internal server error',
-          data: error instanceof Error ? error.message : String(error)
+          message: 'Internal server error'
         }
       }
       return errorResponse

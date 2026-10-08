@@ -151,7 +151,7 @@ export class MemoryTaskStore implements TaskStore {
             ? { inputRequests: outstanding }
             // Fully answered: the task is no longer waiting on the client, so
             // it must not keep reporting `input_required` with nothing to ask.
-            : { inputRequests: undefined, ...(task.status === 'input_required' ? { status: 'working' as const } : {}) }),
+            : { inputRequests: undefined, ...(task.status === 'input_required' ? { status: 'working' as const, statusMessage: undefined } : {}) }),
           answeredInputKeys: [...answered],
           pendingInputResponses: pending,
           pendingInputResponseIds: pendingIds,

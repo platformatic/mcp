@@ -57,10 +57,12 @@ import type { RequestContext } from './request-meta.ts'
 import { supportsTasksExtension } from './request-meta.ts'
 import { InputRequired, requiredCapabilityFor } from './input-required.ts'
 import type { RequestStateSealer } from './request-state.ts'
+import { RequestTooDeepError } from './request-state.ts'
 import { collectHeaderParams, validateToolParamHeaders } from './headers.ts'
 import type { TaskRecord, TaskStore } from '../stores/task-store.ts'
 import { isTerminal } from '../stores/task-store.ts'
 import { principalOf } from '../principal.ts'
+import { NO_NOTIFIERS } from './request-stream.ts'
 
 /** Freshness hints applied to one cacheable operation. */
 export interface CacheHint {
@@ -316,9 +318,12 @@ function inputRequired (
       inputKeys: Object.keys(thrown.inputRequests ?? {})
     })
   } catch (error) {
+    dependencies.app.log.warn({ err: error, method: request.method }, 'Could not seal request state')
+    if (error instanceof RequestTooDeepError) {
+      return createError(request.id, INVALID_PARAMS, `Invalid request: ${error.message}`)
+    }
     // Sealing refuses an unidentified caller when the deployment identifies
     // callers. Answer this request rather than escaping to a bare 500.
-    dependencies.app.log.warn({ err: error, method: request.method }, 'Could not seal request state')
     return createError(request.id, INVALID_REQUEST, 'This request needs additional input, which requires an authenticated caller')
   }
 
@@ -642,6 +647,8 @@ interface TaskResume {
 const DEFAULT_TASK_MAX_CONCURRENT = 1000
 const DEFAULT_TASK_MAX_PER_PRINCIPAL = 100
 const DEFAULT_TASK_LEASE_MS = 15_000
+/** Node's timers cap at 2^31-1 ms; longer delays fire after 1ms instead. */
+const MAX_TIMER_MS = 2 ** 31 - 1
 const TASK_SHUTDOWN_GRACE_MS = 1000
 const SHUTTING_DOWN = 'The server shut down before this task finished'
 
@@ -903,7 +910,10 @@ async function runAsTask (
     pollInterval: DEFAULT_POLL_INTERVAL_MS,
     method: request.method,
     authSubject: principalOf(dependencies.authContext),
-    era: 'modern'
+    era: 'modern',
+    // Leased from the start, so a worker that dies before its first renewal is
+    // still reaped. The renewal right after creation switches to the store's clock.
+    leaseExpiresAt: Date.now() + (opts.taskLeaseMs ?? DEFAULT_TASK_LEASE_MS)
   }
 
   // A task outlives the request that created it, so its handler must not see
@@ -949,12 +959,19 @@ async function runAsTask (
 
   // Past its ttl the task is gone for the client; stop the handler and free
   // the slot even if the handler ignores the signal.
-  const ttlTimer = setTimeout(() => {
-    stop(new TaskStopped('Task expired before it finished'))
-    registry.live.delete(record.taskId)
-  }, ttl).unref()
-
   const stopListening = taskInputs?.onCancel(record.taskId, () => stop(new TaskStopped('Task cancelled')))
+  // A handler that ignores its signal may never settle; it must not keep
+  // renewing a lease or listening for a task that has expired. Node clamps
+  // longer timers to 1ms, so a ttl beyond the timer range gets none.
+  const ttlTimer = ttl <= MAX_TIMER_MS
+    ? setTimeout(() => {
+      stop(new TaskStopped('Task expired before it finished'))
+      registry.live.delete(record.taskId)
+      clearInterval(leaseTimer)
+      stopListening?.()
+      taskInputs?.forget(record.taskId)
+    }, ttl).unref()
+    : undefined
   taskInputs?.claim(record.taskId)
 
   const execution = (async () => {
@@ -1133,7 +1150,10 @@ async function modernToolsCall (
   // are deliberately indistinguishable so authorization cannot leak names.
   const resolved = await resolveRegisteredTool(params.name, dependencies)
   if (!resolved.ok) {
-    await emitToolCallComplete('json-rpc', params.name, args, resolved, startedAt, dependencies)
+    const observed = resolved.reason === 'access-denied'
+      ? { ok: false as const, reason: 'not-found' as const }
+      : resolved
+    await emitToolCallComplete('json-rpc', params.name, args, observed, startedAt, dependencies)
     return createError(request.id, INVALID_PARAMS, `Unknown tool: ${params.name}`)
   }
   const tool = resolved.tool
@@ -1193,7 +1213,9 @@ async function modernToolsCall (
     {
       ...dependencies,
       ...(resume ? { mrtr: resume } : {}),
-      ...(signal ? { signal } : {})
+      // A task's request has already been answered, so it has no stream to
+      // report on; reporting there would take over a reply in flight.
+      ...(signal ? { signal, notifiers: NO_NOTIFIERS } : {})
     },
     observation
   )

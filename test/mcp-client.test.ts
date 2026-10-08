@@ -588,6 +588,43 @@ describe('MCP client', () => {
     await assert.rejects(client.discover(), /Unrecognized resultType 'mystery'/)
   })
 
+  test('modern clients treat an absent resultType as complete, and task only with the extension', async (t) => {
+    const app = Fastify()
+    t.after(() => app.close())
+    await app.register(mcpPlugin)
+    app.post('/plain', async () => ({ jsonrpc: JSONRPC_VERSION, id: 1, result: { tools: [] } }))
+    app.post('/task', async () => ({ jsonrpc: JSONRPC_VERSION, id: 1, result: { resultType: 'task', taskId: 't' } }))
+    await app.ready()
+
+    const plain = createMcpClient(app, { protocolVersion: LATEST_PROTOCOL_VERSION, endpoint: '/plain' })
+    assert.ok('result' in (await plain.listTools()).body)
+
+    const without = createMcpClient(app, { protocolVersion: LATEST_PROTOCOL_VERSION, endpoint: '/task' })
+    await assert.rejects(without.discover(), /Unrecognized resultType 'task'/)
+    const withTasks = createMcpClient(app, {
+      protocolVersion: LATEST_PROTOCOL_VERSION,
+      endpoint: '/task',
+      clientCapabilities: { extensions: { 'io.modelcontextprotocol/tasks': {} } }
+    })
+    assert.equal(((await withTasks.discover()).body as any).result.resultType, 'task')
+  })
+
+  test('modern clients parse CRLF-framed SSE responses', async (t) => {
+    const app = Fastify()
+    t.after(() => app.close())
+    await app.register(mcpPlugin)
+    app.post('/crlf', async (_request, reply) => {
+      reply.type('text/event-stream')
+      return 'data: {"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"p","progress":1}}\r\n\r\n' +
+        'data: {"jsonrpc":"2.0","id":1,"result":{"resultType":"complete"}}\r\n\r\n'
+    })
+    await app.ready()
+    const client = createMcpClient(app, { protocolVersion: LATEST_PROTOCOL_VERSION, endpoint: '/crlf' })
+    const response = await client.discover({ id: 1 })
+    assert.equal((response.body as any).result.resultType, 'complete')
+    assert.equal(response.notifications.length, 1)
+  })
+
   test('modern clients can complete multi round-trip tool calls', async (t) => {
     const app = Fastify()
     t.after(() => app.close())

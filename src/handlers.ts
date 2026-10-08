@@ -404,7 +404,12 @@ async function handleToolsCall (
   // the model cannot correct itself out of missing access.
   const resolved = await resolveRegisteredTool(toolName, dependencies)
   if (!resolved.ok) {
-    await emitToolCallComplete('json-rpc', toolName, params.arguments || {}, resolved, startedAt, dependencies)
+    // Keep the JSON-RPC observer aligned with the privacy-preserving protocol
+    // response: denied registered tools are indistinguishable from unknown ones.
+    const observedOutcome: McpCallToolOutcome = resolved.reason === 'access-denied'
+      ? { ok: false, reason: 'not-found' }
+      : resolved
+    await emitToolCallComplete('json-rpc', toolName, params.arguments || {}, observedOutcome, startedAt, dependencies)
     return toolCallOutcomeToJsonRpc(request.id, toolName, resolved)
   }
 
@@ -480,6 +485,7 @@ export async function emitToolCallComplete (
 type RegisteredToolResolution =
   | { ok: true, tool: MCPTool }
   | { ok: false, reason: 'not-found' }
+  | { ok: false, reason: 'access-denied' }
 
 export async function resolveRegisteredTool (
   toolName: string,
@@ -493,10 +499,7 @@ export async function resolveRegisteredTool (
   }
 
   if (!isAllowed) {
-    // Indistinguishable from an unknown tool for every caller, in-process
-    // ones included, so a relayed outcome cannot reveal that it exists.
-    dependencies.app.log.debug({ tool: toolName }, 'Tool call denied by canAccessTool')
-    return { ok: false, reason: 'not-found' }
+    return { ok: false, reason: 'access-denied' }
   }
 
   return { ok: true, tool }
@@ -523,6 +526,7 @@ function toolCallOutcomeToJsonRpc (
       return createResponse(id, result)
     }
     case 'not-found':
+    case 'access-denied':
       return createError(id, METHOD_NOT_FOUND, `Tool '${toolName}' not found`)
     // Unreachable from the JSON-RPC path today (handleToolsCall resolves task
     // augmentation itself), but kept in the mapping so the two paths stay

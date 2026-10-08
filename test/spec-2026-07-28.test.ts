@@ -2536,6 +2536,260 @@ describe('2026-07-28 over stdio', () => {
   })
 })
 
+describe('round 3: robustness of streams, stdio and tasks', () => {
+  function stdioHarness (t: TestContext, app: FastifyInstance) {
+    const input = new PassThrough()
+    const output = new PassThrough()
+    const transport = createStdioTransport(app, { input, output, error: new PassThrough() })
+    transport.start()
+    t.after(() => transport.stop())
+    const lines: any[] = []
+    let buffered = ''
+    output.on('data', (chunk: Buffer) => {
+      buffered += chunk.toString()
+      const parts = buffered.split('\n')
+      buffered = parts.pop() ?? ''
+      for (const line of parts) if (line.trim()) lines.push(JSON.parse(line))
+    })
+    const waitFor = async (match: (line: any) => boolean) => {
+      for (let attempt = 0; attempt < 200; attempt++) {
+        const found = lines.find(match)
+        if (found) return found
+        await new Promise(resolve => setTimeout(resolve, 10))
+      }
+      return undefined
+    }
+    return { input, lines, waitFor }
+  }
+
+  test('stdio answers non-object JSON lines with -32600 and keeps running', async (t: TestContext) => {
+    const app = await buildServer(t)
+    const { input, lines, waitFor } = stdioHarness(t, app)
+    for (const line of ['null', '5', '"x"', 'true', '[]']) input.write(line + '\n')
+    input.write('[null]\n')
+    for (let attempt = 0; attempt < 100 && lines.length < 6; attempt++) await new Promise(resolve => setTimeout(resolve, 10))
+    t.assert.strictEqual(lines.filter(line => line.error?.code === INVALID_REQUEST).length, 5)
+    t.assert.ok(lines.some(line => Array.isArray(line) && line[0].error?.code === INVALID_REQUEST))
+
+    input.write(JSON.stringify(modernBody('server/discover', { id: 'alive' })) + '\n')
+    t.assert.ok(await waitFor(line => line.id === 'alive' && line.result))
+  })
+
+  test('stdio turns a non-JSON-RPC HTTP error into an error for the same id', async (t: TestContext) => {
+    const app = Fastify({ bodyLimit: 512 })
+    t.after(() => app.close())
+    await app.register(mcpPlugin)
+    await app.ready()
+    const { input, waitFor } = stdioHarness(t, app)
+    input.write(JSON.stringify(modernBody('tools/list', { id: 'big', params: { padding: 'x'.repeat(2000) } })) + '\n')
+    const answer = await waitFor(line => line.id === 'big')
+    t.assert.strictEqual(answer?.jsonrpc, JSONRPC_VERSION)
+    t.assert.strictEqual(answer?.error.code, INVALID_REQUEST)
+  })
+
+  test('stdio is not subject to HTTP bearer authorization', async (t: TestContext) => {
+    const app = Fastify()
+    t.after(() => app.close())
+    await app.register(mcpPlugin, {
+      authorization: {
+        enabled: true,
+        authorizationServers: ['https://auth.example.com'],
+        resourceUri: 'https://mcp.example.com',
+        tokenValidation: { jwksUri: 'https://auth.example.com/.well-known/jwks.json' }
+      }
+    } as any)
+    await app.ready()
+    const { input, waitFor } = stdioHarness(t, app)
+    input.write(JSON.stringify(modernBody('server/discover', { id: 1 })) + '\n')
+    const answer = await waitFor(line => line.id === 1)
+    t.assert.strictEqual(answer?.result.resultType, 'complete')
+  })
+
+  test('a stdio listen cancelled before it opens does not leak a stream', async (t: TestContext) => {
+    const app = await buildServer(t, undefined, {
+      capabilities: { tools: { listChanged: true } },
+      subscriptionMaxStreams: 1
+    })
+    const { input, waitFor } = stdioHarness(t, app)
+    for (const id of ['a', 'b', 'c']) {
+      input.write(JSON.stringify(modernBody('subscriptions/listen', { id, params: { notifications: { toolsListChanged: true } } })) + '\n' +
+        JSON.stringify({ jsonrpc: JSONRPC_VERSION, method: 'notifications/cancelled', params: { requestId: id } }) + '\n')
+    }
+    await new Promise(resolve => setTimeout(resolve, 100))
+    input.write(JSON.stringify(modernBody('subscriptions/listen', { id: 'open', params: { notifications: { toolsListChanged: true } } })) + '\n')
+    const ack = await waitFor(line => line.method === 'notifications/subscriptions/acknowledged')
+    t.assert.strictEqual(ack?.params._meta['io.modelcontextprotocol/subscriptionId'], 'open')
+  })
+
+  test('a notification sent just after the handler returns never hangs the response', async (t: TestContext) => {
+    for (let depth = 0; depth <= 12; depth++) {
+      const app = await buildServer(t, (app) => {
+        app.mcpAddTool({ name: 'late', inputSchema: Type.Object({}) }, async (_args: any, context: any) => {
+          ;(async () => {
+            for (let i = 0; i < depth; i++) await null
+            context.sendProgress(1)
+          })()
+          return { content: [{ type: 'text', text: 'ok' }] }
+        })
+      })
+      const body = modernBody('tools/call', { params: { name: 'late', arguments: {} } }) as any
+      body.params._meta.progressToken = 'p'
+      const response = await Promise.race([
+        app.inject({ method: 'POST', url: '/mcp', headers: modernHeaders('tools/call', { params: { name: 'late' } }), payload: body }),
+        new Promise<'hang'>(resolve => setTimeout(() => resolve('hang'), 1000))
+      ])
+      t.assert.notStrictEqual(response, 'hang', `depth ${depth}`)
+    }
+  })
+
+  test('a task cannot take over the response of the request that created it', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({
+        name: 'reporting-task',
+        inputSchema: Type.Object({}),
+        execution: { taskSupport: 'required' }
+      } as any, async (_args: any, context: any) => {
+        context.sendProgress(1)
+        return { content: [] }
+      })
+    }, { enableTasks: true })
+    const body = modernBody('tools/call', {
+      params: { name: 'reporting-task', arguments: {} },
+      capabilities: { extensions: { [TASKS_EXTENSION]: {} } }
+    }) as any
+    body.params._meta.progressToken = 'p'
+    const response = await app.inject({
+      method: 'POST', url: '/mcp', headers: modernHeaders('tools/call', { params: { name: 'reporting-task' } }), payload: body
+    })
+    t.assert.match(String(response.headers['content-type']), /application\/json/)
+    t.assert.strictEqual(response.json().result.resultType, 'task')
+  })
+
+  test('an error after progress keeps its HTTP status', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'ask', inputSchema: Type.Object({}) }, async (_args: any, context: any) => {
+        context.sendProgress(1)
+        throw new InputRequired({ inputRequests: { q: elicitForm('Name?', { type: 'object', properties: {} }) } })
+      })
+    })
+    const body = modernBody('tools/call', { params: { name: 'ask', arguments: {} } }) as any
+    body.params._meta.progressToken = 'p'
+    const response = await app.inject({
+      method: 'POST', url: '/mcp', headers: modernHeaders('tools/call', { params: { name: 'ask' } }), payload: body
+    })
+    t.assert.strictEqual(response.statusCode, 400)
+    t.assert.strictEqual(response.json().error.code, MISSING_REQUIRED_CLIENT_CAPABILITY)
+  })
+
+  test('a streamed response keeps reply headers and serializes any log data', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.addHook('onRequest', async (_request, reply) => { reply.header('access-control-allow-origin', '*') })
+      app.mcpAddTool({ name: 'chatty', inputSchema: Type.Object({}) }, async (_args: any, context: any) => {
+        const circular: any = { a: 1 }
+        circular.self = circular
+        context.sendProgress(Infinity)
+        context.log('info', { big: 10n, error: new Error('boom'), circular })
+        context.sendProgress(1)
+        return { content: [] }
+      })
+    })
+    const body = modernBody('tools/call', { params: { name: 'chatty', arguments: {} } }) as any
+    body.params._meta.progressToken = 'p'
+    body.params._meta['io.modelcontextprotocol/logLevel'] = 'info'
+    const response = await app.inject({
+      method: 'POST', url: '/mcp', headers: modernHeaders('tools/call', { params: { name: 'chatty' } }), payload: body
+    })
+    t.assert.strictEqual(response.headers['access-control-allow-origin'], '*')
+    const frames = response.body.split('\n\n').map(frame => frame.replace(/^data: /, '').trim()).filter(Boolean).map(frame => JSON.parse(frame))
+    const log = frames.find(frame => frame.method === 'notifications/message')
+    t.assert.deepStrictEqual(log.params.data, { big: '10', error: { name: 'Error', message: 'boom' }, circular: { a: 1, self: '[Circular]' } })
+    const progress = frames.filter(frame => frame.method === 'notifications/progress').map(frame => frame.params.progress)
+    t.assert.deepStrictEqual(progress, [1])
+    t.assert.strictEqual(frames.at(-1).result.resultType, 'complete')
+  })
+
+  test('a hung handler past its ttl stops renewing its lease', async (t: TestContext) => {
+    let renewals = 0
+    const original = MemoryTaskStore.prototype.renewLease
+    t.mock.method(MemoryTaskStore.prototype, 'renewLease', async function (this: MemoryTaskStore, taskId: string, leaseMs: number) {
+      renewals++
+      return await original.call(this, taskId, leaseMs)
+    })
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({
+        name: 'hang',
+        inputSchema: Type.Object({}),
+        execution: { taskSupport: 'required' }
+      } as any, async () => await new Promise(() => {}))
+    }, { enableTasks: true, taskDefaultTtlMs: 100, taskLeaseMs: 30, taskShutdownTimeoutMs: 10 })
+    await call(app, 'tools/call', { params: { name: 'hang', arguments: {} }, capabilities: { extensions: { [TASKS_EXTENSION]: {} } } })
+    await new Promise(resolve => setTimeout(resolve, 200))
+    const afterTtl = renewals
+    await new Promise(resolve => setTimeout(resolve, 150))
+    t.assert.strictEqual(renewals, afterTtl, 'no renewals after the ttl')
+  })
+
+  test('a ttl beyond the timer range does not fail tasks at once', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({
+        name: 'quick',
+        inputSchema: Type.Object({}),
+        execution: { taskSupport: 'required' }
+      } as any, async () => {
+        await new Promise(resolve => setTimeout(resolve, 50))
+        return { content: [{ type: 'text', text: 'done' }] }
+      })
+    }, { enableTasks: true, taskDefaultTtlMs: 30 * 24 * 3600 * 1000, taskMaxTtlMs: 30 * 24 * 3600 * 1000 })
+    const capabilities = { extensions: { [TASKS_EXTENSION]: {} } }
+    const created = (await call(app, 'tools/call', { params: { name: 'quick', arguments: {} }, capabilities })).json().result
+    let task: any
+    for (let attempt = 0; attempt < 50; attempt++) {
+      task = (await call(app, 'tasks/get', { params: { taskId: created.taskId }, capabilities })).json().result
+      if (task.status !== 'working') break
+      await new Promise(resolve => setTimeout(resolve, 20))
+    }
+    t.assert.strictEqual(task.status, 'completed')
+  })
+
+  test('a task whose worker never renews is still reaped', async (t: TestContext) => {
+    t.mock.method(MemoryTaskStore.prototype, 'renewLease', async () => { throw new Error('store unreachable') })
+    let release: () => void = () => {}
+    const blocked = new Promise<void>(resolve => { release = resolve })
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({
+        name: 'orphan',
+        inputSchema: Type.Object({}),
+        execution: { taskSupport: 'required' }
+      } as any, async () => {
+        await blocked
+        return { content: [] }
+      })
+    }, { enableTasks: true, taskLeaseMs: 50, taskShutdownTimeoutMs: 10 })
+    t.after(() => release())
+    const capabilities = { extensions: { [TASKS_EXTENSION]: {} } }
+    const created = (await call(app, 'tools/call', { params: { name: 'orphan', arguments: {} }, capabilities })).json().result
+    await new Promise(resolve => setTimeout(resolve, 120))
+    const task = (await call(app, 'tasks/get', { params: { taskId: created.taskId }, capabilities })).json().result
+    t.assert.strictEqual(task.status, 'failed')
+  })
+
+  test('too deeply nested params needing input are invalid params, not an auth error', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'ask', inputSchema: { type: 'object' } }, async () => {
+        throw new InputRequired({ inputRequests: { q: elicitForm('Name?', { type: 'object', properties: {} }) } })
+      })
+    })
+    let nested: any = {}
+    const root = nested
+    for (let i = 0; i < 100; i++) { nested.n = {}; nested = nested.n }
+    const response = await call(app, 'tools/call', {
+      params: { name: 'ask', arguments: {}, extra: root },
+      capabilities: { elicitation: { form: {} } }
+    })
+    t.assert.strictEqual(response.json().error.code, INVALID_PARAMS)
+  })
+})
+
 describe('2026-07-28: message and transport validation', () => {
   test('a modern batch body is rejected, not accepted as a notification', async (t: TestContext) => {
     const app = await buildServer(t)

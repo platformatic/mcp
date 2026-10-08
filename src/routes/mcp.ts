@@ -509,6 +509,14 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         return createError(message.id, INVALID_PARAMS, `Too many resourceSubscriptions: at most ${maxUris} per stream`)
       }
 
+      // A stdio client may cancel a listen before it is even opened; opening it
+      // then would leak a stream nobody will ever close.
+      const listenCancel = stdioRequestSignal(request.headers)
+      if (listenCancel?.aborted) {
+        reply.code(204)
+        return undefined
+      }
+
       const principal = principalOf(authContext) ?? ''
       const refused = subscriptions.refusal(principal)
       if (refused) {
@@ -523,7 +531,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         types: Object.keys(filter).filter(key => key !== 'resourceSubscriptions'),
         resourceSubscriptions: filter.resourceSubscriptions?.length ?? 0
       }, 'Opening subscription stream')
-      if (!subscriptions.open(reply, message.id, filter, principal, stdioRequestSignal(request.headers)) && !reply.sent) {
+      if (!subscriptions.open(reply, message.id, filter, principal, listenCancel) && !reply.sent) {
         reply.code(503).type('application/json')
         return createError(message.id, INTERNAL_ERROR, 'Server is shutting down')
       }
@@ -582,10 +590,9 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
       handled = true
     }
 
-    if (stream?.opened) {
-      stream.finish(response)
-      return reply
-    }
+    // Concluding the stream also closes it to late notifications, which would
+    // otherwise take over a reply that is about to be sent as JSON.
+    if (stream?.finish(response)) return reply
 
     reply.type('application/json').code(statusForResponse(response))
     return response

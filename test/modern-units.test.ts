@@ -533,7 +533,7 @@ describe('subscription backpressure', () => {
   } as any
 
   function replyFor (raw: FakeResponse): any {
-    return { raw, hijack: () => {} }
+    return { raw, hijack: () => {}, getHeaders: () => ({}) }
   }
 
   const changed = {

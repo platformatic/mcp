@@ -180,7 +180,13 @@ export class SubscriptionRegistry {
     const raw = reply.raw
     if (this.#closing || raw.destroyed || raw.closed || raw.writableEnded) return false
 
+    // Keep headers already set on the reply (CORS and the like) once it is
+    // taken over.
+    const headers = reply.getHeaders()
     reply.hijack()
+    for (const [name, value] of Object.entries(headers)) {
+      if (value !== undefined) raw.setHeader(name, value as string | number | readonly string[])
+    }
 
     raw.setHeader('Content-Type', 'text/event-stream')
     raw.setHeader('Cache-Control', 'no-cache')

@@ -15,7 +15,8 @@ import {
 import {
   META_CLIENT_CAPABILITIES,
   META_CLIENT_INFO,
-  META_PROTOCOL_VERSION
+  META_PROTOCOL_VERSION,
+  TASKS_EXTENSION
 } from './schema-2026.ts'
 import { collectHeaderParams, encodeHeaderValue, expectedNameFor } from './modern/headers.ts'
 import type { InputResponses } from './schema-2026.ts'
@@ -167,18 +168,25 @@ function truncateForError (payload: string): string {
  * Split an SSE response into the notifications sent before the response and
  * the final JSON-RPC response itself.
  */
-function parseEventStream (payload: string, statusCode: number): { body: unknown, notifications: JSONRPCNotification[] } {
+function parseEventStream (
+  payload: string,
+  statusCode: number,
+  requestId: unknown
+): { body: unknown, notifications: JSONRPCNotification[] } {
   const notifications: JSONRPCNotification[] = []
   let body: unknown
-  for (const frame of payload.split('\n\n')) {
+  // SSE lines may end in CRLF, LF or CR; events end at a blank line.
+  for (const frame of payload.replace(/\r\n?/g, '\n').split('\n\n')) {
     const data = frame.split('\n')
       .filter(line => line.startsWith('data:'))
-      .map(line => line.slice(5).trimStart())
+      // The field value starts after the colon and at most one space.
+      .map(line => line.slice(line.startsWith('data: ') ? 6 : 5))
       .join('\n')
     if (!data) continue
     const message = parseJsonBody(data, statusCode)
     if (isRecord(message) && hasOwn(message, 'id') && (hasOwn(message, 'result') || hasOwn(message, 'error'))) {
-      body = message
+      // Only the response to this request ends it.
+      if (message.id === requestId) body = message
     } else {
       notifications.push(message as JSONRPCNotification)
     }
@@ -546,15 +554,20 @@ export function createMcpClient (
       // client must accept both.
       const streamed = String(response.headers['content-type'] ?? '').startsWith('text/event-stream')
       const parsed = streamed
-        ? parseEventStream(payload, response.statusCode)
+        ? parseEventStream(payload, response.statusCode, (request as { id?: unknown }).id)
         : { body: parseJsonBody(payload, response.statusCode), notifications: [] }
       assertMcpResponse(parsed.body)
       body = parsed.body
       notifications = parsed.notifications
 
+      // An absent resultType means "complete". `task` is only meaningful to a
+      // client that declared the tasks extension; anything else is invalid.
       const resultType = (body as { result?: { resultType?: unknown } }).result?.resultType
-      if (modern && 'result' in body && !KNOWN_RESULT_TYPES.has(resultType as string)) {
-        throw new UnrecognizedResultTypeError(String(resultType))
+      if (modern && 'result' in body && resultType !== undefined) {
+        const tasksDeclared = isRecord(clientCapabilities.extensions) &&
+          hasOwn(clientCapabilities.extensions, TASKS_EXTENSION)
+        const known = KNOWN_RESULT_TYPES.has(resultType as string) && (resultType !== 'task' || tasksDeclared)
+        if (!known) throw new UnrecognizedResultTypeError(String(resultType))
       }
     }
 
