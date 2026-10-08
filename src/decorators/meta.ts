@@ -14,6 +14,7 @@ import { callRegisteredTool } from '../handlers.ts'
 import { schemaToArguments, validateToolSchema, isTypeBoxSchema } from '../validation/index.ts'
 import type { JsonSchemaValidator } from '../validation/json-schema-validator.ts'
 import type { ServerCapabilities } from '../schema.ts'
+import { JSONRPC_VERSION } from '../schema.ts'
 
 interface MCPDecoratorsOptions {
   tools: Map<string, MCPTool>
@@ -25,6 +26,8 @@ interface MCPDecoratorsOptions {
   capabilities: ServerCapabilities
 }
 
+const TOOL_NAME = /^[A-Za-z0-9_.-]{1,128}$/
+
 const SUPPORTED_OUTPUT_DIALECTS = new Set([
   'https://json-schema.org/draft/2020-12/schema',
   'https://json-schema.org/draft/2020-12/schema#'
@@ -32,6 +35,20 @@ const SUPPORTED_OUTPUT_DIALECTS = new Set([
 
 const mcpDecoratorsPlugin: FastifyPluginAsync<MCPDecoratorsOptions> = async (app, options) => {
   const { tools, resources, prompts, resourceHandlers, opts, jsonSchemaValidator, capabilities } = options
+
+  // Registrations before the server is ready are its initial lists; only later
+  // ones change a list a client may already hold.
+  let ready = false
+  app.addHook('onReady', async () => { ready = true })
+
+  /** Tell clients a list changed, when the server declares it does so. */
+  function announceListChange (list: 'tools' | 'resources' | 'prompts'): void {
+    if (!ready || !(capabilities[list] as { listChanged?: boolean } | undefined)?.listChanged) return
+    app.mcpBroadcastNotification({
+      jsonrpc: JSONRPC_VERSION,
+      method: `notifications/${list}/list_changed`
+    }).catch((error: unknown) => app.log.warn({ err: error, list }, 'Could not announce list change'))
+  }
 
   // Enhanced tool decorator with TypeBox schema support
   app.decorate('mcpAddTool', (
@@ -41,6 +58,11 @@ const mcpDecoratorsPlugin: FastifyPluginAsync<MCPDecoratorsOptions> = async (app
     const name = definition.name
     if (!name) {
       throw new Error('Tool definition must have a name')
+    }
+    // The spec recommends 1-128 characters from [A-Za-z0-9_.-]; other names
+    // may not work with every client, so flag them without refusing.
+    if (!TOOL_NAME.test(name)) {
+      app.log.warn({ tool: name }, 'Tool name should be 1-128 characters of A-Z, a-z, 0-9, _, - and .')
     }
 
     // Validate schema if provided
@@ -80,6 +102,7 @@ const mcpDecoratorsPlugin: FastifyPluginAsync<MCPDecoratorsOptions> = async (app
       },
       handler
     })
+    announceListChange('tools')
   })
 
   app.decorate('mcpCallTool', (name: string, args: Record<string, unknown>, context: McpCallToolContext) => {
@@ -119,6 +142,7 @@ const mcpDecoratorsPlugin: FastifyPluginAsync<MCPDecoratorsOptions> = async (app
     }
 
     resources.set(uriPattern, { definition: resourceDefinition, handler })
+    announceListChange('resources')
   })
 
   // Enhanced prompt decorator with argument schema support
@@ -147,6 +171,7 @@ const mcpDecoratorsPlugin: FastifyPluginAsync<MCPDecoratorsOptions> = async (app
       },
       handler
     })
+    announceListChange('prompts')
   })
 
   // Resource subscription handler setters

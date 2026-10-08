@@ -466,7 +466,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     const context = parsed.context
 
     // stdio has no header layer, so there is nothing to reconcile there.
-    const headerLayer = !isStdioRequest(request.headers)
+    const headerLayer = !isStdioRequest(request)
     if (headerLayer) {
       // The mirrored header and the body must agree, or a gateway routing on
       // one and this server acting on the other could be made to disagree.
@@ -511,7 +511,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
       // A stdio client may cancel a listen before it is even opened; opening it
       // then would leak a stream nobody will ever close.
-      const listenCancel = stdioRequestSignal(request.headers)
+      const listenCancel = stdioRequestSignal(request)
       if (listenCancel?.aborted) {
         reply.code(204)
         return undefined
@@ -545,7 +545,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     // so the response state alone cannot tell the two apart.
     const cancelled = new AbortController()
     // On stdio there is no stream to close: `notifications/cancelled` does it.
-    const stdioCancel = stdioRequestSignal(request.headers)
+    const stdioCancel = stdioRequestSignal(request)
     let handled = false
     reply.raw.once('close', () => {
       if (!handled) cancelled.abort(new Error('client disconnected'))
@@ -695,7 +695,8 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
       app.log.error({ err: error }, 'Error processing MCP message')
       reply.type('application/json').code(500).send({
         jsonrpc: JSONRPC_VERSION,
-        id: null,
+        // Keep the request's id when it has one, so the client can correlate.
+        id: requestIdOf(request.body),
         error: {
           code: INTERNAL_ERROR,
           message: 'Internal server error'

@@ -21,6 +21,8 @@ const DEFAULT_MAX_BUFFERED_BYTES = 1024 * 1024
 const DEFAULT_CLOSE_DRAIN_TIMEOUT_MS = 1000
 const DEFAULT_MAX_STREAMS = 1000
 const DEFAULT_MAX_STREAMS_PER_PRINCIPAL = 10
+/** Longest resource URI a stream may subscribe to, which bounds a stream's memory. */
+const MAX_RESOURCE_URI_LENGTH = 2048
 /** Most resource URIs one stream may subscribe to, by default. */
 export const DEFAULT_MAX_RESOURCE_SUBSCRIPTIONS = 1000
 
@@ -62,6 +64,9 @@ export function invalidFilter (requested: unknown): string | undefined {
   const uris = filter.resourceSubscriptions
   if (uris !== undefined && (!Array.isArray(uris) || !uris.every(uri => typeof uri === 'string'))) {
     return 'Invalid "notifications.resourceSubscriptions": expected an array of strings'
+  }
+  if (uris?.some(uri => uri.length > MAX_RESOURCE_URI_LENGTH)) {
+    return `Invalid "notifications.resourceSubscriptions": URIs are limited to ${MAX_RESOURCE_URI_LENGTH} characters`
   }
   return undefined
 }

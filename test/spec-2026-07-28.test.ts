@@ -2854,6 +2854,173 @@ describe('round 3: robustness of streams, stdio and tasks', () => {
   })
 })
 
+describe('round 3: validation, defaults and smaller fixes', () => {
+  function asking (inputRequests: Record<string, unknown>) {
+    return (app: FastifyInstance) => app.mcpAddTool({ name: 'ask', inputSchema: Type.Object({}) }, async (_args: any, context: any) => {
+      if (!context.requestState) throw new InputRequired({ inputRequests: inputRequests as any, state: { s: 1 } })
+      return { content: [{ type: 'text', text: JSON.stringify(context.inputResponses) }] }
+    })
+  }
+  const elicitationCapable = { elicitation: { form: {}, url: {} } }
+
+  test('a tool registered without inputSchema is listed with an object schema', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'bare' } as any, async () => ({ content: [] }))
+    })
+    const tool = (await call(app, 'tools/list')).json().result.tools[0]
+    t.assert.strictEqual(tool.inputSchema.type, 'object')
+  })
+
+  test('URL elicitation follows the legacy URL rules', async (t: TestContext) => {
+    for (const url of ['https://user:secret@example.com/', 'javascript:alert(1)', 'file:///etc/passwd']) {
+      const app = await buildServer(t, asking({ q: elicitUrl('Sign in', url) }))
+      const response = await call(app, 'tools/call', { params: { name: 'ask', arguments: {} }, capabilities: elicitationCapable })
+      t.assert.strictEqual(response.json().error?.code, INTERNAL_ERROR, url)
+    }
+  })
+
+  test('form elicitation needs a message and a flat object schema', async (t: TestContext) => {
+    for (const request of [
+      { method: 'elicitation/create', params: { mode: 'form', requestedSchema: { type: 'object', properties: {} } } },
+      { method: 'elicitation/create', params: { message: 'Hi', mode: 'carrier-pigeon' } },
+      elicitForm('Nested?', { type: 'object', properties: { inner: { type: 'object', properties: {} } } } as any)
+    ]) {
+      const app = await buildServer(t, asking({ q: request }))
+      const response = await call(app, 'tools/call', { params: { name: 'ask', arguments: {} }, capabilities: elicitationCapable })
+      t.assert.strictEqual(response.json().error?.code, INTERNAL_ERROR, JSON.stringify(request))
+    }
+  })
+
+  test('answers must be result objects with a valid action', async (t: TestContext) => {
+    const app = await buildServer(t, asking({ q: elicitForm('Name?', { type: 'object', properties: { n: { type: 'string' } } }) }))
+    const params = { name: 'ask', arguments: {} }
+    const first = (await call(app, 'tools/call', { params, capabilities: elicitationCapable })).json().result
+    for (const answer of ['garbage', { action: 'pwned' }]) {
+      const retry = await call(app, 'tools/call', {
+        id: 2,
+        capabilities: elicitationCapable,
+        params: { ...params, requestState: first.requestState, inputResponses: { q: answer } }
+      })
+      t.assert.strictEqual(retry.json().error?.code, INVALID_PARAMS, JSON.stringify(answer))
+    }
+  })
+
+  test('an unknown method is -32601 even with malformed MRTR fields', async (t: TestContext) => {
+    const app = await buildServer(t)
+    const response = await call(app, 'foo/bar', { params: { inputResponses: 5, requestState: 'xyz' } })
+    t.assert.strictEqual(response.statusCode, 404)
+    t.assert.strictEqual(response.json().error.code, METHOD_NOT_FOUND)
+  })
+
+  test('a resource with empty contents is reported as not found', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddResource({ uriPattern: 'file:///nothing' }, async () => ({ contents: [] }))
+    })
+    const response = await call(app, 'resources/read', { params: { uri: 'file:///nothing' } })
+    t.assert.strictEqual(response.json().error.code, INVALID_PARAMS)
+  })
+
+  test('a 500 keeps the request id', async (t: TestContext) => {
+    const app = Fastify()
+    t.after(() => app.close())
+    await app.register(mcpPlugin, {
+      resolveAuthorizationContext: () => { throw new Error('resolver down') }
+    })
+    await app.ready()
+    const response = await call(app, 'tools/list', { id: 42 })
+    t.assert.strictEqual(response.statusCode, 500)
+    t.assert.strictEqual(response.json().id, 42)
+  })
+
+  test('stdio tokens never reach handlers', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'headers', inputSchema: Type.Object({}) }, async (_args: any, context: any) => ({
+        content: [{ type: 'text', text: JSON.stringify(context.request.headers) }]
+      }))
+    })
+    const input = new PassThrough()
+    const output = new PassThrough()
+    const transport = createStdioTransport(app, { input, output, error: new PassThrough() })
+    transport.start()
+    t.after(() => transport.stop())
+    const answered = new Promise<string>(resolve => output.once('data', (chunk: Buffer) => resolve(chunk.toString())))
+    input.write(JSON.stringify(modernBody('tools/call', { id: 1, params: { name: 'headers', arguments: {} } })) + '\n')
+    const headers = JSON.parse(JSON.parse(await answered).result.content[0].text)
+    t.assert.strictEqual(headers['x-platformatic-mcp-stdio-trust'], undefined)
+    t.assert.strictEqual(headers['x-platformatic-mcp-stdio-request'], undefined)
+  })
+
+  test('a resource URI longer than the limit is refused', async (t: TestContext) => {
+    const app = await buildServer(t, undefined, { capabilities: { resources: { subscribe: true } } })
+    const response = await call(app, 'subscriptions/listen', {
+      params: { notifications: { resourceSubscriptions: ['file:///' + 'x'.repeat(3000)] } }
+    })
+    t.assert.strictEqual(response.json().error.code, INVALID_PARAMS)
+  })
+
+  test('adding a tool after ready announces it to listen streams', async (t: TestContext) => {
+    // The plugin's default capabilities, which declare listChanged.
+    const app = await buildServer(t, undefined, { capabilities: undefined })
+    const response = await app.inject({
+      method: 'POST',
+      url: '/mcp',
+      payloadAsStream: true,
+      headers: modernHeaders('subscriptions/listen'),
+      payload: modernBody('subscriptions/listen', { id: 'L', params: { notifications: { toolsListChanged: true } } })
+    })
+    const stream = response.stream()
+    const frames: any[] = []
+    stream.on('data', (chunk: Buffer) => {
+      for (const frame of chunk.toString().split('\n\n')) {
+        const data = frame.replace(/^data: /, '').trim()
+        if (data.startsWith('{')) frames.push(JSON.parse(data))
+      }
+    })
+    await new Promise(resolve => setTimeout(resolve, 30))
+    app.mcpAddTool({ name: 'late-tool', inputSchema: Type.Object({}) }, async () => ({ content: [] }))
+    await new Promise(resolve => setTimeout(resolve, 30))
+    stream.destroy()
+    t.assert.ok(frames.some(frame => frame.method === 'notifications/tools/list_changed'))
+  })
+
+  test('legacy clients without SSE are not promised list-change notifications', async (t: TestContext) => {
+    const app = await buildServer(t, undefined, { capabilities: undefined })
+    const init = await app.inject({
+      method: 'POST',
+      url: '/mcp',
+      payload: {
+        jsonrpc: JSONRPC_VERSION,
+        id: 1,
+        method: 'initialize',
+        params: { protocolVersion: LATEST_LEGACY_PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: 'l', version: '1' } }
+      }
+    })
+    t.assert.strictEqual(init.json().result.capabilities.tools.listChanged, undefined)
+
+    const withSse = await buildServer(t, undefined, { capabilities: undefined, enableSSE: true })
+    const sseInit = await withSse.inject({
+      method: 'POST',
+      url: '/mcp',
+      payload: {
+        jsonrpc: JSONRPC_VERSION,
+        id: 1,
+        method: 'initialize',
+        params: { protocolVersion: LATEST_LEGACY_PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: 'l', version: '1' } }
+      }
+    })
+    t.assert.strictEqual(sseInit.json().result.capabilities.tools.listChanged, true)
+  })
+
+  test('a requestStateSecret without serverInfo logs a warning', async (t: TestContext) => {
+    const lines: string[] = []
+    const app = Fastify({ logger: { level: 'warn', stream: { write: (line: string) => { lines.push(line) } } } })
+    t.after(() => app.close())
+    await app.register(mcpPlugin, { requestStateSecret: 'x'.repeat(32) })
+    await app.ready()
+    t.assert.ok(lines.some(line => line.includes('serverInfo')))
+  })
+})
+
 describe('2026-07-28: message and transport validation', () => {
   test('a modern batch body is rejected, not accepted as a notification', async (t: TestContext) => {
     const app = await buildServer(t)

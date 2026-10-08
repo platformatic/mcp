@@ -16,7 +16,7 @@ export function createAuthPreHandler (
     // stdio is a local transport: the spec has it take credentials from the
     // environment, not from HTTP bearer tokens, and only the in-process stdio
     // transport can present this token.
-    if (isStdioRequest(request.headers)) {
+    if (isStdioRequest(request)) {
       return
     }
 

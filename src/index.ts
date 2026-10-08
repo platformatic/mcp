@@ -14,6 +14,7 @@ import { RedisTaskStore } from './stores/redis-task-store.ts'
 import type { MCPPluginOptions, MCPTool, MCPResource, MCPPrompt, ResourceHandlers } from './types.ts'
 import type { CacheHint, CachingConfig } from './modern/handlers.ts'
 import { drainTasks } from './task-registry.ts'
+import { claimStdioRequest } from './stdio-trust.ts'
 import { RequestStateSealer } from './modern/request-state.ts'
 import { SubscriptionRegistry } from './modern/subscriptions.ts'
 import {
@@ -94,6 +95,12 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
   if (opts.redis && opts.requestStateSecret === undefined) {
     throw new Error('requestStateSecret is required when redis is configured: every instance must verify the request state the others seal')
   }
+
+  // Recognise stdio-injected requests before any other hook (authorization
+  // included) runs, and take their tokens out of the headers handlers see.
+  app.addHook('onRequest', async (request) => {
+    claimStdioRequest(request)
+  })
 
   app.decorate('mcpClient', (clientOptions?: McpClientOptions) => {
     return createMcpClient(app, clientOptions)
@@ -206,6 +213,11 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
 
   if (opts.requestStateSecret === undefined) {
     app.log.debug('MCP: no requestStateSecret configured; multi round-trip retries will only verify on the instance that issued them')
+  } else if (opts.serverInfo === undefined) {
+    // Sealed state names the server it was issued by; without serverInfo every
+    // deployment shares the default name, so two sharing a secret would accept
+    // each other's state.
+    app.log.warn('MCP: requestStateSecret is set without serverInfo; set serverInfo.name so sealed state is bound to this server')
   }
 
   const subscriptions = new SubscriptionRegistry(app.log, undefined, undefined, serverInfo, {

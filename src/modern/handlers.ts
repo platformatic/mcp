@@ -62,6 +62,7 @@ import { collectHeaderParams, validateToolParamHeaders } from './headers.ts'
 import type { TaskRecord } from '../stores/task-store.ts'
 import { isTerminal } from '../stores/task-store.ts'
 import { principalOf } from '../principal.ts'
+import { validateElicitationRequest, validateElicitationUrl } from '../security.ts'
 import { NO_NOTIFIERS } from './request-stream.ts'
 import { MAX_TIMER_MS, TaskStopped, quotaKeyOf, reserveTask } from '../task-registry.ts'
 
@@ -79,6 +80,21 @@ export interface CachingConfig {
   resourceTemplatesList: CacheHint
   resourcesRead: CacheHint
 }
+
+/** Methods `dispatchModern` serves (`subscriptions/listen` is answered by the route). */
+const DISPATCHED_METHODS = new Set([
+  'server/discover',
+  'tools/list',
+  'resources/list',
+  'resources/templates/list',
+  'prompts/list',
+  'tools/call',
+  'resources/read',
+  'prompts/get',
+  'tasks/get',
+  'tasks/update',
+  'tasks/cancel'
+])
 
 /** The hint for a result that must not be cached at all. */
 const UNCACHEABLE: CacheHint = { ttlMs: 0, cacheScope: 'private' }
@@ -275,12 +291,76 @@ function missingInputCapabilities (
  */
 function invalidInputRequests (inputRequests: Record<string, unknown>): string | undefined {
   for (const [key, entry] of Object.entries(inputRequests)) {
+    const method = (entry as { method?: unknown })?.method
     if (!requiredCapabilityFor(entry as { method?: string })) {
-      return `input request '${key}' has unsupported method '${(entry as { method?: unknown })?.method}'`
+      return `input request '${key}' has unsupported method '${method}'`
     }
-    const params = (entry as { params?: { mode?: unknown, url?: unknown } }).params
-    if (params?.mode === 'url' && (typeof params.url !== 'string' || !URL.canParse(params.url))) {
-      return `input request '${key}' has an invalid URL`
+    const params = (entry as { params?: unknown }).params
+    const problem = method === 'elicitation/create'
+      ? invalidElicitation(params)
+      : method === 'sampling/createMessage'
+        ? invalidSampling(params)
+        : undefined
+    if (problem) return `input request '${key}' ${problem}`
+  }
+  return undefined
+}
+
+const FLAT_SCHEMA_TYPES = new Set(['string', 'number', 'integer', 'boolean'])
+
+/** An elicitation needs a message, and per mode a flat schema or a safe URL. */
+function invalidElicitation (params: unknown): string | undefined {
+  if (!params || typeof params !== 'object') return 'has no params'
+  const { mode, message, requestedSchema, url } = params as Record<string, unknown>
+  if (typeof message !== 'string' || message.length === 0) return 'has no message'
+  try {
+    if (mode === 'url') {
+      if (typeof url !== 'string') return 'has no URL'
+      // The same rules as the legacy path: http(s) only, no credentials.
+      validateElicitationUrl(message, url)
+      return undefined
+    }
+    if (mode !== undefined && mode !== 'form') return `has unknown mode '${String(mode)}'`
+    validateElicitationRequest(message, requestedSchema)
+  } catch (error) {
+    return `is invalid: ${error instanceof Error ? error.message : String(error)}`
+  }
+  // Form mode collects flat data: an object of primitive properties.
+  const schema = requestedSchema as { type?: unknown, properties?: unknown } | undefined
+  if (!schema || schema.type !== 'object' || !schema.properties || typeof schema.properties !== 'object') {
+    return 'needs a requestedSchema of type object'
+  }
+  for (const [name, property] of Object.entries(schema.properties as Record<string, unknown>)) {
+    const type = (property as { type?: unknown } | undefined)?.type
+    if (typeof type !== 'string' || !FLAT_SCHEMA_TYPES.has(type)) {
+      return `has requestedSchema property '${name}' that is not a primitive`
+    }
+  }
+  return undefined
+}
+
+function invalidSampling (params: unknown): string | undefined {
+  if (!params || typeof params !== 'object') return 'has no params'
+  const { messages, maxTokens } = params as Record<string, unknown>
+  if (!Array.isArray(messages)) return 'has no messages'
+  if (typeof maxTokens !== 'number') return 'has no maxTokens'
+  return undefined
+}
+
+const ELICIT_ACTIONS = new Set(['accept', 'decline', 'cancel'])
+
+/**
+ * What is wrong with the answers the server asked for, if anything. Each is a
+ * result object, and an elicitation result's `action` is one of three values.
+ */
+function invalidAnswers (inputResponses: Record<string, unknown> | undefined): string | undefined {
+  for (const [key, value] of Object.entries(inputResponses ?? {})) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return `Invalid "inputResponses.${key}": expected a result object`
+    }
+    const action = (value as { action?: unknown }).action
+    if (action !== undefined && !ELICIT_ACTIONS.has(action as string)) {
+      return `Invalid "inputResponses.${key}.action": expected accept, decline or cancel`
     }
   }
   return undefined
@@ -1243,12 +1323,19 @@ export async function dispatchModern (
     )
   }
 
+  // An unknown method is -32601 whatever else is wrong with the request.
+  if (!DISPATCHED_METHODS.has(request.method)) {
+    return createError(request.id, METHOD_NOT_FOUND, `Method '${request.method}' not found`)
+  }
+
   const invalidResponses = invalidInputResponses(request.params)
   if (invalidResponses) return createError(request.id, INVALID_PARAMS, invalidResponses)
 
   const opened = openRequestState(request, dependencies)
   if (!opened.ok) return opened.error
   const scoped = withMrtrContext(request, dependencies, opened)
+  const invalidAnswer = invalidAnswers(scoped.mrtr?.inputResponses)
+  if (invalidAnswer) return createError(request.id, INVALID_PARAMS, invalidAnswer)
 
   // A result produced from `inputResponses`/`requestState` depends on inputs
   // that are not part of the cache key, so it must not be cached. Complete

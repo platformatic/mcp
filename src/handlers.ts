@@ -234,8 +234,9 @@ async function handleInitialize (
 
   const result: InitializeResult = {
     protocolVersion,
-    // Never advertise a capability the agreed revision cannot express
-    capabilities: capabilitiesForRevision(capabilities, protocolVersion),
+    // Never advertise a capability the agreed revision cannot express, nor a
+    // list-change notification a legacy client has no SSE channel to receive.
+    capabilities: withoutUndeliverableListChanges(capabilitiesForRevision(capabilities, protocolVersion), opts.enableSSE === true),
     serverInfo,
     instructions: opts.instructions
   }
@@ -259,6 +260,18 @@ function withSchemaDialect<T> (schema: T, protocolVersion: string | undefined): 
   if (!schema || typeof schema !== 'object') return schema
   if ('$schema' in (schema as Record<string, unknown>)) return schema
   return { $schema: JSON_SCHEMA_DIALECT, ...(schema as Record<string, unknown>) } as T
+}
+
+function withoutUndeliverableListChanges<T extends Record<string, any>> (capabilities: T, deliverable: boolean): T {
+  if (deliverable) return capabilities
+  const trimmed: Record<string, any> = { ...capabilities }
+  for (const list of ['tools', 'resources', 'prompts']) {
+    if (trimmed[list]?.listChanged) {
+      const { listChanged, ...rest } = trimmed[list]
+      trimmed[list] = rest
+    }
+  }
+  return trimmed as T
 }
 
 /**
@@ -327,7 +340,9 @@ export async function handleToolsList (request: JSONRPCRequest, dependencies: Ha
       // TypeBox schemas are already JSON Schema compatible
       const serialized: typeof tool = {
         ...tool,
-        inputSchema: withSchemaDialect(tool.inputSchema, protocolVersion)
+        // `inputSchema` is required, and must be an object schema; a tool
+        // registered without one takes an object of anything.
+        inputSchema: withSchemaDialect(tool.inputSchema ?? { type: 'object' }, protocolVersion)
       }
       if (serialized.outputSchema) {
         serialized.outputSchema = withSchemaDialect(serialized.outputSchema, protocolVersion)
@@ -859,6 +874,11 @@ export async function handleResourcesRead (
 
   try {
     const result = await resource.handler(uri, handlerContext(dependencies, sessionId))
+    // A resource with no contents does not exist: answering an empty array
+    // for it is not allowed, so report it the way a missing resource is.
+    if (dependencies.strictErrors && Array.isArray(result?.contents) && result.contents.length === 0) {
+      return createError(request.id, INVALID_PARAMS, `Resource '${uri}' not found`)
+    }
     return createResponse(request.id, result)
   } catch (error: any) {
     rethrowIfInputRequired(error)
@@ -1580,7 +1600,7 @@ export async function withMcpServerSpan<T> (
 
   // The plain transport header is only a hint any HTTP client could send;
   // trusting it would let a caller drop its address from the span.
-  const isStdio = isStdioRequest(request.headers)
+  const isStdio = isStdioRequest(request)
   if (isStdio) {
     extraAttrs[MCP_ATTR.NETWORK_TRANSPORT] = 'pipe'
   } else {

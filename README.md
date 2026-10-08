@@ -482,7 +482,13 @@ capabilities declare `listChanged: true` for tools, prompts and resources, and
 Each stream holds a socket and buffers, so streams are bounded:
 `subscriptionMaxStreamsPerPrincipal` per caller (default 10, refused with HTTP `429`),
 `subscriptionMaxStreams` per instance (default 1000), and `subscriptionMaxResourceUris` per
-stream (default 1000).
+stream (default 1000, each at most 2048 characters). A caller is a user at an issuer, whichever
+OAuth client they use; when the deployment cannot identify callers, only the per-instance limit
+applies.
+
+With the default capabilities, adding a tool, resource or prompt after the server is ready
+broadcasts the matching `list_changed` notification. Legacy clients are only told
+`listChanged` when `enableSSE` is on, since without SSE they have no channel to receive it.
 
 Request-scoped notifications (`notifications/progress`, `notifications/message`) are never
 delivered here; they belong on the response stream of the request they relate to.
@@ -509,9 +515,13 @@ Both are sent only when the client asked for them, on the response stream of tha
 - `context.log(level, data, logger?)` emits `notifications/message` when the request sets
   `io.modelcontextprotocol/logLevel`, and only at or above that level.
 
-The response switches to `text/event-stream` only when the first notification is sent, so a
-handler that never reports still answers with plain JSON. Both are no-ops on the legacy path
-and for tasks, whose creating request has already been answered.
+Notifications are held until the outcome is known, or until the handler has run for 200ms.
+A request that never reports, or that fails before then, answers with plain JSON and its
+proper status (for example `400` for a missing client capability). Otherwise the response is
+a `text/event-stream` carrying the notifications and then the result. Once streaming has
+started the status is committed to `200`, so a later error arrives inside the stream. Nothing
+is sent after the response. Both are no-ops on the legacy path and for tasks, whose creating
+request has already been answered.
 
 ## Result Caching (2026-07-28)
 
@@ -1452,6 +1462,8 @@ The plugin includes a built-in stdio transport utility for MCP communication ove
   written to stdout as they happen
 - **Cancellation**: `notifications/cancelled` aborts the request's `context.signal`, and
   nothing more is written for it
+- **Local trust**: stdio requests are not subject to HTTP bearer authorization, as the spec has
+  the stdio transport take credentials from its environment
 - **Comprehensive error handling** with proper JSON-RPC error responses
 - **Batch request support** for the legacy revisions that allow it
 - **Debug logging** to stderr without interfering with the stdio protocol
@@ -2209,8 +2221,11 @@ await app.register(import('@fastify/bearer-auth'), {
 - `caching`: Freshness hints per cacheable operation (default `{ ttlMs: 0, cacheScope: 'private' }`)
 - `enableTasks`: Enable tasks (the 2025-11-25 core tasks and the 2026-07-28 extension)
 - `taskDefaultTtlMs` / `taskMaxTtlMs`: Task retention (defaults 60000 / 3600000)
-- `taskMaxConcurrent`: Most 2026-07-28 tasks one instance runs at once (default 1000)
-- `taskMaxPerPrincipal`: Most 2026-07-28 tasks one caller runs on an instance (default 100)
+- `taskMaxConcurrent`: Most tasks one instance runs at once, for both protocol eras (default 1000)
+- `taskMaxPerPrincipal`: Most tasks one caller (a user at an issuer) runs on an instance
+  (default 100). Not applied to callers the deployment cannot identify
+- `taskStoreMaxTasks`: Capacity of the in-memory task store, finished tasks included until their
+  ttl (default 1000). A full store refuses new tasks
 - `taskLeaseMs`: Worker lease; a task whose worker stops renewing it is reported failed
   (default 15000)
 - `taskShutdownTimeoutMs`: How long `close()` waits for running tasks before failing them
@@ -2861,8 +2876,14 @@ the changes to the plugin's own API and defaults:
   versions never misread each other's tasks. Tasks in flight during an upgrade are only
   visible to instances of the version that created them.
 - **Tasks are bound to user, OAuth client and issuer**, not the user alone, in both eras.
+- **Task limits apply to both eras**: 2025-11-25 tasks count against `taskMaxConcurrent` and
+  `taskMaxPerPrincipal`, are aborted at their ttl and are drained on shutdown.
+- **A full in-memory task store refuses new tasks** instead of dropping finished results.
 - **`requestStateSecret` is required with `redis`**, and must be at least 32 bytes.
-- **Default capabilities declare `listChanged: true`** for tools, prompts and resources.
+- **Default capabilities declare `listChanged: true`** for tools, prompts and resources, and
+  registering one after ready broadcasts `list_changed`. Legacy clients only see `listChanged`
+  when `enableSSE` is on.
+- **A tool registered without `inputSchema`** is listed with `{ "type": "object" }`.
 - **`outputSchema` is enforced** (2025-06-18 and later): a result without conforming
   `structuredContent` becomes a tool error, and an `outputSchema` declaring a dialect other
   than JSON Schema 2020-12 is refused at registration.

@@ -1,5 +1,5 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto'
-import type { IncomingHttpHeaders } from 'node:http'
+import type { IncomingHttpHeaders, IncomingMessage } from 'node:http'
 
 /**
  * Marks requests the in-process stdio transport injects into `/mcp`.
@@ -14,11 +14,33 @@ export const STDIO_TRUST_TOKEN = randomBytes(32).toString('hex')
 
 const expected = Buffer.from(STDIO_TRUST_TOKEN)
 
-export function isStdioRequest (headers: IncomingHttpHeaders): boolean {
+function presentsTrustToken (headers: IncomingHttpHeaders): boolean {
   const value = headers[STDIO_TRUST_HEADER]
   if (typeof value !== 'string') return false
   const received = Buffer.from(value)
   return received.length === expected.length && timingSafeEqual(received, expected)
+}
+
+/** Requests recognised as stdio-injected, with their cancellation signal if any. */
+const stdioRequests = new WeakMap<IncomingMessage, { signal?: AbortSignal }>()
+
+/**
+ * Recognise a stdio-injected request once, as it arrives, and remove the
+ * tokens from its headers. Handlers can read their request's headers, and a
+ * handler that echoed or logged them must not hand out a token an HTTP client
+ * could replay to skip header validation.
+ */
+export function claimStdioRequest (request: { raw: IncomingMessage, headers: IncomingHttpHeaders }): void {
+  const headers = request.headers
+  if (!presentsTrustToken(headers)) return
+  const token = headers[STDIO_REQUEST_HEADER]
+  stdioRequests.set(request.raw, { signal: typeof token === 'string' ? requestSignals.get(token) : undefined })
+  delete headers[STDIO_TRUST_HEADER]
+  delete headers[STDIO_REQUEST_HEADER]
+}
+
+export function isStdioRequest (request: { raw: IncomingMessage }): boolean {
+  return stdioRequests.has(request.raw)
 }
 
 /**
@@ -36,8 +58,6 @@ export function registerStdioRequest (signal: AbortSignal): { token: string, rel
 }
 
 /** The cancellation signal of a stdio-injected request, if it has one. */
-export function stdioRequestSignal (headers: IncomingHttpHeaders): AbortSignal | undefined {
-  if (!isStdioRequest(headers)) return undefined
-  const token = headers[STDIO_REQUEST_HEADER]
-  return typeof token === 'string' ? requestSignals.get(token) : undefined
+export function stdioRequestSignal (request: { raw: IncomingMessage }): AbortSignal | undefined {
+  return stdioRequests.get(request.raw)?.signal
 }
