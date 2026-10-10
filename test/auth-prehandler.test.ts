@@ -403,4 +403,52 @@ describe('Authorization PreHandler', () => {
 
     validator.close()
   })
+
+  test('should include requiredScopes in the initial 401 challenge', async (t: TestContext) => {
+    const config = createTestAuthConfig({ requiredScopes: ['mcp:read', 'mcp:write'] })
+    const validator = new TokenValidator(config, app)
+    const preHandler = createAuthPreHandler(config, validator)
+
+    app.addHook('preHandler', preHandler)
+    app.get('/test', async () => ({ success: true }))
+
+    await app.ready()
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/test'
+    })
+
+    t.assert.strictEqual(response.statusCode, 401)
+    t.assert.strictEqual(
+      response.headers['www-authenticate'],
+      'Bearer realm="MCP Server", resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource", scope="mcp:read mcp:write"'
+    )
+
+    validator.close()
+  })
+
+  test('should not include a scope parameter when requiredScopes is not configured', async (t: TestContext) => {
+    const config = createTestAuthConfig()
+    const validator = new TokenValidator(config, app)
+    const preHandler = createAuthPreHandler(config, validator)
+
+    app.addHook('preHandler', preHandler)
+    app.get('/test', async () => ({ success: true }))
+
+    await app.ready()
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/test'
+    })
+
+    t.assert.strictEqual(response.statusCode, 401)
+    t.assert.strictEqual(
+      response.headers['www-authenticate'],
+      'Bearer realm="MCP Server", resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource"'
+    )
+
+    validator.close()
+  })
 })

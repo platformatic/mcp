@@ -126,8 +126,11 @@ function generateWWWAuthenticateHeader (config: AuthorizationConfig, challenge: 
   if (challenge.error) {
     params.push(`error="${challenge.error}"`)
   }
-  if (challenge.scope && challenge.scope.length > 0) {
-    params.push(`scope="${challenge.scope.join(' ')}"`)
+  // Advertise the required scopes on every challenge, including the first 401,
+  // so clients know what to request up front (MCP authorization, scope selection).
+  const scope = challenge.scope ?? config.requiredScopes
+  if (scope && scope.length > 0) {
+    params.push(`scope="${scope.join(' ')}"`)
   }
 
   return `Bearer ${params.join(', ')}`
