@@ -1,6 +1,14 @@
 import type { TaskStatus } from '../schema.ts'
-import type { TaskStore, TaskRecord, TaskOutcome } from './task-store.ts'
-import { canTransition, isTerminal, taskHasExpired } from './task-store.ts'
+import type { TaskStore, TaskRecord, TaskOutcome, TaskListOptions, TaskListPage } from './task-store.ts'
+import {
+  canTransition,
+  decodeTaskCursor,
+  encodeTaskCursor,
+  isAfterTaskCursor,
+  isTerminal,
+  taskHasExpired,
+  taskPageLimit
+} from './task-store.ts'
 
 /**
  * In-process task store for single-instance deployments.
@@ -76,15 +84,27 @@ export class MemoryTaskStore implements TaskStore {
     return { ...updated }
   }
 
-  async list (authSubject?: string): Promise<TaskRecord[]> {
-    const results: TaskRecord[] = []
+  async list (authSubject?: string, options: TaskListOptions = {}): Promise<TaskListPage> {
+    const after = options.cursor === undefined ? undefined : decodeTaskCursor(options.cursor)
+    const limit = taskPageLimit(options.limit)
+
+    const matches: Array<{ createdAt: number, task: TaskRecord }> = []
     for (const task of this.tasks.values()) {
       if (taskHasExpired(task)) continue
       // Tasks bound to a subject are only ever visible to that subject
       if (task.authSubject !== authSubject) continue
-      results.push({ ...task })
+      const createdAt = new Date(task.createdAt).getTime()
+      if (after && !isAfterTaskCursor(createdAt, task.taskId, after)) continue
+      matches.push({ createdAt, task })
     }
-    return results.sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+    matches.sort((a, b) => (b.createdAt - a.createdAt) || (a.task.taskId < b.task.taskId ? 1 : a.task.taskId > b.task.taskId ? -1 : 0))
+
+    const tasks = matches.slice(0, limit).map(({ task }) => ({ ...task }))
+    const page: TaskListPage = { tasks }
+    if (matches.length > limit) {
+      page.nextCursor = encodeTaskCursor(tasks[tasks.length - 1])
+    }
+    return page
   }
 
   async delete (taskId: string): Promise<void> {

@@ -295,6 +295,14 @@ await app.register(mcpPlugin, {
 Tasks are stored in memory by default and in Redis when a `redis` option is given, so any
 instance can serve a poll for a task created on another.
 
+`tasks/list` returns the caller's tasks newest first, 50 per page. When more remain, the
+result carries an opaque `nextCursor`; pass it back as `params.cursor` to fetch the next
+page. An unrecognised cursor is rejected with `-32602` (Invalid params). The Redis store keeps
+a per-subject index, so a listing only reads the caller's own tasks.
+
+Custom `TaskStore` implementations must implement `list(authSubject, { cursor, limit })` and
+return `{ tasks, nextCursor? }`, throwing `InvalidTaskCursorError` for a cursor they did not issue.
+
 **Security**: when authorization is enabled, tasks are bound to the token subject and a
 requestor can only reach its own. Without authorization no requestor can be identified, so
 tasks are reachable by anyone holding the (random UUID) task id, and `tasks/list` is both

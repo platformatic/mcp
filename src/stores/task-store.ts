@@ -39,6 +39,75 @@ export function canTransition (from: TaskStatus, to: TaskStatus): boolean {
   return ALLOWED_TRANSITIONS[from]?.includes(to) ?? false
 }
 
+export interface TaskListOptions {
+  /** Opaque cursor from a previous page's `nextCursor` */
+  cursor?: string
+  /** Maximum number of tasks to return, defaults to DEFAULT_TASK_PAGE_SIZE */
+  limit?: number
+}
+
+export interface TaskListPage {
+  tasks: TaskRecord[]
+  /** Present only when more tasks follow this page */
+  nextCursor?: string
+}
+
+export const DEFAULT_TASK_PAGE_SIZE = 50
+
+/** Thrown by `TaskStore.list` for a cursor it cannot decode */
+export class InvalidTaskCursorError extends Error {
+  constructor () {
+    super('Invalid cursor')
+    this.name = 'InvalidTaskCursorError'
+  }
+}
+
+/**
+ * Position of the last task on a page. Tasks are ordered by creation time then
+ * task id, both descending, so a (time, id) pair is a stable keyset position
+ * that survives tasks being created or deleted between pages.
+ */
+export interface TaskCursorPosition {
+  createdAt: number
+  taskId: string
+}
+
+export function encodeTaskCursor (task: TaskRecord): string {
+  const position = { t: new Date(task.createdAt).getTime(), id: task.taskId }
+  return Buffer.from(JSON.stringify(position)).toString('base64url')
+}
+
+export function decodeTaskCursor (cursor: unknown): TaskCursorPosition {
+  if (typeof cursor !== 'string') throw new InvalidTaskCursorError()
+  let position: any
+  try {
+    position = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8'))
+  } catch {
+    throw new InvalidTaskCursorError()
+  }
+  if (
+    position === null ||
+    typeof position !== 'object' ||
+    !Number.isFinite(position.t) ||
+    typeof position.id !== 'string' ||
+    position.id.length === 0
+  ) {
+    throw new InvalidTaskCursorError()
+  }
+  return { createdAt: position.t, taskId: position.id }
+}
+
+/** Whether a task sorts strictly after the cursor position (newest first) */
+export function isAfterTaskCursor (createdAt: number, taskId: string, position: TaskCursorPosition): boolean {
+  if (createdAt !== position.createdAt) return createdAt < position.createdAt
+  return taskId < position.taskId
+}
+
+export function taskPageLimit (limit: number | undefined): number {
+  if (limit === undefined || !Number.isInteger(limit) || limit < 1) return DEFAULT_TASK_PAGE_SIZE
+  return limit
+}
+
 export interface TaskStore {
   create(task: TaskRecord): Promise<void>
   get(taskId: string): Promise<TaskRecord | null>
@@ -48,8 +117,12 @@ export interface TaskStore {
    * @throws if the transition is not allowed
    */
   updateStatus(taskId: string, status: TaskStatus, options?: { statusMessage?: string, outcome?: TaskOutcome }): Promise<TaskRecord | null>
-  /** Tasks visible to the given authorization subject, newest first */
-  list(authSubject?: string): Promise<TaskRecord[]>
+  /**
+   * One page of the tasks visible to the given authorization subject, newest
+   * first. Pass the previous page's `nextCursor` to continue.
+   * @throws InvalidTaskCursorError if `cursor` was not issued by this store
+   */
+  list(authSubject?: string, options?: TaskListOptions): Promise<TaskListPage>
   delete(taskId: string): Promise<void>
   /** Drop tasks whose ttl has elapsed */
   cleanup(): Promise<void>
