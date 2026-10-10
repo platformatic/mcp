@@ -42,10 +42,10 @@ export class StdioTransport {
   private app: FastifyInstance
   private readline: any
   private transportOpts: StdioTransportOptions
-  private isShuttingDown = false
   // There is no session over stdio, so the transport itself has to remember
   // what `initialize` agreed on and echo it like an HTTP client would.
   private protocolVersion: string | undefined
+  private closePromise: Promise<void> | null = null
 
   constructor (
     app: FastifyInstance,
@@ -117,12 +117,16 @@ export class StdioTransport {
   /**
    * Stop the stdio transport
    */
-  async stop (): Promise<void> {
-    if (this.isShuttingDown) {
-      return
+  stop (): Promise<void> {
+    // Return the same promise to every caller so that concurrent stop() calls
+    // (readline close, stdin end, signals) all wait for app.close() to finish
+    if (!this.closePromise) {
+      this.closePromise = this.doStop()
     }
+    return this.closePromise
+  }
 
-    this.isShuttingDown = true
+  private async doStop (): Promise<void> {
     this.log('Stopping stdio transport...')
 
     if (this.readline) {
@@ -342,8 +346,9 @@ export async function runStdioServer (
     process.once('SIGINT', shutdown)
     process.once('SIGTERM', shutdown)
 
-    // Handle stdin close (when parent process closes our stdin)
-    process.stdin.on('close', shutdown)
-    process.stdin.on('end', shutdown)
+    // Handle input close (when parent process closes our stdin)
+    const input = transportOpts.input ?? process.stdin
+    input.on('close', shutdown)
+    input.on('end', shutdown)
   })
 }
