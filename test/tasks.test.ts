@@ -303,6 +303,50 @@ describe('tasks over the wire', () => {
     t.assert.match(body.error.message, /does not support task-augmented execution/)
   })
 
+  for (const ttl of ['forever', -5, 1.5, Number.MAX_SAFE_INTEGER + 2, true, {}]) {
+    test(`a task ttl of ${JSON.stringify(ttl)} is rejected as invalid params`, async (t: TestContext) => {
+      const app = await buildApp(t)
+      const body = await call(app, 'tools/call', { name: 'slow-add', arguments: { a: 1, b: 2 }, task: { ttl } })
+
+      t.assert.strictEqual(body.error.code, INVALID_PARAMS)
+      t.assert.match(body.error.message, /ttl/)
+      t.assert.strictEqual(body.result, undefined)
+    })
+  }
+
+  for (const task of [{}, { ttl: null }]) {
+    test(`a task ${JSON.stringify(task)} gets the default ttl`, async (t: TestContext) => {
+      const app = await buildApp(t, { taskDefaultTtlMs: 45_000 })
+      const body = await call(app, 'tools/call', { name: 'slow-add', arguments: { a: 1, b: 2 }, task })
+
+      const result = body.result as CreateTaskResult
+      t.assert.strictEqual(result.task.ttl, 45_000)
+      t.assert.strictEqual((await waitForTerminal(app, result.task.taskId)).status, 'completed')
+    })
+  }
+
+  test('a valid task ttl is honoured and capped at the maximum', async (t: TestContext) => {
+    const app = await buildApp(t, { taskMaxTtlMs: 90_000 })
+
+    const honoured = await call(app, 'tools/call', { name: 'slow-add', arguments: { a: 1, b: 2 }, task: { ttl: 20_000 } })
+    t.assert.strictEqual((honoured.result as CreateTaskResult).task.ttl, 20_000)
+
+    const capped = await call(app, 'tools/call', { name: 'slow-add', arguments: { a: 1, b: 2 }, task: { ttl: 10 * 3600_000 } })
+    t.assert.strictEqual((capped.result as CreateTaskResult).task.ttl, 90_000)
+  })
+
+  test('a task ttl of 0 is raised to a usable minimum', async (t: TestContext) => {
+    const app = await buildApp(t)
+    const body = await call(app, 'tools/call', { name: 'slow-add', arguments: { a: 1, b: 2 }, task: { ttl: 0 } })
+
+    const result = body.result as CreateTaskResult
+    t.assert.strictEqual(result.task.ttl, 1000)
+    // The task is still reachable long enough to collect its result
+    t.assert.strictEqual((await waitForTerminal(app, result.task.taskId)).status, 'completed')
+    const final = await call(app, 'tasks/result', { taskId: result.task.taskId })
+    t.assert.strictEqual(final.result.content[0].text, '3')
+  })
+
   test('tasks/cancel moves a task to cancelled and then refuses', async (t: TestContext) => {
     const app = await buildApp(t)
 

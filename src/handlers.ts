@@ -309,6 +309,16 @@ async function handleToolsCall (
 
   const params = paramsValidation.data
   const toolName = params.name
+
+  // A client on an older revision cannot have meant `task`, because we never
+  // declared the capability to it. The spec says to ignore it in that case.
+  const taskParams = supportsTasks(dependencies.protocolVersion)
+    ? (request.params as { task?: { ttl?: unknown } | null } | undefined)?.task
+    : undefined
+  const ttl = taskParams?.ttl ?? undefined
+  if (ttl !== undefined && !isValidTaskTtl(ttl)) {
+    return createError(request.id, INVALID_PARAMS, 'Invalid task ttl: expected a non-negative integer number of milliseconds')
+  }
   const startedAt = performance.now()
 
   // A denied tool answers exactly like an unknown one, so a caller cannot
@@ -331,11 +341,6 @@ async function handleToolsCall (
 
   // Decide up front whether this call runs as a task, so the rest of the
   // handler can stay unaware of it.
-  // A client on an older revision cannot have meant `task`, because we never
-  // declared the capability to it. The spec says to ignore it in that case.
-  const taskParams = supportsTasks(dependencies.protocolVersion)
-    ? (request.params as { task?: { ttl?: number } } | undefined)?.task
-    : undefined
   const augmentation = resolveTaskAugmentation(resolved.tool, taskParams !== undefined)
   if ('error' in augmentation) {
     await emitToolCallComplete('json-rpc', toolName, params.arguments || {}, { ok: false, reason: 'task-required' }, startedAt, dependencies)
@@ -344,7 +349,7 @@ async function handleToolsCall (
   if (augmentation.mode === 'task') {
     return await runToolCallAsTask(
       request,
-      taskParams?.ttl,
+      ttl,
       // Timed from when the task actually starts executing, not from when it
       // was queued, so `durationMs` reflects work done rather than wait time.
       () => executeToolCall(request, resolved.tool, params, sessionId, dependencies, { source: 'task', startedAt: performance.now() }),
@@ -852,6 +857,21 @@ const DEFAULT_TASK_TTL = 60_000
 const MAX_TASK_TTL = 3600_000
 
 /**
+ * Floor on retention. A smaller ttl (0 included) would let the task expire
+ * before the requestor could poll it, and Redis keys have 1s granularity anyway.
+ */
+const MIN_TASK_TTL = 1000
+
+/**
+ * The spec types `ttl` as a number of milliseconds. Anything else (a string,
+ * NaN, a negative or fractional value) is rejected rather than coerced, since it
+ * would otherwise yield a task that never expires or one that is gone at once.
+ */
+function isValidTaskTtl (ttl: unknown): ttl is number {
+  return Number.isSafeInteger(ttl) && (ttl as number) >= 0
+}
+
+/**
  * Resolve the effective task ttl bounds from plugin options. Tasks are meant for
  * long-running work, so a deployment whose tools outlive the 60s default can
  * raise `taskDefaultTtlMs` / `taskMaxTtlMs` rather than have tasks expire before
@@ -948,8 +968,8 @@ function newTaskRecord (
     status: 'working',
     createdAt: now,
     lastUpdatedAt: now,
-    // Receivers may override the requested ttl; we cap it
-    ttl: Math.min(requested, bounds.maxTtl),
+    // Receivers may override the requested ttl; we clamp it
+    ttl: Math.min(Math.max(requested, MIN_TASK_TTL), bounds.maxTtl),
     pollInterval: DEFAULT_POLL_INTERVAL,
     method,
     authSubject: subject
