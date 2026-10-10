@@ -447,6 +447,7 @@ describe('TokenValidator', () => {
     // Some providers use non-standard JWKS paths (e.g. /oauth2/jwks rather than /.well-known/jwks.json)
     test('should validate JWT using custom JSWKS path', async (t: TestContext) => {
       const config = createTestAuthConfig({
+        authorizationServers: ['https://sample-instance-01.authkit.app'],
         tokenValidation: {
           jwksUri: 'https://sample-instance-01.authkit.app/oauth2/jwks',
           validateAudience: true
@@ -492,6 +493,7 @@ describe('TokenValidator', () => {
 
     test('should fail JWT validation when custom JWKS path returns 404', async (t: TestContext) => {
       const config = createTestAuthConfig({
+        authorizationServers: ['https://sample-instance-01.authkit.app'],
         tokenValidation: {
           jwksUri: 'https://sample-instance-01.authkit.app/oauth2/jwks',
           validateAudience: false
@@ -514,6 +516,7 @@ describe('TokenValidator', () => {
 
     test('should not fetch /.well-known/jwks.json when custom path configured', async (t: TestContext) => {
       const config = createTestAuthConfig({
+        authorizationServers: ['https://sample-instance-01.authkit.app'],
         tokenValidation: {
           jwksUri: 'https://sample-instance-01.authkit.app/oauth2/jwks',
           validateAudience: false
@@ -659,6 +662,109 @@ describe('TokenValidator', () => {
       t.assert.strictEqual(result.valid, false)
       t.assert.strictEqual(result.error, 'Invalid audience claim')
 
+      validator.close()
+    })
+  })
+
+  describe('Issuer and required claims', () => {
+    const jwks = () => setupMockAgent({
+      'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse()
+    })
+
+    test('should reject JWT from an issuer that is not a configured authorization server', async (t: TestContext) => {
+      restoreMock = jwks()
+      const validator = new TokenValidator(createTestAuthConfig(), app)
+
+      const result = await validator.validateToken(createTestJWT({ iss: 'https://evil.example.com' }))
+
+      t.assert.strictEqual(result.valid, false)
+      validator.close()
+    })
+
+    test('should reject JWT whose issuer only shares a prefix with a configured server', async (t: TestContext) => {
+      restoreMock = jwks()
+      const validator = new TokenValidator(createTestAuthConfig(), app)
+
+      const result = await validator.validateToken(createTestJWT({ iss: 'https://auth.example.com.evil.com' }))
+
+      t.assert.strictEqual(result.valid, false)
+      validator.close()
+    })
+
+    test('should accept issuer differing from configuration only by a trailing slash', async (t: TestContext) => {
+      restoreMock = jwks()
+      const withSlash = new TokenValidator(createTestAuthConfig(), app)
+      t.assert.strictEqual((await withSlash.validateToken(createTestJWT({ iss: 'https://auth.example.com/' }))).valid, true)
+
+      const configuredWithSlash = new TokenValidator(createTestAuthConfig({ authorizationServers: ['https://auth.example.com/'] }), app)
+      t.assert.strictEqual((await configuredWithSlash.validateToken(createTestJWT({ iss: 'https://auth.example.com' }))).valid, true)
+    })
+
+    test('should accept JWT from any configured authorization server', async (t: TestContext) => {
+      restoreMock = jwks()
+      const validator = new TokenValidator(createTestAuthConfig({
+        authorizationServers: ['https://other.example.com', 'https://auth.example.com']
+      }), app)
+
+      const result = await validator.validateToken(createTestJWT({ iss: 'https://other.example.com' }))
+
+      t.assert.strictEqual(result.valid, true)
+      validator.close()
+    })
+
+    for (const claim of ['iss', 'sub', 'exp'] as const) {
+      test(`should reject JWT without ${claim}`, async (t: TestContext) => {
+        restoreMock = jwks()
+        const validator = new TokenValidator(createTestAuthConfig(), app)
+
+        const result = await validator.validateToken(createTestJWT({ [claim]: undefined }))
+
+        t.assert.strictEqual(result.valid, false)
+        validator.close()
+      })
+    }
+
+    test('should reject introspection response with a foreign issuer', async (t: TestContext) => {
+      restoreMock = setupMockAgent({
+        'https://auth.example.com/introspect': createIntrospectionResponse(true, { iss: 'https://evil.example.com' })
+      })
+      const validator = new TokenValidator(createTestAuthConfig({
+        tokenValidation: { introspectionEndpoint: 'https://auth.example.com/introspect', validateAudience: true }
+      }), app)
+
+      const result = await validator.validateToken('opaque-token-123')
+
+      t.assert.strictEqual(result.valid, false)
+      t.assert.strictEqual(result.error, 'Invalid issuer claim')
+      validator.close()
+    })
+
+    test('should accept introspection response without iss', async (t: TestContext) => {
+      restoreMock = setupMockAgent({
+        'https://auth.example.com/introspect': createIntrospectionResponse(true, { iss: undefined })
+      })
+      const validator = new TokenValidator(createTestAuthConfig({
+        tokenValidation: { introspectionEndpoint: 'https://auth.example.com/introspect', validateAudience: true }
+      }), app)
+
+      const result = await validator.validateToken('opaque-token-123')
+
+      t.assert.strictEqual(result.valid, true)
+      validator.close()
+    })
+
+    test('should reject introspection response without sub', async (t: TestContext) => {
+      restoreMock = setupMockAgent({
+        'https://auth.example.com/introspect': createIntrospectionResponse(true, { sub: undefined })
+      })
+      const validator = new TokenValidator(createTestAuthConfig({
+        tokenValidation: { introspectionEndpoint: 'https://auth.example.com/introspect', validateAudience: true }
+      }), app)
+
+      const result = await validator.validateToken('opaque-token-123')
+
+      t.assert.strictEqual(result.valid, false)
+      t.assert.strictEqual(result.error, 'Missing subject claim')
       validator.close()
     })
   })

@@ -1846,7 +1846,7 @@ await app.register(import('@fastify/bearer-auth'), {
 - `onToolCallComplete`: Transport-neutral hook fired once after every tool call settles, across JSON-RPC, `mcpCallTool()`, and tasks (optional)
 - `authorization`: OAuth 2.1 authorization configuration (optional)
   - `enabled`: Enable OAuth 2.1 authorization (default: false)
-  - `authorizationServers`: Authorization server URIs
+  - `authorizationServers`: Authorization server URIs. JWTs must carry an `iss` matching one of these (a trailing slash difference is tolerated), plus `sub` and `exp`; introspection responses must carry `sub` and, if they report `iss`, a matching one
   - `resourceUri`: Resource URI
   - `tokenValidation`: JWT token validation configuration
     - `jwksUri`: JWKS endpoint URL for JWT signature verification
@@ -2071,6 +2071,8 @@ app.mcpAddTool({
 
 Resource and prompt handlers also receive the same context object as tool handlers, enabling access to HTTP context and authorization information:
 
+When `uriPattern` contains `{name}` placeholders (an RFC 6570 level-1 template), `resources/read` for a concrete URI such as `context://data/42` is routed to it, and the values are available as `context.uriParams` (`{ id: '42' }`). Each placeholder matches a single non-empty segment that does not contain `/`; an exact `uri` registration always takes precedence over a template.
+
 ```typescript
 // Resource handler with context
 app.mcpAddResource({
@@ -2081,11 +2083,12 @@ app.mcpAddResource({
   // Access request information
   const userAgent = context.request.headers['user-agent']
   const authUser = context?.authContext?.userId
-  
+  const id = context.uriParams?.id
+
   return {
     contents: [{
       uri,
-      text: `Resource ${uri} accessed by ${authUser || 'anonymous'} from ${userAgent || 'unknown client'}`,
+      text: `Resource ${id} accessed by ${authUser || 'anonymous'} from ${userAgent || 'unknown client'}`,
       mimeType: 'text/plain'
     }]
   }
@@ -2337,6 +2340,7 @@ await app.register(mcpPlugin, {
 #### Session Management
 
 - **Session IDs are cryptographically secure:** Generated using Node.js crypto
+- **Sessions are bound to their owner:** With authorization enabled, a session remembers the `sub` of the token that created it. Requests (POST, GET, DELETE) presenting that `Mcp-Session-Id` with a token for a different subject get `404 Session not found`, the same answer as for an unknown session, so a leaked session ID cannot be used by another user
 - **Automatic cleanup:** Sessions expire after 1 hour by default
 - **Message history limits:** Prevents unbounded memory growth
 - **Cross-instance isolation:** Sessions are properly isolated between instances

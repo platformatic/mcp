@@ -161,12 +161,54 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     ;(request as any).mcpProtocolVersion = negotiated
   }
 
+  function getRequestSessionId (request: FastifyRequest): string | undefined {
+    return (request.headers['mcp-session-id'] as string | undefined) ||
+      (request.method === 'GET' ? (request.query as any)?.['mcp-session-id'] : undefined)
+  }
+
+  /**
+   * A session created under an access token belongs to that token's subject.
+   * Anyone else presenting its ID gets the same 404 as for an unknown session:
+   * the Streamable HTTP transport defines 404 as "this session does not exist
+   * for you", and a 403 would confirm to an attacker that the ID is live.
+   * Runs ahead of anything else that reads the session.
+   */
+  async function enforceSessionOwner (request: FastifyRequest, reply: FastifyReply): Promise<void> {
+    const sessionId = getRequestSessionId(request)
+    if (!sessionId) return
+
+    const session = await sessionStore.get(sessionId)
+    if (session?.ownerSub === undefined) return
+
+    if (session.ownerSub !== request.tokenPayload?.sub) {
+      request.log.warn({ sessionId }, 'Rejected MCP request for a session owned by a different subject')
+      return reply.code(404).type('application/json').send({ error: 'Session not found' })
+    }
+  }
+
   // Scoped to the /mcp routes only: this plugin is not encapsulated, so an
   // app-level hook would also cover the OAuth and well-known routes.
   const mcpOnRequest = [validateOrigin, validateProtocolVersionHeader]
-  const mcpPreHandler = [reconcileProtocolVersion]
+  const mcpPreHandler = [enforceSessionOwner, reconcileProtocolVersion]
 
-  async function createSSESession (): Promise<SessionMetadata> {
+  function buildAuthContext (payload: any): AuthorizationContext {
+    return {
+      userId: payload.sub,
+      clientId: payload.client_id || payload.azp,
+      scopes: typeof payload.scope === 'string'
+        ? payload.scope.split(' ')
+        : payload.scopes,
+      audience: Array.isArray(payload.aud)
+        ? payload.aud
+        : payload.aud ? [payload.aud] : undefined,
+      tokenType: 'Bearer',
+      expiresAt: payload.exp ? new Date(payload.exp * 1000) : undefined,
+      issuedAt: payload.iat ? new Date(payload.iat * 1000) : undefined,
+      authorizationServer: payload.iss
+    }
+  }
+
+  async function createSSESession (request: FastifyRequest): Promise<SessionMetadata> {
     const sessionId = randomUUID()
     const session: SessionMetadata = {
       id: sessionId,
@@ -174,6 +216,14 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
       lastEventId: undefined,
       createdAt: new Date(),
       lastActivity: new Date()
+    }
+
+    // Bind the session to whoever created it, so its ID alone is not enough to
+    // act as that user.
+    const payload = request.tokenPayload
+    if (payload && typeof payload.sub === 'string') {
+      session.ownerSub = payload.sub
+      session.authorization = buildAuthContext(payload)
     }
 
     await sessionStore.create(session)
@@ -294,11 +344,11 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
             if (existingSession) {
               session = existingSession
             } else {
-              session = await createSSESession()
+              session = await createSSESession(request)
               reply.header('Mcp-Session-Id', session.id)
             }
           } else {
-            session = await createSSESession()
+            session = await createSSESession(request)
             reply.header('Mcp-Session-Id', session.id)
           }
           sessionId = session.id
@@ -306,22 +356,8 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
         // Build auth context from validated token payload
         let authContext: AuthorizationContext | undefined
-        if ((request as any).tokenPayload) {
-          const payload = (request as any).tokenPayload
-          authContext = {
-            userId: payload.sub,
-            clientId: payload.client_id || payload.azp,
-            scopes: typeof payload.scope === 'string'
-              ? payload.scope.split(' ')
-              : payload.scopes,
-            audience: Array.isArray(payload.aud)
-              ? payload.aud
-              : payload.aud ? [payload.aud] : undefined,
-            tokenType: 'Bearer',
-            expiresAt: payload.exp ? new Date(payload.exp * 1000) : undefined,
-            issuedAt: payload.iat ? new Date(payload.iat * 1000) : undefined,
-            authorizationServer: payload.iss
-          }
+        if (request.tokenPayload) {
+          authContext = buildAuthContext(request.tokenPayload)
         } else if (sessionId) {
         // Fallback to session-stored auth context
           const session = await sessionStore.get(sessionId)
@@ -391,8 +427,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
       }
 
       try {
-        const sessionId = (request.headers['mcp-session-id'] as string) ||
-                       (request.query as any)['mcp-session-id']
+        const sessionId = getRequestSessionId(request)
 
         // Check if there's already an active SSE session
         if (hasActiveSSESession(sessionId)) {
@@ -419,11 +454,11 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
           if (existingSession) {
             session = existingSession
           } else {
-            session = await createSSESession()
+            session = await createSSESession(request)
             raw.setHeader('Mcp-Session-Id', session.id)
           }
         } else {
-          session = await createSSESession()
+          session = await createSSESession(request)
           raw.setHeader('Mcp-Session-Id', session.id)
         }
 
