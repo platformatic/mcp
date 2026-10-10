@@ -173,4 +173,124 @@ describe('Resource Templates', () => {
     const templateNames = templates.resourceTemplates.map(r => r.name).sort()
     t.assert.deepStrictEqual(templateNames, ['agent', 'diary'])
   })
+
+  describe('resources/read against a template', () => {
+    async function read (app: ReturnType<typeof Fastify>, uri: string) {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/mcp',
+        payload: {
+          jsonrpc: JSONRPC_VERSION,
+          id: 1,
+          method: 'resources/read',
+          params: { uri }
+        } satisfies JSONRPCRequest
+      })
+      return response.json()
+    }
+
+    test('matches a concrete URI and passes the extracted params', async (t: TestContext) => {
+      const app = Fastify()
+      t.after(() => app.close())
+      await app.register(mcpPlugin)
+      await app.ready()
+
+      const seen: Array<{ uri: string, params: unknown }> = []
+      app.mcpAddResource(
+        { name: 'request', uriPattern: 'guardrails://{tenant}/request/{id}', description: 'Request' },
+        async (uri, context) => {
+          seen.push({ uri, params: context.uriParams })
+          return { contents: [{ uri, text: `request ${context.uriParams?.id}`, mimeType: 'text/plain' }] }
+        }
+      )
+
+      const body = await read(app, 'guardrails://support/request/req-123')
+      const result = body.result as ReadResourceResult
+
+      t.assert.ok('text' in result.contents[0])
+      t.assert.strictEqual(result.contents[0].text, 'request req-123')
+      t.assert.strictEqual(result.contents[0].uri, 'guardrails://support/request/req-123')
+      t.assert.deepStrictEqual(seen, [{
+        uri: 'guardrails://support/request/req-123',
+        params: { tenant: 'support', id: 'req-123' }
+      }])
+    })
+
+    test('percent-decodes extracted params', async (t: TestContext) => {
+      const app = Fastify()
+      t.after(() => app.close())
+      await app.register(mcpPlugin)
+      await app.ready()
+
+      let params: unknown
+      app.mcpAddResource({ name: 'file', uriPattern: 'files://{name}' }, async (uri, context) => {
+        params = context.uriParams
+        return { contents: [{ uri, text: 'ok' }] }
+      })
+
+      await read(app, 'files://hello%20world')
+      t.assert.deepStrictEqual(params, { name: 'hello world' })
+    })
+
+    test('placeholders do not span slashes or match empty segments', async (t: TestContext) => {
+      const app = Fastify()
+      t.after(() => app.close())
+      await app.register(mcpPlugin)
+      await app.ready()
+
+      app.mcpAddResource({ name: 'diary', uriPattern: 'moltnet://diary/{id}' }, async (uri) => ({
+        contents: [{ uri, text: 'ok' }]
+      }))
+
+      for (const uri of ['moltnet://diary/1/2', 'moltnet://diary/', 'moltnet://diary', 'xmoltnet://diary/1', 'moltnet://diary/1x/']) {
+        const body = await read(app, uri)
+        t.assert.strictEqual(body.error?.code, -32601, uri)
+      }
+    })
+
+    test('literal parts are matched literally, not as regex', async (t: TestContext) => {
+      const app = Fastify()
+      t.after(() => app.close())
+      await app.register(mcpPlugin)
+      await app.ready()
+
+      app.mcpAddResource({ name: 'v', uriPattern: 'app://v1.0/{id}' }, async (uri) => ({
+        contents: [{ uri, text: 'ok' }]
+      }))
+
+      t.assert.strictEqual((await read(app, 'app://v1x0/42')).error?.code, -32601)
+      t.assert.ok((await read(app, 'app://v1.0/42')).result)
+    })
+
+    test('an exact concrete resource wins over a matching template', async (t: TestContext) => {
+      const app = Fastify()
+      t.after(() => app.close())
+      await app.register(mcpPlugin)
+      await app.ready()
+
+      app.mcpAddResource({ name: 'any', uriPattern: 'moltnet://diary/{id}' }, async (uri) => ({
+        contents: [{ uri, text: 'template' }]
+      }))
+      app.mcpAddResource({ name: 'latest', uri: 'moltnet://diary/latest' }, async (uri) => ({
+        contents: [{ uri, text: 'concrete' }]
+      }))
+
+      const result = (await read(app, 'moltnet://diary/latest')).result as ReadResourceResult
+      t.assert.ok('text' in result.contents[0])
+      t.assert.strictEqual(result.contents[0].text, 'concrete')
+    })
+
+    test('unsupported template operators never match', async (t: TestContext) => {
+      const app = Fastify()
+      t.after(() => app.close())
+      await app.register(mcpPlugin)
+      await app.ready()
+
+      app.mcpAddResource({ name: 'path', uriPattern: 'files://{+path}' }, async (uri) => ({
+        contents: [{ uri, text: 'ok' }]
+      }))
+
+      t.assert.strictEqual((await read(app, 'files://a')).error?.code, -32601)
+    })
+  })
 })

@@ -27,6 +27,15 @@ export interface HandlerContext {
   authContext?: AuthorizationContext
 }
 
+// Context passed to resource read handlers
+export interface ResourceHandlerContext extends HandlerContext {
+  /**
+   * Values extracted from the requested URI when it was matched against a
+   * registered URI template, e.g. `{ id: '42' }` for `diary://{id}`.
+   */
+  uriParams?: Record<string, string>
+}
+
 // Resource subscription handler types
 export type ResourceSubscribeHandler = (
   params: { uri: string },
@@ -52,7 +61,7 @@ export type ToolHandler<TSchema extends TObject = TObject> = (
 
 export type ResourceHandler<TUriSchema extends TSchema = TString> = (
   uri: Static<TUriSchema>,
-  context: HandlerContext
+  context: ResourceHandlerContext
 ) => Promise<ReadResourceResult> | ReadResourceResult
 
 export type PromptHandler<TArgsSchema extends TObject = TObject> = (
@@ -163,7 +172,7 @@ declare module 'fastify' {
 
 // Unsafe handler types for backward compatibility
 export type UnsafeToolHandler = (params: any, context: HandlerContext) => Promise<CallToolResult> | CallToolResult
-export type UnsafeResourceHandler = (uri: string, context: HandlerContext) => Promise<ReadResourceResult> | ReadResourceResult
+export type UnsafeResourceHandler = (uri: string, context: ResourceHandlerContext) => Promise<ReadResourceResult> | ReadResourceResult
 export type UnsafePromptHandler = (name: string, args: any, context: HandlerContext) => Promise<GetPromptResult> | GetPromptResult
 
 // Unsafe interfaces for backward compatibility
