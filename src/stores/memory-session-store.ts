@@ -27,12 +27,16 @@ export class MemorySessionStore implements SessionStore {
     if (!existing) {
       return
     }
-    // Only the negotiated version and activity time are the caller's to change.
-    // Writing the whole record back would roll the event counter back to a stale
-    // value if a concurrent SSE message bumped it between get() and update().
+    // Only the negotiated version, client capabilities and activity time are the
+    // caller's to change. Writing the whole record back would roll the event
+    // counter back to a stale value if a concurrent SSE message bumped it
+    // between get() and update().
     existing.lastActivity = metadata.lastActivity
     if (metadata.protocolVersion !== undefined) {
       existing.protocolVersion = metadata.protocolVersion
+    }
+    if (metadata.clientCapabilities !== undefined) {
+      existing.clientCapabilities = metadata.clientCapabilities
     }
   }
 

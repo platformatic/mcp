@@ -281,6 +281,7 @@ export type {
   McpCallToolContext,
   McpCallToolOutcome,
   MCPToolCallCompleteEvent,
+  MCPClientResponseContext,
   MCPTool,
   MCPResource,
   MCPPrompt,

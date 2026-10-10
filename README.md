@@ -327,14 +327,27 @@ http(s), or embed credentials.
 
 ### Basic Elicitation
 
+Elicitation is a **client** capability: there is nothing to declare in the server's
+`capabilities`. The client opts in by sending `capabilities: { elicitation: {} }` (form
+mode only), or `{ elicitation: { form: {}, url: {} } }`, in its `initialize` request.
+`mcpElicit()` returns `false`, and `mcpElicitUrl()` `null`, when the client did not declare
+the mode being requested, as the spec forbids sending it.
+
+The request is delivered over the session's SSE stream, so the client must have it open
+(`GET /mcp`). The client answers by POSTing a JSON-RPC response with the same `id`; the
+plugin acknowledges it with `202` and passes it to `onClientResponse`.
+
 ```typescript
 import { Type } from '@sinclair/typebox'
 
 // Register plugin with elicitation support
 await app.register(mcpPlugin, {
   enableSSE: true, // Required for elicitation
-  capabilities: {
-    elicitation: {} // Enable elicitation capability
+  // Receives the client's answer (an ElicitResult) to each elicitation request
+  onClientResponse: async (response, { sessionId }) => {
+    if ('result' in response) {
+      app.log.info({ sessionId, id: response.id, result: response.result }, 'Elicitation answered')
+    }
   }
 })
 
@@ -343,7 +356,7 @@ app.mcpAddTool({
   name: 'collect-user-info',
   description: 'Collect user information',
   inputSchema: Type.Object({})
-}, async (params, { sessionId }) => {
+}, async (_params, { sessionId }) => {
   if (!sessionId) {
     return { 
       content: [{ type: 'text', text: 'No session available' }],
@@ -1844,6 +1857,7 @@ await app.register(import('@fastify/bearer-auth'), {
 - `enableSSE`: Enable Server-Sent Events support (default: false)
 - `canAccessTool`: Per-request tool authorization hook consulted by `tools/list` and `tools/call` (optional)
 - `onToolCallComplete`: Transport-neutral hook fired once after every tool call settles, across JSON-RPC, `mcpCallTool()`, and tasks (optional)
+- `onClientResponse`: Receives the JSON-RPC responses clients POST back for server-initiated requests, such as elicitation results (optional)
 - `authorization`: OAuth 2.1 authorization configuration (optional)
   - `enabled`: Enable OAuth 2.1 authorization (default: false)
   - `authorizationServers`: Authorization server URIs
@@ -2490,7 +2504,7 @@ This version introduces elicitation support and enhanced security features:
 
 **Migration Steps:**
 1. Update client applications to support MCP 2025-06-18
-2. Add elicitation capability if needed: `capabilities: { elicitation: {} }`
+2. Elicitation is declared by the client in `initialize` (`capabilities: { elicitation: {} }`), not in the server's `capabilities`
 3. Review security logs for any validation warnings
 4. Consider implementing rate limiting for production deployments
 

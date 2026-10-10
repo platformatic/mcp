@@ -3,6 +3,7 @@ import type { Options } from 'ajv'
 import type {
   JSONRPCMessage,
   JSONRPCNotification,
+  JSONRPCResponse,
   CallToolResult,
   ReadResourceResult,
   GetPromptResult,
@@ -265,6 +266,12 @@ export type MCPToolCallCompleteEvent =
     reply?: undefined
   })
 
+export interface MCPClientResponseContext {
+  sessionId?: string
+  request: FastifyRequest
+  authContext?: AuthorizationContext
+}
+
 export interface MCPPluginOptions {
   serverInfo?: Implementation
   capabilities?: ServerCapabilities
@@ -327,6 +334,18 @@ export interface MCPPluginOptions {
    */
   onToolCallComplete?: (
     event: MCPToolCallCompleteEvent
+  ) => void | Promise<void>
+  /**
+   * Receives the JSON-RPC responses a client POSTs back for server-initiated
+   * requests, such as the `ElicitResult` answering `app.mcpElicit()`; match it
+   * to the request by `response.id`. The POST is acknowledged with 202 either
+   * way. It fires on whichever instance received the POST, which in a Redis
+   * deployment may not be the one that sent the request. A throwing hook is
+   * logged and otherwise ignored.
+   */
+  onClientResponse?: (
+    response: JSONRPCResponse,
+    context: MCPClientResponseContext
   ) => void | Promise<void>
   /**
    * Customize Fastify/OpenAPI schema metadata for MCP transport routes.
