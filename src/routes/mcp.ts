@@ -1,5 +1,5 @@
 import { randomUUID } from 'crypto'
-import type { FastifyRequest, FastifyReply, FastifyPluginAsync, FastifySchema } from 'fastify'
+import type { FastifyRequest, FastifyReply, FastifyPluginAsync, FastifySchema, preHandlerHookHandler } from 'fastify'
 import fp from 'fastify-plugin'
 import type { JSONRPCMessage } from '../schema.ts'
 import { JSONRPC_VERSION, INTERNAL_ERROR, SUPPORTED_PROTOCOL_VERSIONS, DEFAULT_NEGOTIATED_PROTOCOL_VERSION } from '../schema.ts'
@@ -35,6 +35,7 @@ interface MCPPubSubRoutesOptions {
   taskStore?: TaskStore
   taskWaiters?: TaskWaiters
   jsonSchemaValidator?: JsonSchemaValidator
+  authPreHandler?: preHandlerHookHandler
 }
 
 function resolveRouteUrl (prefix: string | undefined, url: string): string {
@@ -75,7 +76,7 @@ function resolveMcpRouteSchema (
 }
 
 const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async (app, options) => {
-  const { enableSSE, opts, capabilities, serverInfo, tools, resources, prompts, resourceHandlers, sessionStore, messageBroker, localStreams, taskStore, taskWaiters, jsonSchemaValidator } = options
+  const { enableSSE, opts, capabilities, serverInfo, tools, resources, prompts, resourceHandlers, sessionStore, messageBroker, localStreams, taskStore, taskWaiters, jsonSchemaValidator, authPreHandler } = options
   const mcpUrl = resolveRouteUrl(app.prefix, '/mcp')
 
   const allowedOrigins = opts.allowedOrigins
@@ -164,7 +165,11 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
   // Scoped to the /mcp routes only: this plugin is not encapsulated, so an
   // app-level hook would also cover the OAuth and well-known routes.
   const mcpOnRequest = [validateOrigin, validateProtocolVersionHeader]
-  const mcpPreHandler = [reconcileProtocolVersion]
+  // When authorization is scoped to the MCP routes, the auth check runs first,
+  // as it would if it were registered as a global preHandler hook.
+  const mcpPreHandler: preHandlerHookHandler[] = authPreHandler
+    ? [authPreHandler, reconcileProtocolVersion]
+    : [reconcileProtocolVersion]
 
   async function createSSESession (): Promise<SessionMetadata> {
     const sessionId = randomUUID()

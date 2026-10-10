@@ -1353,6 +1353,53 @@ eventSource.onmessage = (event) => {
 
 ### Authorization Configuration
 
+#### Choosing Which Routes Require a Token
+
+By default the plugin adds the bearer-token check as a `preHandler` hook on
+the Fastify instance it is registered on. Because the plugin is not
+encapsulated, that check also covers every route you register yourself on
+that instance. The well-known metadata endpoints and the OAuth flow endpoints
+(`/oauth/authorize`, `/oauth/callback`, `/oauth/register`) are always skipped.
+
+Set `protectedRoutes: 'mcp'` to protect only the MCP endpoints the plugin
+registers (`POST`, `GET` and `DELETE` `/mcp`) and leave your own routes alone:
+
+```typescript
+await app.register(mcpPlugin, {
+  authorization: {
+    enabled: true,
+    authorizationServers: ['https://auth.example.com'],
+    resourceUri: 'https://mcp.example.com',
+    tokenValidation: {
+      jwksUri: 'https://auth.example.com/.well-known/jwks.json'
+    },
+    protectedRoutes: 'mcp' // default: 'all'
+  }
+})
+
+// Reachable without a token
+app.get('/health', async () => ({ status: 'ok' }))
+```
+
+| Value | Behaviour |
+|-------|-----------|
+| `'all'` (default) | Every route of the app requires a token, except the well-known and OAuth endpoints. |
+| `'mcp'` | Only the `/mcp` routes require a token. |
+
+If you keep the default and only need to open a few paths, list them in
+`excludedPaths` instead. Each entry is a URL prefix string or a `RegExp`:
+
+```typescript
+authorization: {
+  enabled: true,
+  // ...
+  excludedPaths: ['/health', /^\/public\//]
+}
+```
+
+`excludedPaths` also applies with `protectedRoutes: 'mcp'`, but there it only
+matters for the `/mcp` routes.
+
 #### JWT Token Validation
 
 ```typescript
