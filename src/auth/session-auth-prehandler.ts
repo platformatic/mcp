@@ -177,7 +177,11 @@ function generateWWWAuthenticateHeader (config: AuthorizationConfig): string {
     throw new Error('Authorization is disabled')
   }
   const resourceMetadataUrl = `${config.resourceUri}/.well-known/oauth-protected-resource`
-  return `Bearer realm="MCP Server", resource_metadata="${resourceMetadataUrl}"`
+  const params = ['realm="MCP Server"', `resource_metadata="${resourceMetadataUrl}"`]
+  if (config.requiredScopes && config.requiredScopes.length > 0) {
+    params.push(`scope="${config.requiredScopes.join(' ')}"`)
+  }
+  return `Bearer ${params.join(', ')}`
 }
 
 // Type augmentation for FastifyRequest to include authorization context

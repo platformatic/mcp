@@ -123,6 +123,39 @@ describe('Well-known Routes', () => {
 
       t.assert.strictEqual(response.statusCode, 404)
     })
+
+    test('should advertise requiredScopes as scopes_supported on both metadata endpoints', async (t: TestContext) => {
+      const authConfig = createTestAuthConfig({
+        requiredScopes: ['mcp:read', 'mcp:write']
+      })
+
+      await app.register(wellKnownRoutes, { authConfig })
+      await app.ready()
+
+      for (const url of ['/.well-known/oauth-protected-resource', '/.well-known/oauth-protected-resource/mcp']) {
+        const response = await app.inject({ method: 'GET', url })
+
+        t.assert.strictEqual(response.statusCode, 200)
+        t.assert.deepStrictEqual(response.json().scopes_supported, ['mcp:read', 'mcp:write'])
+      }
+    })
+
+    test('should omit scopes_supported when requiredScopes is not configured or empty', async (t: TestContext) => {
+      for (const requiredScopes of [undefined, []]) {
+        const localApp = Fastify({ logger: false })
+        t.after(() => localApp.close())
+
+        await localApp.register(wellKnownRoutes, { authConfig: createTestAuthConfig({ requiredScopes }) })
+        await localApp.ready()
+
+        for (const url of ['/.well-known/oauth-protected-resource', '/.well-known/oauth-protected-resource/mcp']) {
+          const response = await localApp.inject({ method: 'GET', url })
+
+          t.assert.strictEqual(response.statusCode, 200)
+          t.assert.strictEqual('scopes_supported' in response.json(), false)
+        }
+      }
+    })
   })
 
   describe('MCP Resource Health Check', () => {
