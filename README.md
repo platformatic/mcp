@@ -599,6 +599,14 @@ TypeBox validation provides structured error messages:
 }
 ```
 
+Prompts and resources report failures as JSON-RPC errors instead of successful results:
+
+- `prompts/get` returns `-32602` (Invalid params) when the arguments fail the TypeBox `argumentSchema`, or, for prompts without a TypeBox schema, when an argument declared with `required: true` in `arguments` is missing. The handler is not invoked.
+- `prompts/get` returns `-32603` (Internal error) with the message `Prompt execution failed: <error.message>` when the prompt handler throws.
+- `resources/read` returns `-32602` when the URI fails the resource's `uriSchema`, and `-32603` with `Resource read failed: <error.message>` when the resource handler throws.
+
+Handler errors are logged on the request logger; only the error message is sent to the client, never the stack trace.
+
 ### Backward Compatibility
 
 The plugin maintains backward compatibility with JSON Schema and unvalidated tools:

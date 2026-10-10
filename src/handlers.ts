@@ -288,7 +288,11 @@ function handleResourceTemplatesList (request: JSONRPCRequest, dependencies: Han
 function handlePromptsList (request: JSONRPCRequest, dependencies: HandlerDependencies): JSONRPCResponse {
   const { prompts, protocolVersion } = dependencies
   const result: ListPromptsResult = {
-    prompts: Array.from(prompts.values()).map(p => trimDefinitionToRevision(p.definition, protocolVersion)),
+    prompts: Array.from(prompts.values()).map(p => {
+      // argumentSchema is our validation input, not part of the spec Prompt shape
+      const { argumentSchema, ...definition } = p.definition
+      return trimDefinitionToRevision(definition, protocolVersion)
+    }),
     nextCursor: undefined
   }
   return createResponse(request.id, result)
@@ -679,14 +683,9 @@ async function handleResourcesRead (
       // TypeBox schema - use our validation
       const uriValidation = validate(schema, uri)
       if (!uriValidation.success) {
-        const result: ReadResourceResult = {
-          contents: [{
-            uri,
-            text: `Invalid resource URI: ${uriValidation.error.message}`,
-            mimeType: 'text/plain'
-          }]
-        }
-        return createResponse(request.id, result)
+        return createError(request.id, INVALID_PARAMS, `Invalid resource URI: ${uriValidation.error.message}`, {
+          validation: uriValidation.error
+        })
       }
     }
   }
@@ -700,14 +699,8 @@ async function handleResourcesRead (
     })
     return createResponse(request.id, result)
   } catch (error: any) {
-    const result: ReadResourceResult = {
-      contents: [{
-        uri,
-        text: `Resource read failed: ${error.message || error}`,
-        mimeType: 'text/plain'
-      }]
-    }
-    return createResponse(request.id, result)
+    dependencies.request.log.error({ err: error, uri }, 'Resource read handler failed')
+    return createError(request.id, INTERNAL_ERROR, `Resource read failed: ${error?.message || error}`)
   }
 }
 
@@ -749,91 +742,37 @@ async function handlePromptsGet (
 
   // Validate prompt arguments against the prompt's argument schema
   const promptArguments = params.arguments || {}
-  if ('argumentSchema' in prompt.definition && prompt.definition.argumentSchema) {
-    // Check if it's a TypeBox schema
-    const schema = prompt.definition.argumentSchema
-    if (isTypeBoxSchema(schema)) {
-      // TypeBox schema - use our validation
-      const argumentsValidation = validate(schema, promptArguments)
-      if (!argumentsValidation.success) {
-        const result: GetPromptResult = {
-          messages: [{
-            role: 'user',
-            content: {
-              type: 'text',
-              text: `Invalid prompt arguments: ${argumentsValidation.error.message}`
-            }
-          }]
-        }
-        return createResponse(request.id, result)
-      }
-
-      // Use validated arguments
-      try {
-        const result = await prompt.handler(promptName, argumentsValidation.data, {
-          sessionId,
-          request: dependencies.request,
-          reply: dependencies.reply,
-          authContext: dependencies.authContext
-        })
-        return createResponse(request.id, result)
-      } catch (error: any) {
-        const result: GetPromptResult = {
-          messages: [{
-            role: 'user',
-            content: {
-              type: 'text',
-              text: `Prompt execution failed: ${error.message || error}`
-            }
-          }]
-        }
-        return createResponse(request.id, result)
-      }
-    } else {
-      // Regular JSON Schema - basic validation or pass through
-      try {
-        const result = await prompt.handler(promptName, promptArguments, {
-          sessionId,
-          request: dependencies.request,
-          reply: dependencies.reply,
-          authContext: dependencies.authContext
-        })
-        return createResponse(request.id, result)
-      } catch (error: any) {
-        const result: GetPromptResult = {
-          messages: [{
-            role: 'user',
-            content: {
-              type: 'text',
-              text: `Prompt execution failed: ${error.message || error}`
-            }
-          }]
-        }
-        return createResponse(request.id, result)
-      }
-    }
-  } else {
-    // Unsafe prompt without schema - pass arguments as-is
-    try {
-      const result = await prompt.handler(promptName, promptArguments, {
-        sessionId,
-        request: dependencies.request,
-        reply: dependencies.reply,
-        authContext: dependencies.authContext
+  let handlerArguments: Record<string, unknown> = promptArguments
+  const { argumentSchema } = prompt.definition
+  if (argumentSchema && isTypeBoxSchema(argumentSchema)) {
+    const argumentsValidation = validate(argumentSchema, promptArguments)
+    if (!argumentsValidation.success) {
+      return createError(request.id, INVALID_PARAMS, `Invalid prompt arguments: ${argumentsValidation.error.message}`, {
+        validation: argumentsValidation.error
       })
-      return createResponse(request.id, result)
-    } catch (error: any) {
-      const result: GetPromptResult = {
-        messages: [{
-          role: 'user',
-          content: {
-            type: 'text',
-            text: `Prompt execution failed: ${error.message || error}`
-          }
-        }]
-      }
-      return createResponse(request.id, result)
     }
+    handlerArguments = argumentsValidation.data
+  } else {
+    // No TypeBox schema: enforce the `required` flags declared in `arguments`
+    const missing = (prompt.definition.arguments ?? [])
+      .filter(arg => arg.required && promptArguments[arg.name] === undefined)
+      .map(arg => arg.name)
+    if (missing.length > 0) {
+      return createError(request.id, INVALID_PARAMS, `Missing required prompt arguments: ${missing.join(', ')}`, { missing })
+    }
+  }
+
+  try {
+    const result = await prompt.handler(promptName, handlerArguments as any, {
+      sessionId,
+      request: dependencies.request,
+      reply: dependencies.reply,
+      authContext: dependencies.authContext
+    })
+    return createResponse(request.id, result)
+  } catch (error: any) {
+    dependencies.request.log.error({ err: error, prompt: promptName }, 'Prompt handler failed')
+    return createError(request.id, INTERNAL_ERROR, `Prompt execution failed: ${error?.message || error}`)
   }
 }
 
