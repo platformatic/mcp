@@ -395,12 +395,12 @@ export interface MCPPluginOptions {
    */
   transformRouteSchema?: MCPRouteSchemaTransformer
   /**
-   * Validate plain JSON Schema tool inputs using AJV.
-   * Omit this option to disable validation, or provide an object to enable it.
-   * Options override the default non-mutating AJV configuration (no coercion,
-   * no defaults injection, no property removal).
+   * Plain JSON Schema tool inputs are validated with AJV (JSON Schema 2020-12)
+   * by default. Provide an object to customize AJV: options override the
+   * default non-mutating configuration (no coercion, no defaults injection,
+   * no property removal). Set to `false` to disable validation.
    */
-  validateJsonSchemaInputs?: Options
+  validateJsonSchemaInputs?: Options | false
   /**
    * Redis connection options, passed as-is to the ioredis constructor.
    * Providing this option switches sessions, messaging and tasks to the Redis backends.
