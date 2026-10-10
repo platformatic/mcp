@@ -234,6 +234,20 @@ default. `initialize` is exempt, so a client may re-negotiate on an existing ses
 > solely by its header. A client that omits it falls back to `2025-03-26` and will not see
 > `2025-11-25` features. Compliant clients always send the header.
 
+## Request Body Errors
+
+Body-parser failures on `POST /mcp` are answered with a JSON-RPC error (with `id: null`)
+while keeping the HTTP status code:
+
+| Cause | Status | JSON-RPC error |
+| --- | --- | --- |
+| Malformed or empty JSON | `400` | `-32700` Parse error |
+| Body larger than Fastify's `bodyLimit` | `413` | `-32600` Invalid Request |
+| Unsupported `Content-Type` | `415` | `-32600` Invalid Request |
+
+The handler is scoped to the `POST /mcp` route. Any other error on that route, and every
+error on your other routes, still goes to your own (or Fastify's default) error handler.
+
 ## Origin Validation
 
 Browser clients can be protected against DNS rebinding by allow-listing origins. A rejected
