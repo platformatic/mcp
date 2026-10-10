@@ -39,18 +39,12 @@ export function createAuthPreHandler (
     }
 
     if (!authHeader.startsWith('Bearer ')) {
-      return reply.code(401).header('WWW-Authenticate', generateWWWAuthenticateHeader(config)).send({
-        error: 'invalid_token',
-        error_description: 'Authorization header must use Bearer scheme'
-      })
+      return sendInvalidToken(reply, config, 'Authorization header must use Bearer scheme')
     }
 
     const token = authHeader.substring(7) // Remove 'Bearer ' prefix
     if (!token) {
-      return reply.code(401).header('WWW-Authenticate', generateWWWAuthenticateHeader(config)).send({
-        error: 'invalid_token',
-        error_description: 'Bearer token is empty'
-      })
+      return sendInvalidToken(reply, config, 'Bearer token is empty')
     }
 
     // Validate the token
@@ -58,10 +52,7 @@ export function createAuthPreHandler (
     if (!validationResult.valid) {
       request.log.warn({ error: validationResult.error }, 'Token validation failed')
 
-      return reply.code(401).header('WWW-Authenticate', generateWWWAuthenticateHeader(config)).send({
-        error: 'invalid_token',
-        error_description: validationResult.error || 'Token validation failed'
-      })
+      return sendInvalidToken(reply, config, validationResult.error || 'Token validation failed')
     }
 
     // SEP-835: the token is good but may not carry everything this resource needs.
@@ -111,12 +102,39 @@ export function findMissingScopes (required: string[] | undefined, payload: any)
   return required.filter(scope => !granted.has(scope))
 }
 
+/**
+ * Reply 401 with an RFC 6750 §3.1 `invalid_token` challenge, mirroring the
+ * error and description in both the WWW-Authenticate header and the body.
+ */
+export function sendInvalidToken (reply: FastifyReply, config: AuthorizationConfig, description: string) {
+  return reply
+    .code(401)
+    .header('WWW-Authenticate', generateWWWAuthenticateHeader(config, {
+      error: 'invalid_token',
+      error_description: description
+    }))
+    .send({
+      error: 'invalid_token',
+      error_description: description
+    })
+}
+
 interface WWWAuthenticateChallenge {
   error?: string
+  error_description?: string
   scope?: string[]
 }
 
-function generateWWWAuthenticateHeader (config: AuthorizationConfig, challenge: WWWAuthenticateChallenge = {}): string {
+/**
+ * RFC 6750 §3 restricts error_description to %x20-21 / %x23-5B / %x5D-7E,
+ * so drop anything else (quotes, backslashes, control and non-ASCII chars)
+ * rather than letting validation messages break out of the quoted-string.
+ */
+function sanitizeErrorDescription (description: string): string {
+  return description.replace(/[^\x20\x21\x23-\x5B\x5D-\x7E]/g, '')
+}
+
+export function generateWWWAuthenticateHeader (config: AuthorizationConfig, challenge: WWWAuthenticateChallenge = {}): string {
   if (!config.enabled) {
     throw new Error('Authorization is disabled')
   }
@@ -125,6 +143,9 @@ function generateWWWAuthenticateHeader (config: AuthorizationConfig, challenge: 
 
   if (challenge.error) {
     params.push(`error="${challenge.error}"`)
+  }
+  if (challenge.error_description) {
+    params.push(`error_description="${sanitizeErrorDescription(challenge.error_description)}"`)
   }
   if (challenge.scope && challenge.scope.length > 0) {
     params.push(`scope="${challenge.scope.join(' ')}"`)

@@ -257,6 +257,10 @@ describe('Session-Based Authorization', () => {
       assert.strictEqual(response1.statusCode, 401)
       const body1 = JSON.parse(response1.body)
       assert.strictEqual(body1.error, 'authorization_required')
+      assert.strictEqual(
+        response1.headers['www-authenticate'],
+        'Bearer realm="MCP Server", resource_metadata="https://api.example.com/.well-known/oauth-protected-resource"'
+      )
     })
 
     test('should skip authorization for well-known endpoints', async (t) => {
@@ -378,6 +382,10 @@ describe('Session-Based Authorization', () => {
       const body = JSON.parse(response.body)
       assert.strictEqual(body.error, 'invalid_token')
       assert.strictEqual(body.error_description, 'Authorization header must use Bearer scheme')
+      assert.strictEqual(
+        response.headers['www-authenticate'],
+        'Bearer realm="MCP Server", resource_metadata="https://api.example.com/.well-known/oauth-protected-resource", error="invalid_token", error_description="Authorization header must use Bearer scheme"'
+      )
     })
 
     test('should handle empty bearer token', async (t) => {
@@ -421,6 +429,57 @@ describe('Session-Based Authorization', () => {
       const body = JSON.parse(response.body)
       assert.strictEqual(body.error, 'invalid_token')
       assert.strictEqual(body.error_description, 'Bearer token is empty')
+      assert.strictEqual(
+        response.headers['www-authenticate'],
+        'Bearer realm="MCP Server", resource_metadata="https://api.example.com/.well-known/oauth-protected-resource", error="invalid_token", error_description="Bearer token is empty"'
+      )
+    })
+
+    test('should include invalid_token in the challenge when token validation fails', async (t) => {
+      const fastify = Fastify()
+      t.after(async () => {
+        await fastify.close()
+      })
+
+      const config = {
+        enabled: true,
+        authorizationServers: ['https://auth.example.com'],
+        resourceUri: 'https://api.example.com',
+        tokenValidation: {
+          jwksUri: 'https://auth.example.com/.well-known/jwks.json',
+          validateAudience: true
+        }
+      }
+
+      const sessionStore = new MemorySessionStore(100)
+      const tokenValidator = {
+        validateToken: async () => ({ valid: false, error: 'Token "expired" \\ x' })
+      } as unknown as TokenValidator
+
+      const preHandler = createSessionAuthPreHandler({
+        config,
+        tokenValidator,
+        sessionStore
+      })
+
+      fastify.addHook('preHandler', preHandler)
+      fastify.get('/test', async () => ({ message: 'success' }))
+
+      const response = await fastify.inject({
+        method: 'GET',
+        url: '/test',
+        headers: {
+          authorization: 'Bearer some-token'
+        }
+      })
+
+      assert.strictEqual(response.statusCode, 401)
+      const body = JSON.parse(response.body)
+      assert.strictEqual(body.error, 'invalid_token')
+      assert.strictEqual(
+        response.headers['www-authenticate'],
+        'Bearer realm="MCP Server", resource_metadata="https://api.example.com/.well-known/oauth-protected-resource", error="invalid_token", error_description="Token expired  x"'
+      )
     })
   })
 

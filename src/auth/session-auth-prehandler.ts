@@ -2,6 +2,7 @@ import type { FastifyRequest, FastifyReply, preHandlerHookHandler } from 'fastif
 import type { AuthorizationConfig } from '../types/auth-types.ts'
 import type { SessionStore } from '../stores/session-store.ts'
 import { TokenValidator } from './token-validator.ts'
+import { generateWWWAuthenticateHeader, sendInvalidToken } from './prehandler.ts'
 import { hashToken, createAuthorizationContext, createTokenRefreshInfo, shouldAttemptRefresh } from './token-utils.ts'
 
 export interface SessionAuthPreHandlerOptions {
@@ -46,18 +47,12 @@ export function createSessionAuthPreHandler (
     }
 
     if (!authHeader.startsWith('Bearer ')) {
-      return reply.code(401).header('WWW-Authenticate', generateWWWAuthenticateHeader(config)).send({
-        error: 'invalid_token',
-        error_description: 'Authorization header must use Bearer scheme'
-      })
+      return sendInvalidToken(reply, config, 'Authorization header must use Bearer scheme')
     }
 
     const token = authHeader.substring(7) // Remove 'Bearer ' prefix
     if (!token) {
-      return reply.code(401).header('WWW-Authenticate', generateWWWAuthenticateHeader(config)).send({
-        error: 'invalid_token',
-        error_description: 'Bearer token is empty'
-      })
+      return sendInvalidToken(reply, config, 'Bearer token is empty')
     }
 
     const tokenHash = hashToken(token)
@@ -72,10 +67,7 @@ export function createSessionAuthPreHandler (
         const validationResult = await tokenValidator.validateToken(token)
         if (!validationResult.valid) {
           request.log.warn({ error: validationResult.error }, 'Token validation failed')
-          return reply.code(401).header('WWW-Authenticate', generateWWWAuthenticateHeader(config)).send({
-            error: 'invalid_token',
-            error_description: validationResult.error || 'Token validation failed'
-          })
+          return sendInvalidToken(reply, config, validationResult.error || 'Token validation failed')
         }
 
         // Create authorization context from validated token
@@ -170,14 +162,6 @@ export function createSessionAuthPreHandler (
       })
     }
   }
-}
-
-function generateWWWAuthenticateHeader (config: AuthorizationConfig): string {
-  if (!config.enabled) {
-    throw new Error('Authorization is disabled')
-  }
-  const resourceMetadataUrl = `${config.resourceUri}/.well-known/oauth-protected-resource`
-  return `Bearer realm="MCP Server", resource_metadata="${resourceMetadataUrl}"`
 }
 
 // Type augmentation for FastifyRequest to include authorization context
