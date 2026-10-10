@@ -119,6 +119,10 @@ export type AuthorizationConfig =
     tokenValidation: {
       introspectionEndpoint?: string
       jwksUri?: string
+      /**
+       * Require the token `aud` (JWT claim or introspection response) to match
+       * `resourceUri`. Defaults to `true`; set to `false` to opt out.
+       */
       validateAudience?: boolean
       /**
        * How to authenticate to the introspection endpoint.

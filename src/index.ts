@@ -137,6 +137,10 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
   // Initialize authorization components if enabled
   let tokenValidator: TokenValidator | null = null
   if (opts.authorization?.enabled) {
+    if (opts.authorization.tokenValidation.validateAudience === false) {
+      app.log.warn('Token audience validation is disabled (tokenValidation.validateAudience: false): tokens issued for other resources will be accepted')
+    }
+
     tokenValidator = new TokenValidator(opts.authorization, app)
 
     // Register authorization preHandler for all routes
