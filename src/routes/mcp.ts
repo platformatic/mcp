@@ -80,15 +80,15 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
   const allowedOrigins = opts.allowedOrigins
 
-  if (allowedOrigins === undefined) {
-    app.log.warn('MCP: no allowedOrigins configured, Origin validation is disabled. Set allowedOrigins to protect browser clients against DNS rebinding.')
+  if (allowedOrigins === true || allowedOrigins === '*') {
+    app.log.warn('MCP: allowedOrigins accepts any origin, Origin validation is disabled. List the allowed origins to protect browser clients against DNS rebinding.')
   }
 
   // Guard against DNS rebinding: reject browser origins we do not trust.
   // The 2025-11-25 revision requires 403 here, not 400.
   async function validateOrigin (request: FastifyRequest, reply: FastifyReply): Promise<void> {
     const origin = request.headers.origin as string | undefined
-    if (!isOriginAllowed(origin, allowedOrigins)) {
+    if (!isOriginAllowed(origin, allowedOrigins, request.host)) {
       request.log.warn({ origin }, 'Rejected MCP request with disallowed Origin')
       return reply.code(403).type('application/json').send({
         error: 'Forbidden: Origin not allowed'
