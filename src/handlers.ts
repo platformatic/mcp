@@ -1294,6 +1294,11 @@ async function handleResourcesSubscribe (
       reply: dependencies.reply,
       authContext: dependencies.authContext
     })
+    // Remember the subscription so resources/updated broadcasts only reach
+    // the sessions that asked for this URI
+    if (sessionId && dependencies.sessionStore) {
+      await dependencies.sessionStore.addResourceSubscription(sessionId, params.uri)
+    }
     return createResponse(request.id, result)
   } catch (error: any) {
     return createError(request.id, INTERNAL_ERROR, `Subscribe failed: ${error.message || error}`)
@@ -1323,6 +1328,9 @@ async function handleResourcesUnsubscribe (
       reply: dependencies.reply,
       authContext: dependencies.authContext
     })
+    if (sessionId && dependencies.sessionStore) {
+      await dependencies.sessionStore.removeResourceSubscription(sessionId, params.uri)
+    }
     return createResponse(request.id, result)
   } catch (error: any) {
     return createError(request.id, INTERNAL_ERROR, `Unsubscribe failed: ${error.message || error}`)
