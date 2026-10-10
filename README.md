@@ -1382,6 +1382,35 @@ authorization: {
 }
 ```
 
+#### Required Scopes and Scope Hierarchies
+
+`requiredScopes` lists the scopes a token must carry to reach the MCP
+endpoints. A valid token missing any of them gets a `403` with a
+`WWW-Authenticate: Bearer error="insufficient_scope"` challenge.
+
+By default, scopes are matched exactly. If your authorization server issues
+hierarchical scopes, pass `scopeImplies(granted, required)` to decide whether a
+granted scope satisfies a required one. The built-in `colonScopeHierarchy`
+helper implements the `resource:action` convention: `files` implies
+`files:read`, but `files:read` does not imply `files`, and `filesystem` does
+not imply `files:read`.
+
+```typescript
+import mcpPlugin, { colonScopeHierarchy } from '@platformatic/mcp'
+
+await app.register(mcpPlugin, {
+  authorization: {
+    enabled: true,
+    authorizationServers: ['https://auth.example.com'],
+    resourceUri: 'https://mcp.example.com',
+    tokenValidation: { jwksUri: 'https://auth.example.com/.well-known/jwks.json' },
+    requiredScopes: ['files:read'],
+    // A token granted `files` is accepted
+    scopeImplies: colonScopeHierarchy
+  }
+})
+```
+
 #### OAuth Client Configuration
 
 This optional configuration is for server-side OAuth client operations. It is
@@ -1848,6 +1877,8 @@ await app.register(import('@fastify/bearer-auth'), {
   - `enabled`: Enable OAuth 2.1 authorization (default: false)
   - `authorizationServers`: Authorization server URIs
   - `resourceUri`: Resource URI
+  - `requiredScopes`: Scopes a token must carry; otherwise `403 insufficient_scope`
+  - `scopeImplies`: `(granted, required) => boolean` deciding whether a granted scope satisfies a required one (default: exact match; see `colonScopeHierarchy`)
   - `tokenValidation`: JWT token validation configuration
     - `jwksUri`: JWKS endpoint URL for JWT signature verification
     - `validateAudience`: Enable audience validation
