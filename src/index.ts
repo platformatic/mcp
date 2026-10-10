@@ -330,8 +330,11 @@ export type {
   IntrospectionAuthConfig,
   DCRRequest,
   DCRResponse,
-  DCRHooks
+  DCRHooks,
+  ScopeImplies
 } from './types/auth-types.ts'
+
+export { colonScopeHierarchy } from './auth/prehandler.ts'
 
 export type {
   JSONRPCMessage,

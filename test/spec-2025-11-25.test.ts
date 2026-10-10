@@ -6,6 +6,7 @@ import mcpPlugin from '../src/index.ts'
 import { JSONRPC_VERSION, LATEST_PROTOCOL_VERSION, URL_ELICITATION_REQUIRED } from '../src/schema.ts'
 import { validateElicitationUrl } from '../src/security.ts'
 import { findMissingScopes, extractTokenScopes } from '../src/auth/prehandler.ts'
+import { colonScopeHierarchy } from '../src/index.ts'
 import { buildDiscoveryUrls, buildClientIdMetadataDocument } from '../src/auth/oauth-client.ts'
 
 async function call (app: any, method: string, params: unknown, id = 1) {
@@ -189,6 +190,41 @@ describe('incremental scope consent (SEP-835)', () => {
     // Nothing required means nothing missing, whatever the token says
     t.assert.deepStrictEqual(findMissingScopes(undefined, {}), [])
     t.assert.deepStrictEqual(findMissingScopes([], {}), [])
+  })
+
+  test('findMissingScopes matches exactly by default', (t: TestContext) => {
+    // A broader scope does not satisfy a narrower one unless told so
+    t.assert.deepStrictEqual(findMissingScopes(['files:read'], { scope: 'files' }), ['files:read'])
+    t.assert.deepStrictEqual(findMissingScopes(['files'], { scope: 'files:read' }), ['files'])
+  })
+
+  test('findMissingScopes honours a custom scopeImplies', (t: TestContext) => {
+    const calls: Array<[string, string]> = []
+    const adminImpliesAll = (granted: string, required: string) => {
+      calls.push([granted, required])
+      return granted === 'admin' || granted === required
+    }
+    t.assert.deepStrictEqual(findMissingScopes(['read', 'write'], { scope: 'admin' }, adminImpliesAll), [])
+    t.assert.deepStrictEqual(findMissingScopes(['read', 'write'], { scope: 'read' }, adminImpliesAll), ['write'])
+    t.assert.deepStrictEqual(calls[0], ['admin', 'read'])
+  })
+
+  test('colonScopeHierarchy treats resource as a superset of resource:action', (t: TestContext) => {
+    t.assert.strictEqual(colonScopeHierarchy('files', 'files'), true)
+    t.assert.strictEqual(colonScopeHierarchy('files', 'files:read'), true)
+    t.assert.strictEqual(colonScopeHierarchy('files', 'files:read:own'), true)
+    t.assert.strictEqual(colonScopeHierarchy('files:read', 'files:read:own'), true)
+    // Narrower never implies broader
+    t.assert.strictEqual(colonScopeHierarchy('files:read', 'files'), false)
+    // Siblings and lookalike prefixes do not match
+    t.assert.strictEqual(colonScopeHierarchy('files:read', 'files:write'), false)
+    t.assert.strictEqual(colonScopeHierarchy('filesystem', 'files:read'), false)
+    t.assert.strictEqual(colonScopeHierarchy('files', 'filesystem:read'), false)
+    t.assert.strictEqual(colonScopeHierarchy('', ':read'), false)
+
+    t.assert.deepStrictEqual(findMissingScopes(['files:read'], { scope: 'files' }, colonScopeHierarchy), [])
+    t.assert.deepStrictEqual(findMissingScopes(['files'], { scope: 'files:read' }, colonScopeHierarchy), ['files'])
+    t.assert.deepStrictEqual(findMissingScopes(['files:read'], { scopes: ['filesystem'] }, colonScopeHierarchy), ['files:read'])
   })
 })
 
