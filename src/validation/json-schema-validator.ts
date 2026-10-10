@@ -22,9 +22,9 @@ export function createJsonSchemaValidator (customOptions: Options = {}) {
   // `validateFormats: false` keeps `format` annotation-only, which is also JSON
   // Schema 2020-12's own default behavior.
   const ajv = new Ajv2020({
-    coerceTypes: 'array',
-    useDefaults: true,
-    removeAdditional: true,
+    coerceTypes: false,
+    useDefaults: false,
+    removeAdditional: false,
     addUsedSchema: false,
     allErrors: false,
     strict: false,
