@@ -1,5 +1,5 @@
 import type { FastifyRequest, FastifyReply, preHandlerHookHandler } from 'fastify'
-import type { AuthorizationConfig } from '../types/auth-types.ts'
+import type { AuthorizationConfig, ScopeImplies } from '../types/auth-types.ts'
 import { TokenValidator } from './token-validator.ts'
 
 export function createAuthPreHandler (
@@ -66,7 +66,7 @@ export function createAuthPreHandler (
 
     // SEP-835: the token is good but may not carry everything this resource needs.
     // Name the missing scopes so the client can run an incremental consent flow.
-    const missingScopes = findMissingScopes(config.requiredScopes, validationResult.payload)
+    const missingScopes = findMissingScopes(config.requiredScopes, validationResult.payload, config.scopeImplies)
     if (missingScopes.length > 0) {
       request.log.warn({ missingScopes }, 'Token is missing required scopes')
 
@@ -105,10 +105,29 @@ export function extractTokenScopes (payload: any): string[] {
   return []
 }
 
-export function findMissingScopes (required: string[] | undefined, payload: any): string[] {
+export function findMissingScopes (
+  required: string[] | undefined,
+  payload: any,
+  scopeImplies?: ScopeImplies
+): string[] {
   if (!required || required.length === 0) return []
-  const granted = new Set(extractTokenScopes(payload))
-  return required.filter(scope => !granted.has(scope))
+  const granted = extractTokenScopes(payload)
+  if (!scopeImplies) {
+    const grantedSet = new Set(granted)
+    return required.filter(scope => !grantedSet.has(scope))
+  }
+  return required.filter(scope => !granted.some(g => scopeImplies(g, scope)))
+}
+
+/**
+ * `scopeImplies` implementation for the `resource:action` convention: a granted
+ * scope implies itself and every scope nested below it with `:`, so `files`
+ * satisfies `files:read`, but `files:read` does not satisfy `files` and
+ * `filesystem` does not satisfy `files:read`.
+ */
+export function colonScopeHierarchy (granted: string, required: string): boolean {
+  if (granted === required) return true
+  return granted.length > 0 && required.startsWith(granted + ':')
 }
 
 interface WWWAuthenticateChallenge {

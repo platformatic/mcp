@@ -99,6 +99,9 @@ export interface DCRHooks {
 // Authorization Configuration
 // =============================================================================
 
+/** Returns true when the `granted` scope satisfies the `required` scope. */
+export type ScopeImplies = (granted: string, required: string) => boolean
+
 export type AuthorizationConfig =
   | {
     enabled: false
@@ -116,6 +119,13 @@ export type AuthorizationConfig =
      * scopes needed, so the client can ask the user to grant them (SEP-835).
      */
     requiredScopes?: string[]
+    /**
+     * Decides whether a granted scope satisfies a required one, so scope
+     * hierarchies can be honoured when checking `requiredScopes`. Defaults to
+     * exact match. `colonScopeHierarchy` implements the `resource` ⊇
+     * `resource:action` convention.
+     */
+    scopeImplies?: ScopeImplies
     tokenValidation: {
       introspectionEndpoint?: string
       jwksUri?: string

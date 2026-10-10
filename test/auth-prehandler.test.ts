@@ -2,6 +2,7 @@ import { test, describe, beforeEach, afterEach } from 'node:test'
 import type { TestContext } from 'node:test'
 import Fastify from 'fastify'
 import { createAuthPreHandler } from '../src/auth/prehandler.ts'
+import { colonScopeHierarchy } from '../src/index.ts'
 import { TokenValidator } from '../src/auth/token-validator.ts'
 import {
   createTestAuthConfig,
@@ -402,5 +403,58 @@ describe('Authorization PreHandler', () => {
     t.assert.strictEqual(response4.statusCode, 401)
 
     validator.close()
+  })
+
+  describe('requiredScopes with scopeImplies', () => {
+    async function request (config: ReturnType<typeof createTestAuthConfig>, scope: string) {
+      restoreMock = setupMockAgent({
+        'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse()
+      })
+      const validator = new TokenValidator(config, app)
+      app.addHook('preHandler', createAuthPreHandler(config, validator))
+      app.get('/test', async () => ({ success: true }))
+      await app.ready()
+
+      const response = await app.inject({
+        method: 'GET',
+        url: '/test',
+        headers: { authorization: `Bearer ${createTestJWT({ scope })}` }
+      })
+      validator.close()
+      return response
+    }
+
+    test('a broader scope is refused by default', async (t: TestContext) => {
+      const response = await request(createTestAuthConfig({ requiredScopes: ['files:read'] }), 'files')
+      t.assert.strictEqual(response.statusCode, 403)
+      t.assert.strictEqual(response.json().error, 'insufficient_scope')
+      t.assert.match(response.headers['www-authenticate'] as string, /scope="files:read"/)
+    })
+
+    test('a broader scope is accepted with colonScopeHierarchy', async (t: TestContext) => {
+      const response = await request(createTestAuthConfig({
+        requiredScopes: ['files:read'],
+        scopeImplies: colonScopeHierarchy
+      }), 'files')
+      t.assert.strictEqual(response.statusCode, 200)
+      t.assert.deepStrictEqual(response.json(), { success: true })
+    })
+
+    test('a narrower scope is still refused with colonScopeHierarchy', async (t: TestContext) => {
+      const response = await request(createTestAuthConfig({
+        requiredScopes: ['files'],
+        scopeImplies: colonScopeHierarchy
+      }), 'files:read')
+      t.assert.strictEqual(response.statusCode, 403)
+      t.assert.strictEqual(response.json().error, 'insufficient_scope')
+    })
+
+    test('a lookalike prefix is refused with colonScopeHierarchy', async (t: TestContext) => {
+      const response = await request(createTestAuthConfig({
+        requiredScopes: ['files:read'],
+        scopeImplies: colonScopeHierarchy
+      }), 'filesystem')
+      t.assert.strictEqual(response.statusCode, 403)
+    })
   })
 })
