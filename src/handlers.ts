@@ -580,8 +580,8 @@ async function executeRegisteredTool (
         return { ok: true, result }
       }
     } else {
-      // Regular JSON Schema - validated with AJV when opted in, pass through otherwise
-      if (dependencies.jsonSchemaValidator) {
+      // Regular JSON Schema - validated with AJV unless opted out, pass through otherwise
+      if (dependencies.jsonSchemaValidator && schema) {
         const validationError = dependencies.jsonSchemaValidator.validate(schema, toolArguments)
         if (validationError !== null) {
           // SEP-1303: a tool execution error, not a protocol error (same as the
