@@ -1639,6 +1639,8 @@ When `oauth2Client` is configured, the plugin registers these legacy server-side
 
 Authorization-aware metadata endpoints:
 
+- `GET /.well-known/oauth-protected-resource` - OAuth 2.0 Protected Resource Metadata (RFC 9728, public)
+- `GET /.well-known/oauth-protected-resource{path}` - Same metadata, served when `resourceUri` has a path (e.g. `resourceUri: 'https://mcp.example.com/mcp'` is served at `/.well-known/oauth-protected-resource/mcp`). This is the URL advertised in the `resource_metadata` parameter of `WWW-Authenticate` challenges, as required by RFC 9728 §3.1, and its `resource` field equals `resourceUri` exactly.
 - `GET /.well-known/mcp-server` - Server metadata (protected)
 - `GET /health` - Health check (public)
 
@@ -1847,7 +1849,7 @@ await app.register(import('@fastify/bearer-auth'), {
 - `authorization`: OAuth 2.1 authorization configuration (optional)
   - `enabled`: Enable OAuth 2.1 authorization (default: false)
   - `authorizationServers`: Authorization server URIs
-  - `resourceUri`: Resource URI
+  - `resourceUri`: Resource URI. May include a path; the protected resource metadata is then served at `/.well-known/oauth-protected-resource{path}` (RFC 9728 §3.1)
   - `tokenValidation`: JWT token validation configuration
     - `jwksUri`: JWKS endpoint URL for JWT signature verification
     - `validateAudience`: Enable audience validation

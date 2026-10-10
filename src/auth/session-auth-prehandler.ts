@@ -2,6 +2,7 @@ import type { FastifyRequest, FastifyReply, preHandlerHookHandler } from 'fastif
 import type { AuthorizationConfig } from '../types/auth-types.ts'
 import type { SessionStore } from '../stores/session-store.ts'
 import { TokenValidator } from './token-validator.ts'
+import { getResourceMetadataUrl } from './resource-metadata.ts'
 import { hashToken, createAuthorizationContext, createTokenRefreshInfo, shouldAttemptRefresh } from './token-utils.ts'
 
 export interface SessionAuthPreHandlerOptions {
@@ -176,7 +177,7 @@ function generateWWWAuthenticateHeader (config: AuthorizationConfig): string {
   if (!config.enabled) {
     throw new Error('Authorization is disabled')
   }
-  const resourceMetadataUrl = `${config.resourceUri}/.well-known/oauth-protected-resource`
+  const resourceMetadataUrl = getResourceMetadataUrl(config.resourceUri)
   return `Bearer realm="MCP Server", resource_metadata="${resourceMetadataUrl}"`
 }
 
