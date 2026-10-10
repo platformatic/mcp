@@ -1,7 +1,7 @@
 import type { Redis } from 'ioredis'
 import type { TaskStatus } from '../schema.ts'
 import type { TaskStore, TaskRecord, TaskOutcome } from './task-store.ts'
-import { canTransition, isTerminal, taskHasExpired } from './task-store.ts'
+import { canTransition, isTerminal } from './task-store.ts'
 
 const TASK_KEY_PREFIX = 'mcp:task:'
 const TASK_INDEX_KEY = 'mcp:tasks'
@@ -51,18 +51,14 @@ export class RedisTaskStore implements TaskStore {
       return null
     }
 
-    let task: TaskRecord
+    // Retention is enforced by the key expiry alone. Re-checking createdAt + ttl
+    // here would compare another instance's timestamp with our clock, and a
+    // fast clock would then hide (or delete) tasks that are still live.
     try {
-      task = JSON.parse(raw)
+      return JSON.parse(raw)
     } catch {
       return null
     }
-
-    if (taskHasExpired(task)) {
-      await this.delete(taskId)
-      return null
-    }
-    return task
   }
 
   async updateStatus (
