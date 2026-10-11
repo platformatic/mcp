@@ -752,7 +752,7 @@ const store: SessionStore = new MemorySessionStore()
 // or: new RedisSessionStore({ redis })
 ```
 
-- **`SessionStore`**: the interface the plugin uses to persist SSE session metadata, message history, and token-to-session mappings.
+- **`SessionStore`**: the interface the plugin uses to persist SSE session metadata, message history, token-to-session mappings, and per-session resource subscriptions (`addResourceSubscription` / `removeResourceSubscription`, exposed as `resourceSubscriptions` on the metadata).
 - **`MemorySessionStore`**: in-process implementation used automatically when no `redis` option is passed. Takes an optional `maxMessages` history cap (default 100).
 - **`RedisSessionStore`**: distributed implementation used automatically when the `redis` option is passed; sessions and message history live in Redis so any instance can serve any client.
 
@@ -1073,7 +1073,9 @@ app.mcpBroadcastNotification({
   method: 'notifications/tools/list_changed'
 })
 
-// Example: Send resource updates
+// Example: Send resource updates. `notifications/resources/updated` is only
+// delivered to sessions that called `resources/subscribe` for this URI (and
+// have not unsubscribed); every other broadcast reaches all sessions.
 app.mcpBroadcastNotification({
   jsonrpc: '2.0',
   method: 'notifications/resources/updated',
@@ -2114,7 +2116,7 @@ app.mcpAddPrompt({
 
 ### Messaging Functions
 
-- `app.mcpBroadcastNotification(notification)`: Broadcast a notification to all connected SSE clients (works across Redis instances)
+- `app.mcpBroadcastNotification(notification)`: Broadcast a notification to all connected SSE clients (works across Redis instances). `notifications/resources/updated` only reaches sessions subscribed to its `params.uri`
 - `app.mcpSendToSession(sessionId, message)`: Send a message/request to a specific SSE session (works across Redis instances)
 - `app.mcpSendToUser(userId, message)`: Send a message to all sessions for a specific user (authorization-aware)
 

@@ -3,6 +3,11 @@ import type { JSONRPCMessage } from '../schema.ts'
 import type { SessionStore, SessionMetadata } from './session-store.ts'
 import type { AuthorizationContext, TokenRefreshInfo } from '../types/auth-types.ts'
 
+// Each subscribed URI is its own hash field, so concurrent subscribe and
+// unsubscribe calls never overwrite each other and the data shares the
+// session's TTL and is removed with it.
+const RESOURCE_SUBSCRIPTION_PREFIX = 'resourceSubscription:'
+
 export class RedisSessionStore implements SessionStore {
   private redis: Redis
   private maxMessages: number
@@ -115,6 +120,13 @@ export class RedisSessionStore implements SessionStore {
       } catch (error) {
         // Ignore parsing errors for auth session
       }
+    }
+
+    const subscriptions = Object.keys(result)
+      .filter(key => key.startsWith(RESOURCE_SUBSCRIPTION_PREFIX))
+      .map(key => key.slice(RESOURCE_SUBSCRIPTION_PREFIX.length))
+    if (subscriptions.length > 0) {
+      metadata.resourceSubscriptions = subscriptions
     }
 
     return metadata
@@ -247,5 +259,22 @@ export class RedisSessionStore implements SessionStore {
     if (authorization.tokenHash) {
       await this.addTokenMapping(authorization.tokenHash, sessionId)
     }
+  }
+
+  async addResourceSubscription (sessionId: string, uri: string): Promise<void> {
+    // Skip the write when the session is gone so we never recreate an expired
+    // session key without a TTL.
+    await this.redis.eval(
+      `if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+       redis.call('HSET', KEYS[1], ARGV[1], '1')
+       return 1`,
+      1,
+      `session:${sessionId}`,
+      RESOURCE_SUBSCRIPTION_PREFIX + uri
+    )
+  }
+
+  async removeResourceSubscription (sessionId: string, uri: string): Promise<void> {
+    await this.redis.hdel(`session:${sessionId}`, RESOURCE_SUBSCRIPTION_PREFIX + uri)
   }
 }
