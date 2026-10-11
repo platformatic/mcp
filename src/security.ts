@@ -204,24 +204,60 @@ export function validateElicitationUrl (message: string, url: string): void {
 /**
  * Configured value for the allowed `Origin` headers.
  *
- * - `undefined` disables validation (non-browser deployments)
- * - `'*'` or `true` accepts any origin
+ * - `undefined` (the default) accepts only loopback origins and the server's own host
+ * - `'*'` or `true` accepts any origin, disabling validation
  * - an array accepts exact origin matches only
  */
 export type AllowedOrigins = string[] | '*' | true | undefined
+
+function parseOrigin (origin: string): URL | undefined {
+  let url: URL
+  try {
+    url = new URL(origin)
+  } catch {
+    return undefined
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return undefined
+  return url
+}
+
+function isLoopbackHostname (hostname: string): boolean {
+  if (hostname === 'localhost' || hostname === '[::1]') return true
+  // URL has already normalised IPv4 literals to dotted-quad form
+  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(hostname)
+}
+
+/**
+ * Compare host:port only, so an `https` origin matches a server that sees plain
+ * HTTP behind a TLS-terminating proxy. The Host header is parsed with the origin's
+ * scheme so an explicit default port (`:443`) matches an implied one.
+ */
+function isSameHost (url: URL, host: string | undefined): boolean {
+  if (!host) return false
+  try {
+    return new URL(`${url.protocol}//${host}`).host === url.host
+  } catch {
+    return false
+  }
+}
 
 /**
  * Check a request `Origin` against the configured allow-list.
  *
  * Requests without an `Origin` header are accepted: the header is set by browsers,
- * and its absence means the request did not come from one. The 2025-11-25 revision
- * clarified that a rejected origin must be answered with 403, not 400.
+ * and its absence means the request did not come from one. Without an explicit
+ * allow-list only loopback origins and the server's own host (`host`, from the
+ * request's Host header) are trusted; an opaque `null` origin never is. The
+ * 2025-11-25 revision clarified that a rejected origin must be answered with 403.
  */
-export function isOriginAllowed (origin: string | undefined, allowed: AllowedOrigins): boolean {
-  if (allowed === undefined) return true
+export function isOriginAllowed (origin: string | undefined, allowed: AllowedOrigins, host?: string): boolean {
   if (origin === undefined) return true
   if (allowed === true || allowed === '*') return true
-  return allowed.includes(origin)
+  if (allowed !== undefined) return allowed.includes(origin)
+
+  const url = parseOrigin(origin)
+  if (url === undefined) return false
+  return isLoopbackHostname(url.hostname) || isSameHost(url, host)
 }
 
 /**

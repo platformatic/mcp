@@ -294,8 +294,9 @@ export interface MCPPluginOptions {
   taskMaxTtlMs?: number
   /**
    * Origins accepted on the MCP endpoints, to prevent DNS rebinding attacks.
-   * Omit to disable validation (non-browser deployments), pass `'*'` or `true`
-   * to accept any origin, or list exact origins to allow.
+   * When omitted, only loopback origins (`localhost`, `127.0.0.0/8`, `[::1]`)
+   * and the server's own host are accepted. Pass `'*'` or `true` to accept any
+   * origin, or list exact origins to allow.
    */
   allowedOrigins?: AllowedOrigins
   /**
