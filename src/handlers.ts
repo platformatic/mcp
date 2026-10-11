@@ -17,7 +17,8 @@ import type {
   ReadResourceResult,
   GetPromptResult,
   CreateTaskResult,
-  ListTasksResult
+  ListTasksResult,
+  ClientCapabilities
 } from './schema.ts'
 
 import {
@@ -137,11 +138,15 @@ async function handleInitialize (
     }, 'Unsupported protocol version requested, offering latest supported version')
   }
 
-  // Remember what we agreed on so later requests can be checked against it
+  // Remember what we agreed on so later requests can be checked against it,
+  // and what the client can handle so server-initiated requests (elicitation)
+  // are only sent when the client declared support for them
   if (sessionId && sessionStore) {
     const session = await sessionStore.get(sessionId)
     if (session) {
       session.protocolVersion = protocolVersion
+      const declared = (request.params as { capabilities?: unknown } | undefined)?.capabilities
+      session.clientCapabilities = declared && typeof declared === 'object' ? declared as ClientCapabilities : {}
       session.lastActivity = new Date()
       await sessionStore.update(session)
     }
@@ -1484,6 +1489,23 @@ export function handleNotification (notification: JSONRPCNotification, app: Fast
   }
 }
 
+async function handleClientResponse (response: JSONRPCResponse, dependencies: HandlerDependencies): Promise<void> {
+  const hook = dependencies.opts.onClientResponse
+  if (!hook) {
+    dependencies.request.log.debug({ id: response.id, sessionId: dependencies.sessionId }, 'Ignoring client response: no onClientResponse hook')
+    return
+  }
+  try {
+    await hook(response, {
+      sessionId: dependencies.sessionId,
+      request: dependencies.request,
+      authContext: dependencies.authContext
+    })
+  } catch (error) {
+    dependencies.request.log.error({ err: error, id: response.id }, 'onClientResponse hook failed')
+  }
+}
+
 export async function processMessage (
   message: JSONRPCMessage,
   sessionId: string | undefined,
@@ -1502,6 +1524,11 @@ export async function processMessage (
       handleNotification(message as JSONRPCNotification, dependencies.app)
       return null
     })
+  } else if ('result' in message || 'error' in message) {
+    // The client answering a server-initiated request (e.g. elicitation/create).
+    // The transport acknowledges it with 202; hand it to the application.
+    await handleClientResponse(message as JSONRPCResponse, dependencies)
+    return null
   } else {
     throw new Error('Invalid JSON-RPC message')
   }

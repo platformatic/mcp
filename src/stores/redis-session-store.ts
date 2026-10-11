@@ -25,6 +25,9 @@ export class RedisSessionStore implements SessionStore {
     if (metadata.protocolVersion) {
       sessionData.protocolVersion = metadata.protocolVersion
     }
+    if (metadata.clientCapabilities) {
+      sessionData.clientCapabilities = JSON.stringify(metadata.clientCapabilities)
+    }
 
     // Add authorization context if present
     if (metadata.authorization) {
@@ -51,14 +54,18 @@ export class RedisSessionStore implements SessionStore {
   async update (metadata: SessionMetadata): Promise<void> {
     const sessionKey = `session:${metadata.id}`
 
-    // Persist only what the caller owns: the negotiated version and activity
-    // time. Writing eventId/lastEventId here would roll the SSE counter back to
-    // a stale value if addMessage bumped it between the caller's get() and now.
+    // Persist only what the caller owns: the negotiated version, client
+    // capabilities and activity time. Writing eventId/lastEventId here would
+    // roll the SSE counter back to a stale value if addMessage bumped it
+    // between the caller's get() and now.
     const sessionData: Record<string, string> = {
       lastActivity: metadata.lastActivity.toISOString()
     }
     if (metadata.protocolVersion) {
       sessionData.protocolVersion = metadata.protocolVersion
+    }
+    if (metadata.clientCapabilities) {
+      sessionData.clientCapabilities = JSON.stringify(metadata.clientCapabilities)
     }
 
     // Check-then-write must be atomic: a separate EXISTS followed by HSET would
@@ -90,6 +97,14 @@ export class RedisSessionStore implements SessionStore {
       createdAt: new Date(result.createdAt),
       lastActivity: new Date(result.lastActivity),
       protocolVersion: result.protocolVersion || undefined
+    }
+
+    if (result.clientCapabilities) {
+      try {
+        metadata.clientCapabilities = JSON.parse(result.clientCapabilities)
+      } catch (error) {
+        // Ignore parsing errors for client capabilities
+      }
     }
 
     // Parse authorization context if present

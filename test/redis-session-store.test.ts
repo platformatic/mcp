@@ -290,4 +290,27 @@ describe('RedisSessionStore', () => {
     assert.strictEqual(updated?.protocolVersion, '2025-11-25')
     assert.strictEqual(updated?.eventId, 5, 'the event counter must not be rolled back by update')
   })
+
+  testWithRedis('persists the client capabilities declared at initialize', async (redis) => {
+    const store = new RedisSessionStore({ redis, maxMessages: 100 })
+
+    await store.create({
+      id: 'caps-session',
+      eventId: 0,
+      createdAt: new Date('2023-01-01T00:00:00.000Z'),
+      lastActivity: new Date('2023-01-01T00:00:00.000Z')
+    })
+    assert.strictEqual((await store.get('caps-session'))?.clientCapabilities, undefined)
+
+    await store.update({
+      id: 'caps-session',
+      eventId: 0,
+      createdAt: new Date('2023-01-01T00:00:00.000Z'),
+      lastActivity: new Date('2023-01-01T00:05:00.000Z'),
+      clientCapabilities: { elicitation: { url: {} } }
+    })
+
+    const updated = await store.get('caps-session')
+    assert.deepStrictEqual(updated?.clientCapabilities, { elicitation: { url: {} } })
+  })
 })

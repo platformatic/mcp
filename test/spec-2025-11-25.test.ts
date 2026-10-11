@@ -147,7 +147,7 @@ describe('URL mode elicitation (SEP-1036)', () => {
     const init = await app.inject({
       method: 'POST',
       url: '/mcp',
-      payload: { jsonrpc: JSONRPC_VERSION, id: 1, method: 'initialize', params: {} }
+      payload: { jsonrpc: JSONRPC_VERSION, id: 1, method: 'initialize', params: { capabilities: { elicitation: { url: {} } } } }
     })
     const sessionId = init.headers['mcp-session-id'] as string
 
@@ -167,7 +167,7 @@ describe('URL mode elicitation (SEP-1036)', () => {
     const init = await app.inject({
       method: 'POST',
       url: '/mcp',
-      payload: { jsonrpc: JSONRPC_VERSION, id: 1, method: 'initialize', params: {} }
+      payload: { jsonrpc: JSONRPC_VERSION, id: 1, method: 'initialize', params: { capabilities: { elicitation: { url: {} } } } }
     })
     const sessionId = init.headers['mcp-session-id'] as string
 

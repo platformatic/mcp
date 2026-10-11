@@ -198,14 +198,14 @@ describe('the session version is authoritative', () => {
   test('URL elicitation is refused for a session on an older revision', async (t: TestContext) => {
     const app = await buildApp(t, { enableSSE: true })
 
-    const oldInit = await call(app, 'initialize', { protocolVersion: OLD, capabilities: {} })
+    const oldInit = await call(app, 'initialize', { protocolVersion: OLD, capabilities: { elicitation: { url: {} } } })
     const oldSession = oldInit.headers['mcp-session-id'] as string
     t.assert.strictEqual(
       await app.mcpElicitUrl(oldSession, 'Authorize', 'https://mcp.example.com/connect'),
       null
     )
 
-    const newInit = await call(app, 'initialize', { protocolVersion: NEW, capabilities: {} })
+    const newInit = await call(app, 'initialize', { protocolVersion: NEW, capabilities: { elicitation: { url: {} } } })
     const newSession = newInit.headers['mcp-session-id'] as string
     t.assert.ok(await app.mcpElicitUrl(newSession, 'Authorize', 'https://mcp.example.com/connect'))
   })
