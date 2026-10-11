@@ -782,6 +782,13 @@ most orchestrators - are never blocked by a Redis outage or a stuck reconnect. P
 `closeTimeoutMs` and `onCloseTimeout` as a second argument to `RedisMessageBroker` to customize
 this behavior, e.g. to log when a shutdown had to fall back to the forced path.
 
+### Connection Errors
+
+A dropped Redis connection (for example during a Redis restart or failover) does not crash the
+process: the plugin logs errors from its Redis client and from the message broker's pub/sub
+connections through the Fastify logger, and ioredis keeps reconnecting. When constructing
+`RedisMessageBroker` yourself, pass an `onError` callback in its options to observe these errors.
+
 ### Session Persistence Features
 
 **Automatic Session Management:**

@@ -95,10 +95,17 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
   if (opts.redis) {
     // Redis implementations for horizontal scaling
     redis = new Redis(opts.redis)
+    // Without an 'error' listener a dropped connection is reported as unhandled; log it and let ioredis reconnect.
+    redis.on('error', (err) => {
+      app.log.error({ err }, 'Redis connection error')
+    })
     sessionStore = new RedisSessionStore({ redis, maxMessages: 100 })
     messageBroker = new RedisMessageBroker(redis, {
       onCloseTimeout: (closeTimeoutMs) => {
         app.log.warn({ closeTimeoutMs }, 'Redis message broker close timed out; forcing disconnect')
+      },
+      onError: (err) => {
+        app.log.error({ err }, 'Redis message broker connection error')
       }
     })
     if (enableTasks) {
