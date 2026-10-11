@@ -541,9 +541,10 @@ describe('TypeBox Validation', () => {
       })
 
       assert.strictEqual(invalidResponse.statusCode, 200)
-      const invalidBody = invalidResponse.json() as JSONRPCResultResponse
-      const invalidResult = invalidBody.result as GetPromptResult
-      assert.ok((invalidResult.messages[0].content as any).text.includes('Invalid prompt arguments'))
+      const invalidBody = invalidResponse.json() as JSONRPCError
+      assert.strictEqual(invalidBody.error.code, INVALID_PARAMS)
+      assert.ok(invalidBody.error.message.includes('Invalid prompt arguments'))
+      assert.strictEqual((invalidBody as any).result, undefined)
     })
 
     test('should reject invalid prompt get parameters', async (t) => {
