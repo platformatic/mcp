@@ -1362,11 +1362,21 @@ authorization: {
     // JWKS endpoint for public key retrieval
     jwksUri: 'https://auth.example.com/.well-known/jwks.json',
     
-    // Validate token audience
-    validateAudience: true
+    // Token audience is validated against resourceUri by default
+    // validateAudience: false  // opt out (not recommended, logs a warning)
   }
 }
 ```
+
+#### Audience Validation
+
+Tokens are only accepted when their audience matches `resourceUri`. This applies to both JWT validation (the `aud` claim) and token introspection (the `aud` field of the response). `aud` may be a string or an array; the token is accepted if any entry matches. A token without an audience is rejected.
+
+Before comparing, both sides are normalised: the scheme and host are lowercased and a single trailing slash is removed, so a token issued for `https://MCP.example.com/` is accepted by a server with `resourceUri: 'https://mcp.example.com'`. The path is still compared case-sensitively. Audiences that are not URLs are compared as plain strings (after removing a trailing slash).
+
+If your authorization server does not set an audience that matches `resourceUri`, you can disable the check with `tokenValidation.validateAudience: false`. The plugin logs a warning at registration when you do, because any valid token issued by the authorization server, including tokens meant for other resources, will then be accepted.
+
+> **Breaking change:** audience validation used to be off unless `validateAudience: true` was set. It is now on by default. Make sure your tokens carry an `aud` that matches `resourceUri`, or set `validateAudience: false` explicitly to keep the old behaviour.
 
 #### Token Introspection (RFC 7662)
 
@@ -1851,7 +1861,7 @@ await app.register(import('@fastify/bearer-auth'), {
   - `requiredScopes`: Scopes a token must carry (optional). Tokens missing any of them get a 403 `insufficient_scope` challenge. When set, the scopes are also advertised as `scopes_supported` in `/.well-known/oauth-protected-resource` metadata and as `scope="..."` in the `WWW-Authenticate` header of every 401 challenge
   - `tokenValidation`: JWT token validation configuration
     - `jwksUri`: JWKS endpoint URL for JWT signature verification
-    - `validateAudience`: Enable audience validation
+    - `validateAudience`: Require the token audience to match `resourceUri` (default: `true`; set to `false` to opt out, which logs a warning)
     - `introspectionEndpoint`: Token introspection endpoint (alternative to JWT)
   - `oauth2Client`: OAuth 2.1 client configuration
     - `clientId`: OAuth client identifier

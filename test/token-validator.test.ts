@@ -1,7 +1,8 @@
 import { test, describe, beforeEach, afterEach } from 'node:test'
 import type { TestContext } from 'node:test'
 import Fastify from 'fastify'
-import { TokenValidator } from '../src/auth/token-validator.ts'
+import { TokenValidator, normalizeAudience } from '../src/auth/token-validator.ts'
+import mcpPlugin from '../src/index.ts'
 import {
   createTestAuthConfig,
   createTestJWT,
@@ -611,6 +612,135 @@ describe('TokenValidator', () => {
   })
 
   describe('Audience Validation', () => {
+    test('should validate JWT audience by default when validateAudience is omitted', async (t: TestContext) => {
+      const config = createTestAuthConfig({
+        tokenValidation: {
+          jwksUri: 'https://auth.example.com/.well-known/jwks.json'
+        }
+      })
+      restoreMock = setupMockAgent({
+        'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse()
+      })
+
+      const validator = new TokenValidator(config, app)
+      const result = await validator.validateToken(createJWTWithInvalidAudience())
+
+      t.assert.strictEqual(result.valid, false)
+      t.assert.strictEqual(result.error, 'Invalid audience claim')
+
+      validator.close()
+    })
+
+    test('should validate introspection audience by default when validateAudience is omitted', async (t: TestContext) => {
+      const config = createTestAuthConfig({
+        tokenValidation: {
+          introspectionEndpoint: 'https://auth.example.com/introspect'
+        }
+      })
+      restoreMock = setupMockAgent({
+        'https://auth.example.com/introspect': createIntrospectionResponse(true, {
+          aud: 'https://different.example.com'
+        })
+      })
+
+      const validator = new TokenValidator(config, app)
+      const result = await validator.validateToken('opaque-token-123')
+
+      t.assert.strictEqual(result.valid, false)
+      t.assert.strictEqual(result.error, 'Invalid audience claim')
+
+      validator.close()
+    })
+
+    test('should reject introspection response without aud by default', async (t: TestContext) => {
+      const config = createTestAuthConfig({
+        tokenValidation: {
+          introspectionEndpoint: 'https://auth.example.com/introspect'
+        }
+      })
+      restoreMock = setupMockAgent({
+        'https://auth.example.com/introspect': createIntrospectionResponse(true, { aud: undefined })
+      })
+
+      const validator = new TokenValidator(config, app)
+      const result = await validator.validateToken('opaque-token-123')
+
+      t.assert.strictEqual(result.valid, false)
+      t.assert.strictEqual(result.error, 'Invalid audience claim')
+
+      validator.close()
+    })
+
+    test('should accept introspection response with mismatched aud when validateAudience is false', async (t: TestContext) => {
+      const config = createTestAuthConfig({
+        tokenValidation: {
+          introspectionEndpoint: 'https://auth.example.com/introspect',
+          validateAudience: false
+        }
+      })
+      restoreMock = setupMockAgent({
+        'https://auth.example.com/introspect': createIntrospectionResponse(true, {
+          aud: 'https://different.example.com'
+        })
+      })
+
+      const validator = new TokenValidator(config, app)
+      const result = await validator.validateToken('opaque-token-123')
+
+      t.assert.strictEqual(result.valid, true)
+
+      validator.close()
+    })
+
+    for (const aud of ['https://MCP.example.com', 'HTTPS://mcp.example.com', 'https://mcp.example.com/', ['https://other.example.com', 'https://MCP.EXAMPLE.COM/']]) {
+      test(`should accept JWT audience ${JSON.stringify(aud)} that differs only in case or trailing slash`, async (t: TestContext) => {
+        const config = createTestAuthConfig()
+        restoreMock = setupMockAgent({
+          'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse()
+        })
+
+        const validator = new TokenValidator(config, app)
+        const result = await validator.validateToken(createTestJWT({ aud }))
+
+        t.assert.strictEqual(result.valid, true)
+
+        validator.close()
+      })
+    }
+
+    test('should normalise a resourceUri with a trailing slash and a path', async (t: TestContext) => {
+      const config = createTestAuthConfig({
+        resourceUri: 'https://Mcp.Example.com/mcp/',
+        tokenValidation: {
+          introspectionEndpoint: 'https://auth.example.com/introspect'
+        }
+      })
+      restoreMock = setupMockAgent({
+        'https://auth.example.com/introspect': createIntrospectionResponse(true, {
+          aud: 'https://mcp.example.com/mcp'
+        })
+      })
+
+      const validator = new TokenValidator(config, app)
+      const result = await validator.validateToken('opaque-token-123')
+
+      t.assert.strictEqual(result.valid, true)
+
+      validator.close()
+    })
+
+    test('should keep path case-sensitive and reject other hosts', (t: TestContext) => {
+      t.assert.notStrictEqual(normalizeAudience('https://mcp.example.com/MCP'), normalizeAudience('https://mcp.example.com/mcp'))
+      t.assert.notStrictEqual(normalizeAudience('https://mcp.example.com.evil.com'), normalizeAudience('https://mcp.example.com'))
+      t.assert.notStrictEqual(normalizeAudience('https://mcp.example.com//'), normalizeAudience('https://mcp.example.com'))
+    })
+
+    test('should compare non-URL audiences as raw strings', (t: TestContext) => {
+      t.assert.strictEqual(normalizeAudience('my-api'), 'my-api')
+      t.assert.strictEqual(normalizeAudience('my-api/'), 'my-api')
+      t.assert.notStrictEqual(normalizeAudience('My-Api'), normalizeAudience('my-api'))
+    })
+
     test('should validate single audience string', async (t: TestContext) => {
       const config = createTestAuthConfig()
       restoreMock = setupMockAgent({
@@ -660,6 +790,47 @@ describe('TokenValidator', () => {
       t.assert.strictEqual(result.error, 'Invalid audience claim')
 
       validator.close()
+    })
+  })
+
+  describe('Plugin registration', () => {
+    test('should log a warning when validateAudience is false', async (t: TestContext) => {
+      const warnings: string[] = []
+      const server = Fastify({
+        logger: {
+          level: 'warn',
+          stream: { write: (line: string) => { warnings.push(JSON.parse(line).msg) } }
+        }
+      })
+      t.after(() => server.close())
+
+      await server.register(mcpPlugin, {
+        authorization: createTestAuthConfig({
+          tokenValidation: {
+            jwksUri: 'https://auth.example.com/.well-known/jwks.json',
+            validateAudience: false
+          }
+        })
+      })
+      await server.ready()
+
+      t.assert.ok(warnings.some((msg) => msg.includes('validateAudience: false')))
+    })
+
+    test('should not log an audience warning by default', async (t: TestContext) => {
+      const warnings: string[] = []
+      const server = Fastify({
+        logger: {
+          level: 'warn',
+          stream: { write: (line: string) => { warnings.push(JSON.parse(line).msg) } }
+        }
+      })
+      t.after(() => server.close())
+
+      await server.register(mcpPlugin, { authorization: createTestAuthConfig() })
+      await server.ready()
+
+      t.assert.ok(!warnings.some((msg) => msg.includes('validateAudience')))
     })
   })
 })

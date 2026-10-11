@@ -88,7 +88,6 @@ export function createTestAuthConfig (overrides: Partial<AuthorizationConfig> = 
     resourceUri: 'https://mcp.example.com',
     tokenValidation: {
       jwksUri: 'https://auth.example.com/.well-known/jwks.json',
-      validateAudience: true,
       ...('tokenValidation' in overrides ? overrides.tokenValidation : {})
     },
     ...overrides
