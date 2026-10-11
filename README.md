@@ -224,15 +224,31 @@ never sees a field or method that revision does not define:
 | `$schema` on tool schemas | omitted | JSON Schema 2020-12 |
 | URL mode elicitation | refused | available |
 
-When SSE is enabled the negotiated revision is stored on the session and is **authoritative**:
+The negotiated revision is stored on the session and is **authoritative**:
 a request whose `MCP-Protocol-Version` header contradicts what the session agreed is rejected
 with `400`, so a client cannot opt into newer behaviour after negotiating an older revision.
 When the header is omitted the session's revision is used in preference to the `2025-03-26`
 default. `initialize` is exempt, so a client may re-negotiate on an existing session.
 
-> Without SSE there is no session to remember the negotiation, so each request is judged
-> solely by its header. A client that omits it falls back to `2025-03-26` and will not see
-> `2025-11-25` features. Compliant clients always send the header.
+> A request sent without an `Mcp-Session-Id` has no session to remember the negotiation, so it
+> is judged solely by its header. A client that omits it falls back to `2025-03-26` and will not
+> see `2025-11-25` features. Compliant clients always send the header.
+
+## Sessions
+
+Session management is part of the Streamable HTTP transport and works whether or not SSE is
+enabled:
+
+- `initialize` on `POST /mcp` creates a session and returns its id in the `Mcp-Session-Id`
+  response header. Clients send it back on later requests.
+- `DELETE /mcp` with the `Mcp-Session-Id` header terminates the session (`204`), answering
+  `404` for an unknown session and `400` when the header is missing.
+- `enableSSE` only controls `GET /mcp`. Without it, `GET /mcp` answers `405` with
+  `Allow: POST, DELETE`.
+
+With SSE disabled, requests that do not carry an `Mcp-Session-Id` keep working statelessly and
+no session is created for them. With SSE enabled, every request without a known session id gets
+a new session, as before.
 
 ## Origin Validation
 
@@ -1841,7 +1857,7 @@ await app.register(import('@fastify/bearer-auth'), {
 - `serverInfo`: Server identification (name, version)
 - `capabilities`: MCP capabilities configuration
 - `instructions`: Optional server instructions
-- `enableSSE`: Enable Server-Sent Events support (default: false)
+- `enableSSE`: Enable Server-Sent Events support on `GET /mcp` (default: false). Sessions and `DELETE /mcp` work either way.
 - `canAccessTool`: Per-request tool authorization hook consulted by `tools/list` and `tools/call` (optional)
 - `onToolCallComplete`: Transport-neutral hook fired once after every tool call settles, across JSON-RPC, `mcpCallTool()`, and tasks (optional)
 - `authorization`: OAuth 2.1 authorization configuration (optional)

@@ -166,7 +166,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
   const mcpOnRequest = [validateOrigin, validateProtocolVersionHeader]
   const mcpPreHandler = [reconcileProtocolVersion]
 
-  async function createSSESession (): Promise<SessionMetadata> {
+  async function createSession (): Promise<SessionMetadata> {
     const sessionId = randomUUID()
     const session: SessionMetadata = {
       id: sessionId,
@@ -177,6 +177,12 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     }
 
     await sessionStore.create(session)
+
+    // Without SSE there is no stream to deliver to, so skip the subscription
+    if (!enableSSE) {
+      return session
+    }
+
     localStreams.set(sessionId, new Set())
 
     // Subscribe to messages for this session
@@ -285,22 +291,15 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     app.post('/mcp', routeOptions, async (request: FastifyRequest, reply: FastifyReply) => {
       try {
         const message = request.body as JSONRPCMessage
-        let sessionId = request.headers['mcp-session-id'] as string
+        let sessionId = request.headers['mcp-session-id'] as string | undefined
+        const existingSession = sessionId ? await sessionStore.get(sessionId) : null
 
-        if (enableSSE) {
-          let session: SessionMetadata
-          if (sessionId) {
-            const existingSession = await sessionStore.get(sessionId)
-            if (existingSession) {
-              session = existingSession
-            } else {
-              session = await createSSESession()
-              reply.header('Mcp-Session-Id', session.id)
-            }
-          } else {
-            session = await createSSESession()
-            reply.header('Mcp-Session-Id', session.id)
-          }
+        // Sessions belong to Streamable HTTP, not to SSE. Without SSE we only open
+        // one on initialize: other requests keep working statelessly as before,
+        // and stateless clients do not each leave a session behind.
+        if (!existingSession && (enableSSE || isInitializeRequest(message))) {
+          const session = await createSession()
+          reply.header('Mcp-Session-Id', session.id)
           sessionId = session.id
         }
 
@@ -370,7 +369,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
   // GET endpoint for server-initiated communication via SSE
   if (!enableSSE) {
     app.get('/mcp', { onRequest: mcpOnRequest, preHandler: mcpPreHandler }, async (_request: FastifyRequest, reply: FastifyReply) => {
-      reply.type('application/json').code(405).send({ error: 'Method Not Allowed: SSE not enabled' })
+      reply.header('Allow', 'POST, DELETE').type('application/json').code(405).send({ error: 'Method Not Allowed: SSE not enabled' })
     })
   }
 
@@ -386,7 +385,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
     app.get('/mcp', routeOptions, async (request: FastifyRequest, reply: FastifyReply) => {
       if (!supportsSSE(request)) {
-        reply.type('application/json').code(405).send({ error: 'Method Not Allowed: SSE not supported' })
+        reply.header('Allow', 'GET, POST, DELETE').type('application/json').code(405).send({ error: 'Method Not Allowed: SSE not supported' })
         return
       }
 
@@ -419,11 +418,11 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
           if (existingSession) {
             session = existingSession
           } else {
-            session = await createSSESession()
+            session = await createSession()
             raw.setHeader('Mcp-Session-Id', session.id)
           }
         } else {
-          session = await createSSESession()
+          session = await createSession()
           raw.setHeader('Mcp-Session-Id', session.id)
         }
 
@@ -521,7 +520,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
   }
 
   // DELETE endpoint for explicit session termination (MCP spec)
-  if (enableSSE) {
+  {
     const schema = resolveMcpRouteSchema(undefined, {
       routeId: 'mcp.delete',
       method: 'DELETE',
