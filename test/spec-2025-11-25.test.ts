@@ -80,7 +80,8 @@ describe('JSON Schema 2020-12 dialect (SEP-1613)', () => {
   test('an author-supplied $schema is left alone', async (t: TestContext) => {
     const app = Fastify({ logger: false })
     t.after(() => app.close())
-    await app.register(mcpPlugin)
+    // A non-2020-12 dialect is refused at registration unless validation is opted out
+    await app.register(mcpPlugin, { validateJsonSchemaInputs: false })
     app.mcpAddTool({
       name: 'x',
       description: 'x',

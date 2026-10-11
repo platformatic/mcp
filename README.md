@@ -604,7 +604,7 @@ TypeBox validation provides structured error messages:
 The plugin maintains backward compatibility with JSON Schema and unvalidated tools:
 
 ```typescript
-// JSON Schema (accepted, but NOT validated at runtime by default — see below)
+// Plain JSON Schema (validated at runtime with AJV — see below)
 app.mcpAddTool({
   name: 'legacy-tool',
   description: 'Uses JSON Schema',
@@ -629,26 +629,36 @@ app.mcpAddTool({
 })
 ```
 
-**Important:** only TypeBox schemas are validated at runtime by default. A tool registered with a plain JSON Schema `inputSchema` receives its arguments **unvalidated** unless you opt in to AJV validation.
+Both TypeBox and plain JSON Schema inputs are validated at runtime by default. Only tools registered without an `inputSchema` receive their arguments unvalidated.
 
 ### Validating plain JSON Schema inputs with AJV
 
-Set `validateJsonSchemaInputs: {}` to validate plain-JSON-Schema tool inputs with [AJV](https://ajv.js.org/) (draft 2020-12, matching the plugin's published schema dialect) before the handler runs. TypeBox tools are unaffected — they keep their existing TypeBox validation.
+Tools with a plain JSON Schema `inputSchema` have their arguments validated with [AJV](https://ajv.js.org/) (draft 2020-12, matching the plugin's published schema dialect) before the handler runs. TypeBox tools are unaffected — they keep their existing TypeBox validation.
+
+Pass AJV options through `validateJsonSchemaInputs` to customize the validator:
 
 ```typescript
 await app.register(mcpPlugin, {
   validateJsonSchemaInputs: {
-    allErrors: true,
-    useDefaults: false
+    allErrors: true
   }
 })
 ```
 
-Behavior when enabled:
+Set `validateJsonSchemaInputs: false` to turn plain JSON Schema validation off. Arguments then reach the handler unchecked, so the handler must validate them itself:
+
+```typescript
+await app.register(mcpPlugin, {
+  validateJsonSchemaInputs: false
+})
+```
+
+Behavior when enabled (the default):
 
 - Invalid arguments return a tool execution error (`isError: true` with an `Invalid tool arguments: ...` message, capped at 5 reported errors), not a protocol error — the same SEP-1303 semantics as TypeBox validation.
-- Validation is non-mutating: no type coercion, no defaults injection, no property removal. Handlers receive the arguments exactly as the client sent them. `format` keywords are annotation-only (JSON Schema 2020-12's own default).
+- Validation is non-mutating: no type coercion, no defaults injection, no property removal. Handlers receive the arguments exactly as the client sent them. `format` keywords are annotation-only (JSON Schema 2020-12's own default). Pass AJV options such as `coerceTypes`, `useDefaults` or `removeAdditional` explicitly if you want AJV to rewrite arguments.
 - A plain JSON Schema that AJV cannot compile makes `mcpAddTool` throw, so a misconfigured tool fails at startup instead of running unvalidated.
+- A plain JSON Schema whose `$schema` declares a dialect other than JSON Schema 2020-12 (for example `http://json-schema.org/draft-07/schema#`) also makes `mcpAddTool` throw. Omit `$schema`, migrate the schema to 2020-12, or set `validateJsonSchemaInputs: false`.
 - Compiled validators are cached per schema, and the option also applies to stdio transports and task-augmented (`task: {}`) calls.
 
 ### Performance

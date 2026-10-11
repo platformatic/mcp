@@ -334,11 +334,12 @@ export interface MCPPluginOptions {
    */
   transformRouteSchema?: MCPRouteSchemaTransformer
   /**
-   * Validate plain JSON Schema tool inputs using AJV.
-   * Omit this option to disable validation, or provide an object to enable it.
-   * Options override the default Fastify-compatible AJV configuration.
+   * Plain JSON Schema tool inputs are validated with AJV (JSON Schema 2020-12)
+   * by default. Provide an object to customize AJV: options override the
+   * default non-mutating configuration (no coercion, no defaults injection,
+   * no property removal). Set to `false` to disable validation.
    */
-  validateJsonSchemaInputs?: Options
+  validateJsonSchemaInputs?: Options | false
   sessionStore?: 'memory' | 'redis'
   messageBroker?: 'memory' | 'redis'
   redis?: {
