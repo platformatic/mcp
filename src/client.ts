@@ -3,13 +3,23 @@ import createFastifyError from 'fastify-error'
 import type {
   Implementation,
   JSONRPCNotification,
+  Tool,
   JSONRPCRequest,
   JSONRPCResponse
 } from './schema.ts'
 import {
   JSONRPC_VERSION,
-  LATEST_PROTOCOL_VERSION
+  LATEST_LEGACY_PROTOCOL_VERSION,
+  MODERN_PROTOCOL_VERSIONS
 } from './schema.ts'
+import {
+  META_CLIENT_CAPABILITIES,
+  META_CLIENT_INFO,
+  META_PROTOCOL_VERSION,
+  TASKS_EXTENSION
+} from './schema-2026.ts'
+import { collectHeaderParams, encodeHeaderValue, expectedNameFor } from './modern/headers.ts'
+import type { InputResponses } from './schema-2026.ts'
 
 const DEFAULT_ENDPOINT = '/mcp'
 const DEFAULT_STARTING_REQUEST_ID = 1
@@ -55,12 +65,30 @@ const InvalidMcpErrorCodeError = createFastifyError(
   'MCP_ERR_INVALID_ERROR_CODE',
   'Expected error.code to be a number'
 )
+const UnrecognizedResultTypeError = createFastifyError(
+  'MCP_ERR_UNRECOGNIZED_RESULT_TYPE',
+  "Unrecognized resultType '%s'; a result whose resultType is not understood is invalid"
+)
+const MissingStreamResponseError = createFastifyError(
+  'MCP_ERR_MISSING_STREAM_RESPONSE',
+  'The response stream ended without a JSON-RPC response (status %s)'
+)
+/** The `resultType` values this client understands: core plus the tasks extension. */
+const KNOWN_RESULT_TYPES = new Set(['complete', 'input_required', 'task'])
+const ModernInitializeError = createFastifyError(
+  'MCP_ERR_MODERN_INITIALIZE',
+  "Protocol version '%s' is stateless and does not support initialize; call methods directly or use discover()"
+)
 
 export interface McpClientOptions {
   endpoint?: string
   headers?: Record<string, string>
   protocolVersion?: string | null
   startingRequestId?: number
+  /** Identity sent in modern per-request metadata. */
+  clientInfo?: Implementation
+  /** Capabilities sent in modern per-request metadata. */
+  clientCapabilities?: Record<string, unknown>
 }
 
 export interface McpClientRequestOptions {
@@ -69,11 +97,29 @@ export interface McpClientRequestOptions {
   id?: string | number
 }
 
+export interface McpClientCallToolOptions extends McpClientRequestOptions {
+  /** Opaque state returned by a modern input_required result. */
+  requestState?: string
+  /** Client answers supplied when retrying a modern multi round-trip call. */
+  inputResponses?: InputResponses
+  /**
+   * Extra `_meta` for the request, such as a `progressToken` or
+   * `io.modelcontextprotocol/logLevel`. The protocol fields are always set by
+   * the client and cannot be overridden here.
+   */
+  meta?: Record<string, unknown>
+}
+
 export interface McpClientResponse<TBody = JSONRPCResponse> {
   statusCode: number
   headers: Record<string, string | string[] | undefined>
   body: TBody
   payload: string
+  /**
+   * Notifications the server sent on the response stream before the final
+   * response (2026-07-28 progress and log messages). Empty for a JSON response.
+   */
+  notifications: JSONRPCNotification[]
 }
 
 export interface McpClientInitializeOptions {
@@ -92,6 +138,8 @@ export interface McpClient {
 
   initialize(options?: McpClientInitializeOptions): Promise<McpClientResponse>
 
+  discover(options?: McpClientRequestOptions): Promise<McpClientResponse>
+
   listTools(options?: McpClientRequestOptions & {
     cursor?: string
   }): Promise<McpClientResponse>
@@ -99,7 +147,7 @@ export interface McpClient {
   callTool(
     name: string,
     args?: Record<string, unknown>,
-    options?: McpClientRequestOptions
+    options?: McpClientCallToolOptions
   ): Promise<McpClientResponse>
 }
 
@@ -114,6 +162,37 @@ function truncateForError (payload: string): string {
   }
 
   return `${payload.slice(0, JSON_PARSE_ERROR_PAYLOAD_LIMIT)}... [truncated ${payload.length - JSON_PARSE_ERROR_PAYLOAD_LIMIT} chars]`
+}
+
+/**
+ * Split an SSE response into the notifications sent before the response and
+ * the final JSON-RPC response itself.
+ */
+function parseEventStream (
+  payload: string,
+  statusCode: number,
+  requestId: unknown
+): { body: unknown, notifications: JSONRPCNotification[] } {
+  const notifications: JSONRPCNotification[] = []
+  let body: unknown
+  // SSE lines may end in CRLF, LF or CR; events end at a blank line.
+  for (const frame of payload.replace(/\r\n?/g, '\n').split('\n\n')) {
+    const data = frame.split('\n')
+      .filter(line => line.startsWith('data:'))
+      // The field value starts after the colon and at most one space.
+      .map(line => line.slice(line.startsWith('data: ') ? 6 : 5))
+      .join('\n')
+    if (!data) continue
+    const message = parseJsonBody(data, statusCode)
+    if (isRecord(message) && hasOwn(message, 'id') && (hasOwn(message, 'result') || hasOwn(message, 'error'))) {
+      // Only the response to this request ends it.
+      if (message.id === requestId) body = message
+    } else {
+      notifications.push(message as JSONRPCNotification)
+    }
+  }
+  if (body === undefined) throw new MissingStreamResponseError(statusCode)
+  return { body, notifications }
 }
 
 function parseJsonBody (payload: string, statusCode: number): unknown {
@@ -269,14 +348,65 @@ function getPayloadProtocolVersion (
   requestProtocolVersion: string | null | undefined
 ): string {
   if (requestProtocolVersion === undefined) {
-    return configuredProtocolVersion ?? LATEST_PROTOCOL_VERSION
+    return configuredProtocolVersion ?? LATEST_LEGACY_PROTOCOL_VERSION
   }
 
   if (requestProtocolVersion === null) {
-    return LATEST_PROTOCOL_VERSION
+    return LATEST_LEGACY_PROTOCOL_VERSION
   }
 
   return requestProtocolVersion
+}
+
+function isModernProtocolVersion (protocolVersion: string | null): protocolVersion is string {
+  return protocolVersion !== null &&
+    (MODERN_PROTOCOL_VERSIONS as readonly string[]).includes(protocolVersion)
+}
+
+function valueAtPath (root: unknown, path: string[]): unknown {
+  let current = root
+  for (const segment of path) {
+    if (!isRecord(current) || Array.isArray(current)) return undefined
+    current = current[segment]
+  }
+  return current
+}
+
+function toolParamHeaders (inputSchema: unknown, args: Record<string, unknown>): Record<string, string> {
+  const collected = collectHeaderParams(inputSchema)
+  if (!collected.ok) return {}
+
+  const headers: Record<string, string> = {}
+  for (const [name, path] of collected.params) {
+    const value = valueAtPath(args, path)
+    if (value !== undefined && value !== null) {
+      headers[`mcp-param-${name}`] = encodeHeaderValue(String(value))
+    }
+  }
+  return headers
+}
+
+function withModernMetadata (
+  request: JSONRPCRequest | JSONRPCNotification,
+  protocolVersion: string,
+  clientInfo: Implementation,
+  clientCapabilities: Record<string, unknown>
+): JSONRPCRequest | JSONRPCNotification {
+  const params = isRecord(request.params) ? request.params : {}
+  const currentMeta = isRecord(params._meta) ? params._meta : {}
+
+  return {
+    ...request,
+    params: {
+      ...params,
+      _meta: {
+        ...currentMeta,
+        [META_PROTOCOL_VERSION]: protocolVersion,
+        [META_CLIENT_INFO]: clientInfo,
+        [META_CLIENT_CAPABILITIES]: clientCapabilities
+      }
+    }
+  }
 }
 
 export function createMcpClient (
@@ -287,8 +417,11 @@ export function createMcpClient (
   const clientHeaders = options.headers ?? {}
   const configuredProtocolVersion =
     options.protocolVersion === undefined
-      ? LATEST_PROTOCOL_VERSION
+      ? LATEST_LEGACY_PROTOCOL_VERSION
       : options.protocolVersion
+  const clientInfo = options.clientInfo ?? DEFAULT_CLIENT_INFO
+  const clientCapabilities = options.clientCapabilities ?? {}
+  const toolSchemas = new Map<string, unknown>()
   let nextRequestId = options.startingRequestId ?? DEFAULT_STARTING_REQUEST_ID
   let storedSessionId: string | undefined
   let negotiatedProtocolVersion = configuredProtocolVersion
@@ -301,6 +434,63 @@ export function createMcpClient (
     const generatedId = nextRequestId
     nextRequestId += 1
     return generatedId
+  }
+
+  function effectiveProtocolVersion (requestOptions?: McpClientRequestOptions): string | null {
+    return requestOptions?.protocolVersion === undefined
+      ? negotiatedProtocolVersion
+      : requestOptions.protocolVersion
+  }
+
+  function filterAndRememberToolSchemas (
+    response: McpClientResponse,
+    rejectInvalidHeaderAnnotations: boolean
+  ): McpClientResponse {
+    if (!('result' in response.body) || !isRecord(response.body.result)) return response
+    const tools = response.body.result.tools
+    if (!Array.isArray(tools)) return response
+
+    const accepted: Tool[] = []
+    for (const entry of tools as Tool[]) {
+      if (typeof entry?.name !== 'string' || !('inputSchema' in entry)) {
+        accepted.push(entry)
+        continue
+      }
+
+      const annotations = collectHeaderParams(entry.inputSchema)
+      if (rejectInvalidHeaderAnnotations && !annotations.ok) {
+        // Streamable HTTP clients MUST exclude malformed x-mcp-header tools.
+        // Also forget an earlier valid schema with the same name so a stale
+        // cache cannot keep generating headers for a now-invalid definition.
+        toolSchemas.delete(entry.name)
+        continue
+      }
+
+      toolSchemas.set(entry.name, entry.inputSchema)
+      accepted.push(entry)
+    }
+
+    if (accepted.length === tools.length) return response
+
+    const body = {
+      ...response.body,
+      result: {
+        ...response.body.result,
+        tools: accepted
+      }
+    } as JSONRPCResponse
+
+    const payload = JSON.stringify(body)
+    const headers = { ...response.headers }
+    // The client changed the representation, so origin validators and digests
+    // no longer describe what callers receive. Length can be recomputed; the
+    // others must be dropped rather than left stale.
+    headers['content-length'] = String(Buffer.byteLength(payload))
+    for (const name of ['etag', 'content-md5', 'digest', 'content-digest', 'content-encoding']) {
+      delete headers[name]
+    }
+
+    return { ...response, headers, body, payload }
   }
 
   function send (
@@ -316,20 +506,28 @@ export function createMcpClient (
     requestOptions?: SendOptions
   ): Promise<McpClientResponse<JSONRPCResponse | undefined>> {
     const expectJsonResponse = requestOptions?.expectJsonResponse ?? true
-    const effectiveProtocolVersion =
-      requestOptions?.protocolVersion === undefined
-        ? negotiatedProtocolVersion
-        : requestOptions.protocolVersion
+    const requestProtocolVersion = effectiveProtocolVersion(requestOptions)
     const effectiveSessionId =
       requestOptions?.sessionId === undefined
         ? storedSessionId
         : requestOptions.sessionId
 
+    const modern = isModernProtocolVersion(requestProtocolVersion)
+    const payloadRequest = modern
+      ? withModernMetadata(request, requestProtocolVersion, clientInfo, clientCapabilities)
+      : request
+
     const generatedHeaders: Record<string, string> = {}
-    if (effectiveProtocolVersion !== null) {
-      generatedHeaders['mcp-protocol-version'] = effectiveProtocolVersion
+    if (requestProtocolVersion !== null) {
+      generatedHeaders['mcp-protocol-version'] = requestProtocolVersion
     }
-    if (effectiveSessionId !== null && effectiveSessionId !== undefined) {
+    if (modern) {
+      generatedHeaders['mcp-method'] = request.method
+      const name = expectedNameFor(request.method, request.params)
+      if (name !== undefined) {
+        generatedHeaders['mcp-name'] = encodeHeaderValue(name)
+      }
+    } else if (effectiveSessionId !== null && effectiveSessionId !== undefined) {
       generatedHeaders['mcp-session-id'] = effectiveSessionId
     }
 
@@ -345,22 +543,40 @@ export function createMcpClient (
       method: 'POST',
       url: endpoint,
       headers,
-      payload: request
+      payload: payloadRequest
     })
 
     const payload = response.body
     let body: JSONRPCResponse | undefined
+    let notifications: JSONRPCNotification[] = []
     if (expectJsonResponse) {
-      const parsedBody = parseJsonBody(payload, response.statusCode)
-      assertMcpResponse(parsedBody)
-      body = parsedBody
+      // A request may be answered with either JSON or an SSE stream, and a
+      // client must accept both.
+      const streamed = String(response.headers['content-type'] ?? '').startsWith('text/event-stream')
+      const parsed = streamed
+        ? parseEventStream(payload, response.statusCode, (request as { id?: unknown }).id)
+        : { body: parseJsonBody(payload, response.statusCode), notifications: [] }
+      assertMcpResponse(parsed.body)
+      body = parsed.body
+      notifications = parsed.notifications
+
+      // An absent resultType means "complete". `task` is only meaningful to a
+      // client that declared the tasks extension; anything else is invalid.
+      const resultType = (body as { result?: { resultType?: unknown } }).result?.resultType
+      if (modern && 'result' in body && resultType !== undefined) {
+        const tasksDeclared = isRecord(clientCapabilities.extensions) &&
+          hasOwn(clientCapabilities.extensions, TASKS_EXTENSION)
+        const known = KNOWN_RESULT_TYPES.has(resultType as string) && (resultType !== 'task' || tasksDeclared)
+        if (!known) throw new UnrecognizedResultTypeError(String(resultType))
+      }
     }
 
     return {
       statusCode: response.statusCode,
       headers: normalizeResponseHeaders(response.headers as Record<string, unknown>),
       body,
-      payload
+      payload,
+      notifications
     }
   }
 
@@ -370,12 +586,15 @@ export function createMcpClient (
     },
 
     async initialize (initOptions?: McpClientInitializeOptions): Promise<McpClientResponse> {
-      const id = getRequestId(initOptions?.id)
       const payloadProtocolVersion = getPayloadProtocolVersion(
         configuredProtocolVersion,
         initOptions?.protocolVersion
       )
+      if (isModernProtocolVersion(payloadProtocolVersion)) {
+        throw new ModernInitializeError(payloadProtocolVersion)
+      }
 
+      const id = getRequestId(initOptions?.id)
       const request: JSONRPCRequest = {
         jsonrpc: JSONRPC_VERSION,
         id,
@@ -404,7 +623,7 @@ export function createMcpClient (
       const candidateProtocolVersion =
         typeof responseProtocolVersion === 'string'
           ? responseProtocolVersion
-          : configuredProtocolVersion
+          : payloadProtocolVersion
 
       const initializedResponse = await send(
         {
@@ -430,6 +649,15 @@ export function createMcpClient (
       return response
     },
 
+    async discover (requestOptions?: McpClientRequestOptions): Promise<McpClientResponse> {
+      const id = getRequestId(requestOptions?.id)
+      return await send({
+        jsonrpc: JSONRPC_VERSION,
+        id,
+        method: 'server/discover'
+      }, requestOptions)
+    },
+
     async listTools (requestOptions?: McpClientRequestOptions & { cursor?: string }): Promise<McpClientResponse> {
       const id = getRequestId(requestOptions?.id)
 
@@ -440,15 +668,25 @@ export function createMcpClient (
         ...(requestOptions?.cursor === undefined ? {} : { params: { cursor: requestOptions.cursor } })
       }
 
-      return await send(request, requestOptions)
+      const response = await send(request, requestOptions)
+      return filterAndRememberToolSchemas(
+        response,
+        isModernProtocolVersion(effectiveProtocolVersion(requestOptions))
+      )
     },
 
     async callTool (
       name: string,
       args: Record<string, unknown> = {},
-      requestOptions?: McpClientRequestOptions
+      requestOptions?: McpClientCallToolOptions
     ): Promise<McpClientResponse> {
       const id = getRequestId(requestOptions?.id)
+      const {
+        requestState,
+        inputResponses,
+        meta,
+        ...baseRequestOptions
+      } = requestOptions ?? {}
 
       const request: JSONRPCRequest = {
         jsonrpc: JSONRPC_VERSION,
@@ -456,11 +694,25 @@ export function createMcpClient (
         method: 'tools/call',
         params: {
           name,
-          arguments: args
+          arguments: args,
+          ...(requestState === undefined ? {} : { requestState }),
+          ...(inputResponses === undefined ? {} : { inputResponses }),
+          ...(meta === undefined ? {} : { _meta: meta })
         }
       }
 
-      return await send(request, requestOptions)
+      const schema = toolSchemas.get(name)
+      const generatedHeaders = isModernProtocolVersion(effectiveProtocolVersion(requestOptions)) && schema !== undefined
+        ? toolParamHeaders(schema, args)
+        : {}
+
+      return await send(request, {
+        ...baseRequestOptions,
+        headers: {
+          ...generatedHeaders,
+          ...(requestOptions?.headers ?? {})
+        }
+      })
     }
   }
 }

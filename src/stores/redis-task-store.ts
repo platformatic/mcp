@@ -1,10 +1,66 @@
 import type { Redis } from 'ioredis'
 import type { TaskStatus } from '../schema.ts'
-import type { TaskStore, TaskRecord, TaskOutcome } from './task-store.ts'
-import { canTransition, isTerminal, taskHasExpired } from './task-store.ts'
+import type { TaskStore, TaskRecord, TaskUpdateOptions, TaskInputUpdate, TaskOutcome } from './task-store.ts'
+import { applyInputRequestUpdates, canTransition, isTerminal } from './task-store.ts'
 
-const TASK_KEY_PREFIX = 'mcp:task:'
-const TASK_INDEX_KEY = 'mcp:tasks'
+// Versioned: records here store opaque fields as JSON strings, which earlier
+// releases cannot read. A separate keyspace keeps old and new instances from
+// misreading each other's tasks during a rolling deploy or a rollback.
+const TASK_KEY_PREFIX = 'mcp:task:v2:'
+const TASK_INDEX_KEY = 'mcp:tasks:v2'
+const CLEANUP_BATCH = 500
+
+/**
+ * Lua's cjson cannot round-trip arbitrary JSON: it turns empty arrays into
+ * objects and keeps only 14 significant digits. The scripts below rewrite
+ * records in place, so every field carrying tool or client data is stored as a
+ * JSON string they pass through without decoding.
+ */
+function encodeOpaqueMap (map: Record<string, unknown> | undefined): Record<string, string> | undefined {
+  if (map === undefined) return undefined
+  return Object.fromEntries(Object.entries(map).map(([key, value]) => [key, JSON.stringify(value)]))
+}
+
+function decodeOpaqueMap (map: unknown): Record<string, unknown> | undefined {
+  if (!map || typeof map !== 'object' || Array.isArray(map)) return undefined
+  return Object.fromEntries(Object.entries(map).map(([key, value]) =>
+    [key, typeof value === 'string' ? JSON.parse(value) : value]
+  ))
+}
+
+/**
+ * Replace lone UTF-16 surrogates, which JSON.stringify escapes as `\udXXX`
+ * and Lua's cjson then refuses to decode, failing every script on the record.
+ */
+function toWellFormed (value: string): string {
+  return value.toWellFormed()
+}
+
+function encodeTask (task: TaskRecord): string {
+  return JSON.stringify({
+    ...task,
+    ...(task.statusMessage !== undefined ? { statusMessage: toWellFormed(task.statusMessage) } : {}),
+    ...(task.authSubject !== undefined ? { authSubject: toWellFormed(task.authSubject) } : {}),
+    outcome: task.outcome === undefined ? undefined : JSON.stringify(task.outcome),
+    inputRequests: encodeOpaqueMap(task.inputRequests),
+    pendingInputResponses: encodeOpaqueMap(task.pendingInputResponses)
+  })
+}
+
+function decodeTask (raw: string): TaskRecord {
+  return fromStored(JSON.parse(raw))
+}
+
+function fromStored (stored: any): TaskRecord {
+  const task: TaskRecord = { ...stored }
+  // Records written before this encoding hold the outcome as an object.
+  if (typeof stored.outcome === 'string') task.outcome = JSON.parse(stored.outcome)
+  if (stored.inputRequests !== undefined) task.inputRequests = decodeOpaqueMap(stored.inputRequests)
+  if (stored.pendingInputResponses !== undefined) {
+    task.pendingInputResponses = decodeOpaqueMap(stored.pendingInputResponses)
+  }
+  return task
+}
 
 /**
  * Redis-backed task store, so tasks created on one instance can be polled from
@@ -35,9 +91,9 @@ export class RedisTaskStore implements TaskStore {
     // memory store), so write the key without an expiry rather than falling back
     // to the default and silently expiring it.
     if (task.ttl === null) {
-      await this.redis.set(key, JSON.stringify(task))
+      await this.redis.set(key, encodeTask(task))
     } else {
-      await this.redis.set(key, JSON.stringify(task), 'EX', this.expirySeconds(task))
+      await this.redis.set(key, encodeTask(task), 'EX', this.expirySeconds(task))
     }
     // Index membership lets `list` enumerate without a keyspace scan; stale ids
     // are pruned on read, since the task keys expire independently.
@@ -53,22 +109,21 @@ export class RedisTaskStore implements TaskStore {
 
     let task: TaskRecord
     try {
-      task = JSON.parse(raw)
+      task = decodeTask(raw)
     } catch {
       return null
     }
 
-    if (taskHasExpired(task)) {
-      await this.delete(taskId)
-      return null
-    }
+    // Retention is the key's own expiry (SET … EX), timed by Redis. Judging it
+    // again by this instance's clock would let one instance whose clock runs
+    // ahead delete tasks that are still running, for every instance.
     return task
   }
 
   async updateStatus (
     taskId: string,
     status: TaskStatus,
-    options: { statusMessage?: string, outcome?: TaskOutcome } = {}
+    options: TaskUpdateOptions = {}
   ): Promise<TaskRecord | null> {
     const task = await this.get(taskId)
     if (!task) return null
@@ -87,18 +142,25 @@ export class RedisTaskStore implements TaskStore {
       status,
       lastUpdatedAt: new Date().toISOString()
     }
-    if (options.statusMessage !== undefined) {
+    if (options.statusMessage === null) {
+      delete updated.statusMessage
+    } else if (options.statusMessage !== undefined) {
       updated.statusMessage = options.statusMessage
     }
     if (options.outcome !== undefined) {
       updated.outcome = options.outcome
     }
+    applyInputRequestUpdates(updated, options)
 
     // The read above and this write are two round trips, so a concurrent write
     // can slip between them. Re-check the stored status atomically in Lua and
-    // refuse if it has since become terminal, so a cancel and a completion
-    // racing on the same task cannot overwrite each other — the spec requires a
-    // cancelled task to stay cancelled. KEEPTTL preserves retention-from-creation.
+    // merge input/outbox bookkeeping from the current record when this status
+    // update did not explicitly replace it. That prevents task execution from
+    // clobbering a concurrent tasks/update. KEEPTTL preserves retention.
+    const preserveInputRequests = options.inputRequests === undefined &&
+      !options.clearAnsweredInputKeys &&
+      !options.answeredInputKeys?.length
+    const preservePendingResponses = !options.clearPendingInputResponses
     const result = await this.redis.eval(
       `local raw = redis.call('GET', KEYS[1])
        if not raw then return false end
@@ -106,19 +168,207 @@ export class RedisTaskStore implements TaskStore {
        if not ok then return false end
        local s = cur.status
        if s == 'completed' or s == 'failed' or s == 'cancelled' then return s end
-       redis.call('SET', KEYS[1], ARGV[1], 'KEEPTTL')
-       return 'OK'`,
+
+       local proposed = cjson.decode(ARGV[1])
+       if ARGV[2] == '1' then
+         proposed.inputRequests = cur.inputRequests
+         proposed.answeredInputKeys = cur.answeredInputKeys
+         proposed.inputRequestRound = cur.inputRequestRound
+       end
+       if ARGV[3] == '1' then
+         proposed.pendingInputResponses = cur.pendingInputResponses
+         proposed.pendingInputResponseIds = cur.pendingInputResponseIds
+         proposed.pendingInputResponseRounds = cur.pendingInputResponseRounds
+       end
+       if ARGV[4] == '1' then
+         proposed.inputRequestRound = (cur.inputRequestRound or 0) + 1
+       end
+
+       local encoded = cjson.encode(proposed)
+       redis.call('SET', KEYS[1], encoded, 'KEEPTTL')
+       return encoded`,
       1,
       this.key(taskId),
-      JSON.stringify(updated)
+      encodeTask(updated),
+      preserveInputRequests ? '1' : '0',
+      preservePendingResponses ? '1' : '0',
+      options.incrementInputRequestRound ? '1' : '0'
     )
 
     if (result === null) return null
-    if (result !== 'OK') {
-      // A terminal status was written concurrently; `result` is that status
+    if (result === 'completed' || result === 'failed' || result === 'cancelled') {
+      // A terminal status was written concurrently; `result` is that status.
       throw new Error(`Task ${taskId} is already in terminal status '${result}'`)
     }
-    return updated
+    if (typeof result !== 'string') return null
+    return decodeTask(result)
+  }
+
+  async updateInputResponses (
+    taskId: string,
+    responses: Record<string, unknown>,
+    responseId: string
+  ): Promise<TaskInputUpdate | null> {
+    const result = await this.redis.eval(
+      `local raw = redis.call('GET', KEYS[1])
+       if not raw then return nil end
+       local ok, task = pcall(cjson.decode, raw)
+       if not ok then return nil end
+
+       local submitted = cjson.decode(ARGV[1])
+       local outstanding = task.inputRequests or {}
+       local pending = task.pendingInputResponses or {}
+       local pendingIds = task.pendingInputResponseIds or {}
+       local pendingRounds = task.pendingInputResponseRounds or {}
+       local currentRound = task.inputRequestRound or 0
+       local answered = task.answeredInputKeys or {}
+       local answeredSet = {}
+       for _, key in ipairs(answered) do answeredSet[key] = true end
+
+       local terminal = task.status == 'completed' or task.status == 'failed' or task.status == 'cancelled'
+       local deliverable = {}
+       local responseIds = {}
+       local changed = false
+
+       for key, value in pairs(submitted) do
+         if pending[key] ~= nil and (pendingRounds[key] == nil or pendingRounds[key] == currentRound) then
+           deliverable[key] = pending[key]
+           responseIds[key] = pendingIds[key] or ARGV[3]
+         elseif not terminal and outstanding[key] ~= nil and not answeredSet[key] then
+           deliverable[key] = value
+           responseIds[key] = ARGV[3]
+           pending[key] = value
+           pendingIds[key] = ARGV[3]
+           pendingRounds[key] = currentRound
+           outstanding[key] = nil
+           answeredSet[key] = true
+           table.insert(answered, key)
+           changed = true
+         end
+       end
+
+       if changed then
+         if next(outstanding) == nil then
+           task.inputRequests = nil
+           -- Fully answered: stop reporting input_required with nothing to ask.
+           if task.status == 'input_required' then
+             task.status = 'working'
+             task.statusMessage = nil
+           end
+         else
+           task.inputRequests = outstanding
+         end
+         task.answeredInputKeys = answered
+         task.pendingInputResponses = pending
+         task.pendingInputResponseIds = pendingIds
+         task.pendingInputResponseRounds = pendingRounds
+         task.lastUpdatedAt = ARGV[2]
+         redis.call('SET', KEYS[1], cjson.encode(task), 'KEEPTTL')
+       end
+
+       return cjson.encode({ task = task, responses = deliverable, responseIds = responseIds })`,
+      1,
+      this.key(taskId),
+      JSON.stringify(encodeOpaqueMap(responses)),
+      new Date().toISOString(),
+      responseId
+    )
+
+    if (typeof result !== 'string') return null
+    const parsed = JSON.parse(result) as {
+      task: unknown
+      responses: Record<string, string> | unknown[]
+      responseIds: Record<string, string> | unknown[]
+    }
+    return {
+      task: fromStored(parsed.task),
+      responses: decodeOpaqueMap(parsed.responses) ?? {},
+      responseIds: Array.isArray(parsed.responseIds) ? {} : parsed.responseIds
+    }
+  }
+
+  // Leases are timed by Redis's own clock (TIME), so instances whose clocks
+  // disagree still agree on whether a worker is alive.
+
+  async renewLease (taskId: string, leaseMs: number): Promise<TaskStatus | null> {
+    const result = await this.redis.eval(
+      `local raw = redis.call('GET', KEYS[1])
+       if not raw then return false end
+       local ok, task = pcall(cjson.decode, raw)
+       if not ok then return false end
+       local s = task.status
+       if s == 'completed' or s == 'failed' or s == 'cancelled' then return s end
+       local now = redis.call('TIME')
+       task.leaseExpiresAt = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000) + tonumber(ARGV[1])
+       redis.call('SET', KEYS[1], cjson.encode(task), 'KEEPTTL')
+       return s`,
+      1,
+      this.key(taskId),
+      String(leaseMs)
+    )
+    return typeof result === 'string' ? result as TaskStatus : null
+  }
+
+  async expireStaleLease (taskId: string, statusMessage: string, outcome: TaskOutcome): Promise<TaskRecord | null> {
+    const result = await this.redis.eval(
+      `local raw = redis.call('GET', KEYS[1])
+       if not raw then return false end
+       local ok, task = pcall(cjson.decode, raw)
+       if not ok then return false end
+       local s = task.status
+       if s == 'completed' or s == 'failed' or s == 'cancelled' then return false end
+       if type(task.leaseExpiresAt) ~= 'number' then return false end
+       local now = redis.call('TIME')
+       local nowMs = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
+       if nowMs <= task.leaseExpiresAt then return false end
+       task.status = 'failed'
+       task.statusMessage = ARGV[1]
+       task.outcome = ARGV[2]
+       task.lastUpdatedAt = ARGV[3]
+       task.inputRequests = nil
+       task.pendingInputResponses = nil
+       task.pendingInputResponseIds = nil
+       task.pendingInputResponseRounds = nil
+       local encoded = cjson.encode(task)
+       redis.call('SET', KEYS[1], encoded, 'KEEPTTL')
+       return encoded`,
+      1,
+      this.key(taskId),
+      toWellFormed(statusMessage),
+      JSON.stringify(outcome),
+      new Date().toISOString()
+    )
+    return typeof result === 'string' ? decodeTask(result) : null
+  }
+
+  async acknowledgeInputResponses (taskId: string, responseIds: Record<string, string>): Promise<void> {
+    if (Object.keys(responseIds).length === 0) return
+
+    await this.redis.eval(
+      `local raw = redis.call('GET', KEYS[1])
+       if not raw then return 0 end
+       local ok, task = pcall(cjson.decode, raw)
+       if not ok or not task.pendingInputResponses then return 0 end
+
+       local acknowledgements = cjson.decode(ARGV[1])
+       for key, deliveryId in pairs(acknowledgements) do
+         if task.pendingInputResponseIds and task.pendingInputResponseIds[key] == deliveryId then
+           task.pendingInputResponses[key] = nil
+           task.pendingInputResponseIds[key] = nil
+           if task.pendingInputResponseRounds then task.pendingInputResponseRounds[key] = nil end
+         end
+       end
+       if next(task.pendingInputResponses) == nil then
+         task.pendingInputResponses = nil
+         task.pendingInputResponseIds = nil
+         task.pendingInputResponseRounds = nil
+       end
+       redis.call('SET', KEYS[1], cjson.encode(task), 'KEEPTTL')
+       return 1`,
+      1,
+      this.key(taskId),
+      JSON.stringify(responseIds)
+    )
   }
 
   async list (authSubject?: string): Promise<TaskRecord[]> {
@@ -143,11 +393,16 @@ export class RedisTaskStore implements TaskStore {
   async cleanup (): Promise<void> {
     // Task keys expire on their own; this only prunes the index of ids whose
     // task key is already gone.
+    // Check existence in pipelined batches: one round trip per batch rather
+    // than two per indexed task.
     const ids = await this.redis.zrange(TASK_INDEX_KEY, 0, -1)
-    for (const id of ids) {
-      if (await this.redis.exists(this.key(id)) === 0) {
-        await this.redis.zrem(TASK_INDEX_KEY, id)
-      }
+    for (let start = 0; start < ids.length; start += CLEANUP_BATCH) {
+      const batch = ids.slice(start, start + CLEANUP_BATCH)
+      const pipeline = this.redis.pipeline()
+      for (const id of batch) pipeline.exists(this.key(id))
+      const results = await pipeline.exec()
+      const gone = batch.filter((_, index) => results?.[index]?.[1] === 0)
+      if (gone.length > 0) await this.redis.zrem(TASK_INDEX_KEY, ...gone)
     }
   }
 }

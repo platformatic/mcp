@@ -15,6 +15,8 @@ import type {
   MCPResource,
   MCPPrompt,
   MCPPluginOptions,
+  AuthorizationContext,
+  AuthorizationContextResolver,
   SSESession,
   UnsafeToolHandler,
   UnsafeResourceHandler,
@@ -254,6 +256,16 @@ expectNotAssignable<MCPRouteSchemaTransformer>(async (schema: FastifySchema) => 
 expectNotAssignable<MCPRouteSchemaTransformer>((_schema: FastifySchema) => {
   return undefined
 })
+
+const authorizationContextResolver: AuthorizationContextResolver = async (request) => {
+  expectType<FastifyRequest>(request)
+  return { userId: 'user-1', scopes: ['tools:read'] }
+}
+expectAssignable<MCPPluginOptions>({ resolveAuthorizationContext: authorizationContextResolver })
+expectType<Promise<AuthorizationContext | undefined> | AuthorizationContext | undefined>(
+  authorizationContextResolver({} as FastifyRequest)
+)
+expectNotAssignable<AuthorizationContextResolver>(() => 'user-1')
 
 // Full options
 expectAssignable<MCPPluginOptions>({

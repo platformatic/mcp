@@ -35,6 +35,7 @@ describe('MCP plugin shutdown (Fastify integration)', () => {
 
     const app = Fastify()
     await app.register(mcpPlugin, {
+      requestStateSecret: 'test-request-state-secret-32-bytes!!',
       redis: { host: '127.0.0.1', port }
     })
     await app.ready()

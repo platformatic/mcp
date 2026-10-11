@@ -12,11 +12,15 @@ import type {
   Resource,
   Prompt,
   ElicitRequestFormParams,
-  RequestId
+  RequestId,
+  LoggingLevel
 } from './schema.ts'
 import type { Static, TSchema, TObject, TString } from '@sinclair/typebox'
 import type { AuthorizationConfig, AuthorizationContext } from './types/auth-types.ts'
 import type { AllowedOrigins } from './security.ts'
+import type { CacheHint } from './modern/handlers.ts'
+
+export type { CacheHint }
 
 // Context interface for all handler types
 export interface HandlerContext {
@@ -24,6 +28,37 @@ export interface HandlerContext {
   request: FastifyRequest
   reply: FastifyReply
   authContext?: AuthorizationContext
+  /**
+   * Answers to a previous `InputRequiredResult`, keyed the way the handler
+   * keyed its `inputRequests` (2026-07-28 multi round-trip requests). Absent on
+   * a first attempt, and always absent on the legacy path.
+   */
+  inputResponses?: Record<string, unknown>
+  /**
+   * The value the handler passed as `state` when it threw `InputRequired`,
+   * verified and unsealed. Absent unless the client is retrying.
+   */
+  requestState?: unknown
+  /**
+   * Aborts when the request is cancelled, so the handler can stop work early:
+   * a 2026-07-28 client that disconnects before the response, or the
+   * cancellation of the task the handler is running in. Never aborts on the
+   * legacy path, where a disconnect is not a cancellation.
+   */
+  signal: AbortSignal
+  /**
+   * Report progress on this request (`notifications/progress`). Only sent to
+   * a 2026-07-28 client that asked for it with a `progressToken`; `progress`
+   * must increase with each call, and smaller values are dropped. A no-op
+   * otherwise.
+   */
+  sendProgress: (progress: number, total?: number, message?: string) => void
+  /**
+   * Log a message to the client (`notifications/message`). Only sent to a
+   * 2026-07-28 client that set `io.modelcontextprotocol/logLevel`, and only at
+   * or above that level. A no-op otherwise.
+   */
+  log: (level: LoggingLevel, data: unknown, logger?: string) => void
 }
 
 // Resource subscription handler types
@@ -200,6 +235,11 @@ export interface TracerLike {
  */
 export type ToolAccessOperation = 'list' | 'call'
 
+/** Resolve an application-authenticated identity from a Fastify request. */
+export type AuthorizationContextResolver = (
+  request: FastifyRequest
+) => AuthorizationContext | undefined | Promise<AuthorizationContext | undefined>
+
 /** Per-request context handed to the `canAccessTool` hook. */
 export interface ToolAccessContext {
   authContext?: AuthorizationContext
@@ -292,6 +332,85 @@ export interface MCPPluginOptions {
    * `ttl` above this is capped, so a client cannot pin resources indefinitely.
    */
   taskMaxTtlMs?: number
+  /**
+   * Most 2026-07-28 tasks one instance runs in the background at once
+   * (default 1000). Past it, a tool that only optionally supports tasks runs
+   * synchronously, and one that requires a task is refused.
+   */
+  taskMaxConcurrent?: number
+  /**
+   * Most 2026-07-28 tasks one caller (user, client and issuer; unidentified
+   * callers share one allowance) may run on an instance at once (default 100).
+   * Past it, the same fallback as `taskMaxConcurrent` applies.
+   */
+  taskMaxPerPrincipal?: number
+  /**
+   * Most tasks the in-memory task store holds, finished ones included until
+   * their ttl (default 1000). A full store refuses new tasks rather than
+   * dropping results their owners have not read yet.
+   */
+  taskStoreMaxTasks?: number
+  /**
+   * How long a running 2026-07-28 task's worker lease lasts, in milliseconds
+   * (default 15000; renewed every third of it). When an instance dies, its
+   * tasks are reported failed this long after its last renewal.
+   */
+  taskLeaseMs?: number
+  /** Most `subscriptions/listen` streams one instance holds open (default 1000). */
+  subscriptionMaxStreams?: number
+  /**
+   * Most `subscriptions/listen` streams one caller (user, client and issuer;
+   * unidentified callers share one allowance) may hold open on an instance
+   * (default 10). Further streams are refused with HTTP 429.
+   */
+  subscriptionMaxStreamsPerPrincipal?: number
+  /** Most `resourceSubscriptions` URIs one stream may name (default 1000). */
+  subscriptionMaxResourceUris?: number
+  /**
+   * On close, how long to wait for running 2026-07-28 tasks to finish before
+   * aborting them and recording them as failed, in milliseconds (default
+   * 5000). Fastify bounds close hooks by its `pluginTimeout` (10s by default),
+   * so keep this comfortably below it.
+   */
+  taskShutdownTimeoutMs?: number
+  /**
+   * Freshness hints for the operations 2026-07-28 makes cacheable. Every
+   * cacheable result must carry `ttlMs` and `cacheScope`, so anything omitted
+   * here falls back to `{ ttlMs: 0, cacheScope: 'private' }` — immediately
+   * stale and never shared between callers, which is always safe.
+   *
+   * Raise `ttlMs` for lists that rarely change; combined with `listChanged`
+   * notifications the client gets both a cheap steady state and prompt
+   * invalidation. Only mark something `public` when the result genuinely does
+   * not vary per user, since a shared cache may serve it across access tokens.
+   */
+  caching?: {
+    discover?: CacheHint
+    toolsList?: CacheHint
+    promptsList?: CacheHint
+    resourcesList?: CacheHint
+    resourceTemplatesList?: CacheHint
+    resourcesRead?: CacheHint
+  }
+  /**
+   * Secret used to seal the `requestState` blob that carries multi round-trip
+   * context through the client. It must be shared by every instance that can
+   * serve a retry, otherwise a retry landing on another replica is rejected.
+   * Defaults to a per-process random key, which is correct for a single
+   * instance only.
+   */
+  requestStateSecret?: string
+  /** How long a sealed `requestState` stays valid. Defaults to 5 minutes. */
+  requestStateTtlMs?: number
+  /**
+   * Resolve identities established by application-owned authentication hooks.
+   * When present, this resolver is authoritative instead of the built-in OAuth
+   * token payload. It runs once per MCP POST after Fastify preHandlers.
+   *
+   * The application remains responsible for rejecting unauthenticated requests.
+   * Return a context with `userId` to bind request state and tasks to a principal.
+   */
+  resolveAuthorizationContext?: AuthorizationContextResolver
   /**
    * Origins accepted on the MCP endpoints, to prevent DNS rebinding attacks.
    * Omit to disable validation (non-browser deployments), pass `'*'` or `true`

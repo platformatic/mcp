@@ -3,12 +3,18 @@ import type { TestContext } from 'node:test'
 import assert from 'node:assert/strict'
 import Fastify, { type FastifyInstance } from 'fastify'
 import { Type } from '@sinclair/typebox'
-import mcpPlugin, { createMcpClient } from '../src/index.ts'
+import mcpPlugin, { createMcpClient, elicitForm, InputRequired } from '../src/index.ts'
 import {
   JSONRPC_VERSION,
   LATEST_PROTOCOL_VERSION,
+  LATEST_LEGACY_PROTOCOL_VERSION,
   METHOD_NOT_FOUND
 } from '../src/schema.ts'
+import {
+  META_CLIENT_CAPABILITIES,
+  META_CLIENT_INFO,
+  META_PROTOCOL_VERSION
+} from '../src/schema-2026.ts'
 
 interface CapturedRequest {
   headers: Record<string, string | string[] | undefined>
@@ -398,7 +404,7 @@ describe('MCP client', () => {
     assert.equal(request.method, 'initialize')
     assert.equal(request.id, 1)
     assert.deepEqual(request.params, {
-      protocolVersion: LATEST_PROTOCOL_VERSION,
+      protocolVersion: LATEST_LEGACY_PROTOCOL_VERSION,
       capabilities: {},
       clientInfo: {
         name: '@platformatic/mcp-client',
@@ -408,13 +414,278 @@ describe('MCP client', () => {
 
     assert.equal(capturedRequests[0].headers['content-type'], 'application/json')
     assert.equal(capturedRequests[0].headers.accept, 'application/json, text/event-stream')
-    assert.equal(capturedRequests[0].headers['mcp-protocol-version'], LATEST_PROTOCOL_VERSION)
+    assert.equal(capturedRequests[0].headers['mcp-protocol-version'], LATEST_LEGACY_PROTOCOL_VERSION)
 
     const initializedNotification = getPayload(capturedRequests[1])
     assert.equal(initializedNotification.jsonrpc, JSONRPC_VERSION)
     assert.equal(initializedNotification.method, 'notifications/initialized')
     assert.equal(initializedNotification.id, undefined)
     assert.equal(capturedRequests[1].headers.accept, 'application/json, text/event-stream')
+  })
+
+  test('modern clients send per-request metadata and routing headers without a session', async (t) => {
+    const { app, capturedRequests } = await createTestApp(t)
+    const client = createMcpClient(app, {
+      protocolVersion: LATEST_PROTOCOL_VERSION,
+      clientInfo: { name: 'modern-test-client', version: '2.0.0' },
+      clientCapabilities: { sampling: {} }
+    })
+
+    await assert.rejects(
+      () => client.initialize(),
+      (error: unknown) => {
+        assert.ok(error instanceof Error)
+        assert.equal((error as { code?: string }).code, 'MCP_ERR_MODERN_INITIALIZE')
+        return true
+      }
+    )
+
+    const discover = await client.discover()
+    const listed = await client.listTools()
+    const called = await client.callTool('echo', { message: 'modern' })
+
+    assert.equal(discover.statusCode, 200)
+    assert.equal(listed.statusCode, 200)
+    assert.equal(called.statusCode, 200)
+    assert.equal(client.sessionId, undefined)
+    assert.equal(capturedRequests.length, 3)
+
+    for (const captured of capturedRequests) {
+      assert.equal(captured.headers['mcp-protocol-version'], LATEST_PROTOCOL_VERSION)
+      assert.equal(captured.headers['mcp-session-id'], undefined)
+      const request = getPayload(captured)
+      const params = request.params as Record<string, unknown>
+      const meta = params._meta as Record<string, unknown>
+      assert.equal(meta[META_PROTOCOL_VERSION], LATEST_PROTOCOL_VERSION)
+      assert.deepEqual(meta[META_CLIENT_INFO], { name: 'modern-test-client', version: '2.0.0' })
+      assert.deepEqual(meta[META_CLIENT_CAPABILITIES], { sampling: {} })
+    }
+
+    assert.equal(capturedRequests[0].headers['mcp-method'], 'server/discover')
+    assert.equal(capturedRequests[1].headers['mcp-method'], 'tools/list')
+    assert.equal(capturedRequests[2].headers['mcp-method'], 'tools/call')
+    assert.equal(capturedRequests[2].headers['mcp-name'], 'echo')
+
+    assert.ok('result' in called.body)
+    assert.deepEqual(called.body.result, {
+      resultType: 'complete',
+      content: [{ type: 'text', text: 'modern' }],
+      _meta: {
+        'io.modelcontextprotocol/serverInfo': {
+          name: '@platformatic/mcp',
+          version: '1.0.0'
+        }
+      }
+    })
+  })
+
+  test('modern clients mirror annotated tool arguments after listing tools', async (t) => {
+    const app = Fastify()
+    t.after(() => app.close())
+    const capturedHeaders: Array<Record<string, string | string[] | undefined>> = []
+    app.addHook('preHandler', async (request) => {
+      if ((request.body as { method?: string } | undefined)?.method === 'tools/call') {
+        capturedHeaders.push(normalizeHeaders(request.headers as Record<string, unknown>))
+      }
+    })
+    await app.register(mcpPlugin)
+    app.mcpAddTool({
+      name: 'regional-echo',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          region: { type: 'string', 'x-mcp-header': 'Region' }
+        },
+        required: ['region']
+      }
+    }, async ({ region }) => ({ content: [{ type: 'text', text: region }] }))
+    await app.ready()
+
+    const client = app.mcpClient({ protocolVersion: LATEST_PROTOCOL_VERSION })
+    await client.listTools()
+    const response = await client.callTool('regional-echo', { region: '日本' })
+
+    assert.equal(response.statusCode, 200)
+    assert.ok('result' in response.body)
+    assert.equal(capturedHeaders.length, 1)
+    assert.equal(capturedHeaders[0]['mcp-param-region'], `=?base64?${Buffer.from('日本').toString('base64')}?=`)
+  })
+
+  test('modern clients exclude tools with invalid x-mcp-header annotations', async (t) => {
+    const app = Fastify()
+    t.after(() => app.close())
+    app.post('/mcp', async (request, reply) => {
+      const message = request.body as { id: string | number }
+      reply.header('etag', '"unfiltered"')
+      reply.header('content-digest', 'sha-256=:stale:')
+      return {
+        jsonrpc: JSONRPC_VERSION,
+        id: message.id,
+        result: {
+          resultType: 'complete',
+          tools: [
+            {
+              name: 'valid',
+              inputSchema: {
+                type: 'object',
+                properties: { region: { type: 'string', 'x-mcp-header': 'Region' } }
+              }
+            },
+            {
+              name: 'invalid',
+              inputSchema: {
+                type: 'object',
+                allOf: [{ type: 'string', 'x-mcp-header': 'Tenant' }]
+              }
+            }
+          ],
+          ttlMs: 0,
+          cacheScope: 'private'
+        }
+      }
+    })
+    await app.ready()
+
+    const client = createMcpClient(app, { protocolVersion: LATEST_PROTOCOL_VERSION })
+    const response = await client.listTools()
+    assert.ok('result' in response.body)
+    assert.deepEqual(
+      (response.body.result as { tools: Array<{ name: string }> }).tools.map(tool => tool.name),
+      ['valid']
+    )
+    assert.deepEqual(JSON.parse(response.payload), response.body)
+    assert.equal(response.headers.etag, undefined)
+    assert.equal(response.headers['content-digest'], undefined)
+    assert.equal(response.headers['content-length'], String(Buffer.byteLength(response.payload)))
+  })
+
+  test('modern clients read an SSE response with its progress notifications', async (t) => {
+    const app = Fastify()
+    t.after(() => app.close())
+    await app.register(mcpPlugin)
+    app.mcpAddTool({ name: 'work', inputSchema: Type.Object({}) }, async (_args, context) => {
+      context.sendProgress(1, 2)
+      context.sendProgress(2, 2)
+      return { content: [{ type: 'text', text: 'done' }] }
+    })
+    await app.ready()
+
+    const client = createMcpClient(app, { protocolVersion: LATEST_PROTOCOL_VERSION })
+    const response = await client.callTool('work', {}, { meta: { progressToken: 'p' } })
+    assert.ok('result' in response.body)
+    assert.equal((response.body.result as any).content[0].text, 'done')
+    assert.deepEqual(response.notifications.map(n => (n.params as any).progress), [1, 2])
+  })
+
+  test('modern clients reject a result whose resultType they do not understand', async (t) => {
+    const app = Fastify()
+    t.after(() => app.close())
+    await app.register(mcpPlugin)
+    app.post('/fake-mcp', async () => ({ jsonrpc: JSONRPC_VERSION, id: 1, result: { resultType: 'mystery' } }))
+    await app.ready()
+
+    const client = createMcpClient(app, { protocolVersion: LATEST_PROTOCOL_VERSION, endpoint: '/fake-mcp' })
+    await assert.rejects(client.discover(), /Unrecognized resultType 'mystery'/)
+  })
+
+  test('modern clients treat an absent resultType as complete, and task only with the extension', async (t) => {
+    const app = Fastify()
+    t.after(() => app.close())
+    await app.register(mcpPlugin)
+    app.post('/plain', async () => ({ jsonrpc: JSONRPC_VERSION, id: 1, result: { tools: [] } }))
+    app.post('/task', async () => ({ jsonrpc: JSONRPC_VERSION, id: 1, result: { resultType: 'task', taskId: 't' } }))
+    await app.ready()
+
+    const plain = createMcpClient(app, { protocolVersion: LATEST_PROTOCOL_VERSION, endpoint: '/plain' })
+    assert.ok('result' in (await plain.listTools()).body)
+
+    const without = createMcpClient(app, { protocolVersion: LATEST_PROTOCOL_VERSION, endpoint: '/task' })
+    await assert.rejects(without.discover(), /Unrecognized resultType 'task'/)
+    const withTasks = createMcpClient(app, {
+      protocolVersion: LATEST_PROTOCOL_VERSION,
+      endpoint: '/task',
+      clientCapabilities: { extensions: { 'io.modelcontextprotocol/tasks': {} } }
+    })
+    assert.equal(((await withTasks.discover()).body as any).result.resultType, 'task')
+  })
+
+  test('modern clients parse CRLF-framed SSE responses', async (t) => {
+    const app = Fastify()
+    t.after(() => app.close())
+    await app.register(mcpPlugin)
+    app.post('/crlf', async (_request, reply) => {
+      reply.type('text/event-stream')
+      return 'data: {"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"p","progress":1}}\r\n\r\n' +
+        'data: {"jsonrpc":"2.0","id":1,"result":{"resultType":"complete"}}\r\n\r\n'
+    })
+    await app.ready()
+    const client = createMcpClient(app, { protocolVersion: LATEST_PROTOCOL_VERSION, endpoint: '/crlf' })
+    const response = await client.discover({ id: 1 })
+    assert.equal((response.body as any).result.resultType, 'complete')
+    assert.equal(response.notifications.length, 1)
+  })
+
+  test('modern clients can complete multi round-trip tool calls', async (t) => {
+    const app = Fastify()
+    t.after(() => app.close())
+    await app.register(mcpPlugin)
+    app.mcpAddTool({
+      name: 'greet',
+      inputSchema: Type.Object({})
+    }, async (_args, context) => {
+      const answer = context.inputResponses?.who as { content?: { name?: string } } | undefined
+      if (!answer) {
+        throw new InputRequired({
+          inputRequests: {
+            who: elicitForm('Who are you?', {
+              type: 'object',
+              properties: { name: { type: 'string' } },
+              required: ['name']
+            })
+          },
+          state: { asked: true }
+        })
+      }
+      return { content: [{ type: 'text', text: `hello ${answer.content?.name}` }] }
+    })
+    await app.ready()
+
+    const client = app.mcpClient({
+      protocolVersion: LATEST_PROTOCOL_VERSION,
+      clientCapabilities: { elicitation: { form: {} } }
+    })
+    const first = await client.callTool('greet')
+    assert.ok('result' in first.body)
+    const pending = first.body.result as { resultType: string, requestState?: string }
+    assert.equal(pending.resultType, 'input_required')
+    assert.equal(typeof pending.requestState, 'string')
+
+    const completed = await client.callTool('greet', {}, {
+      requestState: pending.requestState,
+      inputResponses: {
+        who: { action: 'accept', content: { name: 'octocat' } }
+      }
+    })
+    assert.ok('result' in completed.body)
+    const result = completed.body.result as { content: Array<{ text: string }> }
+    assert.equal(result.content[0].text, 'hello octocat')
+  })
+
+  test('legacy and modern client instances can interleave on one server', async (t) => {
+    const { app } = await createTestApp(t)
+    const legacy = createMcpClient(app)
+    const modern = createMcpClient(app, { protocolVersion: LATEST_PROTOCOL_VERSION })
+
+    await legacy.initialize()
+    const modernList = await modern.listTools()
+    const legacyCall = await legacy.callTool('echo', { message: 'legacy' })
+    const modernCall = await modern.callTool('echo', { message: 'modern' })
+
+    assert.ok('result' in modernList.body)
+    assert.ok('result' in legacyCall.body)
+    assert.ok('result' in modernCall.body)
+    assert.equal(typeof legacy.sessionId, 'string')
+    assert.equal(modern.sessionId, undefined)
   })
 
   test('initialize captures returned session id', async (t) => {
@@ -715,7 +986,7 @@ describe('MCP client', () => {
     const client = createMcpClient(app, {
       headers: {
         'x-test-header': 'client-value',
-        'mcp-protocol-version': LATEST_PROTOCOL_VERSION
+        'mcp-protocol-version': LATEST_LEGACY_PROTOCOL_VERSION
       }
     })
 
@@ -745,7 +1016,7 @@ describe('MCP client', () => {
     assert.equal(capturedRequests[0].headers['mcp-protocol-version'], undefined)
     const initRequest = getPayload(capturedRequests[0])
     assert.deepEqual(initRequest.params, {
-      protocolVersion: LATEST_PROTOCOL_VERSION,
+      protocolVersion: LATEST_LEGACY_PROTOCOL_VERSION,
       capabilities: {},
       clientInfo: {
         name: '@platformatic/mcp-client',
@@ -757,7 +1028,7 @@ describe('MCP client', () => {
   test('per-request protocol version overrides client default', async (t) => {
     const { app, capturedRequests } = await createTestApp(t)
     const client = createMcpClient(app, {
-      protocolVersion: LATEST_PROTOCOL_VERSION
+      protocolVersion: LATEST_LEGACY_PROTOCOL_VERSION
     })
 
     await client.initialize()
