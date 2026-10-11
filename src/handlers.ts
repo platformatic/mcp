@@ -34,7 +34,7 @@ import type { RequestId } from './schema.ts'
 import type { MCPTool, MCPResource, MCPPrompt, MCPPluginOptions, ResourceHandlers, McpCallToolOutcome, ToolAccessOperation, MCPToolCallCompleteEvent, TracerLike } from './types.ts'
 import type { SessionStore } from './stores/session-store.ts'
 import type { TaskStore, TaskRecord, TaskWaiters } from './stores/task-store.ts'
-import { isTerminal, toWireTask } from './stores/task-store.ts'
+import { InvalidTaskCursorError, decodeTaskCursor, isTerminal, toWireTask } from './stores/task-store.ts'
 import type { AuthorizationContext } from './types/auth-types.ts'
 import {
   supportsTasks,
@@ -1126,6 +1126,15 @@ async function handleTasksList (
     return createError(request.id, METHOD_NOT_FOUND, 'Method tasks/list not found')
   }
 
+  const cursor = (request.params as { cursor?: unknown } | undefined)?.cursor
+  if (cursor !== undefined) {
+    try {
+      decodeTaskCursor(cursor)
+    } catch {
+      return createError(request.id, INVALID_PARAMS, 'Invalid cursor')
+    }
+  }
+
   const subject = taskSubject(dependencies)
   if (subject === undefined) {
     // Auth is on but this token carries no `sub`, so it owns nothing we can
@@ -1134,10 +1143,18 @@ async function handleTasksList (
     return createResponse(request.id, { tasks: [], nextCursor: undefined } as ListTasksResult)
   }
 
-  const tasks = await taskStore.list(subject)
+  let page
+  try {
+    page = await taskStore.list(subject, { cursor: cursor as string | undefined })
+  } catch (err) {
+    if (err instanceof InvalidTaskCursorError) {
+      return createError(request.id, INVALID_PARAMS, 'Invalid cursor')
+    }
+    throw err
+  }
   const result: ListTasksResult = {
-    tasks: tasks.map(toWireTask),
-    nextCursor: undefined
+    tasks: page.tasks.map(toWireTask),
+    nextCursor: page.nextCursor
   }
   return createResponse(request.id, result)
 }

@@ -6,7 +6,7 @@ import mcpPlugin from '../src/index.ts'
 import { JSONRPC_VERSION, LATEST_PROTOCOL_VERSION, METHOD_NOT_FOUND, INVALID_PARAMS } from '../src/schema.ts'
 import type { Task, CreateTaskResult, ListTasksResult, CallToolResult } from '../src/schema.ts'
 import { MemoryTaskStore } from '../src/stores/memory-task-store.ts'
-import { canTransition, isTerminal, taskHasExpired, toWireTask } from '../src/stores/task-store.ts'
+import { canTransition, isTerminal, taskHasExpired, toWireTask, InvalidTaskCursorError, DEFAULT_TASK_PAGE_SIZE } from '../src/stores/task-store.ts'
 import type { TaskRecord } from '../src/stores/task-store.ts'
 import { resolveTaskAugmentation, RELATED_TASK_META_KEY } from '../src/handlers.ts'
 import { createTestAuthConfig, createTestJWT, setupMockAgent, generateMockJWKSResponse } from './auth-test-utils.ts'
@@ -151,9 +151,50 @@ describe('task store', () => {
     await store.create(record({ taskId: 'b', authSubject: 'user-2' }))
     await store.create(record({ taskId: 'c' }))
 
-    t.assert.deepStrictEqual((await store.list('user-1')).map(x => x.taskId), ['a'])
-    t.assert.deepStrictEqual((await store.list('user-2')).map(x => x.taskId), ['b'])
-    t.assert.deepStrictEqual((await store.list()).map(x => x.taskId), ['c'])
+    t.assert.deepStrictEqual((await store.list('user-1')).tasks.map(x => x.taskId), ['a'])
+    t.assert.deepStrictEqual((await store.list('user-2')).tasks.map(x => x.taskId), ['b'])
+    t.assert.deepStrictEqual((await store.list()).tasks.map(x => x.taskId), ['c'])
+  })
+
+  test('MemoryTaskStore paginates list newest first with an opaque cursor', async (t: TestContext) => {
+    const store = new MemoryTaskStore()
+    const base = Date.now()
+    // Two tasks share a creation time to exercise the id tie-break
+    const times = [0, 1, 2, 2, 3]
+    for (let i = 0; i < times.length; i++) {
+      await store.create(record({ taskId: `t${i}`, authSubject: 'user-1', createdAt: new Date(base + times[i]).toISOString() }))
+    }
+    await store.create(record({ taskId: 'other', authSubject: 'user-2', createdAt: new Date(base + 10).toISOString() }))
+
+    const seen: string[] = []
+    let cursor: string | undefined
+    let pages = 0
+    do {
+      const page = await store.list('user-1', { cursor, limit: 2 })
+      t.assert.ok(page.tasks.length <= 2)
+      seen.push(...page.tasks.map(x => x.taskId))
+      cursor = page.nextCursor
+      pages++
+    } while (cursor)
+
+    t.assert.strictEqual(pages, 3)
+    t.assert.deepStrictEqual(seen, ['t4', 't3', 't2', 't1', 't0'])
+  })
+
+  test('MemoryTaskStore omits nextCursor on the last page', async (t: TestContext) => {
+    const store = new MemoryTaskStore()
+    await store.create(record({ taskId: 'a', authSubject: 'user-1' }))
+    await store.create(record({ taskId: 'b', authSubject: 'user-1' }))
+
+    const page = await store.list('user-1', { limit: 2 })
+    t.assert.strictEqual(page.tasks.length, 2)
+    t.assert.strictEqual(page.nextCursor, undefined)
+  })
+
+  test('MemoryTaskStore rejects an invalid cursor', async (t: TestContext) => {
+    const store = new MemoryTaskStore()
+    await t.assert.rejects(store.list('user-1', { cursor: 'not-a-cursor' }), InvalidTaskCursorError)
+    await t.assert.rejects(store.list('user-1', { cursor: Buffer.from('{"t":"x"}').toString('base64url') }), InvalidTaskCursorError)
   })
 
   test('concurrent cancel and completion cannot overwrite each other', async (t: TestContext) => {
@@ -395,6 +436,67 @@ describe('tasks over the wire', () => {
     // A cannot reach B's task by id either
     const cross = await authedCall(tokenA, 'tasks/get', { taskId: taskB })
     t.assert.strictEqual(cross.error.code, INVALID_PARAMS)
+  })
+
+  test('tasks/list paginates, stays subject-scoped across pages and rejects invalid cursors', async (t: TestContext) => {
+    const restoreMock = setupMockAgent({
+      'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse()
+    })
+    t.after(() => restoreMock())
+
+    const app = Fastify({ logger: false })
+    t.after(() => app.close())
+    await app.register(mcpPlugin, { enableTasks: true, authorization: createTestAuthConfig() })
+    app.mcpAddTool({
+      name: 'noop',
+      description: 'x',
+      inputSchema: Type.Object({}),
+      execution: { taskSupport: 'optional' }
+    } as any, async (): Promise<CallToolResult> => ({ content: [{ type: 'text', text: 'ok' }] }))
+    await app.ready()
+
+    const authedCall = async (token: string, method: string, params: unknown) => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/mcp',
+        headers: { authorization: `Bearer ${token}`, 'mcp-protocol-version': LATEST_PROTOCOL_VERSION },
+        payload: { jsonrpc: JSONRPC_VERSION, id: 1, method, params }
+      })
+      return res.json()
+    }
+
+    const tokenA = createTestJWT({ sub: 'user-a' })
+    const tokenB = createTestJWT({ sub: 'user-b' })
+
+    const created = new Set<string>()
+    for (let i = 0; i < DEFAULT_TASK_PAGE_SIZE + 5; i++) {
+      const res = await authedCall(tokenA, 'tools/call', { name: 'noop', arguments: {}, task: {} })
+      created.add((res.result as CreateTaskResult).task.taskId)
+    }
+    const b = await authedCall(tokenB, 'tools/call', { name: 'noop', arguments: {}, task: {} })
+    const taskB = (b.result as CreateTaskResult).task.taskId
+
+    const first = (await authedCall(tokenA, 'tasks/list', {})).result as ListTasksResult
+    t.assert.strictEqual(first.tasks.length, DEFAULT_TASK_PAGE_SIZE)
+    t.assert.strictEqual(typeof first.nextCursor, 'string')
+
+    const second = (await authedCall(tokenA, 'tasks/list', { cursor: first.nextCursor })).result as ListTasksResult
+    t.assert.strictEqual(second.tasks.length, 5)
+    t.assert.strictEqual(second.nextCursor, undefined)
+
+    const all = [...first.tasks, ...second.tasks].map(x => x.taskId)
+    t.assert.strictEqual(new Set(all).size, all.length, 'no task appears on two pages')
+    t.assert.deepStrictEqual(new Set(all), created)
+    t.assert.strictEqual(all.includes(taskB), false)
+
+    // A's cursor positions B within B's own tasks only
+    const crossPage = (await authedCall(tokenB, 'tasks/list', { cursor: first.nextCursor })).result as ListTasksResult
+    t.assert.strictEqual(crossPage.tasks.some(x => created.has(x.taskId)), false)
+
+    for (const cursor of ['garbage', 42, '']) {
+      const bad = await authedCall(tokenA, 'tasks/list', { cursor })
+      t.assert.strictEqual(bad.error.code, INVALID_PARAMS)
+    }
   })
 
   test('a token without sub cannot list or reach subject-less tasks', async (t: TestContext) => {
