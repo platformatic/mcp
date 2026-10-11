@@ -110,6 +110,15 @@ export type AuthorizationConfig =
     /** Paths to exclude from authorization (e.g., health checks). Supports string prefix or RegExp. */
     excludedPaths?: (string | RegExp)[]
     /**
+     * Which routes require a bearer token.
+     * - 'all' (default): every route of the Fastify instance the plugin is
+     *   registered on, including your own routes (use `excludedPaths` to opt
+     *   specific paths out).
+     * - 'mcp': only the MCP endpoints (`POST`/`GET`/`DELETE` `/mcp`) registered
+     *   by this plugin; your own routes are left untouched.
+     */
+    protectedRoutes?: 'all' | 'mcp'
+    /**
      * Scopes a token must carry to reach the MCP endpoints. A token that is
      * valid but missing any of these is answered with 403 and a
      * `WWW-Authenticate: Bearer error="insufficient_scope"` challenge naming the

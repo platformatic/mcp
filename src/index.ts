@@ -1,4 +1,4 @@
-import type { FastifyInstance } from 'fastify'
+import type { FastifyInstance, preHandlerHookHandler } from 'fastify'
 import fp from 'fastify-plugin'
 import { Redis } from 'ioredis'
 import type { SessionStore } from './stores/session-store.ts'
@@ -136,11 +136,18 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
 
   // Initialize authorization components if enabled
   let tokenValidator: TokenValidator | null = null
+  // Set when only the MCP routes should be protected; attached per route
+  let mcpAuthPreHandler: preHandlerHookHandler | undefined
   if (opts.authorization?.enabled) {
     tokenValidator = new TokenValidator(opts.authorization, app)
 
-    // Register authorization preHandler for all routes
-    app.addHook('preHandler', createAuthPreHandler(opts.authorization, tokenValidator))
+    const authPreHandler = createAuthPreHandler(opts.authorization, tokenValidator)
+    if (opts.authorization.protectedRoutes === 'mcp') {
+      mcpAuthPreHandler = authPreHandler
+    } else {
+      // Register authorization preHandler for all routes
+      app.addHook('preHandler', authPreHandler)
+    }
 
     // Register OAuth client plugin if configured
     if (opts.authorization.oauth2Client) {
@@ -197,7 +204,8 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     localStreams,
     taskStore,
     taskWaiters,
-    jsonSchemaValidator
+    jsonSchemaValidator,
+    authPreHandler: mcpAuthPreHandler
   })
 
   // Add close hook to clean up Redis connections and authorization components
