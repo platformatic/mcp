@@ -216,7 +216,7 @@ describe('Session DELETE', () => {
     t.assert.strictEqual(secondDelete.statusCode, 404)
   })
 
-  test('DELETE route is not registered when SSE is disabled', async (t: TestContext) => {
+  test('DELETE answers 405 with Allow: POST when SSE is disabled', async (t: TestContext) => {
     const app = Fastify({ logger: false })
     t.after(() => app.close())
 
@@ -232,7 +232,8 @@ describe('Session DELETE', () => {
       headers: { 'mcp-session-id': 'some-session' }
     })
 
-    // Fastify returns 404 for unregistered routes
-    t.assert.strictEqual(response.statusCode, 404)
+    // Without SSE there is no session to end; the transport asks for 405.
+    t.assert.strictEqual(response.statusCode, 405)
+    t.assert.strictEqual(response.headers.allow, 'POST')
   })
 })

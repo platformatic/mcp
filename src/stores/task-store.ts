@@ -230,18 +230,18 @@ export function taskHasExpired (task: TaskRecord, now: number = Date.now()): boo
 }
 
 /**
- * Strip storage-only fields so a record can go on the wire as a spec `Task`.
+ * The 2025-11-25 `Task` for a record. Built from the spec's fields rather than
+ * by stripping storage ones, so a field added to the record for another reason
+ * (the era, the lease, the input bookkeeping) never leaks onto the wire.
  */
 export function toWireTask (task: TaskRecord): Task {
-  const {
-    authSubject,
-    method,
-    outcome,
-    inputRequestRound,
-    pendingInputResponses,
-    pendingInputResponseIds,
-    pendingInputResponseRounds,
-    ...wire
-  } = task
-  return wire
+  return {
+    taskId: task.taskId,
+    status: task.status,
+    ...(task.statusMessage !== undefined ? { statusMessage: task.statusMessage } : {}),
+    createdAt: task.createdAt,
+    lastUpdatedAt: task.lastUpdatedAt,
+    ttl: task.ttl,
+    ...(task.pollInterval !== undefined ? { pollInterval: task.pollInterval } : {})
+  }
 }

@@ -1,63 +1,70 @@
-import { randomBytes, timingSafeEqual } from 'node:crypto'
+import { randomBytes } from 'node:crypto'
 import type { IncomingHttpHeaders, IncomingMessage } from 'node:http'
+import type { AuthorizationContext } from './types/auth-types.ts'
 
 /**
  * Marks requests the in-process stdio transport injects into `/mcp`.
  *
  * stdio has no header layer: the 2026-07-28 transport carries everything in
  * the body, so the header/body reconciliation that protects HTTP gateways does
- * not apply. The token is random per process, so an HTTP client cannot claim
- * to be stdio to skip that validation.
+ * not apply, and the caller is whoever started the process. Each injected
+ * request carries a random token that is good for that one request only: it
+ * is registered just before the injection and consumed as the request
+ * arrives. A token that shows up in a log, or in a hook that runs before the
+ * plugin's, has already been spent and cannot be replayed over HTTP.
  */
-export const STDIO_TRUST_HEADER = 'x-platformatic-mcp-stdio-trust'
-export const STDIO_TRUST_TOKEN = randomBytes(32).toString('hex')
+export const STDIO_REQUEST_HEADER = 'x-platformatic-mcp-stdio-request'
 
-const expected = Buffer.from(STDIO_TRUST_TOKEN)
-
-function presentsTrustToken (headers: IncomingHttpHeaders): boolean {
-  const value = headers[STDIO_TRUST_HEADER]
-  if (typeof value !== 'string') return false
-  const received = Buffer.from(value)
-  return received.length === expected.length && timingSafeEqual(received, expected)
+interface StdioRequest {
+  signal?: AbortSignal
+  authContext?: AuthorizationContext
 }
 
-/** Requests recognised as stdio-injected, with their cancellation signal if any. */
-const stdioRequests = new WeakMap<IncomingMessage, { signal?: AbortSignal }>()
+/** Tokens issued for injections that have not arrived yet. */
+const issued = new Map<string, StdioRequest>()
+/** Requests recognised as stdio-injected. */
+const stdioRequests = new WeakMap<IncomingMessage, StdioRequest>()
 
 /**
- * Recognise a stdio-injected request once, as it arrives, and remove the
- * tokens from its headers. Handlers can read their request's headers, and a
- * handler that echoed or logged them must not hand out a token an HTTP client
- * could replay to skip header validation.
+ * Issue a single-use token for one injected request. `signal` carries its
+ * cancellation (on stdio the client cancels with `notifications/cancelled`
+ * rather than by closing a stream), and `authContext` is the identity the
+ * operator configured for this transport, if any.
+ */
+export function registerStdioRequest (
+  signal: AbortSignal,
+  authContext?: AuthorizationContext
+): { token: string, release: () => void } {
+  const token = randomBytes(32).toString('hex')
+  issued.set(token, { signal, authContext })
+  return { token, release: () => issued.delete(token) }
+}
+
+/**
+ * Recognise a stdio-injected request once, as it arrives, spending its token
+ * and removing it from the headers handlers can read.
  */
 export function claimStdioRequest (request: { raw: IncomingMessage, headers: IncomingHttpHeaders }): void {
-  const headers = request.headers
-  if (!presentsTrustToken(headers)) return
-  const token = headers[STDIO_REQUEST_HEADER]
-  stdioRequests.set(request.raw, { signal: typeof token === 'string' ? requestSignals.get(token) : undefined })
-  delete headers[STDIO_TRUST_HEADER]
-  delete headers[STDIO_REQUEST_HEADER]
+  const token = request.headers[STDIO_REQUEST_HEADER]
+  if (token === undefined) return
+  delete request.headers[STDIO_REQUEST_HEADER]
+  if (typeof token !== 'string') return
+  const entry = issued.get(token)
+  if (!entry) return
+  issued.delete(token)
+  stdioRequests.set(request.raw, entry)
 }
 
 export function isStdioRequest (request: { raw: IncomingMessage }): boolean {
   return stdioRequests.has(request.raw)
 }
 
-/**
- * Carries a stdio request's cancellation into the route. On stdio the client
- * cancels with `notifications/cancelled` rather than by closing a stream, so
- * the transport registers a signal per request and passes its token along.
- */
-export const STDIO_REQUEST_HEADER = 'x-platformatic-mcp-stdio-request'
-const requestSignals = new Map<string, AbortSignal>()
-
-export function registerStdioRequest (signal: AbortSignal): { token: string, release: () => void } {
-  const token = randomBytes(16).toString('hex')
-  requestSignals.set(token, signal)
-  return { token, release: () => requestSignals.delete(token) }
-}
-
 /** The cancellation signal of a stdio-injected request, if it has one. */
 export function stdioRequestSignal (request: { raw: IncomingMessage }): AbortSignal | undefined {
   return stdioRequests.get(request.raw)?.signal
+}
+
+/** The identity the stdio transport was configured with, if any. */
+export function stdioAuthContext (request: { raw: IncomingMessage }): AuthorizationContext | undefined {
+  return stdioRequests.get(request.raw)?.authContext
 }

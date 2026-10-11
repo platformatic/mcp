@@ -7,6 +7,7 @@ import type {
   ReadResourceResult,
   GetPromptResult,
   ServerCapabilities,
+  ClientCapabilities,
   Implementation,
   Tool,
   Resource,
@@ -25,6 +26,17 @@ export type { CacheHint }
 // Context interface for all handler types
 export interface HandlerContext {
   sessionId?: string
+  /**
+   * The protocol revision this request is served under: the per-request
+   * version on 2026-07-28, the negotiated one on earlier revisions.
+   */
+  protocolVersion?: string
+  /**
+   * What the client declared it supports on this request (2026-07-28), so a
+   * handler can choose, say, URL-mode over form elicitation, or skip asking
+   * at all. Absent on the legacy path.
+   */
+  clientCapabilities?: ClientCapabilities
   request: FastifyRequest
   reply: FastifyReply
   authContext?: AuthorizationContext
@@ -41,9 +53,10 @@ export interface HandlerContext {
   requestState?: unknown
   /**
    * Aborts when the request is cancelled, so the handler can stop work early:
-   * a 2026-07-28 client that disconnects before the response, or the
-   * cancellation of the task the handler is running in. Never aborts on the
-   * legacy path, where a disconnect is not a cancellation.
+   * a 2026-07-28 client that disconnects before the response,
+   * `notifications/cancelled` on stdio, or the cancellation of the task the
+   * handler is running in. A legacy HTTP disconnect does not abort it, since
+   * it is not a cancellation on those revisions.
    */
   signal: AbortSignal
   /**

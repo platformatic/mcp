@@ -43,6 +43,8 @@ interface Subscription {
   /** Ends the stream when the client cancels it without closing a socket (stdio). */
   cancelSignal?: AbortSignal
   onCancel?: () => void
+  /** Runs once when the stream ends, however it ends. */
+  onEnd?: () => void
 }
 
 const BOOLEAN_FILTER_FIELDS = ['toolsListChanged', 'promptsListChanged', 'resourcesListChanged'] as const
@@ -183,10 +185,14 @@ export class SubscriptionRegistry {
     id: RequestId,
     filter: SubscriptionFilter,
     quotaKey?: string,
-    cancelSignal?: AbortSignal
+    cancelSignal?: AbortSignal,
+    onEnd?: () => void
   ): boolean {
     const raw = reply.raw
-    if (this.#closing || raw.destroyed || raw.closed || raw.writableEnded) return false
+    if (this.#closing || raw.destroyed || raw.closed || raw.writableEnded) {
+      onEnd?.()
+      return false
+    }
 
     // Keep headers already set on the reply (CORS and the like) once it is
     // taken over.
@@ -211,7 +217,8 @@ export class SubscriptionRegistry {
       quotaKey,
       blocked: false,
       queue: [],
-      queuedBytes: 0
+      queuedBytes: 0,
+      onEnd
     }
 
     subscription.onClose = () => {
@@ -281,7 +288,10 @@ export class SubscriptionRegistry {
       // `end(frame)` appends the final frames after Node's existing writable
       // buffer even when write() previously returned false. Queuing and then
       // clearing them would silently drop the protocol's graceful completion.
-      this.#close(subscription, this.#teardownFrames(subscription, 'Server is shutting down'))
+      // Notifications still queued for a slow reader go first: a graceful end
+      // tells the client it missed nothing.
+      const pending = subscription.queue.join('')
+      this.#close(subscription, pending + this.#teardownFrames(subscription, 'Server is shutting down'))
     }
   }
 
@@ -399,6 +409,15 @@ export class SubscriptionRegistry {
     subscription.queuedBytes = 0
     subscription.blocked = false
     this.#subscriptions.delete(subscription)
+    const onEnd = subscription.onEnd
+    subscription.onEnd = undefined
+    if (onEnd) {
+      try {
+        onEnd()
+      } catch (error) {
+        this.#log.warn({ err: error, subscriptionId: subscription.id }, 'Subscription end handler failed')
+      }
+    }
   }
 
   #close (subscription: Subscription, finalFrame?: string): void {

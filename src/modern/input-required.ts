@@ -9,13 +9,14 @@
  * `context.inputResponses` when the client retries.
  */
 
+import type { ElicitRequestFormParams } from '../schema.ts'
 import type {
-  ElicitRequest,
-  ElicitRequestFormParams,
-  CreateMessageRequest,
-  ListRootsRequest
-} from '../schema.ts'
-import type { InputRequests, InputResponses } from '../schema-2026.ts'
+  CreateMessageInputRequest,
+  ElicitInputRequest,
+  InputRequests,
+  InputResponses,
+  ListRootsInputRequest
+} from '../schema-2026.ts'
 
 /**
  * Thrown by a handler that cannot finish without more input.
@@ -45,29 +46,29 @@ export class InputRequired extends Error {
 export function elicitForm (
   message: string,
   requestedSchema: ElicitRequestFormParams['requestedSchema']
-): ElicitRequest {
+): ElicitInputRequest {
   return {
     method: 'elicitation/create',
     params: { mode: 'form', message, requestedSchema }
-  } as ElicitRequest
+  }
 }
 
 /** Build a URL-mode `elicitation/create` to put in `inputRequests`. */
-export function elicitUrl (message: string, url: string): ElicitRequest {
+export function elicitUrl (message: string, url: string): ElicitInputRequest {
   return {
     method: 'elicitation/create',
     params: { mode: 'url', message, url }
-  } as ElicitRequest
+  }
 }
 
 /** Build a `sampling/createMessage` to put in `inputRequests`. */
-export function requestSampling (params: CreateMessageRequest['params']): CreateMessageRequest {
-  return { method: 'sampling/createMessage', params } as CreateMessageRequest
+export function requestSampling (params: CreateMessageInputRequest['params']): CreateMessageInputRequest {
+  return { method: 'sampling/createMessage', params }
 }
 
 /** Build a `roots/list` to put in `inputRequests`. */
-export function requestRoots (): ListRootsRequest {
-  return { method: 'roots/list' } as ListRootsRequest
+export function requestRoots (): ListRootsInputRequest {
+  return { method: 'roots/list' }
 }
 
 /**

@@ -1,7 +1,8 @@
 import { stdin, stdout, stderr } from 'process'
 import { createInterface } from 'readline'
 import type { FastifyInstance } from 'fastify'
-import { STDIO_REQUEST_HEADER, STDIO_TRUST_HEADER, STDIO_TRUST_TOKEN, registerStdioRequest } from './stdio-trust.ts'
+import { STDIO_REQUEST_HEADER, registerStdioRequest } from './stdio-trust.ts'
+import type { AuthorizationContext } from './types/auth-types.ts'
 import { bodyClaimsModern } from './modern/request-meta.ts'
 import type {
   JSONRPCMessage,
@@ -35,6 +36,15 @@ export interface StdioTransportOptions {
    * Custom error stream (defaults to process.stderr)
    */
   error?: NodeJS.WritableStream
+  /**
+   * Who the stdio client is. stdio carries no bearer token: the client is
+   * whoever started the process, and the spec has it take credentials from
+   * the environment. Requests over stdio skip HTTP authorization; with this
+   * set they act as this identity, so per-caller features (multi round-trip
+   * requests and tasks when authorization is enabled, task ownership, quotas)
+   * work. Without it they are anonymous.
+   */
+  authContext?: AuthorizationContext
 }
 
 function isJsonRpcObject (value: unknown): value is JSONRPCMessage {
@@ -255,7 +265,7 @@ export class StdioTransport {
     const key = id === undefined ? undefined : requestKey(id)
     const cancel = new AbortController()
     if (key !== undefined) this.inFlight.set(key, cancel)
-    const registration = registerStdioRequest(cancel.signal)
+    const registration = registerStdioRequest(cancel.signal, this.transportOpts.authContext)
 
     try {
       // Use Fastify's inject method to simulate an HTTP request to the /mcp endpoint
@@ -266,7 +276,6 @@ export class StdioTransport {
           'content-type': 'application/json',
           accept: 'application/json, text/event-stream',
           'x-platformatic-mcp-transport': 'stdio',
-          [STDIO_TRUST_HEADER]: STDIO_TRUST_TOKEN,
           [STDIO_REQUEST_HEADER]: registration.token
         },
         payload: message,
@@ -299,7 +308,11 @@ export class StdioTransport {
       } catch {
         parsed = undefined
       }
-      if (isJsonRpcResponse(parsed)) return parsed
+      if (isJsonRpcResponse(parsed)) {
+        // A body-parser error cannot know the id (HTTP never parsed the
+        // body), but this transport did: answer the request it belongs to.
+        return parsed.id === null ? { ...parsed, id } as JSONRPCError : parsed
+      }
       this.logError(`Non-JSON-RPC response (status ${response.statusCode}):`, body)
       return {
         jsonrpc: '2.0',

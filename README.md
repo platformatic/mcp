@@ -486,9 +486,33 @@ stream (default 1000, each at most 2048 characters). A caller is a user at an is
 OAuth client they use; when the deployment cannot identify callers, only the per-instance limit
 applies.
 
+Resource subscriptions go through the same handlers as the legacy `resources/subscribe`: the
+subscribe handler runs for each requested URI with the caller's `authContext`, and a URI whose
+handler throws is left out of the acknowledgement. Throw there for resources the caller may not
+watch; update notifications reveal what changed and when. The unsubscribe handler runs for each
+accepted URI when the stream ends, however it ends.
+
+```typescript
+app.mcpSetResourceSubscribeHandler(async ({ uri }, { authContext }) => {
+  if (!canRead(authContext, uri)) throw new Error('Forbidden')
+  watch(uri)
+  return {}
+})
+app.mcpSetResourceUnsubscribeHandler(async ({ uri }) => {
+  unwatch(uri)
+  return {}
+})
+```
+
 With the default capabilities, adding a tool, resource or prompt after the server is ready
 broadcasts the matching `list_changed` notification. Legacy clients are only told
-`listChanged` when `enableSSE` is on, since without SSE they have no channel to receive it.
+`listChanged` (and `resources.subscribe`) when `enableSSE` is on, since without SSE they have
+no channel to receive notifications.
+
+With Redis, that broadcast reaches every instance, but each instance has its own registry: a
+tool added at runtime must be added on every instance, or clients told the list changed may
+list it on one that does not have it. Designing this for rolling redeploys is tracked in
+[#237](https://github.com/platformatic/mcp/issues/237).
 
 Request-scoped notifications (`notifications/progress`, `notifications/message`) are never
 delivered here; they belong on the response stream of the request they relate to.
@@ -1460,10 +1484,13 @@ The plugin includes a built-in stdio transport utility for MCP communication ove
 - **Fastify integration** using the `.inject()` method for consistency with HTTP routes
 - **Streaming**: `subscriptions/listen` and request-scoped progress or log notifications are
   written to stdout as they happen
-- **Cancellation**: `notifications/cancelled` aborts the request's `context.signal`, and
-  nothing more is written for it
+- **Cancellation**: `notifications/cancelled` aborts the request's `context.signal`, whichever
+  revision the client speaks, and nothing more is written for it
 - **Local trust**: stdio requests are not subject to HTTP bearer authorization, as the spec has
-  the stdio transport take credentials from its environment
+  the stdio transport take credentials from its environment. Pass the identity they act as with
+  `runStdioServer(app, { authContext: { userId: process.env.USER } })`; without one they are
+  anonymous, and with authorization enabled multi round-trip requests and tasks (which need an
+  identified caller) are refused
 - **Comprehensive error handling** with proper JSON-RPC error responses
 - **Batch request support** for the legacy revisions that allow it
 - **Debug logging** to stderr without interfering with the stdio protocol
@@ -2412,9 +2439,13 @@ All handlers receive a consistent context object containing:
 - `context.sessionId`: Session identifier (when using SSE)
 - `context.authContext`: Authorization context (when OAuth is enabled)
 - `context.signal`: `AbortSignal` that aborts when the request is cancelled: a 2026-07-28 client
-  disconnecting before the response, or `tasks/cancel` for a handler running as a task. Pass it
-  to `fetch` or check it between steps to stop work early. It never aborts on the legacy path,
-  where a disconnect is not a cancellation.
+  disconnecting before the response, `notifications/cancelled` on stdio, or `tasks/cancel` for a
+  handler running as a task (in either era). Pass it to `fetch` or check it between steps to stop
+  work early. A legacy HTTP disconnect does not abort it, since it is not a cancellation there.
+- `context.protocolVersion`: the protocol revision the request is served under.
+- `context.clientCapabilities`: what a 2026-07-28 client declared on this request, so a handler
+  can choose URL-mode over form elicitation, or skip asking a client that cannot answer. Absent
+  on the legacy path.
 
 #### Backward Compatibility
 
@@ -2507,6 +2538,11 @@ interface HandlerContext {
   request: FastifyRequest         // HTTP request object
   reply: FastifyReply            // HTTP reply object
   authContext?: AuthorizationContext  // OAuth authorization data
+  protocolVersion?: string        // Revision this request is served under
+  clientCapabilities?: ClientCapabilities // Declared per request (2026-07-28)
+  signal: AbortSignal             // Aborts when the request is cancelled
+  sendProgress: (progress: number, total?: number, message?: string) => void
+  log: (level: LoggingLevel, data: unknown, logger?: string) => void
 }
 
 // Normalized handler signatures
@@ -2869,7 +2905,6 @@ the changes to the plugin's own API and defaults:
   Use `LATEST_LEGACY_PROTOCOL_VERSION` for the newest handshake revision (see below).
 - **`HandlerContext` gained required members**: `signal`, `sendProgress` and `log`. Code that
   builds a context by hand (for example to unit-test a handler) must provide them.
-- **`ToolAccessContext.operation` is required**: `'list'` or `'call'`.
 - **`TaskStore` gained methods**: `updateInputResponses`, `acknowledgeInputResponses`,
   `renewLease` and `expireStaleLease`. Custom stores must implement them.
 - **Redis task records moved** to the `mcp:task:v2:` keyspace, so instances of different
@@ -2890,6 +2925,21 @@ the changes to the plugin's own API and defaults:
 - **Invalid `caching` values throw at startup** instead of being clamped.
 - **An argument sanitization failure** is reported by `mcpCallTool()` as
   `{ ok: false, reason: 'invalid-arguments' }`.
+- **stdio requests skip HTTP authorization.** stdio has no bearer token: the client is whoever
+  started the process. With authorization enabled, stdio requests used to be refused with `401`;
+  now they run as the identity passed to `runStdioServer(app, { authContext })`, or anonymously
+  without one (then multi round-trip requests and tasks are refused, since they need an
+  identified caller).
+- **`subscriptions/listen` calls the resource subscribe handlers**: `mcpSetResourceSubscribeHandler`
+  runs for each requested URI (a throw drops the URI), and the unsubscribe handler when the stream
+  ends.
+- **Legacy clients without `enableSSE` no longer see `resources.subscribe`**, since updates could
+  never reach them.
+- **`GET` and `DELETE /mcp` answer `405` with `Allow: POST`** when `enableSSE` is off (`DELETE`
+  used to be a `404`).
+- **Body-parser errors on `/mcp` are JSON-RPC errors**: malformed JSON is `-32700`, a body over
+  the size limit or with the wrong content type is `-32600`, with the same HTTP status as before.
+- **Legacy task responses only carry the spec's `Task` fields.**
 - **Era detection**: a request whose `_meta` carries `io.modelcontextprotocol/protocolVersion`,
   or whose `MCP-Protocol-Version` header names 2026-07-28, takes the modern path. With
   authorization enabled, a POST with a bad version header now gets `401` before `400`.

@@ -57,7 +57,7 @@ import type { RequestContext } from './request-meta.ts'
 import { supportsTasksExtension } from './request-meta.ts'
 import { InputRequired, requiredCapabilityFor } from './input-required.ts'
 import type { RequestStateSealer } from './request-state.ts'
-import { RequestTooDeepError } from './request-state.ts'
+import { PrincipalRequiredError, RequestTooDeepError } from './request-state.ts'
 import { collectHeaderParams, validateToolParamHeaders } from './headers.ts'
 import type { TaskRecord } from '../stores/task-store.ts'
 import { isTerminal } from '../stores/task-store.ts'
@@ -332,11 +332,22 @@ function invalidElicitation (params: unknown): string | undefined {
   }
   for (const [name, property] of Object.entries(schema.properties as Record<string, unknown>)) {
     const type = (property as { type?: unknown } | undefined)?.type
-    if (typeof type !== 'string' || !FLAT_SCHEMA_TYPES.has(type)) {
-      return `has requestedSchema property '${name}' that is not a primitive`
-    }
+    if (typeof type === 'string' && FLAT_SCHEMA_TYPES.has(type)) continue
+    if (type === 'array' && isMultiSelectItems((property as { items?: unknown }).items)) continue
+    return `has requestedSchema property '${name}' that is neither a primitive nor a multi-select enum`
   }
   return undefined
+}
+
+/** The `items` of a multi-select enum: string values, listed or titled. */
+function isMultiSelectItems (items: unknown): boolean {
+  if (!items || typeof items !== 'object') return false
+  const { type, enum: values, anyOf } = items as { type?: unknown, enum?: unknown, anyOf?: unknown }
+  if (type === 'string' && Array.isArray(values)) return values.every(value => typeof value === 'string')
+  if (Array.isArray(anyOf)) {
+    return anyOf.every(option => typeof (option as { const?: unknown } | undefined)?.const === 'string')
+  }
+  return false
 }
 
 function invalidSampling (params: unknown): string | undefined {
@@ -348,22 +359,88 @@ function invalidSampling (params: unknown): string | undefined {
 }
 
 const ELICIT_ACTIONS = new Set(['accept', 'decline', 'cancel'])
+const SAMPLING_ROLES = new Set(['user', 'assistant'])
+
+function isPlainObject (value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/** Which field of `value` is wrong as a result to `method`, and what it should be. */
+function invalidResult (method: string, value: Record<string, unknown>): [field: string, expected: string] | undefined {
+  switch (method) {
+    case 'elicitation/create':
+      if (!ELICIT_ACTIONS.has(value.action as string)) return ['action', 'accept, decline or cancel']
+      if (value.content !== undefined) {
+        if (!isPlainObject(value.content)) return ['content', 'an object']
+        for (const [name, field] of Object.entries(value.content)) {
+          const ok = ['string', 'number', 'boolean'].includes(typeof field) ||
+            (Array.isArray(field) && field.every(item => typeof item === 'string'))
+          if (!ok) return [`content.${name}`, 'a string, number, boolean or array of strings']
+        }
+      }
+      return undefined
+    case 'sampling/createMessage':
+      if (!SAMPLING_ROLES.has(value.role as string)) return ['role', 'user or assistant']
+      if (!isPlainObject(value.content) && !Array.isArray(value.content)) return ['content', 'a content block or an array of them']
+      if (typeof value.model !== 'string') return ['model', 'a string']
+      return undefined
+    case 'roots/list':
+      if (!Array.isArray(value.roots) || !value.roots.every(root => isPlainObject(root) && typeof root.uri === 'string')) {
+        return ['roots', 'an array of roots']
+      }
+      return undefined
+    default:
+      return undefined
+  }
+}
 
 /**
- * What is wrong with the answers the server asked for, if anything. Each is a
- * result object, and an elicitation result's `action` is one of three values.
+ * What is wrong with the answers to the server's questions, if anything. Each
+ * must be the result of the method it was asked with: an elicitation answer
+ * is an `ElicitResult`, a sampling answer a `CreateMessageResult`, and so on.
+ * Whether accepted content satisfies the `requestedSchema` is for the handler
+ * to judge.
  */
-function invalidAnswers (inputResponses: Record<string, unknown> | undefined): string | undefined {
+function invalidAnswers (
+  inputResponses: Record<string, unknown> | undefined,
+  asked: Record<string, string>
+): string | undefined {
   for (const [key, value] of Object.entries(inputResponses ?? {})) {
-    if (!value || typeof value !== 'object' || Array.isArray(value)) {
-      return `Invalid "inputResponses.${key}": expected a result object`
-    }
-    const action = (value as { action?: unknown }).action
-    if (action !== undefined && !ELICIT_ACTIONS.has(action as string)) {
-      return `Invalid "inputResponses.${key}.action": expected accept, decline or cancel`
-    }
+    if (!isPlainObject(value)) return `Invalid "inputResponses.${key}": expected a result object`
+    const method = asked[key]
+    const problem = method === undefined ? undefined : invalidResult(method, value)
+    if (problem) return `Invalid "inputResponses.${key}.${problem[0]}": expected ${problem[1]}`
   }
   return undefined
+}
+
+/**
+ * Drop what 2026-07-28 removed from input requests, for handlers that build
+ * them by hand from legacy shapes: `elicitationId` (the client learns the
+ * outcome by retrying) and `task` (the server is asking within a request).
+ */
+function withoutLegacyFields (inputRequests: InputRequests): InputRequests {
+  const cleaned: InputRequests = {}
+  for (const [key, entry] of Object.entries(inputRequests)) {
+    const params = entry.params as Record<string, unknown> | undefined
+    if (params && ('elicitationId' in params || 'task' in params)) {
+      const { elicitationId, task, ...rest } = params
+      cleaned[key] = { ...entry, params: rest } as typeof entry
+    } else {
+      cleaned[key] = entry
+    }
+  }
+  return cleaned
+}
+
+/** Each input request key and the method it asks with. */
+function inputMethods (inputRequests: Record<string, unknown> | undefined): Record<string, string> {
+  const methods: Record<string, string> = {}
+  for (const [key, entry] of Object.entries(inputRequests ?? {})) {
+    const method = (entry as { method?: unknown } | undefined)?.method
+    if (typeof method === 'string') methods[key] = method
+  }
+  return methods
 }
 
 /**
@@ -396,21 +473,28 @@ function inputRequired (
       method: request.method,
       params: request.params,
       payload: thrown.state ?? null,
-      inputKeys: Object.keys(thrown.inputRequests ?? {})
+      inputs: inputMethods(thrown.inputRequests)
     })
   } catch (error) {
-    dependencies.app.log.warn({ err: error, method: request.method }, 'Could not seal request state')
     if (error instanceof RequestTooDeepError) {
+      dependencies.app.log.warn({ err: error, method: request.method }, 'Could not seal request state')
       return createError(request.id, INVALID_PARAMS, `Invalid request: ${error.message}`)
     }
-    // Sealing refuses an unidentified caller when the deployment identifies
-    // callers. Answer this request rather than escaping to a bare 500.
-    return createError(request.id, INVALID_REQUEST, 'This request needs additional input, which requires an authenticated caller')
+    if (error instanceof PrincipalRequiredError) {
+      // Sealing refuses an unidentified caller when the deployment identifies
+      // callers. Answer this request rather than escaping to a bare 500.
+      dependencies.app.log.warn({ method: request.method }, 'Could not seal request state for an unidentified caller')
+      return createError(request.id, INVALID_REQUEST, 'This request needs additional input, which requires an authenticated caller')
+    }
+    // State the handler cannot have serialized (a BigInt, a cycle) is a bug
+    // on this side, not something the client could fix.
+    dependencies.app.log.error({ err: error, method: request.method }, 'Could not seal request state')
+    return createError(request.id, INTERNAL_ERROR, 'Internal server error')
   }
 
   const result: InputRequiredResult = {
     resultType: 'input_required',
-    ...(thrown.inputRequests ? { inputRequests: thrown.inputRequests } : {}),
+    ...(thrown.inputRequests ? { inputRequests: withoutLegacyFields(thrown.inputRequests) } : {}),
     requestState
   }
 
@@ -431,7 +515,7 @@ function inputRequired (
 function openRequestState (
   request: JSONRPCRequest,
   dependencies: ModernDependencies
-): { ok: true, payload: unknown, inputKeys?: string[] } | { ok: false, error: JSONRPCError } {
+): { ok: true, payload: unknown, inputs?: Record<string, string> } | { ok: false, error: JSONRPCError } {
   const state = (request.params as { requestState?: unknown } | undefined)?.requestState
   if (state === undefined) return { ok: true, payload: undefined }
 
@@ -450,7 +534,7 @@ function openRequestState (
     return { ok: false, error: createError(request.id, INVALID_PARAMS, `Invalid "requestState": ${opened.reason}`) }
   }
 
-  return { ok: true, payload: opened.claims.payload, inputKeys: opened.claims.inputKeys ?? [] }
+  return { ok: true, payload: opened.claims.payload, inputs: opened.claims.inputs ?? {} }
 }
 
 /**
@@ -465,17 +549,18 @@ function openRequestState (
 function withMrtrContext (
   request: JSONRPCRequest,
   dependencies: ModernDependencies,
-  opened: { payload: unknown, inputKeys?: string[] }
+  opened: { payload: unknown, inputs?: Record<string, string> }
 ): ModernDependencies {
   const params = request.params as { inputResponses?: Record<string, unknown> } | undefined
-  const asked = new Set(opened.inputKeys ?? [])
+  const asked = opened.inputs ?? {}
   const inputResponses = params?.inputResponses === undefined
     ? undefined
-    : Object.fromEntries(Object.entries(params.inputResponses).filter(([key]) => asked.has(key)))
+    : Object.fromEntries(Object.entries(params.inputResponses).filter(([key]) => Object.hasOwn(asked, key)))
 
   return {
     ...dependencies,
     strictErrors: true,
+    clientCapabilities: dependencies.context.clientCapabilities,
     mrtr: {
       inputResponses,
       requestState: opened.payload
@@ -619,6 +704,11 @@ async function handleTasksUpdate (
   if (!record) {
     return createError(request.id, INVALID_PARAMS, `Task '${params.taskId}' not found`)
   }
+
+  // The same rules as a synchronous retry: a malformed answer rejects the
+  // whole update, so the handler never sees half of one.
+  const invalidAnswer = invalidAnswers(params.inputResponses as Record<string, unknown>, inputMethods(record.inputRequests))
+  if (invalidAnswer) return createError(request.id, INVALID_PARAMS, invalidAnswer)
 
   // Atomically move new answers into the store-backed publication outbox.
   // Previously this only marked keys answered, so a broker failure made the
@@ -1334,7 +1424,7 @@ export async function dispatchModern (
   const opened = openRequestState(request, dependencies)
   if (!opened.ok) return opened.error
   const scoped = withMrtrContext(request, dependencies, opened)
-  const invalidAnswer = invalidAnswers(scoped.mrtr?.inputResponses)
+  const invalidAnswer = invalidAnswers(scoped.mrtr?.inputResponses, opened.inputs ?? {})
   if (invalidAnswer) return createError(request.id, INVALID_PARAMS, invalidAnswer)
 
   // A result produced from `inputResponses`/`requestState` depends on inputs

@@ -574,7 +574,7 @@ describe('MCP client', () => {
     const response = await client.callTool('work', {}, { meta: { progressToken: 'p' } })
     assert.ok('result' in response.body)
     assert.equal((response.body.result as any).content[0].text, 'done')
-    assert.deepEqual(response.notifications.map(n => (n.params as any).progress), [1, 2])
+    assert.deepEqual(response.notifications?.map(n => (n.params as any).progress), [1, 2])
   })
 
   test('modern clients reject a result whose resultType they do not understand', async (t) => {
@@ -622,7 +622,7 @@ describe('MCP client', () => {
     const client = createMcpClient(app, { protocolVersion: LATEST_PROTOCOL_VERSION, endpoint: '/crlf' })
     const response = await client.discover({ id: 1 })
     assert.equal((response.body as any).result.resultType, 'complete')
-    assert.equal(response.notifications.length, 1)
+    assert.equal(response.notifications?.length, 1)
   })
 
   test('modern clients can complete multi round-trip tool calls', async (t) => {

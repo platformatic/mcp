@@ -28,11 +28,15 @@ export interface RequestStateClaims {
   /** Whatever the server needs to resume, opaque to us. */
   payload: unknown
   /**
-   * The `inputRequests` keys the server asked for. Only those are handed to
-   * the handler on the retry; anything else the client sends is ignored.
+   * The `inputRequests` the server asked for: each key and the method it
+   * asked with. Only those keys are handed to the handler on the retry, and
+   * each answer must have the shape of a result to that method.
    */
-  inputKeys?: string[]
+  inputs?: Record<string, string>
 }
+
+/** Sealing was refused because the deployment identifies callers and this one is not. */
+export class PrincipalRequiredError extends Error {}
 
 export type VerifyResult =
   | { ok: true, claims: RequestStateClaims }
@@ -127,14 +131,14 @@ export class RequestStateSealer {
     method: string
     params: unknown
     payload?: unknown
-    inputKeys?: string[]
+    inputs?: Record<string, string>
     ttlMs?: number
   }): string {
     if (this.#requirePrincipal && input.principal === undefined) {
       // Binding to "nobody" would let any other unidentified caller replay the
       // state. When the deployment can identify callers, refusing is the only
       // safe answer; this mirrors how tasks refuse a subject-less token.
-      throw new Error('Cannot seal request state without an authenticated principal')
+      throw new PrincipalRequiredError('Cannot seal request state without an authenticated principal')
     }
 
     const claims: RequestStateClaims = {
@@ -144,7 +148,7 @@ export class RequestStateSealer {
       expiresAt: Date.now() + (input.ttlMs ?? this.#ttlMs),
       ...(this.#audience !== undefined ? { audience: this.#audience } : {}),
       payload: input.payload ?? null,
-      ...(input.inputKeys ? { inputKeys: input.inputKeys } : {})
+      ...(input.inputs ? { inputs: input.inputs } : {})
     }
 
     const body = Buffer.from(JSON.stringify(claims), 'utf8').toString('base64url')

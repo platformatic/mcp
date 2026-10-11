@@ -233,10 +233,10 @@ describe('request state sealing', () => {
 
   test('the sealed state records which input keys were asked for', (t: TestContext) => {
     const sealer = new RequestStateSealer()
-    const state = sealer.seal({ ...base, inputKeys: ['a', 'b'] })
+    const state = sealer.seal({ ...base, inputs: { a: 'elicitation/create', b: 'roots/list' } })
     const opened = sealer.open(state, base)
     t.assert.ok(opened.ok)
-    if (opened.ok) t.assert.deepStrictEqual(opened.claims.inputKeys, ['a', 'b'])
+    if (opened.ok) t.assert.deepStrictEqual(opened.claims.inputs, { a: 'elicitation/create', b: 'roots/list' })
   })
 
   test('state from another server sharing the secret is refused', (t: TestContext) => {
@@ -555,6 +555,44 @@ describe('subscription backpressure', () => {
     raw.emit('drain')
     t.assert.strictEqual(raw.writes.length, 2)
     registry.closeAll()
+  })
+
+  test('a graceful shutdown sends the notifications still queued before the completion', (t: TestContext) => {
+    const raw = new FakeResponse()
+    const registry = new SubscriptionRegistry(logger, 10_000)
+    registry.open(replyFor(raw), 1, { toolsListChanged: true })
+
+    // Backpressured: the notification waits in the queue.
+    registry.deliver(changed)
+    t.assert.strictEqual(raw.writes.length, 1)
+
+    registry.closeAll()
+    const final = raw.writes[1].split('\n\n').filter(Boolean).map(frame => JSON.parse(frame.slice('data: '.length)))
+    t.assert.deepStrictEqual(final.map(message => message.method ?? 'response'), [
+      'notifications/tools/list_changed',
+      'notifications/cancelled',
+      'response'
+    ])
+  })
+
+  test('the end hook runs once, however the stream ends', (t: TestContext) => {
+    for (const end of ['shutdown', 'client'] as const) {
+      const raw = new FakeResponse()
+      const registry = new SubscriptionRegistry(logger, 10_000)
+      let ended = 0
+      registry.open(replyFor(raw), 1, { toolsListChanged: true }, undefined, undefined, () => { ended++ })
+      if (end === 'shutdown') registry.closeAll()
+      else raw.destroy()
+      raw.destroy()
+      t.assert.strictEqual(ended, 1, end)
+    }
+
+    // A stream that could not open still releases what was acquired for it.
+    const closed = new FakeResponse()
+    closed.destroyed = true
+    let ended = 0
+    new SubscriptionRegistry(logger).open(replyFor(closed), 1, {}, undefined, undefined, () => { ended++ })
+    t.assert.strictEqual(ended, 1)
   })
 
   test('graceful completion is appended even while the stream is backpressured', (t: TestContext) => {

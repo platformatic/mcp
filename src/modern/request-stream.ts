@@ -59,7 +59,7 @@ export class RequestStream {
    * when nothing was reported or the response is an error that has not
    * already been committed to a 200 stream.
    */
-  finish (response: JSONRPCMessage): boolean {
+  finish (response: JSONRPCMessage, serialized: string = JSON.stringify(response)): boolean {
     this.#finished = true
     if (this.#timer) clearTimeout(this.#timer)
 
@@ -73,7 +73,7 @@ export class RequestStream {
     }
 
     const raw = this.#reply.raw
-    if (!raw.destroyed && !raw.writableEnded) raw.end(`data: ${JSON.stringify(response)}\n\n`)
+    if (!raw.destroyed && !raw.writableEnded) raw.end(`data: ${serialized}\n\n`)
     return true
   }
 

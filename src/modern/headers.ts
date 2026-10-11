@@ -61,6 +61,24 @@ export function encodeHeaderValue (value: string): string {
   return `${BASE64_PREFIX}${Buffer.from(value, 'utf8').toString('base64')}${BASE64_SUFFIX}`
 }
 
+/**
+ * The first mirrored header the client sent more than once, if any.
+ *
+ * Node joins repeated lines with ", ", so `Mcp-Param-Tenant: acme` twice plus
+ * `evil` would compare as "acme, evil" while a gateway reading the first line
+ * routes on "acme". Mirrored headers must therefore appear exactly once.
+ */
+export function repeatedMirroredHeader (rawHeaders: string[]): string | undefined {
+  const seen = new Set<string>()
+  for (let i = 0; i < rawHeaders.length; i += 2) {
+    const name = rawHeaders[i].toLowerCase()
+    if (name !== 'mcp-protocol-version' && name !== 'mcp-method' && name !== 'mcp-name' && !name.startsWith('mcp-param-')) continue
+    if (seen.has(name)) return rawHeaders[i]
+    seen.add(name)
+  }
+  return undefined
+}
+
 function single (headers: IncomingHttpHeaders, name: string): string | undefined {
   const value = headers[name]
   if (value === undefined) return undefined
@@ -398,6 +416,8 @@ function valueAtPath (root: unknown, path: string[]): unknown {
   let current = root
   for (const segment of path) {
     if (!current || typeof current !== 'object' || Array.isArray(current)) return undefined
+    // Only the arguments the client sent: `constructor` must not resolve to Object's.
+    if (!Object.hasOwn(current, segment)) return undefined
     current = (current as Record<string, unknown>)[segment]
   }
   return current
@@ -461,7 +481,16 @@ export function validateToolParamHeaders (
       continue
     }
 
-    const expected = typeof value === 'boolean' ? String(value) : String(value)
+    // Headers only mirror primitives. A gateway would route an array or object
+    // on its string form while the tool received something else entirely.
+    if (typeof value !== 'string' && typeof value !== 'boolean') {
+      return {
+        ok: false,
+        message: `Header mismatch: Mcp-Param-${name} mirrors '${path.join('.')}', which must be a string, number or boolean`
+      }
+    }
+
+    const expected = String(value)
     if (decoded !== expected) {
       return {
         ok: false,

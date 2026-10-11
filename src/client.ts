@@ -117,9 +117,11 @@ export interface McpClientResponse<TBody = JSONRPCResponse> {
   payload: string
   /**
    * Notifications the server sent on the response stream before the final
-   * response (2026-07-28 progress and log messages). Empty for a JSON response.
+   * response (2026-07-28 progress and log messages). The client always sets
+   * it, empty for a JSON response; optional so hand-built responses (mocks)
+   * written for 2.x still type-check.
    */
-  notifications: JSONRPCNotification[]
+  notifications?: JSONRPCNotification[]
 }
 
 export interface McpClientInitializeOptions {

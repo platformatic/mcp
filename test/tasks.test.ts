@@ -3,7 +3,7 @@ import type { TestContext } from 'node:test'
 import Fastify from 'fastify'
 import { Type } from '@sinclair/typebox'
 import mcpPlugin from '../src/index.ts'
-import { JSONRPC_VERSION, LATEST_LEGACY_PROTOCOL_VERSION, METHOD_NOT_FOUND, INVALID_PARAMS } from '../src/schema.ts'
+import { JSONRPC_VERSION, LATEST_LEGACY_PROTOCOL_VERSION, METHOD_NOT_FOUND, INVALID_PARAMS, INVALID_REQUEST } from '../src/schema.ts'
 import type { Task, CreateTaskResult, ListTasksResult, CallToolResult } from '../src/schema.ts'
 import { MemoryTaskStore } from '../src/stores/memory-task-store.ts'
 import { canTransition, isTerminal, taskHasExpired, toWireTask } from '../src/stores/task-store.ts'
@@ -502,7 +502,7 @@ describe('tasks over the wire', () => {
     t.assert.deepStrictEqual(listed.tasks.map(task => task.taskId), [taskId])
   })
 
-  test('a token without sub cannot list or reach subject-less tasks', async (t: TestContext) => {
+  test('a token without sub cannot create or list tasks', async (t: TestContext) => {
     const restoreMock = setupMockAgent({
       'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse()
     })
@@ -533,17 +533,14 @@ describe('tasks over the wire', () => {
     const anonA = createTestJWT({ sub: undefined })
     const anonB = createTestJWT({ sub: undefined })
 
+    // A task nobody could reach again, and that no per-caller limit covers,
+    // is refused rather than created.
     const created = await authedCall(anonA, 'tools/call', { name: 'noop', arguments: {}, task: {} })
-    const taskId = (created.result as CreateTaskResult).task.taskId
-    t.assert.ok(taskId)
+    t.assert.strictEqual(created.error?.code, INVALID_REQUEST)
 
-    // B must not enumerate A's task via list (both resolve to an undefined subject)
+    // B must not enumerate anything via list (both resolve to an undefined subject)
     const list = await authedCall(anonB, 'tasks/list', {})
     t.assert.deepStrictEqual((list.result as ListTasksResult).tasks, [])
-
-    // ...nor reach it by id
-    const get = await authedCall(anonB, 'tasks/get', { taskId })
-    t.assert.strictEqual(get.error.code, INVALID_PARAMS)
   })
 
   test('task methods are unavailable when tasks are disabled', async (t: TestContext) => {
@@ -557,5 +554,87 @@ describe('tasks over the wire', () => {
 
     const init = await call(app, 'initialize', { protocolVersion: '2025-11-25', capabilities: {} })
     t.assert.strictEqual(init.result.capabilities.tasks, undefined)
+  })
+})
+
+/** Poll until `check` passes, for up to a second. */
+async function until (check: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 100 && !check(); attempt++) await new Promise(resolve => setTimeout(resolve, 10))
+}
+
+describe('round 4: legacy tasks', () => {
+  test('tasks/cancel aborts the worker and frees its slot', async (t: TestContext) => {
+    const app = Fastify({ logger: false })
+    t.after(() => app.close())
+    await app.register(mcpPlugin, { enableTasks: true, taskMaxConcurrent: 1 })
+    let aborted = false
+    app.mcpAddTool({
+      name: 'wait',
+      description: 'Waits until cancelled',
+      inputSchema: Type.Object({}),
+      execution: { taskSupport: 'optional' }
+    } as any, async (_params: any, context: any): Promise<CallToolResult> => {
+      await new Promise<void>(resolve => {
+        if (context.signal.aborted) return resolve()
+        context.signal.addEventListener('abort', () => resolve(), { once: true })
+      })
+      aborted = context.signal.aborted
+      return { content: [{ type: 'text', text: 'stopped' }] }
+    })
+    await app.ready()
+
+    const created = await call(app, 'tools/call', { name: 'wait', arguments: {}, task: {} })
+    const taskId = (created.result as CreateTaskResult).task.taskId
+    const cancelled = await call(app, 'tasks/cancel', { taskId })
+    t.assert.strictEqual(cancelled.result.status, 'cancelled')
+
+    await until(() => aborted)
+    t.assert.strictEqual(aborted, true)
+
+    // With a limit of one, a second task fits only once the first let go.
+    let second: any
+    for (let attempt = 0; attempt < 50; attempt++) {
+      second = await call(app, 'tools/call', { name: 'wait', arguments: {}, task: {} }, 2)
+      if (second.result) break
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+    t.assert.ok(second.result?.task?.taskId, JSON.stringify(second))
+    await call(app, 'tasks/cancel', { taskId: second.result.task.taskId }, 3)
+  })
+
+  test('legacy task responses carry only the spec Task fields', async (t: TestContext) => {
+    const app = await buildApp(t)
+    const created = await call(app, 'tools/call', { name: 'slow-add', arguments: { a: 1, b: 2 }, task: {} })
+    const task = (created.result as CreateTaskResult).task
+    t.assert.deepStrictEqual(
+      Object.keys(task).sort(),
+      ['createdAt', 'lastUpdatedAt', 'pollInterval', 'status', 'taskId', 'ttl']
+    )
+    const wire = toWireTask(record({ era: 'legacy', leaseExpiresAt: 1, authSubject: 'x', answeredInputKeys: ['a'] } as any))
+    t.assert.strictEqual('era' in wire, false)
+    t.assert.strictEqual('leaseExpiresAt' in wire, false)
+    t.assert.strictEqual('answeredInputKeys' in wire, false)
+  })
+
+  test('a terminal task cannot be rewritten, even with the same status', async (t: TestContext) => {
+    const store = new MemoryTaskStore()
+    await store.create(record())
+    await store.updateStatus('task-1', 'failed', { statusMessage: 'first' })
+    await t.assert.rejects(store.updateStatus('task-1', 'failed', { statusMessage: 'second' }), /terminal/)
+    t.assert.strictEqual((await store.get('task-1'))?.statusMessage, 'first')
+  })
+})
+
+describe('round 4: legacy capabilities without SSE', () => {
+  test('resources.subscribe is not advertised when updates cannot be delivered', async (t: TestContext) => {
+    for (const enableSSE of [false, true]) {
+      const app = Fastify({ logger: false })
+      t.after(() => app.close())
+      await app.register(mcpPlugin, { enableSSE })
+      app.mcpSetResourceSubscribeHandler(async () => ({}))
+      await app.ready()
+      const init = await call(app, 'initialize', { protocolVersion: LATEST_LEGACY_PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: 'c', version: '1' } })
+      t.assert.strictEqual(init.result.capabilities.resources?.subscribe, enableSSE ? true : undefined)
+    }
   })
 })

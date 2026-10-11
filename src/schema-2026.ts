@@ -25,11 +25,11 @@ import type {
   PromptMessage,
   ResourceContents,
   ContentBlock,
-  ElicitRequest,
+  ElicitRequestFormParams,
+  ElicitRequestURLParams,
   ElicitResult,
-  CreateMessageRequest,
+  CreateMessageRequestParams,
   CreateMessageResult,
-  ListRootsRequest,
   ListRootsResult
 } from './schema.ts'
 
@@ -187,7 +187,26 @@ export interface DiscoverResult extends CacheableResult {
 /* Multi round-trip requests (MRTR)                                    */
 /* ------------------------------------------------------------------ */
 
-export type InputRequest = CreateMessageRequest | ListRootsRequest | ElicitRequest
+/**
+ * The requests a server may put in `inputRequests`. These are not JSON-RPC
+ * messages, so they carry no `jsonrpc` or `id`; nor `task`, since the server
+ * asks within a request; nor `elicitationId`, which 2026-07-28 removed
+ * together with `notifications/elicitation/complete`.
+ */
+export interface ElicitInputRequest {
+  method: 'elicitation/create'
+  params: Omit<ElicitRequestFormParams, 'task'> | Omit<ElicitRequestURLParams, 'task' | 'elicitationId'>
+}
+export interface CreateMessageInputRequest {
+  method: 'sampling/createMessage'
+  params: Omit<CreateMessageRequestParams, 'task'>
+}
+export interface ListRootsInputRequest {
+  method: 'roots/list'
+  params?: RequestParams
+}
+
+export type InputRequest = CreateMessageInputRequest | ListRootsInputRequest | ElicitInputRequest
 export type InputResponse = CreateMessageResult | ListRootsResult | ElicitResult
 
 /** Server-assigned key -> the request the client must fulfil. */

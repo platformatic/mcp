@@ -54,10 +54,12 @@ export class MemoryTaskStore implements TaskStore {
       return null
     }
 
+    // A terminal task never changes again, not even to rewrite the same status
+    // with another message or outcome (the Redis store refuses the same).
+    if (isTerminal(task.status)) {
+      throw new Error(`Task ${taskId} is already in terminal status '${task.status}'`)
+    }
     if (task.status !== status) {
-      if (isTerminal(task.status)) {
-        throw new Error(`Task ${taskId} is already in terminal status '${task.status}'`)
-      }
       if (!canTransition(task.status, status)) {
         throw new Error(`Invalid task transition '${task.status}' -> '${status}'`)
       }

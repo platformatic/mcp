@@ -31,7 +31,7 @@ import {
   INVALID_PARAMS,
   INVALID_REQUEST
 } from './schema.ts'
-import type { RequestId } from './schema.ts'
+import type { ClientCapabilities, RequestId } from './schema.ts'
 
 import type {
   MCPTool,
@@ -117,6 +117,8 @@ export type HandlerDependencies = {
   signal?: AbortSignal
   /** Request-scoped notifications; see `HandlerContext.sendProgress` and `log`. */
   notifiers?: RequestNotifiers
+  /** What the client declared on this request; see `HandlerContext.clientCapabilities`. */
+  clientCapabilities?: ClientCapabilities
 }
 
 export type ToolCallDependencies = Pick<HandlerDependencies,
@@ -131,7 +133,8 @@ export type ToolCallDependencies = Pick<HandlerDependencies,
   'mrtr' |
   'signal' |
   'protocolVersion' |
-  'notifiers'
+  'notifiers' |
+  'clientCapabilities'
 >
 
 export function createResponse (id: string | number, result: any): JSONRPCResponse {
@@ -162,12 +165,14 @@ export function createError (id: string | number | null, code: number, message: 
 const NEVER_ABORTED = new AbortController().signal
 const NO_NOTIFIERS: RequestNotifiers = { sendProgress: () => {}, log: () => {} }
 
-function handlerContext (
-  dependencies: Pick<HandlerDependencies, 'request' | 'reply' | 'authContext' | 'mrtr' | 'signal' | 'notifiers'>,
+export function handlerContext (
+  dependencies: Pick<HandlerDependencies, 'request' | 'reply' | 'authContext' | 'mrtr' | 'signal' | 'notifiers' | 'protocolVersion' | 'clientCapabilities'>,
   sessionId: string | undefined
 ): HandlerContext {
   return {
     sessionId,
+    protocolVersion: dependencies.protocolVersion,
+    clientCapabilities: dependencies.clientCapabilities,
     request: dependencies.request,
     reply: dependencies.reply,
     authContext: dependencies.authContext,
@@ -236,7 +241,7 @@ async function handleInitialize (
     protocolVersion,
     // Never advertise a capability the agreed revision cannot express, nor a
     // list-change notification a legacy client has no SSE channel to receive.
-    capabilities: withoutUndeliverableListChanges(capabilitiesForRevision(capabilities, protocolVersion), opts.enableSSE === true),
+    capabilities: withoutUndeliverableNotifications(capabilitiesForRevision(capabilities, protocolVersion), opts.enableSSE === true),
     serverInfo,
     instructions: opts.instructions
   }
@@ -262,12 +267,18 @@ function withSchemaDialect<T> (schema: T, protocolVersion: string | undefined): 
   return { $schema: JSON_SCHEMA_DIALECT, ...(schema as Record<string, unknown>) } as T
 }
 
-function withoutUndeliverableListChanges<T extends Record<string, any>> (capabilities: T, deliverable: boolean): T {
+/**
+ * A legacy client only receives notifications on its SSE stream. Without one,
+ * advertising `listChanged` or resource `subscribe` would promise
+ * notifications that can never arrive.
+ */
+function withoutUndeliverableNotifications<T extends Record<string, any>> (capabilities: T, deliverable: boolean): T {
   if (deliverable) return capabilities
   const trimmed: Record<string, any> = { ...capabilities }
   for (const list of ['tools', 'resources', 'prompts']) {
-    if (trimmed[list]?.listChanged) {
+    if (trimmed[list]?.listChanged || (list === 'resources' && trimmed[list]?.subscribe)) {
       const { listChanged, ...rest } = trimmed[list]
+      if (list === 'resources') delete rest.subscribe
       trimmed[list] = rest
     }
   }
@@ -921,94 +932,48 @@ export async function handlePromptsGet (
     return createError(request.id, METHOD_NOT_FOUND, `Prompt '${promptName}' not found`)
   }
 
-  if (!prompt.handler) {
-    const result: GetPromptResult = {
-      messages: [{
-        role: 'user',
-        content: {
-          type: 'text',
-          text: `Prompt '${promptName}' has no handler implementation`
-        }
-      }]
-    }
-    return createResponse(request.id, result)
+  // The legacy path reports failures as a message, as it always has. On
+  // 2026-07-28 they are JSON-RPC errors (-32602 for the client's arguments,
+  // -32603 otherwise) and a handler's error text stays in the server log.
+  const strict = dependencies.strictErrors === true
+  const asMessage = (text: string): JSONRPCResponse => createResponse(request.id, {
+    messages: [{ role: 'user', content: { type: 'text', text } }]
+  } satisfies GetPromptResult)
+  const invalidArguments = (message: string): JSONRPCResponse | JSONRPCError => strict
+    ? createError(request.id, INVALID_PARAMS, `Invalid prompt arguments: ${message}`)
+    : asMessage(`Invalid prompt arguments: ${message}`)
+  const failed = (error: any): JSONRPCResponse | JSONRPCError => {
+    if (!strict) return asMessage(`Prompt execution failed: ${error?.message || error}`)
+    dependencies.app.log.error({ err: error, prompt: promptName }, 'Prompt handler failed')
+    return createError(request.id, INTERNAL_ERROR, 'Internal server error')
   }
 
-  // Validate prompt arguments against the prompt's argument schema
-  const promptArguments = params.arguments || {}
-  if ('argumentSchema' in prompt.definition && prompt.definition.argumentSchema) {
-    // Check if it's a TypeBox schema
-    const schema = prompt.definition.argumentSchema
-    if (isTypeBoxSchema(schema)) {
-      // TypeBox schema - use our validation
-      const argumentsValidation = validate(schema, promptArguments)
-      if (!argumentsValidation.success) {
-        const result: GetPromptResult = {
-          messages: [{
-            role: 'user',
-            content: {
-              type: 'text',
-              text: `Invalid prompt arguments: ${argumentsValidation.error.message}`
-            }
-          }]
-        }
-        return createResponse(request.id, result)
-      }
+  if (!prompt.handler) {
+    if (!strict) return asMessage(`Prompt '${promptName}' has no handler implementation`)
+    dependencies.app.log.error({ prompt: promptName }, 'Prompt has no handler implementation')
+    return createError(request.id, INTERNAL_ERROR, 'Internal server error')
+  }
 
-      // Use validated arguments
-      try {
-        const result = await prompt.handler(promptName, argumentsValidation.data, handlerContext(dependencies, sessionId))
-        return createResponse(request.id, result)
-      } catch (error: any) {
-        rethrowIfInputRequired(error)
-        const result: GetPromptResult = {
-          messages: [{
-            role: 'user',
-            content: {
-              type: 'text',
-              text: `Prompt execution failed: ${error.message || error}`
-            }
-          }]
-        }
-        return createResponse(request.id, result)
-      }
-    } else {
-      // Regular JSON Schema - basic validation or pass through
-      try {
-        const result = await prompt.handler(promptName, promptArguments, handlerContext(dependencies, sessionId))
-        return createResponse(request.id, result)
-      } catch (error: any) {
-        rethrowIfInputRequired(error)
-        const result: GetPromptResult = {
-          messages: [{
-            role: 'user',
-            content: {
-              type: 'text',
-              text: `Prompt execution failed: ${error.message || error}`
-            }
-          }]
-        }
-        return createResponse(request.id, result)
-      }
-    }
-  } else {
-    // Unsafe prompt without schema - pass arguments as-is
-    try {
-      const result = await prompt.handler(promptName, promptArguments, handlerContext(dependencies, sessionId))
-      return createResponse(request.id, result)
-    } catch (error: any) {
-      rethrowIfInputRequired(error)
-      const result: GetPromptResult = {
-        messages: [{
-          role: 'user',
-          content: {
-            type: 'text',
-            text: `Prompt execution failed: ${error.message || error}`
-          }
-        }]
-      }
-      return createResponse(request.id, result)
-    }
+  let promptArguments: Record<string, unknown> = params.arguments || {}
+  const schema = 'argumentSchema' in prompt.definition ? prompt.definition.argumentSchema : undefined
+  if (schema && isTypeBoxSchema(schema)) {
+    const argumentsValidation = validate(schema, promptArguments)
+    if (!argumentsValidation.success) return invalidArguments(argumentsValidation.error.message)
+    promptArguments = argumentsValidation.data as Record<string, unknown>
+  } else if (strict) {
+    // Without a schema, the declared `arguments` still say which are required.
+    const missing = (prompt.definition.arguments ?? [])
+      .filter(argument => argument.required && promptArguments[argument.name] === undefined)
+      .map(argument => argument.name)
+    if (missing.length > 0) return invalidArguments(`missing required arguments: ${missing.join(', ')}`)
+  }
+
+  try {
+    const result = await prompt.handler(promptName, promptArguments, handlerContext(dependencies, sessionId))
+    return createResponse(request.id, result)
+  } catch (error: any) {
+    rethrowIfInputRequired(error)
+    return failed(error)
   }
 }
 
@@ -1413,7 +1378,15 @@ async function runToolCallAsTask (
     return createError(request.id, METHOD_NOT_FOUND, 'Tasks are not enabled on this server')
   }
 
-  const task = newTaskRecord('tools/call', ttl, taskSubject(dependencies), taskTtlBounds(dependencies))
+  // When the deployment identifies callers a task is visible only to its
+  // creator, so one created for a caller without an identity would be
+  // unreachable, and would escape the per-caller limit too.
+  const subject = taskSubject(dependencies)
+  if (canIdentifyRequestors(dependencies) && subject === undefined) {
+    return createError(request.id, INVALID_REQUEST, 'Cannot create a task: the caller is not identified')
+  }
+
+  const task = newTaskRecord('tools/call', ttl, subject, taskTtlBounds(dependencies))
 
   // Legacy tasks share the limits, ttl abort and shutdown drain of the
   // 2026-07-28 ones, so neither era can starve the other.
@@ -1433,6 +1406,10 @@ async function runToolCallAsTask (
   reservation.live.stop = (reason: TaskStopped) => {
     if (!stopped.aborted) stopController.abort(reason)
   }
+  // `tasks/cancel` may arrive on any instance; it reaches the worker here.
+  const stopListening = dependencies.taskInputs?.onCancel(task.taskId, () => {
+    reservation.live.stop(new TaskStopped('Task cancelled'))
+  })
   const taskTtl = task.ttl ?? undefined
   const ttlTimer = taskTtl !== undefined && taskTtl <= MAX_TIMER_MS
     ? setTimeout(() => {
@@ -1490,6 +1467,7 @@ async function runToolCallAsTask (
     })
     .finally(() => {
       if (ttlTimer) clearTimeout(ttlTimer)
+      stopListening?.()
       reservation.release()
     })
 
