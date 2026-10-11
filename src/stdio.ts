@@ -43,6 +43,9 @@ export class StdioTransport {
   private readline: any
   private transportOpts: StdioTransportOptions
   private isShuttingDown = false
+  // There is no session over stdio, so the transport itself has to remember
+  // what `initialize` agreed on and echo it like an HTTP client would.
+  private protocolVersion: string | undefined
 
   constructor (
     app: FastifyInstance,
@@ -204,22 +207,35 @@ export class StdioTransport {
    * Process a single JSON-RPC message using Fastify's inject method
    */
   private async processMessage (message: JSONRPCMessage): Promise<JSONRPCResponse | JSONRPCError | null> {
+    const isInitialize = (message as { method?: string }).method === 'initialize'
+
     try {
+      const headers: Record<string, string> = {
+        'content-type': 'application/json',
+        accept: 'application/json', // Explicitly request JSON, not SSE
+        'x-platformatic-mcp-transport': 'stdio'
+      }
+      // `initialize` is the negotiation itself, so it never carries a version
+      if (!isInitialize && this.protocolVersion) {
+        headers['mcp-protocol-version'] = this.protocolVersion
+      }
+
       // Use Fastify's inject method to simulate an HTTP request to the /mcp endpoint
       const response = await this.app.inject({
         method: 'POST',
         url: '/mcp',
-        headers: {
-          'content-type': 'application/json',
-          accept: 'application/json', // Explicitly request JSON, not SSE
-          'x-platformatic-mcp-transport': 'stdio'
-        },
+        headers,
         payload: message
       })
 
       // Parse the response
       if (response.statusCode === 200) {
-        return JSON.parse(response.body)
+        const body = JSON.parse(response.body)
+        const negotiated = body?.result?.protocolVersion
+        if (isInitialize && typeof negotiated === 'string') {
+          this.protocolVersion = negotiated
+        }
+        return body
       } else if (response.statusCode === 202) {
         // No content - this is for notifications that don't expect a response
         return null
