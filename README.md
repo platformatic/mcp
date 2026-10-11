@@ -1221,6 +1221,7 @@ The stdio transport follows the MCP stdio transport specification:
 - Messages must NOT contain embedded newlines
 - Server logs can be written to stderr
 - Supports both single messages and batch requests
+- The protocol version negotiated by `initialize` applies to every later message on the stream (a new `initialize` re-negotiates it)
 
 ### Error Handling
 
