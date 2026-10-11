@@ -336,7 +336,8 @@ export interface MCPPluginOptions {
   /**
    * Validate plain JSON Schema tool inputs using AJV.
    * Omit this option to disable validation, or provide an object to enable it.
-   * Options override the default Fastify-compatible AJV configuration.
+   * Options override the default non-mutating AJV configuration (no coercion,
+   * no defaults injection, no property removal).
    */
   validateJsonSchemaInputs?: Options
   sessionStore?: 'memory' | 'redis'

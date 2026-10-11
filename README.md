@@ -647,7 +647,7 @@ await app.register(mcpPlugin, {
 Behavior when enabled:
 
 - Invalid arguments return a tool execution error (`isError: true` with an `Invalid tool arguments: ...` message, capped at 5 reported errors), not a protocol error — the same SEP-1303 semantics as TypeBox validation.
-- Validation is non-mutating: no type coercion, no defaults injection, no property removal. Handlers receive the arguments exactly as the client sent them. `format` keywords are annotation-only (JSON Schema 2020-12's own default).
+- Validation is non-mutating: no type coercion, no defaults injection, no property removal. Handlers receive the arguments exactly as the client sent them. `format` keywords are annotation-only (JSON Schema 2020-12's own default). Pass AJV options such as `coerceTypes`, `useDefaults` or `removeAdditional` explicitly if you want AJV to rewrite arguments.
 - A plain JSON Schema that AJV cannot compile makes `mcpAddTool` throw, so a misconfigured tool fails at startup instead of running unvalidated.
 - Compiled validators are cached per schema, and the option also applies to stdio transports and task-augmented (`task: {}`) calls.
 
