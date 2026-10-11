@@ -1,8 +1,8 @@
 import { randomUUID } from 'crypto'
-import type { FastifyRequest, FastifyReply, FastifyPluginAsync, FastifySchema } from 'fastify'
+import type { FastifyRequest, FastifyReply, FastifyPluginAsync, FastifySchema, FastifyError } from 'fastify'
 import fp from 'fastify-plugin'
 import type { JSONRPCMessage } from '../schema.ts'
-import { JSONRPC_VERSION, INTERNAL_ERROR, SUPPORTED_PROTOCOL_VERSIONS, DEFAULT_NEGOTIATED_PROTOCOL_VERSION } from '../schema.ts'
+import { JSONRPC_VERSION, INTERNAL_ERROR, PARSE_ERROR, INVALID_REQUEST, SUPPORTED_PROTOCOL_VERSIONS, DEFAULT_NEGOTIATED_PROTOCOL_VERSION } from '../schema.ts'
 import { isOriginAllowed } from '../security.ts'
 import type {
   MCPPluginOptions,
@@ -72,6 +72,30 @@ function resolveMcpRouteSchema (
   }
 
   return transformed
+}
+
+// Body-parser failures happen before the handler runs, so without this they
+// would surface as Fastify's default error body instead of a JSON-RPC error.
+const BODY_PARSER_ERRORS: Record<string, { code: number, message: string }> = {
+  FST_ERR_CTP_INVALID_JSON_BODY: { code: PARSE_ERROR, message: 'Parse error' },
+  FST_ERR_CTP_EMPTY_JSON_BODY: { code: PARSE_ERROR, message: 'Parse error' },
+  FST_ERR_CTP_BODY_TOO_LARGE: { code: INVALID_REQUEST, message: 'Invalid Request' },
+  FST_ERR_CTP_INVALID_MEDIA_TYPE: { code: INVALID_REQUEST, message: 'Invalid Request' }
+}
+
+function mcpPostErrorHandler (error: FastifyError, request: FastifyRequest, reply: FastifyReply) {
+  const mapped = error.code ? BODY_PARSER_ERRORS[error.code] : undefined
+  if (!mapped) {
+    // Throwing hands the error to the parent (user or default) error handler.
+    throw error
+  }
+
+  request.log.info({ err: error }, 'Rejected MCP request body')
+  return reply.code(error.statusCode ?? 400).type('application/json').send({
+    jsonrpc: JSONRPC_VERSION,
+    id: null,
+    error: mapped
+  })
 }
 
 const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async (app, options) => {
@@ -279,8 +303,8 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
       url: mcpUrl
     }, opts.transformRouteSchema)
     const routeOptions = schema === undefined
-      ? { onRequest: mcpOnRequest, preHandler: mcpPreHandler }
-      : { onRequest: mcpOnRequest, preHandler: mcpPreHandler, schema }
+      ? { onRequest: mcpOnRequest, preHandler: mcpPreHandler, errorHandler: mcpPostErrorHandler }
+      : { onRequest: mcpOnRequest, preHandler: mcpPreHandler, errorHandler: mcpPostErrorHandler, schema }
 
     app.post('/mcp', routeOptions, async (request: FastifyRequest, reply: FastifyReply) => {
       try {
