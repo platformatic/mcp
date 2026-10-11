@@ -26,6 +26,10 @@ export class RedisSessionStore implements SessionStore {
       sessionData.protocolVersion = metadata.protocolVersion
     }
 
+    if (metadata.ownerSub !== undefined) {
+      sessionData.ownerSub = metadata.ownerSub
+    }
+
     // Add authorization context if present
     if (metadata.authorization) {
       sessionData.authorization = JSON.stringify(metadata.authorization)
@@ -90,6 +94,10 @@ export class RedisSessionStore implements SessionStore {
       createdAt: new Date(result.createdAt),
       lastActivity: new Date(result.lastActivity),
       protocolVersion: result.protocolVersion || undefined
+    }
+
+    if (result.ownerSub !== undefined) {
+      metadata.ownerSub = result.ownerSub
     }
 
     // Parse authorization context if present

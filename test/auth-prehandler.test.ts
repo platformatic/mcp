@@ -304,7 +304,7 @@ describe('Authorization PreHandler', () => {
   })
 
   test('should add token payload to request context', async (t: TestContext) => {
-    const config = createTestAuthConfig()
+    const config = createTestAuthConfig({ authorizationServers: ['https://custom.example.com'] })
     restoreMock = setupMockAgent({
       'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse()
     })

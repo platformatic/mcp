@@ -10,6 +10,12 @@ export interface SessionMetadata {
   /** Protocol revision agreed during `initialize`, if the handshake has happened */
   protocolVersion?: string
   authSession?: any // OAuth session data (legacy - for Phase 2 compatibility)
+  /**
+   * Subject (`sub`) of the verified access token that created the session.
+   * When set, only requests bearing a token for the same subject may use the
+   * session. Unset when authorization is disabled.
+   */
+  ownerSub?: string
 
   // Enhanced authorization context
   authorization?: AuthorizationContext

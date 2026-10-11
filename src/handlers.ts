@@ -260,6 +260,67 @@ function isTemplateUri (uri: string): boolean {
   return URI_TEMPLATE_REGEX.test(uri)
 }
 
+interface CompiledUriTemplate {
+  regex: RegExp
+  names: string[]
+}
+
+const compiledUriTemplates = new Map<string, CompiledUriTemplate | null>()
+
+/**
+ * Compile an RFC 6570 level-1 template (`{name}` placeholders only) into an
+ * anchored regex. Each placeholder matches one non-empty, slash-bounded
+ * segment; everything else must match literally. Templates using operators
+ * (`{+x}`, `{?x}`, ...) are not supported and never match.
+ */
+function compileUriTemplate (template: string): CompiledUriTemplate | null {
+  let compiled = compiledUriTemplates.get(template)
+  if (compiled !== undefined) return compiled
+
+  const names: string[] = []
+  let source = '^'
+  let lastIndex = 0
+  let supported = true
+  for (const match of template.matchAll(/\{([^}]*)\}/g)) {
+    const name = match[1]
+    if (!/^[A-Za-z0-9_]+$/.test(name)) {
+      supported = false
+      break
+    }
+    source += escapeRegExp(template.slice(lastIndex, match.index)) + '([^/]+)'
+    names.push(name)
+    lastIndex = match.index + match[0].length
+  }
+  source += escapeRegExp(template.slice(lastIndex)) + '$'
+
+  compiled = supported ? { regex: new RegExp(source), names } : null
+  compiledUriTemplates.set(template, compiled)
+  return compiled
+}
+
+function escapeRegExp (value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function matchUriTemplate (template: string, uri: string): Record<string, string> | null {
+  const compiled = compileUriTemplate(template)
+  if (!compiled) return null
+
+  const match = compiled.regex.exec(uri)
+  if (!match) return null
+
+  const params: Record<string, string> = {}
+  compiled.names.forEach((name, i) => {
+    const raw = match[i + 1]
+    try {
+      params[name] = decodeURIComponent(raw)
+    } catch {
+      params[name] = raw
+    }
+  })
+  return params
+}
+
 function handleResourcesList (request: JSONRPCRequest, dependencies: HandlerDependencies): JSONRPCResponse {
   const { resources, protocolVersion } = dependencies
   const result: ListResourcesResult = {
@@ -657,6 +718,20 @@ async function handleResourcesRead (
     }
   }
 
+  // Otherwise look for a registered template the concrete URI expands from
+  let uriParams: Record<string, string> | undefined
+  if (!resource) {
+    for (const candidate of resources.values()) {
+      if (!isTemplateUri(candidate.definition.uri)) continue
+      const params = matchUriTemplate(candidate.definition.uri, uri)
+      if (params) {
+        resource = candidate
+        uriParams = params
+        break
+      }
+    }
+  }
+
   if (!resource) {
     return createError(request.id, METHOD_NOT_FOUND, `Resource '${uri}' not found`)
   }
@@ -696,7 +771,8 @@ async function handleResourcesRead (
       sessionId,
       request: dependencies.request,
       reply: dependencies.reply,
-      authContext: dependencies.authContext
+      authContext: dependencies.authContext,
+      uriParams
     })
     return createResponse(request.id, result)
   } catch (error: any) {
