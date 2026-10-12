@@ -292,6 +292,11 @@ await app.register(mcpPlugin, {
 })
 ```
 
+A client-requested `ttl` must be a non-negative integer number of milliseconds; anything else
+(a string, a negative or fractional number) is rejected with `-32602` Invalid params. A valid
+`ttl` is clamped between 1 second and `taskMaxTtlMs`, and the effective value is returned in the
+`CreateTaskResult`.
+
 Tasks are stored in memory by default and in Redis when a `redis` option is given, so any
 instance can serve a poll for a task created on another.
 
