@@ -259,6 +259,47 @@ describe('Session-Based Authorization', () => {
       assert.strictEqual(body1.error, 'authorization_required')
     })
 
+    test('should include requiredScopes in the initial 401 challenge', async (t) => {
+      const fastify = Fastify()
+      t.after(async () => {
+        await fastify.close()
+      })
+
+      const config = {
+        enabled: true,
+        authorizationServers: ['https://auth.example.com'],
+        resourceUri: 'https://api.example.com',
+        requiredScopes: ['mcp:read', 'mcp:write'],
+        tokenValidation: {
+          jwksUri: 'https://auth.example.com/.well-known/jwks.json',
+          validateAudience: true
+        }
+      }
+
+      const sessionStore = new MemorySessionStore(100)
+      const tokenValidator = new TokenValidator(config, fastify)
+
+      const preHandler = createSessionAuthPreHandler({
+        config,
+        tokenValidator,
+        sessionStore
+      })
+
+      fastify.addHook('preHandler', preHandler)
+      fastify.get('/test', async () => ({ message: 'success' }))
+
+      const response = await fastify.inject({
+        method: 'GET',
+        url: '/test'
+      })
+
+      assert.strictEqual(response.statusCode, 401)
+      assert.strictEqual(
+        response.headers['www-authenticate'],
+        'Bearer realm="MCP Server", resource_metadata="https://api.example.com/.well-known/oauth-protected-resource", scope="mcp:read mcp:write"'
+      )
+    })
+
     test('should skip authorization for well-known endpoints', async (t) => {
       const fastify = Fastify()
       t.after(async () => {

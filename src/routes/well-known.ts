@@ -40,6 +40,10 @@ const wellKnownRoutesPlugin = fp(async function (app: FastifyInstance, opts: Wel
             authorization_servers: {
               type: 'array',
               items: { type: 'string' }
+            },
+            scopes_supported: {
+              type: 'array',
+              items: { type: 'string' }
             }
           },
           required: ['resource', 'authorization_servers']
@@ -50,6 +54,9 @@ const wellKnownRoutesPlugin = fp(async function (app: FastifyInstance, opts: Wel
     const metadata: ProtectedResourceMetadata = {
       resource: authConfig.resourceUri,
       authorization_servers: authConfig.authorizationServers
+    }
+    if (authConfig.requiredScopes && authConfig.requiredScopes.length > 0) {
+      metadata.scopes_supported = authConfig.requiredScopes
     }
 
     reply.header('Content-Type', 'application/json')
@@ -68,6 +75,10 @@ const wellKnownRoutesPlugin = fp(async function (app: FastifyInstance, opts: Wel
             authorization_servers: {
               type: 'array',
               items: { type: 'string' }
+            },
+            scopes_supported: {
+              type: 'array',
+              items: { type: 'string' }
             }
           },
           required: ['resource', 'authorization_servers']
@@ -78,6 +89,9 @@ const wellKnownRoutesPlugin = fp(async function (app: FastifyInstance, opts: Wel
     const metadata: ProtectedResourceMetadata = {
       resource: `${authConfig.resourceUri.replace(/\/+$/, '')}/mcp`,
       authorization_servers: authConfig.authorizationServers
+    }
+    if (authConfig.requiredScopes && authConfig.requiredScopes.length > 0) {
+      metadata.scopes_supported = authConfig.requiredScopes
     }
 
     reply.header('Content-Type', 'application/json')

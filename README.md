@@ -1614,6 +1614,8 @@ The stdio transport follows the MCP stdio transport specification:
 - 2026-07-28 messages are always sent one per line; a batch containing one is refused with
   `-32600`. Legacy revisions may still send batches.
 - 2026-07-28 has no header layer on stdio: everything travels in the body's `_meta`
+- The protocol version negotiated by a legacy `initialize` applies to every later legacy message
+  on the stream (a new `initialize` re-negotiates it)
 
 ### Error Handling
 
@@ -2242,6 +2244,7 @@ await app.register(import('@fastify/bearer-auth'), {
   - `enabled`: Enable OAuth 2.1 authorization (default: false)
   - `authorizationServers`: Authorization server URIs
   - `resourceUri`: Resource URI
+  - `requiredScopes`: Scopes a token must carry (optional). Tokens missing any of them get a 403 `insufficient_scope` challenge. When set, the scopes are also advertised as `scopes_supported` in `/.well-known/oauth-protected-resource` metadata and as `scope="..."` in the `WWW-Authenticate` header of every 401 challenge
   - `tokenValidation`: JWT token validation configuration
     - `jwksUri`: JWKS endpoint URL for JWT signature verification
     - `validateAudience`: Enable audience validation

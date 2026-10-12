@@ -76,6 +76,9 @@ export class StdioTransport {
   private isShuttingDown = false
   /** Requests still being served, by JSON-RPC id, so a client can cancel them. */
   private inFlight = new Map<string, AbortController>()
+  // There is no session over stdio, so the transport itself has to remember
+  // what a legacy `initialize` agreed on and echo it like an HTTP client would.
+  private protocolVersion: string | undefined
 
   constructor (
     app: FastifyInstance,
@@ -266,18 +269,26 @@ export class StdioTransport {
     const cancel = new AbortController()
     if (key !== undefined) this.inFlight.set(key, cancel)
     const registration = registerStdioRequest(cancel.signal, this.transportOpts.authContext)
+    const isInitialize = (message as { method?: string }).method === 'initialize'
 
     try {
+      const headers: Record<string, string> = {
+        'content-type': 'application/json',
+        accept: 'application/json, text/event-stream',
+        'x-platformatic-mcp-transport': 'stdio',
+        [STDIO_REQUEST_HEADER]: registration.token
+      }
+      // `initialize` is the negotiation itself, so it never carries a version,
+      // and a 2026-07-28 message carries its own in `_meta`.
+      if (!isInitialize && this.protocolVersion && !bodyClaimsModern(message)) {
+        headers['mcp-protocol-version'] = this.protocolVersion
+      }
+
       // Use Fastify's inject method to simulate an HTTP request to the /mcp endpoint
       const response = await this.app.inject({
         method: 'POST',
         url: '/mcp',
-        headers: {
-          'content-type': 'application/json',
-          accept: 'application/json, text/event-stream',
-          'x-platformatic-mcp-transport': 'stdio',
-          [STDIO_REQUEST_HEADER]: registration.token
-        },
+        headers,
         payload: message,
         payloadAsStream: true
       })
@@ -309,6 +320,8 @@ export class StdioTransport {
         parsed = undefined
       }
       if (isJsonRpcResponse(parsed)) {
+        const negotiated = (parsed as { result?: { protocolVersion?: unknown } }).result?.protocolVersion
+        if (isInitialize && typeof negotiated === 'string') this.protocolVersion = negotiated
         // A body-parser error cannot know the id (HTTP never parsed the
         // body), but this transport did: answer the request it belongs to.
         return parsed.id === null ? { ...parsed, id } as JSONRPCError : parsed

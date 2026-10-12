@@ -158,6 +158,7 @@ export interface TokenValidationResult {
 export interface ProtectedResourceMetadata {
   resource: string
   authorization_servers: string[]
+  scopes_supported?: string[]
 }
 
 export interface TokenIntrospectionResponse {
