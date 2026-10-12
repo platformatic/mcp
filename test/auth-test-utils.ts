@@ -11,6 +11,7 @@ export interface TestJWTOptions {
   sub?: string
   exp?: number
   iat?: number
+  scope?: string
 }
 
 export interface MockJWKSKey {
