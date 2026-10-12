@@ -23,6 +23,7 @@ function suppressUnhandledQuitRejection (conn?: RedisConnLike): void {
 }
 
 interface RedisMQEmitter extends ReturnType<typeof MQEmitterRedis> {
+  state?: { on (event: 'error', listener: (err: Error) => void): unknown }
   removeAllListeners? (topic: string, done?: (err?: Error) => void): void
   subConn?: RedisConnLike
   pubConn?: RedisConnLike
@@ -34,6 +35,8 @@ export interface RedisMessageBrokerOptions {
   closeTimeoutMs?: number
   /** Called with closeTimeoutMs when close() falls back to a forced disconnect after it elapses. */
   onCloseTimeout?: (closeTimeoutMs: number) => void
+  /** Called with errors from the pub/sub connections (e.g. while Redis restarts); ioredis keeps reconnecting. */
+  onError?: (err: Error) => void
 }
 
 export class RedisMessageBroker implements MessageBroker {
@@ -46,6 +49,7 @@ export class RedisMessageBroker implements MessageBroker {
    * @param redis Redis connection duplicated (all ioredis options: host, port, auth, db, tls, …) for the MQEmitter pub/sub connections.
    * @param options.closeTimeoutMs Bound on how long close() waits for a graceful shutdown, in ms (default 2000).
    * @param options.onCloseTimeout Called with closeTimeoutMs when close() falls back to a forced disconnect after it elapses.
+   * @param options.onError Called with errors from the pub/sub connections; ioredis keeps reconnecting.
    */
   constructor (redis: Redis, options: RedisMessageBrokerOptions = {}) {
     // Duplicate the parent connection instead of copying a subset of its options: copying dropped
@@ -57,6 +61,16 @@ export class RedisMessageBroker implements MessageBroker {
     })
     this.closeTimeoutMs = options.closeTimeoutMs ?? DEFAULT_CLOSE_TIMEOUT_MS
     this.onCloseTimeout = options.onCloseTimeout
+    // mqemitter-redis re-emits pub/sub connection errors on `state`; without a listener a Redis
+    // restart would crash the process with an unhandled 'error' event. ioredis reconnects on its own.
+    const onError = options.onError
+    this.emitter.state?.on('error', (err) => {
+      try {
+        onError?.(err)
+      } catch {
+        // caller-supplied hook must not crash the process
+      }
+    })
     suppressUnhandledQuitRejection(this.emitter.subConn)
     suppressUnhandledQuitRejection(this.emitter.pubConn)
   }
