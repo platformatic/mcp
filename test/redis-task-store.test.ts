@@ -113,9 +113,24 @@ describe('RedisTaskStore', () => {
     t.assert.strictEqual((await store.get('task-1'))?.ttl, null)
   })
 
-  test('treats a task past its ttl as absent', async (t: TestContext) => {
-    await store.create(record({ createdAt: new Date(Date.now() - 10_000).toISOString(), ttl: 1_000 }))
+  test('treats a task whose key has expired as absent', async (t: TestContext) => {
+    await store.create(record({ ttl: 1_000 }))
+    await redis.pexpire('mcp:task:task-1', 1)
+    await new Promise(resolve => setTimeout(resolve, 20))
+
     t.assert.strictEqual(await store.get('task-1'), null)
+    t.assert.strictEqual(await redis.zcard('mcp:tasks'), 0)
+  })
+
+  test('does not delete a live task that looks expired by the local clock', async (t: TestContext) => {
+    // Another instance with a slower clock created this task: by our clock it is
+    // past its ttl, but its Redis key is still live, so Redis is authoritative.
+    await store.create(record({ createdAt: new Date(Date.now() - 600_000).toISOString(), ttl: 60_000 }))
+
+    const task = await store.get('task-1')
+    t.assert.strictEqual(task?.taskId, 'task-1')
+    t.assert.strictEqual(await redis.exists('mcp:task:task-1'), 1)
+    t.assert.strictEqual(await redis.zcard('mcp:tasks'), 1)
   })
 
   test('list is scoped to the authorization subject', async (t: TestContext) => {
