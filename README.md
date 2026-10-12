@@ -250,6 +250,19 @@ With SSE disabled, requests that do not carry an `Mcp-Session-Id` keep working s
 no session is created for them. With SSE enabled, every request without a known session id gets
 a new session, as before.
 
+Sessions expire after `sessionTtlMs` milliseconds without activity (default `3600000`, one
+hour), so clients that disconnect without sending `DELETE` do not leave sessions behind. Every
+request carrying the session id, every message stored for it, and every heartbeat on an open SSE
+stream counts as activity, so a session in use is never expired from under a live connection.
+The Redis store applies this as the key TTL; the memory store checks it on every read and sweeps
+expired sessions on an unref'd timer that is cleared when the server closes.
+
+```typescript
+await app.register(mcpPlugin, {
+  sessionTtlMs: 15 * 60_000 // expire sessions after 15 idle minutes
+})
+```
+
 ## Request Body Errors
 
 Body-parser failures on `POST /mcp` are answered with a JSON-RPC error (with `id: null`)
@@ -748,7 +761,7 @@ The plugin supports Redis-backed session management and message broadcasting for
 **With Redis (Distributed):**
 - **Shared Session State**: All instances access the same session data from Redis
 - **Cross-Instance Broadcasting**: Messages sent from any instance reach all connected clients
-- **Session Persistence**: Sessions survive server restarts with 1-hour TTL
+- **Session Persistence**: Sessions survive server restarts, expiring after one idle hour by default (`sessionTtlMs`)
 - **High Availability**: Clients can reconnect to any instance and resume from last event
 - **True Horizontal Scaling**: Add more instances without architectural changes
 
@@ -808,8 +821,8 @@ const store: SessionStore = new MemorySessionStore()
 // or: new RedisSessionStore({ redis })
 ```
 
-- **`SessionStore`**: the interface the plugin uses to persist SSE session metadata, message history, token-to-session mappings, and per-session resource subscriptions (`addResourceSubscription` / `removeResourceSubscription`, exposed as `resourceSubscriptions` on the metadata).
-- **`MemorySessionStore`**: in-process implementation used automatically when no `redis` option is passed. Takes an optional `maxMessages` history cap (default 100).
+- **`SessionStore`**: the interface the plugin uses to persist SSE session metadata, message history, token-to-session mappings, and per-session resource subscriptions (`addResourceSubscription` / `removeResourceSubscription`, exposed as `resourceSubscriptions` on the metadata). The optional `touch(sessionId)` records activity so the session is not expired while in use.
+- **`MemorySessionStore`**: in-process implementation used automatically when no `redis` option is passed. Takes an optional `maxMessages` history cap (default 100) and `{ sessionTtlMs }` idle expiry (default 1 hour); call `cleanup()` periodically to free expired sessions when using it outside the plugin.
 - **`RedisSessionStore`**: distributed implementation used automatically when the `redis` option is passed; sessions and message history live in Redis so any instance can serve any client.
 
 These are the same store classes the plugin instantiates internally based on the `redis` option. Exporting them lets you construct or inspect one directly in tests and scripts.
@@ -849,7 +862,7 @@ connections through the Fastify logger, and ioredis keeps reconnecting. When con
 
 **Automatic Session Management:**
 - Sessions persist across server restarts
-- 1-hour session TTL with automatic cleanup
+- Idle session TTL (`sessionTtlMs`, default 1 hour) with automatic cleanup
 - Message history stored in Redis Streams
 
 **Message Replay:**

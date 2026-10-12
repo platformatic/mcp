@@ -80,6 +80,10 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
 
   const enableSSE = opts.enableSSE ?? false
   const enableTasks = opts.enableTasks ?? false
+
+  if (opts.sessionTtlMs !== undefined && !(Number.isFinite(opts.sessionTtlMs) && opts.sessionTtlMs > 0)) {
+    throw new Error('sessionTtlMs must be a positive number of milliseconds')
+  }
   const tools = new Map<string, MCPTool>()
   const resources = new Map<string, MCPResource>()
   const prompts = new Map<string, MCPPrompt>()
@@ -99,7 +103,7 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     redis.on('error', (err) => {
       app.log.error({ err }, 'Redis connection error')
     })
-    sessionStore = new RedisSessionStore({ redis, maxMessages: 100 })
+    sessionStore = new RedisSessionStore({ redis, maxMessages: 100, sessionTtlMs: opts.sessionTtlMs })
     messageBroker = new RedisMessageBroker(redis, {
       onCloseTimeout: (closeTimeoutMs) => {
         app.log.warn({ closeTimeoutMs }, 'Redis message broker close timed out; forcing disconnect')
@@ -113,7 +117,7 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     }
   } else {
     // Memory implementations for single-instance deployment
-    sessionStore = new MemorySessionStore(100)
+    sessionStore = new MemorySessionStore(100, { sessionTtlMs: opts.sessionTtlMs })
     messageBroker = new MemoryMessageBroker()
     if (enableTasks) {
       taskStore = new MemoryTaskStore()
@@ -140,6 +144,33 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
 
   // Local stream management per server instance
   const localStreams = new Map<string, Set<any>>()
+
+  // Redis expires idle sessions itself through key TTLs. The memory store has no
+  // such mechanism, so sweep it periodically: otherwise every session a client
+  // abandons without DELETE would stay in memory forever. Reads already treat an
+  // expired session as gone; this sweep is what actually frees the memory.
+  let sessionCleanupTimer: NodeJS.Timeout | undefined
+  if (sessionStore instanceof MemorySessionStore) {
+    const memoryStore = sessionStore
+    const sweep = async () => {
+      await memoryStore.cleanup()
+      // An SSE session created by POST that never opened a stream keeps an empty
+      // stream set and a broker subscription; drop both once the session is gone
+      for (const [sessionId, streams] of localStreams) {
+        if (streams.size === 0 && !(await memoryStore.get(sessionId))) {
+          localStreams.delete(sessionId)
+          await messageBroker.unsubscribe(`mcp/session/${sessionId}/message`)
+        }
+      }
+    }
+    sessionCleanupTimer = setInterval(() => {
+      sweep().catch((err: unknown) => {
+        app.log.error({ err }, 'Failed to clean up expired sessions')
+      })
+    }, Math.min(memoryStore.sessionTtlMs, 60_000))
+    // Never keep the process alive just to sweep sessions
+    sessionCleanupTimer.unref()
+  }
 
   // Initialize authorization components if enabled
   let tokenValidator: TokenValidator | null = null
@@ -217,6 +248,8 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
 
   // Add close hook to clean up Redis connections and authorization components
   app.addHook('onClose', async () => {
+    clearInterval(sessionCleanupTimer)
+
     // Clean up all SSE streams and sessions
     const unsubscribePromises: Promise<void>[] = []
     for (const [sessionId, streams] of localStreams.entries()) {

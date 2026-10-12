@@ -40,6 +40,12 @@ export interface SessionStore {
    */
   update(metadata: SessionMetadata): Promise<void>
   get(sessionId: string): Promise<SessionMetadata | null>
+  /**
+   * Record activity on a session so it is not expired while in use. Called on
+   * every request carrying the session id and on each SSE heartbeat. A no-op
+   * when the session is gone. Optional for custom stores that do not expire.
+   */
+  touch?(sessionId: string): Promise<void>
   delete(sessionId: string): Promise<void>
   cleanup(): Promise<void>
 

@@ -14,6 +14,7 @@ import type {
   MCPRouteSchemaTransformer
 } from '../types.ts'
 import type { SessionStore, SessionMetadata } from '../stores/session-store.ts'
+import { DEFAULT_SESSION_TTL_MS } from '../stores/memory-session-store.ts'
 import type { TaskStore, TaskWaiters } from '../stores/task-store.ts'
 import type { MessageBroker } from '../brokers/message-broker.ts'
 import type { AuthorizationContext } from '../types/auth-types.ts'
@@ -238,6 +239,10 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     ? [authPreHandler, enforceSessionOwner, reconcileProtocolVersion]
     : [enforceSessionOwner, reconcileProtocolVersion]
 
+  // Heartbeats refresh session activity, so they must come more often than the
+  // idle TTL or a live stream's session could expire between two of them
+  const heartbeatIntervalMs = Math.min(30_000, Math.max(1, Math.floor((opts.sessionTtlMs ?? DEFAULT_SESSION_TTL_MS) / 2)))
+
   function buildAuthContext (payload: any): AuthorizationContext {
     return {
       userId: payload.sub,
@@ -402,6 +407,12 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
           sessionId = session.id
         }
 
+        // Each request on a session counts as activity, so sessions that are in
+        // use are not expired by the store's idle TTL
+        if (existingSession) {
+          await sessionStore.touch?.(existingSession.id)
+        }
+
         // Build auth context from validated token payload
         let authContext: AuthorizationContext | undefined
         if (request.tokenPayload) {
@@ -501,6 +512,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
           const existingSession = await sessionStore.get(sessionId)
           if (existingSession) {
             session = existingSession
+            await sessionStore.touch?.(session.id)
           } else {
             session = await createSession(request)
             raw.setHeader('Mcp-Session-Id', session.id)
@@ -576,10 +588,15 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         // Send initial heartbeat
         reply.raw.write(': heartbeat\n\n')
 
-        // Keep connection alive with periodic heartbeats
+        // Keep connection alive with periodic heartbeats. Each heartbeat also
+        // counts as session activity, so an open stream keeps its session from
+        // expiring even when no messages flow over it.
         const heartbeatInterval = setInterval(() => {
           try {
             reply.raw.write(': heartbeat\n\n')
+            sessionStore.touch?.(session.id)?.catch((err: unknown) => {
+              app.log.warn({ err, sessionId: session.id }, 'Failed to refresh session activity on heartbeat')
+            })
           } catch (error) {
             clearInterval(heartbeatInterval)
             const streams = localStreams.get(session.id)
@@ -587,7 +604,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
               streams.delete(reply)
             }
           }
-        }, 30000) // 30 second heartbeat
+        }, heartbeatIntervalMs)
         heartbeatInterval.unref()
 
         reply.raw.on('close', () => {
