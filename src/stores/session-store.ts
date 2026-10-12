@@ -1,4 +1,4 @@
-import type { JSONRPCMessage } from '../schema.ts'
+import type { ClientCapabilities, JSONRPCMessage } from '../schema.ts'
 import type { AuthorizationContext, TokenRefreshInfo } from '../types/auth-types.ts'
 
 export interface SessionMetadata {
@@ -9,6 +9,8 @@ export interface SessionMetadata {
   lastActivity: Date
   /** Protocol revision agreed during `initialize`, if the handshake has happened */
   protocolVersion?: string
+  /** Capabilities the client declared during `initialize`, if the handshake has happened */
+  clientCapabilities?: ClientCapabilities
   authSession?: any // OAuth session data (legacy - for Phase 2 compatibility)
 
   // Enhanced authorization context

@@ -5,7 +5,8 @@ import type {
   JSONRPCNotification,
   JSONRPCRequest,
   ElicitRequestFormParams,
-  RequestId
+  RequestId,
+  ClientCapabilities
 } from '../schema.ts'
 import { validateElicitationRequest, validateElicitationUrl } from '../security.ts'
 import { JSONRPC_VERSION } from '../schema.ts'
@@ -13,6 +14,20 @@ import { randomUUID } from 'node:crypto'
 import { supportsUrlElicitation } from '../protocol-version.ts'
 import type { SessionStore } from '../stores/session-store.ts'
 import type { MessageBroker } from '../brokers/message-broker.ts'
+
+/**
+ * Whether the client declared support for an elicitation mode. Elicitation is a
+ * client capability: the server never needs to declare it, but MUST NOT send a
+ * mode the client did not declare. An empty `elicitation: {}` means form only.
+ * When the client has not initialized yet nothing is known, so we do not block.
+ */
+function clientSupportsElicitation (capabilities: ClientCapabilities | undefined, mode: 'form' | 'url'): boolean {
+  if (capabilities === undefined) return true
+  const elicitation = capabilities.elicitation
+  if (!elicitation) return false
+  if (mode === 'url') return elicitation.url !== undefined
+  return elicitation.form !== undefined || elicitation.url === undefined
+}
 
 interface MCPPubSubDecoratorsOptions {
   enableSSE: boolean
@@ -82,6 +97,12 @@ const mcpPubSubDecoratorsPlugin: FastifyPluginAsync<MCPPubSubDecoratorsOptions> 
       return false
     }
 
+    const session = await sessionStore.get(sessionId)
+    if (session && !clientSupportsElicitation(session.clientCapabilities, 'form')) {
+      app.log.warn({ sessionId }, 'Cannot send elicitation request: the client did not declare the elicitation capability (form mode)')
+      return false
+    }
+
     // Generate a request ID if not provided
     const id = requestId ?? `elicit-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
 
@@ -121,6 +142,10 @@ const mcpPubSubDecoratorsPlugin: FastifyPluginAsync<MCPPubSubDecoratorsOptions> 
         sessionId,
         negotiated: session.protocolVersion
       }, 'Cannot send URL elicitation: the session negotiated a revision without URL mode')
+      return null
+    }
+    if (session && !clientSupportsElicitation(session.clientCapabilities, 'url')) {
+      app.log.warn({ sessionId }, 'Cannot send URL elicitation: the client did not declare the elicitation capability (url mode)')
       return null
     }
 
