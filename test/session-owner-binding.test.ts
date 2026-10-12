@@ -9,10 +9,21 @@ import { JSONRPC_VERSION, LATEST_PROTOCOL_VERSION } from '../src/schema.ts'
 import { createTestJWT, setupMockAgent, generateMockJWKSResponse } from './auth-test-utils.ts'
 import { testWithRedis } from './redis-test-utils.ts'
 
-async function buildApp (t: TestContext, redis?: Redis) {
-  const restoreMock = setupMockAgent({
+interface BuildOptions {
+  authorizationServers?: string[]
+  introspectionEndpoint?: string
+  introspectionResponse?: Record<string, unknown>
+  protectedRoutes?: 'all' | 'mcp'
+}
+
+async function buildApp (t: TestContext, redis?: Redis, options: BuildOptions = {}) {
+  const mocks: Record<string, any> = {
     'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse()
-  })
+  }
+  if (options.introspectionEndpoint) {
+    mocks[options.introspectionEndpoint] = options.introspectionResponse
+  }
+  const restoreMock = setupMockAgent(mocks)
 
   const app = Fastify({ logger: false })
   t.after(async () => {
@@ -26,10 +37,12 @@ async function buildApp (t: TestContext, redis?: Redis) {
     enableSSE: true,
     authorization: {
       enabled: true,
-      authorizationServers: ['https://auth.example.com'],
+      authorizationServers: options.authorizationServers ?? ['https://auth.example.com'],
       resourceUri: 'https://mcp.example.com',
+      protectedRoutes: options.protectedRoutes,
       tokenValidation: {
         jwksUri: 'https://auth.example.com/.well-known/jwks.json',
+        introspectionEndpoint: options.introspectionEndpoint,
         validateAudience: true
       }
     },
@@ -91,10 +104,16 @@ function callWhoami (app: Awaited<ReturnType<typeof buildApp>>, token: string, s
   })
 }
 
-async function assertHijackRejected (t: TestContext, redis?: Redis) {
-  const app = await buildApp(t, redis)
-  const alice = createTestJWT({ sub: 'alice' })
-  const bob = createTestJWT({ sub: 'bob' })
+async function assertHijackRejected (
+  t: TestContext,
+  redis?: Redis,
+  buildOptions?: BuildOptions,
+  aliceClaims: Record<string, unknown> = { sub: 'alice' },
+  bobClaims: Record<string, unknown> = { sub: 'bob' }
+) {
+  const app = await buildApp(t, redis, buildOptions)
+  const alice = createTestJWT(aliceClaims)
+  const bob = createTestJWT(bobClaims)
 
   const sessionId = await initialize(app, alice)
 
@@ -165,6 +184,80 @@ describe('Session owner binding', () => {
     await assertHijackRejected(t, redis)
   })
 
+  // Two trusted authorization servers both issue `sub: alice`, for two
+  // different people. Owning a session takes the issuer and the subject.
+  const twoIssuers: BuildOptions = {
+    authorizationServers: ['https://auth.example.com', 'https://other.example.com']
+  }
+  const aliceA = { sub: 'alice', iss: 'https://auth.example.com' }
+  const aliceB = { sub: 'alice', iss: 'https://other.example.com' }
+
+  test('rejects the same subject from another issuer (memory)', async (t: TestContext) => {
+    await assertHijackRejected(t, undefined, twoIssuers, aliceA, aliceB)
+  })
+
+  test('rejects the same subject from another issuer, the other way round (memory)', async (t: TestContext) => {
+    await assertHijackRejected(t, undefined, twoIssuers, aliceB, aliceA)
+  })
+
+  testWithRedis('rejects the same subject from another issuer (redis)', async (redis, t: TestContext) => {
+    await assertHijackRejected(t, redis, twoIssuers, aliceA, aliceB)
+  })
+
+  test('binding holds when authorization only covers the MCP routes', async (t: TestContext) => {
+    await assertHijackRejected(t, undefined, { ...twoIssuers, protectedRoutes: 'mcp' }, aliceA, aliceB)
+  })
+
+  test('a trailing slash on iss does not change the owner', async (t: TestContext) => {
+    const app = await buildApp(t, undefined, twoIssuers)
+    const sessionId = await initialize(app, createTestJWT(aliceA))
+
+    const response = await callWhoami(app, createTestJWT({ ...aliceA, iss: 'https://auth.example.com/' }), sessionId)
+    t.assert.strictEqual(response.statusCode, 200)
+  })
+
+  async function assertIntrospectionBinding (t: TestContext, redis?: Redis) {
+    // No `iss` in the response (RFC 7662 makes it optional): the owner's issuer
+    // is the configured introspection endpoint.
+    const introspectionEndpoint = 'https://auth.example.com/oauth/introspect'
+    const app = await buildApp(t, redis, {
+      introspectionEndpoint,
+      introspectionResponse: { active: true, sub: 'alice', aud: 'https://mcp.example.com' }
+    })
+
+    const sessionId = await initialize(app, 'opaque-alice-token')
+
+    const own = await callWhoami(app, 'opaque-alice-token-2', sessionId)
+    t.assert.strictEqual(own.statusCode, 200)
+    t.assert.strictEqual(own.json().result.content[0].text, 'alice')
+
+    // A JWT for `alice` from the configured authorization server is a
+    // different identity from what the introspection endpoint vouched for.
+    const jwtAlice = createTestJWT({ sub: 'alice' })
+    const post = await callWhoami(app, jwtAlice, sessionId)
+    t.assert.strictEqual(post.statusCode, 404)
+
+    const del = await app.inject({
+      method: 'DELETE',
+      url: '/mcp',
+      headers: { authorization: `Bearer ${jwtAlice}`, 'mcp-session-id': sessionId }
+    })
+    t.assert.strictEqual(del.statusCode, 404)
+
+    // And the other way round: an introspected `alice` cannot use a JWT session.
+    const jwtSession = await initialize(app, jwtAlice)
+    const cross = await callWhoami(app, 'opaque-alice-token', jwtSession)
+    t.assert.strictEqual(cross.statusCode, 404)
+  }
+
+  test('introspection without iss still binds the session (memory)', async (t: TestContext) => {
+    await assertIntrospectionBinding(t)
+  })
+
+  testWithRedis('introspection without iss still binds the session (redis)', async (redis, t: TestContext) => {
+    await assertIntrospectionBinding(t, redis)
+  })
+
   test('a new token for the same subject can keep using the session', async (t: TestContext) => {
     const app = await buildApp(t)
     const sessionId = await initialize(app, createTestJWT({ sub: 'alice' }))
@@ -208,15 +301,18 @@ describe('Session owner binding', () => {
 
   test('memory session store keeps the owner', async (t: TestContext) => {
     const store = new MemorySessionStore()
-    await store.create({ id: 's1', eventId: 0, createdAt: new Date(), lastActivity: new Date(), ownerSub: 'alice' })
+    await store.create({ id: 's1', eventId: 0, createdAt: new Date(), lastActivity: new Date(), ownerSub: 'alice', ownerIss: 'https://auth.example.com' })
     t.assert.strictEqual((await store.get('s1'))?.ownerSub, 'alice')
+    t.assert.strictEqual((await store.get('s1'))?.ownerIss, 'https://auth.example.com')
   })
 
   testWithRedis('redis session store keeps the owner', async (redis, t: TestContext) => {
     const store = new RedisSessionStore({ redis })
-    await store.create({ id: 's1', eventId: 0, createdAt: new Date(), lastActivity: new Date(), ownerSub: 'alice' })
+    await store.create({ id: 's1', eventId: 0, createdAt: new Date(), lastActivity: new Date(), ownerSub: 'alice', ownerIss: 'https://auth.example.com' })
     await store.create({ id: 's2', eventId: 0, createdAt: new Date(), lastActivity: new Date() })
     t.assert.strictEqual((await store.get('s1'))?.ownerSub, 'alice')
+    t.assert.strictEqual((await store.get('s1'))?.ownerIss, 'https://auth.example.com')
     t.assert.strictEqual((await store.get('s2'))?.ownerSub, undefined)
+    t.assert.strictEqual((await store.get('s2'))?.ownerIss, undefined)
   })
 })

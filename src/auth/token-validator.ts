@@ -15,11 +15,19 @@ import type { AuthorizationConfig, TokenValidationResult, TokenIntrospectionResp
 export function buildAllowedIssuers (authorizationServers: string[]): string[] {
   const allowed = new Set<string>()
   for (const server of authorizationServers) {
-    const base = server.replace(/\/+$/, '')
+    const base = normalizeIssuer(server)
     allowed.add(base)
     allowed.add(`${base}/`)
   }
   return [...allowed]
+}
+
+/**
+ * Canonical form of an issuer identifier: the two spellings
+ * `buildAllowedIssuers` accepts for one server collapse to the same value.
+ */
+export function normalizeIssuer (issuer: string): string {
+  return issuer.replace(/\/+$/, '')
 }
 
 export class TokenValidator {
@@ -94,7 +102,9 @@ export class TokenValidator {
 
           return {
             valid: true,
-            payload
+            payload,
+            // fast-jwt has already checked `iss` against allowedIss
+            issuer: normalizeIssuer(payload.iss)
           }
         } catch (jwtError) {
           this.fastify.log.warn({ err: jwtError }, 'JWT validation failed, trying introspection')
@@ -210,9 +220,19 @@ export class TokenValidator {
         }
       }
 
+      // RFC 7662 lets the server omit `iss`. The response then speaks only for
+      // the introspection endpoint we were configured to trust, so that endpoint
+      // is the issuer identity. It is never confused with a real issuer: a
+      // response that does report `iss` was checked against
+      // authorizationServers above and is identified by it.
+      const issuer = result.iss !== undefined
+        ? normalizeIssuer(result.iss)
+        : `introspection:${this.config.tokenValidation.introspectionEndpoint}`
+
       return {
         valid: true,
-        payload: result
+        payload: result,
+        issuer
       }
     } catch (error) {
       this.fastify.log.error({ err: error, endpoint: this.config.tokenValidation.introspectionEndpoint }, 'Token introspection failed')

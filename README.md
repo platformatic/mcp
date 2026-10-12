@@ -2457,7 +2457,7 @@ await app.register(mcpPlugin, {
 #### Session Management
 
 - **Session IDs are cryptographically secure:** Generated using Node.js crypto
-- **Sessions are bound to their owner:** With authorization enabled, a session remembers the `sub` of the token that created it. Requests (POST, GET, DELETE) presenting that `Mcp-Session-Id` with a token for a different subject get `404 Session not found`, the same answer as for an unknown session, so a leaked session ID cannot be used by another user
+- **Sessions are bound to their owner:** With authorization enabled, a session remembers the issuer and `sub` of the token that created it; a subject is only unique per issuer, so both must match. Requests (POST, GET, DELETE) presenting that `Mcp-Session-Id` with a token from a different issuer or for a different subject get `404 Session not found`, the same answer as for an unknown session, so a leaked session ID cannot be used by another user. The issuer is the verified JWT `iss` (a trailing slash is ignored). Introspection responses may omit `iss` (RFC 7662); the issuer is then taken from configuration as `introspection:<introspectionEndpoint>`, the endpoint that vouched for the token, so such sessions never match a JWT or an introspection response that names an issuer
 - **Automatic cleanup:** Sessions expire after 1 hour by default
 - **Message history limits:** Prevents unbounded memory growth
 - **Cross-instance isolation:** Sessions are properly isolated between instances

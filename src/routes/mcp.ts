@@ -168,8 +168,9 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
   }
 
   /**
-   * A session created under an access token belongs to that token's subject.
-   * Anyone else presenting its ID gets the same 404 as for an unknown session:
+   * A session created under an access token belongs to that token's issuer and
+   * subject: two authorization servers may assign the same `sub` to different
+   * users, so the subject alone does not identify the owner. Anyone else presenting its ID gets the same 404 as for an unknown session:
    * the Streamable HTTP transport defines 404 as "this session does not exist
    * for you", and a 403 would confirm to an attacker that the ID is live.
    * Runs ahead of anything else that reads the session.
@@ -181,8 +182,8 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     const session = await sessionStore.get(sessionId)
     if (session?.ownerSub === undefined) return
 
-    if (session.ownerSub !== request.tokenPayload?.sub) {
-      request.log.warn({ sessionId }, 'Rejected MCP request for a session owned by a different subject')
+    if (session.ownerSub !== request.tokenPayload?.sub || session.ownerIss !== request.tokenIssuer) {
+      request.log.warn({ sessionId }, 'Rejected MCP request for a session owned by a different user')
       return reply.code(404).type('application/json').send({ error: 'Session not found' })
     }
   }
@@ -229,6 +230,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     const payload = request.tokenPayload
     if (payload && typeof payload.sub === 'string') {
       session.ownerSub = payload.sub
+      session.ownerIss = request.tokenIssuer
       session.authorization = buildAuthContext(payload)
     }
 

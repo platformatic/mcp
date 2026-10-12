@@ -66,6 +66,22 @@ describe('TokenValidator', () => {
       t.assert.strictEqual(result.valid, true)
       t.assert.ok(result.payload)
       t.assert.strictEqual(result.payload.sub, 'test-user')
+      t.assert.strictEqual(result.issuer, 'https://auth.example.com')
+
+      validator.close()
+    })
+
+    test('reports the JWT issuer without its trailing slash', async (t: TestContext) => {
+      const config = createTestAuthConfig()
+      restoreMock = setupMockAgent({
+        'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse()
+      })
+
+      const validator = new TokenValidator(config, app)
+      const result = await validator.validateToken(createTestJWT({ iss: 'https://auth.example.com/' }))
+
+      t.assert.strictEqual(result.valid, true)
+      t.assert.strictEqual(result.issuer, 'https://auth.example.com')
 
       validator.close()
     })
@@ -184,6 +200,29 @@ describe('TokenValidator', () => {
       t.assert.ok(result.payload)
       t.assert.strictEqual(result.payload.active, true)
       t.assert.strictEqual(result.payload.sub, 'test-user')
+      t.assert.strictEqual(result.issuer, 'https://auth.example.com')
+
+      validator.close()
+    })
+
+    test('derives the issuer from the introspection endpoint when the response has no iss', async (t: TestContext) => {
+      const config = createTestAuthConfig({
+        tokenValidation: {
+          introspectionEndpoint: 'https://auth.example.com/introspect',
+          validateAudience: true
+        }
+      })
+
+      restoreMock = setupMockAgent({
+        // undefined is dropped when the mock serialises the body
+        'https://auth.example.com/introspect': createIntrospectionResponse(true, { iss: undefined })
+      })
+
+      const validator = new TokenValidator(config, app)
+      const result = await validator.validateToken('opaque-token-123')
+
+      t.assert.strictEqual(result.valid, true)
+      t.assert.strictEqual(result.issuer, 'introspection:https://auth.example.com/introspect')
 
       validator.close()
     })
