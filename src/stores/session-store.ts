@@ -14,6 +14,9 @@ export interface SessionMetadata {
   // Enhanced authorization context
   authorization?: AuthorizationContext
   tokenRefresh?: TokenRefreshInfo
+
+  /** Resource URIs this session subscribed to via `resources/subscribe` */
+  resourceSubscriptions?: string[]
 }
 
 export interface SessionStore {
@@ -36,4 +39,8 @@ export interface SessionStore {
   addTokenMapping(tokenHash: string, sessionId: string): Promise<void>
   removeTokenMapping(tokenHash: string): Promise<void>
   updateAuthorization(sessionId: string, authorization: AuthorizationContext, tokenRefresh?: TokenRefreshInfo): Promise<void>
+
+  // Resource subscription operations (no-ops when the session is gone)
+  addResourceSubscription(sessionId: string, uri: string): Promise<void>
+  removeResourceSubscription(sessionId: string, uri: string): Promise<void>
 }

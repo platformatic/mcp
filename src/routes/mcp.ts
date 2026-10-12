@@ -570,12 +570,28 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
   // Subscribe to broadcast notifications
   if (enableSSE) {
-    messageBroker.subscribe('mcp/broadcast/notification', (notification: JSONRPCMessage) => {
+    messageBroker.subscribe('mcp/broadcast/notification', async (notification: JSONRPCMessage) => {
+      const isResourceUpdate = 'method' in notification && notification.method === 'notifications/resources/updated'
+      const resourceUri = isResourceUpdate ? (notification.params as { uri?: unknown } | undefined)?.uri : undefined
+
       // Send to all local streams
       for (const [sessionId, streams] of localStreams.entries()) {
-        if (streams.size > 0) {
-          sendSSEToStreams(sessionId, notification, streams)
+        if (streams.size === 0) continue
+
+        // resources/updated only goes to sessions subscribed to that URI
+        if (isResourceUpdate) {
+          try {
+            const session = await sessionStore.get(sessionId)
+            if (typeof resourceUri !== 'string' || !session?.resourceSubscriptions?.includes(resourceUri)) {
+              continue
+            }
+          } catch (error) {
+            app.log.error({ err: error, sessionId }, 'Failed to check resource subscriptions')
+            continue
+          }
         }
+
+        sendSSEToStreams(sessionId, notification, streams)
       }
     })
   }
