@@ -1,5 +1,5 @@
 import type { FastifyRequest, FastifyReply, preHandlerHookHandler } from 'fastify'
-import type { AuthorizationConfig } from '../types/auth-types.ts'
+import type { AuthorizationConfig, ScopeImplies } from '../types/auth-types.ts'
 import { TokenValidator } from './token-validator.ts'
 import { isStdioRequest } from '../stdio-trust.ts'
 
@@ -47,18 +47,12 @@ export function createAuthPreHandler (
     }
 
     if (!authHeader.startsWith('Bearer ')) {
-      return reply.code(401).header('WWW-Authenticate', generateWWWAuthenticateHeader(config)).send({
-        error: 'invalid_token',
-        error_description: 'Authorization header must use Bearer scheme'
-      })
+      return sendInvalidToken(reply, config, 'Authorization header must use Bearer scheme')
     }
 
     const token = authHeader.substring(7) // Remove 'Bearer ' prefix
     if (!token) {
-      return reply.code(401).header('WWW-Authenticate', generateWWWAuthenticateHeader(config)).send({
-        error: 'invalid_token',
-        error_description: 'Bearer token is empty'
-      })
+      return sendInvalidToken(reply, config, 'Bearer token is empty')
     }
 
     // Validate the token
@@ -66,15 +60,12 @@ export function createAuthPreHandler (
     if (!validationResult.valid) {
       request.log.warn({ error: validationResult.error }, 'Token validation failed')
 
-      return reply.code(401).header('WWW-Authenticate', generateWWWAuthenticateHeader(config)).send({
-        error: 'invalid_token',
-        error_description: validationResult.error || 'Token validation failed'
-      })
+      return sendInvalidToken(reply, config, validationResult.error || 'Token validation failed')
     }
 
     // SEP-835: the token is good but may not carry everything this resource needs.
     // Name the missing scopes so the client can run an incremental consent flow.
-    const missingScopes = findMissingScopes(config.requiredScopes, validationResult.payload)
+    const missingScopes = findMissingScopes(config.requiredScopes, validationResult.payload, config.scopeImplies)
     if (missingScopes.length > 0) {
       request.log.warn({ missingScopes }, 'Token is missing required scopes')
 
@@ -113,18 +104,64 @@ export function extractTokenScopes (payload: any): string[] {
   return []
 }
 
-export function findMissingScopes (required: string[] | undefined, payload: any): string[] {
+export function findMissingScopes (
+  required: string[] | undefined,
+  payload: any,
+  scopeImplies?: ScopeImplies
+): string[] {
   if (!required || required.length === 0) return []
-  const granted = new Set(extractTokenScopes(payload))
-  return required.filter(scope => !granted.has(scope))
+  const granted = extractTokenScopes(payload)
+  if (!scopeImplies) {
+    const grantedSet = new Set(granted)
+    return required.filter(scope => !grantedSet.has(scope))
+  }
+  return required.filter(scope => !granted.some(g => scopeImplies(g, scope)))
+}
+
+/**
+ * `scopeImplies` implementation for the `resource:action` convention: a granted
+ * scope implies itself and every scope nested below it with `:`, so `files`
+ * satisfies `files:read`, but `files:read` does not satisfy `files` and
+ * `filesystem` does not satisfy `files:read`.
+ */
+export function colonScopeHierarchy (granted: string, required: string): boolean {
+  if (granted === required) return true
+  return granted.length > 0 && required.startsWith(granted + ':')
+}
+
+/**
+ * Reply 401 with an RFC 6750 §3.1 `invalid_token` challenge, mirroring the
+ * error and description in both the WWW-Authenticate header and the body.
+ */
+export function sendInvalidToken (reply: FastifyReply, config: AuthorizationConfig, description: string) {
+  return reply
+    .code(401)
+    .header('WWW-Authenticate', generateWWWAuthenticateHeader(config, {
+      error: 'invalid_token',
+      error_description: description
+    }))
+    .send({
+      error: 'invalid_token',
+      error_description: description
+    })
 }
 
 interface WWWAuthenticateChallenge {
   error?: string
+  error_description?: string
   scope?: string[]
 }
 
-function generateWWWAuthenticateHeader (config: AuthorizationConfig, challenge: WWWAuthenticateChallenge = {}): string {
+/**
+ * RFC 6750 §3 restricts error_description to %x20-21 / %x23-5B / %x5D-7E,
+ * so drop anything else (quotes, backslashes, control and non-ASCII chars)
+ * rather than letting validation messages break out of the quoted-string.
+ */
+function sanitizeErrorDescription (description: string): string {
+  return description.replace(/[^\x20\x21\x23-\x5B\x5D-\x7E]/g, '')
+}
+
+export function generateWWWAuthenticateHeader (config: AuthorizationConfig, challenge: WWWAuthenticateChallenge = {}): string {
   if (!config.enabled) {
     throw new Error('Authorization is disabled')
   }
@@ -133,6 +170,9 @@ function generateWWWAuthenticateHeader (config: AuthorizationConfig, challenge: 
 
   if (challenge.error) {
     params.push(`error="${challenge.error}"`)
+  }
+  if (challenge.error_description) {
+    params.push(`error_description="${sanitizeErrorDescription(challenge.error_description)}"`)
   }
   // Advertise the required scopes on every challenge, including the first 401,
   // so clients know what to request up front (MCP authorization, scope selection).

@@ -1,4 +1,4 @@
-import type { FastifyInstance } from 'fastify'
+import type { FastifyInstance, preHandlerHookHandler } from 'fastify'
 import fp from 'fastify-plugin'
 import { Redis } from 'ioredis'
 import type { SessionStore } from './stores/session-store.ts'
@@ -126,10 +126,17 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
   if (opts.redis) {
     // Redis implementations for horizontal scaling
     redis = new Redis(opts.redis)
+    // Without an 'error' listener a dropped connection is reported as unhandled; log it and let ioredis reconnect.
+    redis.on('error', (err) => {
+      app.log.error({ err }, 'Redis connection error')
+    })
     sessionStore = new RedisSessionStore({ redis, maxMessages: 100 })
     messageBroker = new RedisMessageBroker(redis, {
       onCloseTimeout: (closeTimeoutMs) => {
         app.log.warn({ closeTimeoutMs }, 'Redis message broker close timed out; forcing disconnect')
+      },
+      onError: (err) => {
+        app.log.error({ err }, 'Redis message broker connection error')
       }
     })
     if (enableTasks) {
@@ -278,11 +285,18 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
 
   // Initialize authorization components if enabled
   let tokenValidator: TokenValidator | null = null
+  // Set when only the MCP routes should be protected; attached per route
+  let mcpAuthPreHandler: preHandlerHookHandler | undefined
   if (opts.authorization?.enabled) {
     tokenValidator = new TokenValidator(opts.authorization, app)
 
-    // Register authorization preHandler for all routes
-    app.addHook('preHandler', createAuthPreHandler(opts.authorization, tokenValidator))
+    const authPreHandler = createAuthPreHandler(opts.authorization, tokenValidator)
+    if (opts.authorization.protectedRoutes === 'mcp') {
+      mcpAuthPreHandler = authPreHandler
+    } else {
+      // Register authorization preHandler for all routes
+      app.addHook('preHandler', authPreHandler)
+    }
 
     // Register OAuth client plugin if configured
     if (opts.authorization.oauth2Client) {
@@ -345,7 +359,8 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     sealer,
     caching,
     subscriptions,
-    enableTasks
+    enableTasks,
+    authPreHandler: mcpAuthPreHandler
   })
 
   // Streams must be closed in `preClose`: Fastify shuts the HTTP server down
@@ -469,6 +484,7 @@ export type {
   McpCallToolContext,
   McpCallToolOutcome,
   MCPToolCallCompleteEvent,
+  MCPClientResponseContext,
   MCPTool,
   MCPResource,
   MCPPrompt,
@@ -503,8 +519,11 @@ export type {
   IntrospectionAuthConfig,
   DCRRequest,
   DCRResponse,
-  DCRHooks
+  DCRHooks,
+  ScopeImplies
 } from './types/auth-types.ts'
+
+export { colonScopeHierarchy } from './auth/prehandler.ts'
 
 export type {
   JSONRPCMessage,

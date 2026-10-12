@@ -241,11 +241,15 @@ async function handleInitialize (
     }, 'Unsupported protocol version requested, offering latest supported version')
   }
 
-  // Remember what we agreed on so later requests can be checked against it
+  // Remember what we agreed on so later requests can be checked against it,
+  // and what the client can handle so server-initiated requests (elicitation)
+  // are only sent when the client declared support for them
   if (sessionId && sessionStore) {
     const session = await sessionStore.get(sessionId)
     if (session) {
       session.protocolVersion = protocolVersion
+      const declared = (request.params as { capabilities?: unknown } | undefined)?.capabilities
+      session.clientCapabilities = declared && typeof declared === 'object' ? declared as ClientCapabilities : {}
       session.lastActivity = new Date()
       await sessionStore.update(session)
     }
@@ -417,7 +421,11 @@ export function handleResourceTemplatesList (request: JSONRPCRequest, dependenci
 export function handlePromptsList (request: JSONRPCRequest, dependencies: HandlerDependencies): JSONRPCResponse {
   const { prompts, protocolVersion } = dependencies
   const result: ListPromptsResult = {
-    prompts: Array.from(prompts.values()).map(p => trimDefinitionToRevision(p.definition, protocolVersion)),
+    prompts: Array.from(prompts.values()).map(p => {
+      // argumentSchema is our validation input, not part of the spec Prompt shape
+      const { argumentSchema, ...definition } = p.definition
+      return trimDefinitionToRevision(definition, protocolVersion)
+    }),
     nextCursor: undefined
   }
   return createResponse(request.id, result)
@@ -438,6 +446,16 @@ async function handleToolsCall (
 
   const params = paramsValidation.data
   const toolName = params.name
+
+  // A client on an older revision cannot have meant `task`, because we never
+  // declared the capability to it. The spec says to ignore it in that case.
+  const taskParams = supportsTasks(dependencies.protocolVersion)
+    ? (request.params as { task?: { ttl?: unknown } | null } | undefined)?.task
+    : undefined
+  const ttl = taskParams?.ttl ?? undefined
+  if (ttl !== undefined && !isValidTaskTtl(ttl)) {
+    return createError(request.id, INVALID_PARAMS, 'Invalid task ttl: expected a non-negative integer number of milliseconds')
+  }
   const startedAt = performance.now()
 
   // A denied tool answers exactly like an unknown one, so a caller cannot
@@ -460,11 +478,6 @@ async function handleToolsCall (
 
   // Decide up front whether this call runs as a task, so the rest of the
   // handler can stay unaware of it.
-  // A client on an older revision cannot have meant `task`, because we never
-  // declared the capability to it. The spec says to ignore it in that case.
-  const taskParams = supportsTasks(dependencies.protocolVersion)
-    ? (request.params as { task?: { ttl?: number } } | undefined)?.task
-    : undefined
   const augmentation = resolveTaskAugmentation(resolved.tool, taskParams !== undefined)
   if ('error' in augmentation) {
     await emitToolCallComplete('json-rpc', toolName, params.arguments || {}, { ok: false, reason: 'task-required' }, startedAt, dependencies)
@@ -473,7 +486,7 @@ async function handleToolsCall (
   if (augmentation.mode === 'task') {
     return await runToolCallAsTask(
       request,
-      taskParams?.ttl,
+      ttl,
       // Timed from when the task actually starts executing, not from when it
       // was queued, so `durationMs` reflects work done rather than wait time.
       (signal) => executeToolCall(request, resolved.tool, params, sessionId, { ...dependencies, signal }, { source: 'task', startedAt: performance.now() }),
@@ -900,17 +913,9 @@ export async function handleResourcesRead (
       // TypeBox schema - use our validation
       const uriValidation = validate(schema, uri)
       if (!uriValidation.success) {
-        if (dependencies.strictErrors) {
-          return createError(request.id, INVALID_PARAMS, `Invalid resource URI: ${uriValidation.error.message}`)
-        }
-        const result: ReadResourceResult = {
-          contents: [{
-            uri,
-            text: `Invalid resource URI: ${uriValidation.error.message}`,
-            mimeType: 'text/plain'
-          }]
-        }
-        return createResponse(request.id, result)
+        return createError(request.id, INVALID_PARAMS, `Invalid resource URI: ${uriValidation.error.message}`, {
+          validation: uriValidation.error
+        })
       }
     }
   }
@@ -925,19 +930,11 @@ export async function handleResourcesRead (
     return createResponse(request.id, result)
   } catch (error: any) {
     rethrowIfInputRequired(error)
-    if (dependencies.strictErrors) {
-      // The handler's error may carry internals; it goes to the log only.
-      dependencies.app.log.error({ err: error, uri }, 'Resource read failed')
-      return createError(request.id, INTERNAL_ERROR, 'Resource read failed')
-    }
-    const result: ReadResourceResult = {
-      contents: [{
-        uri,
-        text: `Resource read failed: ${error.message || error}`,
-        mimeType: 'text/plain'
-      }]
-    }
-    return createResponse(request.id, result)
+    dependencies.app.log.error({ err: error, uri }, 'Resource read handler failed')
+    // On 2026-07-28 the handler's error may carry internals: it goes to the
+    // log only. The legacy path keeps reporting its message.
+    if (dependencies.strictErrors) return createError(request.id, INTERNAL_ERROR, 'Resource read failed')
+    return createError(request.id, INTERNAL_ERROR, `Resource read failed: ${error?.message || error}`)
   }
 }
 
@@ -964,19 +961,17 @@ export async function handlePromptsGet (
     return createError(request.id, METHOD_NOT_FOUND, `Prompt '${promptName}' not found`)
   }
 
-  // The legacy path reports failures as a message, as it always has. On
-  // 2026-07-28 they are JSON-RPC errors (-32602 for the client's arguments,
-  // -32603 otherwise) and a handler's error text stays in the server log.
+  // Failures are JSON-RPC errors: -32602 for the client's arguments, -32603
+  // otherwise. On 2026-07-28 a handler's error text stays in the server log;
+  // the legacy path still reports it, and a prompt with no handler there is
+  // still answered with a message.
   const strict = dependencies.strictErrors === true
   const asMessage = (text: string): JSONRPCResponse => createResponse(request.id, {
     messages: [{ role: 'user', content: { type: 'text', text } }]
   } satisfies GetPromptResult)
-  const invalidArguments = (message: string): JSONRPCResponse | JSONRPCError => strict
-    ? createError(request.id, INVALID_PARAMS, `Invalid prompt arguments: ${message}`)
-    : asMessage(`Invalid prompt arguments: ${message}`)
-  const failed = (error: any): JSONRPCResponse | JSONRPCError => {
-    if (!strict) return asMessage(`Prompt execution failed: ${error?.message || error}`)
+  const failed = (error: any): JSONRPCError => {
     dependencies.app.log.error({ err: error, prompt: promptName }, 'Prompt handler failed')
+    if (!strict) return createError(request.id, INTERNAL_ERROR, `Prompt execution failed: ${error?.message || error}`)
     return createError(request.id, INTERNAL_ERROR, 'Internal server error')
   }
 
@@ -986,22 +981,30 @@ export async function handlePromptsGet (
     return createError(request.id, INTERNAL_ERROR, 'Internal server error')
   }
 
-  let promptArguments: Record<string, unknown> = params.arguments || {}
-  const schema = 'argumentSchema' in prompt.definition ? prompt.definition.argumentSchema : undefined
-  if (schema && isTypeBoxSchema(schema)) {
-    const argumentsValidation = validate(schema, promptArguments)
-    if (!argumentsValidation.success) return invalidArguments(argumentsValidation.error.message)
-    promptArguments = argumentsValidation.data as Record<string, unknown>
-  } else if (strict) {
-    // Without a schema, the declared `arguments` still say which are required.
+  // Validate prompt arguments against the prompt's argument schema
+  const promptArguments: Record<string, unknown> = params.arguments || {}
+  let handlerArguments: Record<string, unknown> = promptArguments
+  const { argumentSchema } = prompt.definition
+  if (argumentSchema && isTypeBoxSchema(argumentSchema)) {
+    const argumentsValidation = validate(argumentSchema, promptArguments)
+    if (!argumentsValidation.success) {
+      return createError(request.id, INVALID_PARAMS, `Invalid prompt arguments: ${argumentsValidation.error.message}`, {
+        validation: argumentsValidation.error
+      })
+    }
+    handlerArguments = argumentsValidation.data as Record<string, unknown>
+  } else {
+    // No TypeBox schema: enforce the `required` flags declared in `arguments`
     const missing = (prompt.definition.arguments ?? [])
       .filter(argument => argument.required && promptArguments[argument.name] === undefined)
       .map(argument => argument.name)
-    if (missing.length > 0) return invalidArguments(`missing required arguments: ${missing.join(', ')}`)
+    if (missing.length > 0) {
+      return createError(request.id, INVALID_PARAMS, `Missing required prompt arguments: ${missing.join(', ')}`, { missing })
+    }
   }
 
   try {
-    const result = await prompt.handler(promptName, promptArguments, handlerContext(dependencies, sessionId))
+    const result = await prompt.handler(promptName, handlerArguments as any, handlerContext(dependencies, sessionId))
     return createResponse(request.id, result)
   } catch (error: any) {
     rethrowIfInputRequired(error)
@@ -1022,6 +1025,21 @@ const DEFAULT_TASK_TTL = 60_000
 
 /** Ceiling on retention, so a client cannot pin resources indefinitely */
 const MAX_TASK_TTL = 3600_000
+
+/**
+ * Floor on retention. A smaller ttl (0 included) would let the task expire
+ * before the requestor could poll it, and Redis keys have 1s granularity anyway.
+ */
+const MIN_TASK_TTL = 1000
+
+/**
+ * The spec types `ttl` as a number of milliseconds. Anything else (a string,
+ * NaN, a negative or fractional value) is rejected rather than coerced, since it
+ * would otherwise yield a task that never expires or one that is gone at once.
+ */
+function isValidTaskTtl (ttl: unknown): ttl is number {
+  return Number.isSafeInteger(ttl) && (ttl as number) >= 0
+}
 
 /**
  * Resolve the effective task ttl bounds from plugin options. Tasks are meant for
@@ -1125,8 +1143,8 @@ function newTaskRecord (
     status: 'working',
     createdAt: now,
     lastUpdatedAt: now,
-    // Receivers may override the requested ttl; we cap it
-    ttl: Math.min(requested, bounds.maxTtl),
+    // Receivers may override the requested ttl; we clamp it
+    ttl: Math.min(Math.max(requested, MIN_TASK_TTL), bounds.maxTtl),
     pollInterval: DEFAULT_POLL_INTERVAL,
     method,
     authSubject: subject,
@@ -1530,6 +1548,11 @@ async function handleResourcesSubscribe (
 
   try {
     const result = await resourceHandlers.subscribeHandler(params, handlerContext(dependencies, sessionId))
+    // Remember the subscription so resources/updated broadcasts only reach
+    // the sessions that asked for this URI
+    if (sessionId && dependencies.sessionStore) {
+      await dependencies.sessionStore.addResourceSubscription(sessionId, params.uri)
+    }
     return createResponse(request.id, result)
   } catch (error: any) {
     return createError(request.id, INTERNAL_ERROR, `Subscribe failed: ${error.message || error}`)
@@ -1554,6 +1577,9 @@ async function handleResourcesUnsubscribe (
 
   try {
     const result = await resourceHandlers.unsubscribeHandler(params, handlerContext(dependencies, sessionId))
+    if (sessionId && dependencies.sessionStore) {
+      await dependencies.sessionStore.removeResourceSubscription(sessionId, params.uri)
+    }
     return createResponse(request.id, result)
   } catch (error: any) {
     return createError(request.id, INTERNAL_ERROR, `Unsubscribe failed: ${error.message || error}`)
@@ -1725,6 +1751,23 @@ export function handleNotification (notification: JSONRPCNotification, app: Fast
   }
 }
 
+async function handleClientResponse (response: JSONRPCResponse, dependencies: HandlerDependencies): Promise<void> {
+  const hook = dependencies.opts.onClientResponse
+  if (!hook) {
+    dependencies.request.log.debug({ id: response.id, sessionId: dependencies.sessionId }, 'Ignoring client response: no onClientResponse hook')
+    return
+  }
+  try {
+    await hook(response, {
+      sessionId: dependencies.sessionId,
+      request: dependencies.request,
+      authContext: dependencies.authContext
+    })
+  } catch (error) {
+    dependencies.request.log.error({ err: error, id: response.id }, 'onClientResponse hook failed')
+  }
+}
+
 export async function processMessage (
   message: JSONRPCMessage,
   sessionId: string | undefined,
@@ -1743,6 +1786,11 @@ export async function processMessage (
       handleNotification(message as JSONRPCNotification, dependencies.app)
       return null
     })
+  } else if ('result' in message || 'error' in message) {
+    // The client answering a server-initiated request (e.g. elicitation/create).
+    // The transport acknowledges it with 202; hand it to the application.
+    await handleClientResponse(message as JSONRPCResponse, dependencies)
+    return null
   } else {
     throw new Error('Invalid JSON-RPC message')
   }

@@ -27,18 +27,27 @@ export class MemorySessionStore implements SessionStore {
     if (!existing) {
       return
     }
-    // Only the negotiated version and activity time are the caller's to change.
-    // Writing the whole record back would roll the event counter back to a stale
-    // value if a concurrent SSE message bumped it between get() and update().
+    // Only the negotiated version, client capabilities and activity time are the
+    // caller's to change. Writing the whole record back would roll the event
+    // counter back to a stale value if a concurrent SSE message bumped it
+    // between get() and update().
     existing.lastActivity = metadata.lastActivity
     if (metadata.protocolVersion !== undefined) {
       existing.protocolVersion = metadata.protocolVersion
+    }
+    if (metadata.clientCapabilities !== undefined) {
+      existing.clientCapabilities = metadata.clientCapabilities
     }
   }
 
   async get (sessionId: string): Promise<SessionMetadata | null> {
     const session = this.sessions.get(sessionId)
-    return session ? { ...session } : null
+    if (!session) return null
+    const copy = { ...session }
+    if (session.resourceSubscriptions) {
+      copy.resourceSubscriptions = [...session.resourceSubscriptions]
+    }
+    return copy
   }
 
   async delete (sessionId: string): Promise<void> {
@@ -146,5 +155,20 @@ export class MemorySessionStore implements SessionStore {
     }
 
     this.sessions.set(sessionId, session)
+  }
+
+  async addResourceSubscription (sessionId: string, uri: string): Promise<void> {
+    const session = this.sessions.get(sessionId)
+    if (!session) return
+    const subscriptions = session.resourceSubscriptions ??= []
+    if (!subscriptions.includes(uri)) {
+      subscriptions.push(uri)
+    }
+  }
+
+  async removeResourceSubscription (sessionId: string, uri: string): Promise<void> {
+    const session = this.sessions.get(sessionId)
+    if (!session?.resourceSubscriptions) return
+    session.resourceSubscriptions = session.resourceSubscriptions.filter(s => s !== uri)
   }
 }

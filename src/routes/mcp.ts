@@ -1,5 +1,5 @@
 import { randomUUID } from 'crypto'
-import type { FastifyError, FastifyRequest, FastifyReply, FastifyPluginAsync, FastifySchema } from 'fastify'
+import type { FastifyError, FastifyRequest, FastifyReply, FastifyPluginAsync, FastifySchema, preHandlerHookHandler } from 'fastify'
 import fp from 'fastify-plugin'
 import type { JSONRPCMessage, JSONRPCNotification, JSONRPCRequest, JSONRPCResponse, JSONRPCError } from '../schema.ts'
 import {
@@ -71,6 +71,7 @@ interface MCPPubSubRoutesOptions {
   caching: CachingConfig
   subscriptions: SubscriptionRegistry
   enableTasks: boolean
+  authPreHandler?: preHandlerHookHandler
 }
 
 const PARSE_ERROR_CODES = new Set(['FST_ERR_CTP_INVALID_JSON_BODY', 'FST_ERR_CTP_EMPTY_JSON_BODY'])
@@ -121,7 +122,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
   const {
     enableSSE, opts, capabilities, serverInfo, tools, resources, prompts, resourceHandlers,
     sessionStore, messageBroker, localStreams, taskStore, taskWaiters, jsonSchemaValidator,
-    taskInputs, sealer, caching, subscriptions, enableTasks
+    taskInputs, sealer, caching, subscriptions, enableTasks, authPreHandler
   } = options
   const mcpUrl = resolveRouteUrl(app.prefix, '/mcp')
 
@@ -251,7 +252,11 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
   // Scoped to the /mcp routes only: this plugin is not encapsulated, so an
   // app-level hook would also cover the OAuth and well-known routes.
   const mcpOnRequest = [validateOrigin, validateProtocolVersionHeader]
-  const mcpPreHandler = [enforceProtocolVersionHeader, reconcileProtocolVersion]
+  // When authorization is scoped to the MCP routes, the auth check runs first,
+  // as it would if it were registered as a global preHandler hook.
+  const mcpPreHandler: preHandlerHookHandler[] = authPreHandler
+    ? [authPreHandler, enforceProtocolVersionHeader, reconcileProtocolVersion]
+    : [enforceProtocolVersionHeader, reconcileProtocolVersion]
 
   async function createSSESession (): Promise<SessionMetadata> {
     const sessionId = randomUUID()
@@ -1068,14 +1073,30 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
   // standing stream, and modern `subscriptions/listen` streams get whichever
   // notification types they opted in to. Registering unconditionally means
   // modern subscriptions work without `enableSSE`, which is a legacy concept.
-  await messageBroker.subscribe('mcp/broadcast/notification', (notification: JSONRPCMessage) => {
+  await messageBroker.subscribe('mcp/broadcast/notification', async (notification: JSONRPCMessage) => {
     subscriptions.deliver(notification as JSONRPCNotification)
 
     if (!enableSSE) return
+    const isResourceUpdate = 'method' in notification && notification.method === 'notifications/resources/updated'
+    const resourceUri = isResourceUpdate ? (notification.params as { uri?: unknown } | undefined)?.uri : undefined
+
     for (const [sessionId, streams] of localStreams.entries()) {
-      if (streams.size > 0) {
-        sendSSEToStreams(sessionId, notification, streams)
+      if (streams.size === 0) continue
+
+      // resources/updated only goes to legacy sessions subscribed to that URI
+      if (isResourceUpdate) {
+        try {
+          const session = await sessionStore.get(sessionId)
+          if (typeof resourceUri !== 'string' || !session?.resourceSubscriptions?.includes(resourceUri)) {
+            continue
+          }
+        } catch (error) {
+          app.log.error({ err: error, sessionId }, 'Failed to check resource subscriptions')
+          continue
+        }
       }
+
+      sendSSEToStreams(sessionId, notification, streams)
     }
   })
 }

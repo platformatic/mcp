@@ -4,7 +4,7 @@ import fastify from 'fastify'
 import { Type } from '@sinclair/typebox'
 import mcpPlugin from '../src/index.ts'
 import { testWithRedis } from './redis-test-utils.ts'
-import { JSONRPC_VERSION, LATEST_LEGACY_PROTOCOL_VERSION, LATEST_PROTOCOL_VERSION } from '../src/schema.ts'
+import { JSONRPC_VERSION, LATEST_LEGACY_PROTOCOL_VERSION, LATEST_PROTOCOL_VERSION, INVALID_PARAMS } from '../src/schema.ts'
 import { InputRequired, elicitForm } from '../src/modern/input-required.ts'
 import { META_CLIENT_CAPABILITIES, META_PROTOCOL_VERSION, TASKS_EXTENSION } from '../src/schema-2026.ts'
 import type { CreateTaskResult, CallToolResult } from '../src/schema.ts'
@@ -193,6 +193,37 @@ describe('Redis task integration (multi-instance)', () => {
 
     // B can also read the full result across instances
     const result = await call(b, 'tasks/result', { taskId })
+    assert.strictEqual(result.result.content[0].text, 'ok')
+  })
+
+  testWithRedis('an invalid task ttl is rejected and a valid one is stored', async (redis, t) => {
+    const app = fastify()
+    t.after(() => app.close())
+    await app.register(mcpPlugin, {
+      enableTasks: true,
+      redis: { host: redis.options.host!, port: redis.options.port!, db: redis.options.db! },
+      requestStateSecret: 'test-request-state-secret-32-bytes!!'
+    })
+    app.mcpAddTool({
+      name: 'quick',
+      description: 'Returns at once',
+      inputSchema: Type.Object({}),
+      execution: { taskSupport: 'optional' }
+    } as any, async (): Promise<CallToolResult> => {
+      return { content: [{ type: 'text', text: 'ok' }] }
+    })
+    await app.ready()
+
+    // A non-numeric ttl used to reach `SET ... EX NaN` and throw
+    for (const ttl of ['forever', -5, 1.5]) {
+      const body = await call(app, 'tools/call', { name: 'quick', arguments: {}, task: { ttl } })
+      assert.strictEqual(body.error.code, INVALID_PARAMS)
+    }
+
+    const created = await call(app, 'tools/call', { name: 'quick', arguments: {}, task: { ttl: 30_000 } })
+    const taskId = (created.result as CreateTaskResult).task.taskId
+    assert.strictEqual((created.result as CreateTaskResult).task.ttl, 30_000)
+    const result = await call(app, 'tasks/result', { taskId })
     assert.strictEqual(result.result.content[0].text, 'ok')
   })
 })

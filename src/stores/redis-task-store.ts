@@ -107,17 +107,14 @@ export class RedisTaskStore implements TaskStore {
       return null
     }
 
-    let task: TaskRecord
-    try {
-      task = decodeTask(raw)
-    } catch {
-      return null
-    }
-
     // Retention is the key's own expiry (SET … EX), timed by Redis. Judging it
     // again by this instance's clock would let one instance whose clock runs
     // ahead delete tasks that are still running, for every instance.
-    return task
+    try {
+      return decodeTask(raw)
+    } catch {
+      return null
+    }
   }
 
   async updateStatus (

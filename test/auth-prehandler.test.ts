@@ -2,6 +2,7 @@ import { test, describe, beforeEach, afterEach } from 'node:test'
 import type { TestContext } from 'node:test'
 import Fastify from 'fastify'
 import { createAuthPreHandler } from '../src/auth/prehandler.ts'
+import { colonScopeHierarchy } from '../src/index.ts'
 import { TokenValidator } from '../src/auth/token-validator.ts'
 import {
   createTestAuthConfig,
@@ -116,6 +117,8 @@ describe('Authorization PreHandler', () => {
     t.assert.ok(wwwAuth)
     t.assert.ok(wwwAuth.includes('Bearer realm="MCP Server"'))
     t.assert.ok(wwwAuth.includes('resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource"'))
+    // RFC 6750 §3.1: no error code when the request carried no authentication
+    t.assert.ok(!wwwAuth.includes('error='))
 
     validator.close()
   })
@@ -143,6 +146,10 @@ describe('Authorization PreHandler', () => {
     const body = response.json()
     t.assert.strictEqual(body.error, 'invalid_token')
     t.assert.strictEqual(body.error_description, 'Authorization header must use Bearer scheme')
+    t.assert.strictEqual(
+      response.headers['www-authenticate'],
+      'Bearer realm="MCP Server", resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource", error="invalid_token", error_description="Authorization header must use Bearer scheme"'
+    )
 
     validator.close()
   })
@@ -170,6 +177,10 @@ describe('Authorization PreHandler', () => {
     const body = response.json()
     t.assert.strictEqual(body.error, 'invalid_token')
     t.assert.strictEqual(body.error_description, 'Bearer token is empty')
+    t.assert.strictEqual(
+      response.headers['www-authenticate'],
+      'Bearer realm="MCP Server", resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource", error="invalid_token", error_description="Bearer token is empty"'
+    )
 
     validator.close()
   })
@@ -237,7 +248,38 @@ describe('Authorization PreHandler', () => {
     t.assert.strictEqual(body.error, 'invalid_token')
     t.assert.ok(body.error_description)
 
+    const wwwAuth = response.headers['www-authenticate'] as string
+    t.assert.ok(wwwAuth.startsWith('Bearer realm="MCP Server", resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource"'))
+    t.assert.ok(wwwAuth.includes(', error="invalid_token", error_description="'))
+
     validator.close()
+  })
+
+  test('should keep validation errors inside the error_description quoted-string', async (t: TestContext) => {
+    const config = createTestAuthConfig()
+    const validator = {
+      validateToken: async () => ({ valid: false, error: 'bad "token", error="x" \\ café\r\n' })
+    } as unknown as TokenValidator
+    const preHandler = createAuthPreHandler(config, validator)
+
+    app.addHook('preHandler', preHandler)
+    app.get('/test', async () => ({ success: true }))
+
+    await app.ready()
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/test',
+      headers: {
+        authorization: 'Bearer some-token'
+      }
+    })
+
+    t.assert.strictEqual(response.statusCode, 401)
+    t.assert.strictEqual(
+      response.headers['www-authenticate'],
+      'Bearer realm="MCP Server", resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource", error="invalid_token", error_description="bad token, error=x  caf"'
+    )
   })
 
   test('should return 401 with expired token', async (t: TestContext) => {
@@ -450,5 +492,58 @@ describe('Authorization PreHandler', () => {
     )
 
     validator.close()
+  })
+
+  describe('requiredScopes with scopeImplies', () => {
+    async function request (config: ReturnType<typeof createTestAuthConfig>, scope: string) {
+      restoreMock = setupMockAgent({
+        'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse()
+      })
+      const validator = new TokenValidator(config, app)
+      app.addHook('preHandler', createAuthPreHandler(config, validator))
+      app.get('/test', async () => ({ success: true }))
+      await app.ready()
+
+      const response = await app.inject({
+        method: 'GET',
+        url: '/test',
+        headers: { authorization: `Bearer ${createTestJWT({ scope })}` }
+      })
+      validator.close()
+      return response
+    }
+
+    test('a broader scope is refused by default', async (t: TestContext) => {
+      const response = await request(createTestAuthConfig({ requiredScopes: ['files:read'] }), 'files')
+      t.assert.strictEqual(response.statusCode, 403)
+      t.assert.strictEqual(response.json().error, 'insufficient_scope')
+      t.assert.match(response.headers['www-authenticate'] as string, /scope="files:read"/)
+    })
+
+    test('a broader scope is accepted with colonScopeHierarchy', async (t: TestContext) => {
+      const response = await request(createTestAuthConfig({
+        requiredScopes: ['files:read'],
+        scopeImplies: colonScopeHierarchy
+      }), 'files')
+      t.assert.strictEqual(response.statusCode, 200)
+      t.assert.deepStrictEqual(response.json(), { success: true })
+    })
+
+    test('a narrower scope is still refused with colonScopeHierarchy', async (t: TestContext) => {
+      const response = await request(createTestAuthConfig({
+        requiredScopes: ['files'],
+        scopeImplies: colonScopeHierarchy
+      }), 'files:read')
+      t.assert.strictEqual(response.statusCode, 403)
+      t.assert.strictEqual(response.json().error, 'insufficient_scope')
+    })
+
+    test('a lookalike prefix is refused with colonScopeHierarchy', async (t: TestContext) => {
+      const response = await request(createTestAuthConfig({
+        requiredScopes: ['files:read'],
+        scopeImplies: colonScopeHierarchy
+      }), 'filesystem')
+      t.assert.strictEqual(response.statusCode, 403)
+    })
   })
 })

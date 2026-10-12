@@ -99,6 +99,9 @@ export interface DCRHooks {
 // Authorization Configuration
 // =============================================================================
 
+/** Returns true when the `granted` scope satisfies the `required` scope. */
+export type ScopeImplies = (granted: string, required: string) => boolean
+
 export type AuthorizationConfig =
   | {
     enabled: false
@@ -110,12 +113,28 @@ export type AuthorizationConfig =
     /** Paths to exclude from authorization (e.g., health checks). Supports string prefix or RegExp. */
     excludedPaths?: (string | RegExp)[]
     /**
+     * Which routes require a bearer token.
+     * - 'all' (default): every route of the Fastify instance the plugin is
+     *   registered on, including your own routes (use `excludedPaths` to opt
+     *   specific paths out).
+     * - 'mcp': only the MCP endpoints (`POST`/`GET`/`DELETE` `/mcp`) registered
+     *   by this plugin; your own routes are left untouched.
+     */
+    protectedRoutes?: 'all' | 'mcp'
+    /**
      * Scopes a token must carry to reach the MCP endpoints. A token that is
      * valid but missing any of these is answered with 403 and a
      * `WWW-Authenticate: Bearer error="insufficient_scope"` challenge naming the
      * scopes needed, so the client can ask the user to grant them (SEP-835).
      */
     requiredScopes?: string[]
+    /**
+     * Decides whether a granted scope satisfies a required one, so scope
+     * hierarchies can be honoured when checking `requiredScopes`. Defaults to
+     * exact match. `colonScopeHierarchy` implements the `resource` ⊇
+     * `resource:action` convention.
+     */
+    scopeImplies?: ScopeImplies
     tokenValidation: {
       introspectionEndpoint?: string
       jwksUri?: string

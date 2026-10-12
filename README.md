@@ -683,6 +683,11 @@ await app.register(mcpPlugin, {
 })
 ```
 
+A client-requested `ttl` must be a non-negative integer number of milliseconds; anything else
+(a string, a negative or fractional number) is rejected with `-32602` Invalid params. A valid
+`ttl` is clamped between 1 second and `taskMaxTtlMs`, and the effective value is returned in the
+`CreateTaskResult`.
+
 Tasks are stored in memory by default and in Redis when a `redis` option is given, so any
 instance can serve a poll for a task created on another.
 
@@ -719,14 +724,27 @@ http(s), or embed credentials.
 
 ### Basic Elicitation
 
+Elicitation is a **client** capability: there is nothing to declare in the server's
+`capabilities`. The client opts in by sending `capabilities: { elicitation: {} }` (form
+mode only), or `{ elicitation: { form: {}, url: {} } }`, in its `initialize` request.
+`mcpElicit()` returns `false`, and `mcpElicitUrl()` `null`, when the client did not declare
+the mode being requested, as the spec forbids sending it.
+
+The request is delivered over the session's SSE stream, so the client must have it open
+(`GET /mcp`). The client answers by POSTing a JSON-RPC response with the same `id`; the
+plugin acknowledges it with `202` and passes it to `onClientResponse`.
+
 ```typescript
 import { Type } from '@sinclair/typebox'
 
 // Register plugin with elicitation support
 await app.register(mcpPlugin, {
   enableSSE: true, // Required for elicitation
-  capabilities: {
-    elicitation: {} // Enable elicitation capability
+  // Receives the client's answer (an ElicitResult) to each elicitation request
+  onClientResponse: async (response, { sessionId }) => {
+    if ('result' in response) {
+      app.log.info({ sessionId, id: response.id, result: response.result }, 'Elicitation answered')
+    }
   }
 })
 
@@ -735,7 +753,7 @@ app.mcpAddTool({
   name: 'collect-user-info',
   description: 'Collect user information',
   inputSchema: Type.Object({})
-}, async (params, { sessionId }) => {
+}, async (_params, { sessionId }) => {
   if (!sessionId) {
     return { 
       content: [{ type: 'text', text: 'No session available' }],
@@ -991,6 +1009,14 @@ TypeBox validation provides structured error messages:
 }
 ```
 
+Prompts and resources report failures as JSON-RPC errors instead of successful results:
+
+- `prompts/get` returns `-32602` (Invalid params) when the arguments fail the TypeBox `argumentSchema`, or, for prompts without a TypeBox schema, when an argument declared with `required: true` in `arguments` is missing. The handler is not invoked.
+- `prompts/get` returns `-32603` (Internal error) with the message `Prompt execution failed: <error.message>` when the prompt handler throws.
+- `resources/read` returns `-32602` when the URI fails the resource's `uriSchema`, and `-32603` with `Resource read failed: <error.message>` when the resource handler throws.
+
+Handler errors are logged; only the error message is sent to the client, never the stack trace. On 2026-07-28 not even the message is: those clients get `Internal server error` for a prompt and `Resource read failed` for a resource, and the details stay in the log.
+
 ### Backward Compatibility
 
 The plugin maintains backward compatibility with JSON Schema and unvalidated tools:
@@ -1145,7 +1171,7 @@ const store: SessionStore = new MemorySessionStore()
 // or: new RedisSessionStore({ redis })
 ```
 
-- **`SessionStore`**: the interface the plugin uses to persist SSE session metadata, message history, and token-to-session mappings.
+- **`SessionStore`**: the interface the plugin uses to persist SSE session metadata, message history, token-to-session mappings, and per-session resource subscriptions (`addResourceSubscription` / `removeResourceSubscription`, exposed as `resourceSubscriptions` on the metadata).
 - **`MemorySessionStore`**: in-process implementation used automatically when no `redis` option is passed. Takes an optional `maxMessages` history cap (default 100).
 - **`RedisSessionStore`**: distributed implementation used automatically when the `redis` option is passed; sessions and message history live in Redis so any instance can serve any client.
 
@@ -1174,6 +1200,13 @@ disconnecting them so Fastify's `onClose` hooks - and the process shutdown deadl
 most orchestrators - are never blocked by a Redis outage or a stuck reconnect. Pass
 `closeTimeoutMs` and `onCloseTimeout` as a second argument to `RedisMessageBroker` to customize
 this behavior, e.g. to log when a shutdown had to fall back to the forced path.
+
+### Connection Errors
+
+A dropped Redis connection (for example during a Redis restart or failover) does not crash the
+process: the plugin logs errors from its Redis client and from the message broker's pub/sub
+connections through the Fastify logger, and ioredis keeps reconnecting. When constructing
+`RedisMessageBroker` yourself, pass an `onError` callback in its options to observe these errors.
 
 ### Session Persistence Features
 
@@ -1466,7 +1499,9 @@ app.mcpBroadcastNotification({
   method: 'notifications/tools/list_changed'
 })
 
-// Example: Send resource updates
+// Example: Send resource updates. `notifications/resources/updated` is only
+// delivered to sessions that called `resources/subscribe` for this URI (and
+// have not unsubscribed); every other broadcast reaches all sessions.
 app.mcpBroadcastNotification({
   jsonrpc: '2.0',
   method: 'notifications/resources/updated',
@@ -1764,6 +1799,53 @@ eventSource.onmessage = (event) => {
 
 ### Authorization Configuration
 
+#### Choosing Which Routes Require a Token
+
+By default the plugin adds the bearer-token check as a `preHandler` hook on
+the Fastify instance it is registered on. Because the plugin is not
+encapsulated, that check also covers every route you register yourself on
+that instance. The well-known metadata endpoints and the OAuth flow endpoints
+(`/oauth/authorize`, `/oauth/callback`, `/oauth/register`) are always skipped.
+
+Set `protectedRoutes: 'mcp'` to protect only the MCP endpoints the plugin
+registers (`POST`, `GET` and `DELETE` `/mcp`) and leave your own routes alone:
+
+```typescript
+await app.register(mcpPlugin, {
+  authorization: {
+    enabled: true,
+    authorizationServers: ['https://auth.example.com'],
+    resourceUri: 'https://mcp.example.com',
+    tokenValidation: {
+      jwksUri: 'https://auth.example.com/.well-known/jwks.json'
+    },
+    protectedRoutes: 'mcp' // default: 'all'
+  }
+})
+
+// Reachable without a token
+app.get('/health', async () => ({ status: 'ok' }))
+```
+
+| Value | Behaviour |
+|-------|-----------|
+| `'all'` (default) | Every route of the app requires a token, except the well-known and OAuth endpoints. |
+| `'mcp'` | Only the `/mcp` routes require a token. |
+
+If you keep the default and only need to open a few paths, list them in
+`excludedPaths` instead. Each entry is a URL prefix string or a `RegExp`:
+
+```typescript
+authorization: {
+  enabled: true,
+  // ...
+  excludedPaths: ['/health', /^\/public\//]
+}
+```
+
+`excludedPaths` also applies with `protectedRoutes: 'mcp'`, but there it only
+matters for the `/mcp` routes.
+
 #### JWT Token Validation
 
 ```typescript
@@ -1791,6 +1873,35 @@ authorization: {
     clientSecret: process.env.OAUTH_CLIENT_SECRET
   }
 }
+```
+
+#### Required Scopes and Scope Hierarchies
+
+`requiredScopes` lists the scopes a token must carry to reach the MCP
+endpoints. A valid token missing any of them gets a `403` with a
+`WWW-Authenticate: Bearer error="insufficient_scope"` challenge.
+
+By default, scopes are matched exactly. If your authorization server issues
+hierarchical scopes, pass `scopeImplies(granted, required)` to decide whether a
+granted scope satisfies a required one. The built-in `colonScopeHierarchy`
+helper implements the `resource:action` convention: `files` implies
+`files:read`, but `files:read` does not imply `files`, and `filesystem` does
+not imply `files:read`.
+
+```typescript
+import mcpPlugin, { colonScopeHierarchy } from '@platformatic/mcp'
+
+await app.register(mcpPlugin, {
+  authorization: {
+    enabled: true,
+    authorizationServers: ['https://auth.example.com'],
+    resourceUri: 'https://mcp.example.com',
+    tokenValidation: { jwksUri: 'https://auth.example.com/.well-known/jwks.json' },
+    requiredScopes: ['files:read'],
+    // A token granted `files` is accepted
+    scopeImplies: colonScopeHierarchy
+  }
+})
 ```
 
 #### OAuth Client Configuration
@@ -2256,11 +2367,13 @@ await app.register(import('@fastify/bearer-auth'), {
 - `resolveAuthorizationContext`: Maps identities established by upstream Fastify authentication hooks into MCP authorization context (optional)
 - `canAccessTool`: Per-request tool authorization hook consulted by `tools/list` and `tools/call` (optional)
 - `onToolCallComplete`: Transport-neutral hook fired once after every tool call settles, across JSON-RPC, `mcpCallTool()`, and tasks (optional)
+- `onClientResponse`: Receives the JSON-RPC responses clients POST back for server-initiated requests, such as elicitation results (optional)
 - `authorization`: OAuth 2.1 authorization configuration (optional)
   - `enabled`: Enable OAuth 2.1 authorization (default: false)
   - `authorizationServers`: Authorization server URIs
   - `resourceUri`: Resource URI
   - `requiredScopes`: Scopes a token must carry (optional). Tokens missing any of them get a 403 `insufficient_scope` challenge. When set, the scopes are also advertised as `scopes_supported` in `/.well-known/oauth-protected-resource` metadata and as `scope="..."` in the `WWW-Authenticate` header of every 401 challenge
+  - `scopeImplies`: `(granted, required) => boolean` deciding whether a granted scope satisfies a required one (default: exact match; see `colonScopeHierarchy`)
   - `tokenValidation`: JWT token validation configuration
     - `jwksUri`: JWKS endpoint URL for JWT signature verification
     - `validateAudience`: Enable audience validation
@@ -2556,7 +2669,7 @@ app.mcpAddPrompt({
 
 ### Messaging Functions
 
-- `app.mcpBroadcastNotification(notification)`: Broadcast a notification to all connected SSE clients (works across Redis instances)
+- `app.mcpBroadcastNotification(notification)`: Broadcast a notification to all connected SSE clients (works across Redis instances). `notifications/resources/updated` only reaches sessions subscribed to its `params.uri`
 - `app.mcpSendToSession(sessionId, message)`: Send a message/request to a specific SSE session (works across Redis instances)
 - `app.mcpSendToUser(userId, message)`: Send a message to all sessions for a specific user (authorization-aware)
 
@@ -3074,7 +3187,7 @@ This version introduces elicitation support and enhanced security features:
 
 **Migration Steps:**
 1. Update client applications to support MCP 2025-06-18
-2. Add elicitation capability if needed: `capabilities: { elicitation: {} }`
+2. Elicitation is declared by the client in `initialize` (`capabilities: { elicitation: {} }`), not in the server's `capabilities`
 3. Review security logs for any validation warnings
 4. Consider implementing rate limiting for production deployments
 

@@ -1,4 +1,4 @@
-import type { JSONRPCMessage } from '../schema.ts'
+import type { ClientCapabilities, JSONRPCMessage } from '../schema.ts'
 import type { AuthorizationContext, TokenRefreshInfo } from '../types/auth-types.ts'
 
 export interface SessionMetadata {
@@ -9,11 +9,16 @@ export interface SessionMetadata {
   lastActivity: Date
   /** Protocol revision agreed during `initialize`, if the handshake has happened */
   protocolVersion?: string
+  /** Capabilities the client declared during `initialize`, if the handshake has happened */
+  clientCapabilities?: ClientCapabilities
   authSession?: any // OAuth session data (legacy - for Phase 2 compatibility)
 
   // Enhanced authorization context
   authorization?: AuthorizationContext
   tokenRefresh?: TokenRefreshInfo
+
+  /** Resource URIs this session subscribed to via `resources/subscribe` */
+  resourceSubscriptions?: string[]
 }
 
 export interface SessionStore {
@@ -36,4 +41,8 @@ export interface SessionStore {
   addTokenMapping(tokenHash: string, sessionId: string): Promise<void>
   removeTokenMapping(tokenHash: string): Promise<void>
   updateAuthorization(sessionId: string, authorization: AuthorizationContext, tokenRefresh?: TokenRefreshInfo): Promise<void>
+
+  // Resource subscription operations (no-ops when the session is gone)
+  addResourceSubscription(sessionId: string, uri: string): Promise<void>
+  removeResourceSubscription(sessionId: string, uri: string): Promise<void>
 }
