@@ -63,6 +63,11 @@ export function digestRequest (method: string, params: unknown): string {
   delete record._meta
   delete record.inputResponses
   delete record.requestState
+  // The server treats absent arguments as empty ones, and clients commonly
+  // normalize one into the other between the first call and the retry.
+  if ((method === 'tools/call' || method === 'prompts/get') && record.arguments === undefined) {
+    record.arguments = {}
+  }
 
   return createHash('sha256')
     .update(method)
@@ -147,7 +152,9 @@ export class RequestStateSealer {
       requestDigest: digestRequest(input.method, input.params),
       expiresAt: Date.now() + (input.ttlMs ?? this.#ttlMs),
       ...(this.#audience !== undefined ? { audience: this.#audience } : {}),
-      payload: input.payload ?? null,
+      // Omitted, not null, when the handler saved nothing, so the retry sees
+      // `requestState` exactly as the first attempt did.
+      payload: input.payload,
       ...(input.inputs ? { inputs: input.inputs } : {})
     }
 

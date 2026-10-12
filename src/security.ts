@@ -71,35 +71,32 @@ export function validateObjectDepth (obj: any, maxDepth: number = MAX_OBJECT_DEP
 }
 
 /**
- * Sanitize tool parameters from untrusted sources
+ * Check tool parameters from untrusted sources and return them unchanged.
+ *
+ * Arguments are refused rather than rewritten: stripping characters would let
+ * two keys collapse into one, and would hand the handler a value different
+ * from the one a gateway saw mirrored in the `Mcp-Param-*` headers.
  */
 export function sanitizeToolParams (params: Record<string, any>): Record<string, any> {
   // Validate object structure first
   validateObjectDepth(params)
+  checkStrings(params)
+  return params
+}
 
-  const sanitized: Record<string, any> = {}
-
-  for (const [key, value] of Object.entries(params)) {
-    // Sanitize key
-    const sanitizedKey = sanitizeString(key)
-
-    // Sanitize value based on type
-    if (typeof value === 'string') {
-      sanitized[sanitizedKey] = sanitizeString(value)
-    } else if (typeof value === 'object' && value !== null) {
-      if (Array.isArray(value)) {
-        sanitized[sanitizedKey] = value.map(item =>
-          typeof item === 'string' ? sanitizeString(item) : item
-        )
-      } else {
-        sanitized[sanitizedKey] = sanitizeToolParams(value)
-      }
-    } else {
-      sanitized[sanitizedKey] = value
+function checkStrings (value: unknown): void {
+  if (typeof value === 'string') {
+    if (sanitizeString(value) !== value) {
+      throw new Error('Tool arguments must not contain control characters')
+    }
+  } else if (Array.isArray(value)) {
+    for (const item of value) checkStrings(item)
+  } else if (typeof value === 'object' && value !== null) {
+    for (const [key, item] of Object.entries(value)) {
+      checkStrings(key)
+      checkStrings(item)
     }
   }
-
-  return sanitized
 }
 
 /**

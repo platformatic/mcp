@@ -50,7 +50,7 @@ import type { TaskStore, TaskRecord, TaskWaiters } from './stores/task-store.ts'
 import { isTerminal, toWireTask } from './stores/task-store.ts'
 import type { AuthorizationContext } from './types/auth-types.ts'
 import { principalOf } from './principal.ts'
-import { MAX_TIMER_MS, TaskStopped, quotaKeyOf, reserveTask } from './task-registry.ts'
+import { TaskStopped, quotaKeyOf, reserveTask, setLongTimeout } from './task-registry.ts'
 import type { TaskInputChannel } from './modern/task-inputs.ts'
 import { InputRequired } from './modern/input-required.ts'
 import type { RequestNotifiers } from './modern/request-stream.ts'
@@ -190,6 +190,20 @@ export function handlerContext (
  */
 function rethrowIfInputRequired (error: unknown): void {
   if (error instanceof InputRequired) throw error
+}
+
+/** The {@link InputRequired} behind each `input-required` tool outcome. */
+const inputRequiredErrors = new WeakMap<McpCallToolOutcome, InputRequired>()
+
+/**
+ * A tool asking for client input reports it as an outcome, so in-process
+ * callers and `onToolCallComplete` see it like any other. The JSON-RPC paths
+ * turn it back into the error the dispatchers handle.
+ */
+function inputRequiredOutcome (error: InputRequired): McpCallToolOutcome {
+  const outcome: McpCallToolOutcome = { ok: false, reason: 'input-required', inputRequests: error.inputRequests ?? {} }
+  inputRequiredErrors.set(outcome, error)
+  return outcome
 }
 
 /**
@@ -560,6 +574,9 @@ function toolCallOutcomeToJsonRpc (
     // consistent if they ever converge. Mirrors resolveTaskAugmentation's error.
     case 'task-required':
       return createError(id, METHOD_NOT_FOUND, `Tool '${toolName}' requires task-augmented execution`)
+    // The multi round-trip machinery answers this, not a tool result.
+    case 'input-required':
+      throw inputRequiredErrors.get(outcome) ?? new InputRequired({ inputRequests: outcome.inputRequests })
     default: {
       const unhandled: never = outcome
       throw new UnhandledToolCallOutcomeError(JSON.stringify(unhandled))
@@ -758,7 +775,7 @@ async function runRegisteredTool (
         const result = await tool.handler(argumentsValidation.data, handlerContext(dependencies, sessionId))
         return { ok: true, result }
       } catch (error: any) {
-        rethrowIfInputRequired(error)
+        if (error instanceof InputRequired) return inputRequiredOutcome(error)
         const result: CallToolResult = {
           content: [{
             type: 'text',
@@ -782,7 +799,7 @@ async function runRegisteredTool (
         const result = await tool.handler(toolArguments, handlerContext(dependencies, sessionId))
         return { ok: true, result }
       } catch (error: any) {
-        rethrowIfInputRequired(error)
+        if (error instanceof InputRequired) return inputRequiredOutcome(error)
         const result: CallToolResult = {
           content: [{
             type: 'text',
@@ -799,7 +816,7 @@ async function runRegisteredTool (
       const result = await tool.handler(toolArguments, handlerContext(dependencies, sessionId))
       return { ok: true, result }
     } catch (error: any) {
-      rethrowIfInputRequired(error)
+      if (error instanceof InputRequired) return inputRequiredOutcome(error)
       const result: CallToolResult = {
         content: [{
           type: 'text',
@@ -1394,6 +1411,13 @@ async function runToolCallAsTask (
   if (!reservation.ok) {
     return createError(request.id, INTERNAL_ERROR, `Cannot create a task: ${reservation.reason}`)
   }
+  // Stoppable from the moment it holds a slot: a shutdown that begins while
+  // the task is still being created must reach it too.
+  const stopController = new AbortController()
+  const stopped = stopController.signal
+  reservation.live.stop = (reason: TaskStopped) => {
+    if (!stopped.aborted) stopController.abort(reason)
+  }
   try {
     await taskStore.create(task)
   } catch (error) {
@@ -1401,21 +1425,17 @@ async function runToolCallAsTask (
     throw error
   }
 
-  const stopController = new AbortController()
-  const stopped = stopController.signal
-  reservation.live.stop = (reason: TaskStopped) => {
-    if (!stopped.aborted) stopController.abort(reason)
-  }
   // `tasks/cancel` may arrive on any instance; it reaches the worker here.
   const stopListening = dependencies.taskInputs?.onCancel(task.taskId, () => {
     reservation.live.stop(new TaskStopped('Task cancelled'))
   })
+  // The slot stays held until the handler settles, even past the ttl, so a
+  // caller cannot pile up background work by outliving it.
   const taskTtl = task.ttl ?? undefined
-  const ttlTimer = taskTtl !== undefined && taskTtl <= MAX_TIMER_MS
-    ? setTimeout(() => {
+  const ttlTimer = taskTtl !== undefined && Number.isFinite(taskTtl)
+    ? setLongTimeout(() => {
       reservation.live.stop(new TaskStopped('Task expired before it finished'))
-      reservation.release()
-    }, taskTtl).unref()
+    }, taskTtl)
     : undefined
 
   // Deliberately not awaited: the point of a task is to return control now.
@@ -1425,6 +1445,8 @@ async function runToolCallAsTask (
     let statusMessage: string | undefined
 
     try {
+      // Stopped before it ever ran: the handler must not start.
+      if (stopped.aborted) throw stopped.reason
       const result = await execute(stopped)
       outcome = result
       // A tool result carrying isError counts as a failed task
@@ -1461,12 +1483,12 @@ async function runToolCallAsTask (
 
   // Nothing awaits `execution`; keep an explicit rejection guard so an
   // unexpected throw can never become an unhandled rejection.
-  reservation.live.done = execution
+  execution
     .catch((error) => {
       app.log.error({ err: error, taskId: task.taskId }, 'Task execution failed unexpectedly')
     })
     .finally(() => {
-      if (ttlTimer) clearTimeout(ttlTimer)
+      ttlTimer?.clear()
       stopListening?.()
       reservation.release()
     })

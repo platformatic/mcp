@@ -8,6 +8,7 @@
  */
 
 import type { InputResponses } from '../schema-2026.ts'
+import { MAX_TIMER_MS } from '../task-registry.ts'
 
 export const TASK_INPUT_TOPIC = 'mcp/tasks/input'
 export const TASK_INPUT_CANCEL_TOPIC = 'mcp/tasks/input/cancel'
@@ -297,10 +298,13 @@ export class TaskInputChannel {
     ]
     if (expiries.length === 0) return
 
+    // Node fires a timer beyond its range after 1ms; waking early to prune
+    // nothing and re-arm is harmless, spinning every millisecond is not.
+    const delay = Math.min(MAX_TIMER_MS, Math.max(1, Math.min(...expiries) - Date.now()))
     this.#expiryTimer = setTimeout(() => {
       this.#expiryTimer = undefined
       this.#pruneExpired()
-    }, Math.max(1, Math.min(...expiries) - Date.now()))
+    }, delay)
     this.#expiryTimer.unref()
   }
 

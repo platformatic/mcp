@@ -406,6 +406,9 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     // gave the transport.
     const stdioIdentity = stdioAuthContext(request)
     if (stdioIdentity) return stdioIdentity
+    // The resolver reads HTTP credentials, which a stdio request never has:
+    // without a transport identity it is anonymous.
+    if (isStdioRequest(request)) return undefined
 
     if (opts.resolveAuthorizationContext) {
       return await opts.resolveAuthorizationContext(request)
@@ -429,7 +432,8 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
   /**
    * Ask the application about each resource a listen stream subscribes to,
    * through the same handlers as `resources/subscribe`. A URI whose handler
-   * throws is dropped from the filter, so the acknowledgement shows the
+   * throws is dropped from the filter (all of them are when no handler is
+   * registered), so the acknowledgement shows the
    * client what it was refused; the server must check access to resources,
    * and update notifications can reveal what changed and when. Returns what
    * to run when the stream ends: the unsubscribe handler for each URI that
@@ -442,8 +446,16 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     authContext: AuthorizationContext | undefined,
     context: RequestContext
   ): Promise<(() => void) | undefined> {
+    if (!filter.resourceSubscriptions) return undefined
     const { subscribeHandler } = resourceHandlers
-    if (!subscribeHandler || !filter.resourceSubscriptions) return undefined
+    // Without a handler nothing can check access, and update notifications
+    // reveal what changed and when: refuse them all, as `resources/subscribe`
+    // does on the handshake revisions.
+    if (!subscribeHandler) {
+      request.log.info({ refused: filter.resourceSubscriptions.length }, 'Resource subscriptions refused: no subscribe handler is registered')
+      delete filter.resourceSubscriptions
+      return undefined
+    }
 
     const handlerContextFor = () => handlerContext({
       request,
@@ -587,21 +599,31 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
       }
 
       const quotaKey = quotaKeyOf(authContext)
-      const refused = subscriptions.refusal(quotaKey)
-      if (refused) {
+      const reserved = subscriptions.reserve(quotaKey)
+      if (typeof reserved === 'string') {
         reply.code(429).type('application/json')
-        return createError(message.id, INVALID_REQUEST, refused)
+        return createError(message.id, INVALID_REQUEST, reserved)
       }
 
-      const filter = negotiateFilter(requested as SubscriptionFilter, capabilities)
-      const onEnd = await authorizeResourceSubscriptions(filter, request, reply, authContext, context)
-      // The filter can be large and is the client's to choose: log its shape.
-      request.log.info({
-        subscriptionId: message.id,
-        types: Object.keys(filter).filter(key => key !== 'resourceSubscriptions'),
-        resourceSubscriptions: filter.resourceSubscriptions?.length ?? 0
-      }, 'Opening subscription stream')
-      if (!subscriptions.open(reply, message.id, filter, quotaKey, listenCancel, onEnd) && !reply.sent) {
+      let opened: boolean
+      try {
+        const filter = negotiateFilter(requested as SubscriptionFilter, capabilities)
+        const onEnd = await authorizeResourceSubscriptions(filter, request, reply, authContext, context)
+        // The filter can be large and is the client's to choose: log its shape.
+        request.log.info({
+          subscriptionId: message.id,
+          types: Object.keys(filter).filter(key => key !== 'resourceSubscriptions'),
+          resourceSubscriptions: filter.resourceSubscriptions?.length ?? 0
+        }, 'Opening subscription stream')
+        opened = subscriptions.open(reply, message.id, filter, quotaKey, listenCancel, onEnd)
+      } finally {
+        reserved()
+      }
+      if (!opened && !reply.sent) {
+        if (listenCancel?.aborted) {
+          reply.code(204)
+          return undefined
+        }
         reply.code(503).type('application/json')
         return createError(message.id, INTERNAL_ERROR, 'Server is shutting down')
       }
@@ -678,7 +700,12 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
     // Concluding the stream also closes it to late notifications, which would
     // otherwise take over a reply that is about to be sent as JSON.
-    if (stream?.finish(response, serialized)) return reply
+    if (stream?.finish(response, serialized)) {
+      // The stream carried the response. Returning it as well (Fastify sends
+      // nothing for a hijacked reply) lets telemetry record its outcome.
+      if (!reply.sent) reply.hijack()
+      return response
+    }
 
     // The response object is still returned so telemetry can read its outcome;
     // the serializer reuses the string instead of encoding it a second time.

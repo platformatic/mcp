@@ -140,6 +140,8 @@ export class SubscriptionRegistry {
   #serverInfo?: Implementation
   #maxStreams: number
   #maxStreamsPerPrincipal: number
+  /** Streams admitted but not open yet (their subscribe handlers are running). */
+  #pending: Array<string | undefined> = []
 
   constructor (
     log: FastifyBaseLogger,
@@ -166,14 +168,34 @@ export class SubscriptionRegistry {
    * memory, so neither one caller nor everyone together may open unboundedly.
    */
   refusal (quotaKey: string | undefined): string | undefined {
-    if (this.#subscriptions.size >= this.#maxStreams) return 'Too many open subscription streams'
+    if (this.#subscriptions.size + this.#pending.length >= this.#maxStreams) return 'Too many open subscription streams'
     // Unidentified callers are bounded by the global limit only: one shared
     // allowance would let any of them lock out all the others.
     if (quotaKey === undefined) return undefined
     let mine = 0
     for (const subscription of this.#subscriptions) if (subscription.quotaKey === quotaKey) mine++
+    for (const pending of this.#pending) if (pending === quotaKey) mine++
     if (mine >= this.#maxStreamsPerPrincipal) return 'Too many open subscription streams for this caller'
     return undefined
+  }
+
+  /**
+   * Admit a stream that will open after asynchronous work (the subscribe
+   * handlers). The slot counts against the limits from now on, so concurrent
+   * requests cannot all pass the check before any of them opens. Returns why
+   * it was refused, or a release to call once `open()` has run (or will not).
+   */
+  reserve (quotaKey: string | undefined): string | (() => void) {
+    const refused = this.refusal(quotaKey)
+    if (refused !== undefined) return refused
+    const slot = quotaKey
+    this.#pending.push(slot)
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      this.#pending.splice(this.#pending.indexOf(slot), 1)
+    }
   }
 
   /**
@@ -189,7 +211,9 @@ export class SubscriptionRegistry {
     onEnd?: () => void
   ): boolean {
     const raw = reply.raw
-    if (this.#closing || raw.destroyed || raw.closed || raw.writableEnded) {
+    // A cancellation that arrived while the caller was still preparing the
+    // stream would never fire the listener added below.
+    if (this.#closing || raw.destroyed || raw.closed || raw.writableEnded || cancelSignal?.aborted === true) {
       onEnd?.()
       return false
     }

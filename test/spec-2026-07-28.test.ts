@@ -4,7 +4,7 @@ import type { TestContext } from 'node:test'
 import Fastify from 'fastify'
 import type { FastifyInstance } from 'fastify'
 import { Type } from '@sinclair/typebox'
-import mcpPlugin from '../src/index.ts'
+import mcpPlugin, { isStdioRequest } from '../src/index.ts'
 import { createStdioTransport } from '../src/stdio.ts'
 import { MemoryTaskStore } from '../src/stores/memory-task-store.ts'
 import {
@@ -1073,7 +1073,9 @@ describe('2026-07-28: subscriptions', () => {
   }
 
   test('listen acknowledges with the filter the server agreed to', async (t: TestContext) => {
-    const app = await buildServer(t, undefined, { capabilities: emitting })
+    const app = await buildServer(t, (app) => {
+      app.mcpSetResourceSubscribeHandler(async () => ({}))
+    }, { capabilities: emitting })
 
     const response = await app.inject({
       method: 'POST',
@@ -2279,12 +2281,13 @@ describe('2026-07-28: tasks extension', () => {
       elicitation: { form: {} }
     }
 
-    // Only the task input wait arms an AbortSignal.timeout.
+    // Timers longer than the outbox poll interval are the task's ttl timer
+    // and each input round's wait.
     const timeouts: number[] = []
-    const original = AbortSignal.timeout.bind(AbortSignal)
-    t.mock.method(AbortSignal, 'timeout', (ms: number) => {
-      timeouts.push(ms)
-      return original(ms)
+    const original = globalThis.setTimeout
+    t.mock.method(globalThis, 'setTimeout', (callback: () => void, ms?: number) => {
+      if (typeof ms === 'number' && ms > 1000 && ms <= ttl) timeouts.push(ms)
+      return original(callback, ms)
     })
 
     const created = (await call(app, 'tools/call', {
@@ -2313,9 +2316,10 @@ describe('2026-07-28: tasks extension', () => {
     })
     await waitForRequest('second')
 
-    t.assert.strictEqual(timeouts.length, 2)
-    t.assert.ok(timeouts[0] <= ttl)
-    t.assert.ok(timeouts[1] <= ttl - elapsed, `second round waited ${timeouts[1]}ms, past the task expiry`)
+    // The ttl timer, then one wait per round.
+    t.assert.strictEqual(timeouts.length, 3)
+    t.assert.ok(timeouts[1] <= ttl)
+    t.assert.ok(timeouts[2] <= ttl - elapsed, `second round waited ${timeouts[2]}ms, past the task expiry`)
   })
 
   test('a resumed task gets back the state it saved before asking for input', async (t: TestContext) => {
@@ -3323,6 +3327,31 @@ async function until (check: () => boolean): Promise<void> {
   for (let attempt = 0; attempt < 100 && !check(); attempt++) await new Promise(resolve => setTimeout(resolve, 10))
 }
 
+function stdioHarness (t: TestContext, app: FastifyInstance, options: Record<string, unknown> = {}) {
+  const input = new PassThrough()
+  const output = new PassThrough()
+  const transport = createStdioTransport(app, { input, output, error: new PassThrough(), ...options })
+  transport.start()
+  t.after(() => transport.stop())
+  const lines: any[] = []
+  let buffered = ''
+  output.on('data', (chunk: Buffer) => {
+    buffered += chunk.toString()
+    const parts = buffered.split('\n')
+    buffered = parts.pop() ?? ''
+    for (const line of parts) if (line.trim()) lines.push(JSON.parse(line))
+  })
+  const waitFor = async (match: (line: any) => boolean) => {
+    for (let attempt = 0; attempt < 200; attempt++) {
+      const found = lines.find(match)
+      if (found) return found
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+    return undefined
+  }
+  return { input, lines, waitFor }
+}
+
 describe('round 4: transport, input validation and stdio', () => {
   /** Send a raw HTTP request, so headers can repeat and the socket can drop. */
   async function listen (app: FastifyInstance): Promise<number> {
@@ -3689,31 +3718,6 @@ describe('round 4: transport, input validation and stdio', () => {
     t.assert.deepStrictEqual(unsubscribed, ['tenant://alice/inbox'])
   })
 
-  function stdioHarness (t: TestContext, app: FastifyInstance, options: Record<string, unknown> = {}) {
-    const input = new PassThrough()
-    const output = new PassThrough()
-    const transport = createStdioTransport(app, { input, output, error: new PassThrough(), ...options })
-    transport.start()
-    t.after(() => transport.stop())
-    const lines: any[] = []
-    let buffered = ''
-    output.on('data', (chunk: Buffer) => {
-      buffered += chunk.toString()
-      const parts = buffered.split('\n')
-      buffered = parts.pop() ?? ''
-      for (const line of parts) if (line.trim()) lines.push(JSON.parse(line))
-    })
-    const waitFor = async (match: (line: any) => boolean) => {
-      for (let attempt = 0; attempt < 200; attempt++) {
-        const found = lines.find(match)
-        if (found) return found
-        await new Promise(resolve => setTimeout(resolve, 10))
-      }
-      return undefined
-    }
-    return { input, lines, waitFor }
-  }
-
   test('stdio cancellation aborts legacy handlers too', async (t: TestContext) => {
     let aborted: boolean | undefined
     const app = await buildServer(t, (app) => {
@@ -3796,5 +3800,307 @@ describe('round 4: transport, input validation and stdio', () => {
     const answer = await waitFor(line => line.id === 'a')
     t.assert.strictEqual(answer?.result?.resultType, 'input_required')
     t.assert.strictEqual(who, 'local-user')
+  })
+})
+
+describe('round 5: arguments, subscriptions, input rounds and stdio', () => {
+  /** A tool whose `tenant` argument is mirrored into `Mcp-Param-Tenant`. */
+  function tenantTool (app: FastifyInstance, seen: unknown[], schema: Record<string, unknown> = { type: 'string', 'x-mcp-header': 'Tenant' }) {
+    app.mcpAddTool({
+      name: 'tenant-tool',
+      inputSchema: { type: 'object', properties: { tenant: schema } }
+    }, async (args: any) => {
+      seen.push(args.tenant)
+      return { content: [{ type: 'text', text: 'ran' }] }
+    })
+  }
+
+  test('arguments with control characters are refused, never rewritten past the header check', async (t: TestContext) => {
+    const seen: unknown[] = []
+    const app = await buildServer(t, (app) => tenantTool(app, seen))
+
+    // Two keys that would collapse into one once the control character went.
+    const collide = { name: 'tenant-tool', arguments: { tenant: 'allowed', 'ten\u0001ant': 'victim' } }
+    const collided = await call(app, 'tools/call', { params: collide, headers: { 'mcp-param-tenant': 'allowed' } })
+    t.assert.strictEqual(collided.json().result?.isError, true, collided.body)
+
+    // A value the header only matches once a NUL is stripped.
+    const nul = { name: 'tenant-tool', arguments: { tenant: 'acme\u0000' } }
+    const stripped = await call(app, 'tools/call', { params: nul, headers: { 'mcp-param-tenant': encodeHeaderValue('acme\u0000') } })
+    t.assert.strictEqual(stripped.json().result?.isError, true, stripped.body)
+
+    t.assert.deepStrictEqual(seen, [])
+  })
+
+  test('JSON Schema validation never coerces arguments, whatever the AJV options', async (t: TestContext) => {
+    const seen: unknown[] = []
+    const app = await buildServer(t, (app) => tenantTool(app, seen, { type: 'integer', 'x-mcp-header': 'Tenant' }), {
+      validateJsonSchemaInputs: { coerceTypes: true, useDefaults: true, removeAdditional: true }
+    })
+    const params = { name: 'tenant-tool', arguments: { tenant: '0x2A' } }
+    const response = await call(app, 'tools/call', { params, headers: { 'mcp-param-tenant': '0x2A' } })
+    t.assert.strictEqual(response.json().result?.isError, true, response.body)
+    t.assert.deepStrictEqual(seen, [])
+  })
+
+  async function openListen (app: FastifyInstance, notifications: Record<string, unknown>, id: string | number = 1) {
+    return await app.inject({
+      method: 'POST',
+      url: '/mcp',
+      payloadAsStream: true,
+      headers: modernHeaders('subscriptions/listen'),
+      payload: modernBody('subscriptions/listen', { id, params: { notifications } })
+    })
+  }
+
+  test('without a subscribe handler, listen accepts no resource URIs', async (t: TestContext) => {
+    const app = await buildServer(t, undefined, { capabilities: { resources: { subscribe: true } } })
+    const response = await openListen(app, { resourceSubscriptions: ['tenant://alice/payroll'] })
+    const stream = response.stream()
+    let received = ''
+    stream.on('data', (chunk: Buffer) => { received += chunk.toString() })
+    await until(() => received.includes('acknowledged'))
+    const ack = JSON.parse(received.split('\n\n')[0].slice('data: '.length))
+    t.assert.deepStrictEqual(ack.params.notifications, {})
+
+    await app.mcpBroadcastNotification({ jsonrpc: JSONRPC_VERSION, method: 'notifications/resources/updated', params: { uri: 'tenant://alice/payroll' } })
+    await new Promise(resolve => setTimeout(resolve, 50))
+    t.assert.doesNotMatch(received, /payroll/)
+    stream.destroy()
+  })
+
+  test('listen limits hold while subscribe handlers run', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpSetResourceSubscribeHandler(async () => {
+        await new Promise(resolve => setTimeout(resolve, 50))
+        return {}
+      })
+    }, {
+      capabilities: { resources: { subscribe: true } },
+      resolveAuthorizationContext: async () => ({ userId: 'same-user' }),
+      subscriptionMaxStreamsPerPrincipal: 1
+    })
+
+    const responses = await Promise.all([1, 2, 3].map(id => openListen(app, { resourceSubscriptions: ['a:1'] }, id)))
+    t.assert.deepStrictEqual(responses.map(response => response.statusCode).sort(), [200, 429, 429])
+    for (const response of responses) response.stream().destroy()
+  })
+
+  test('a stdio listen cancelled while its subscribe handler runs is torn down', async (t: TestContext) => {
+    const unsubscribed: string[] = []
+    const app = await buildServer(t, (app) => {
+      app.mcpSetResourceSubscribeHandler(async () => {
+        await new Promise(resolve => setTimeout(resolve, 100))
+        return {}
+      })
+      app.mcpSetResourceUnsubscribeHandler(async ({ uri }) => {
+        unsubscribed.push(uri)
+        return {}
+      })
+    }, { capabilities: { resources: { subscribe: true } }, subscriptionMaxStreams: 1 })
+    const { input, waitFor } = stdioHarness(t, app)
+
+    input.write(JSON.stringify(modernBody('subscriptions/listen', { id: 'a', params: { notifications: { resourceSubscriptions: ['a:1'] } } })) + '\n')
+    await new Promise(resolve => setTimeout(resolve, 30))
+    input.write(JSON.stringify({ jsonrpc: JSONRPC_VERSION, method: 'notifications/cancelled', params: { requestId: 'a' } }) + '\n')
+    await until(() => unsubscribed.length > 0)
+    t.assert.deepStrictEqual(unsubscribed, ['a:1'])
+
+    // Its slot is free again.
+    input.write(JSON.stringify(modernBody('subscriptions/listen', { id: 'b', params: { notifications: {} } })) + '\n')
+    const ack = await waitFor(line => line.method === 'notifications/subscriptions/acknowledged')
+    t.assert.strictEqual(ack?.params._meta['io.modelcontextprotocol/subscriptionId'], 'b')
+  })
+
+  test('a null client capability is a -32602, not a crash', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => askingTool(app))
+    for (const capabilities of [{ elicitation: null }, { sampling: 5 }, { elicitation: { url: null } }]) {
+      const response = await call(app, 'tools/call', { params: { name: 'ask', arguments: {} }, capabilities: capabilities as any })
+      t.assert.strictEqual(response.statusCode, 400, JSON.stringify(capabilities))
+      t.assert.strictEqual(response.json().error.code, INVALID_PARAMS)
+    }
+  })
+
+  function askingTool (app: FastifyInstance, states: unknown[] = []) {
+    app.mcpAddTool({ name: 'ask', inputSchema: Type.Object({}) }, async (_args: any, context: any) => {
+      states.push(context.requestState)
+      if (!context.inputResponses?.q) {
+        throw new InputRequired({ inputRequests: { q: elicitForm('Name?', { type: 'object', properties: {} }) } })
+      }
+      return { content: [{ type: 'text', text: 'done' }] }
+    })
+  }
+
+  test('a retry may send empty arguments where the first call sent none, and sees no state it never saved', async (t: TestContext) => {
+    const states: unknown[] = []
+    const app = await buildServer(t, (app) => askingTool(app, states))
+    const capabilities = { elicitation: { form: {} } }
+    const first = (await call(app, 'tools/call', { params: { name: 'ask' }, capabilities })).json().result
+    t.assert.strictEqual(first.resultType, 'input_required')
+
+    const retry = await call(app, 'tools/call', {
+      id: 2,
+      capabilities,
+      params: { name: 'ask', arguments: {}, requestState: first.requestState, inputResponses: { q: { action: 'accept', content: {} } } }
+    })
+    t.assert.strictEqual(retry.json().result?.content?.[0]?.text, 'done', retry.body)
+    t.assert.deepStrictEqual(states, [undefined, undefined])
+  })
+
+  test('mcpCallTool and onToolCallComplete report a tool asking for input as an outcome', async (t: TestContext) => {
+    const events: any[] = []
+    const app = await buildServer(t, (app) => {
+      askingTool(app)
+      app.post('/run', async (request, reply) => await app.mcpCallTool('ask', {}, { request, reply }))
+    }, {
+      onToolCallComplete: (event: any) => { events.push(event) }
+    })
+    const outcome = (await app.inject({ method: 'POST', url: '/run', payload: {} })).json()
+    t.assert.strictEqual(outcome.ok, false)
+    t.assert.strictEqual(outcome.reason, 'input-required')
+    t.assert.strictEqual(outcome.inputRequests.q.method, 'elicitation/create')
+
+    const response = await call(app, 'tools/call', { params: { name: 'ask', arguments: {} }, capabilities: { elicitation: { form: {} } } })
+    t.assert.strictEqual(response.json().result.resultType, 'input_required')
+    t.assert.deepStrictEqual(events.map(event => [event.source, event.outcome.reason]), [['in-process', 'input-required'], ['json-rpc', 'input-required']])
+  })
+
+  test('requestStateTtlMs must be a positive integer', async (t: TestContext) => {
+    for (const requestStateTtlMs of [Number.NaN, -1, 0, '300000']) {
+      const app = Fastify()
+      t.after(() => app.close())
+      app.register(mcpPlugin, { requestStateTtlMs } as any)
+      await t.assert.rejects(async () => { await app.ready() }, /requestStateTtlMs/)
+    }
+  })
+
+  test('telemetry records the outcome of a response sent on the stream', async (t: TestContext) => {
+    const attributes: Record<string, unknown> = {}
+    const span = { setAttribute (key: string, value: unknown) { attributes[key] = value }, setStatus () {}, end () {}, recordException () {} }
+    const tracer = { startActiveSpan: (_name: string, ...args: any[]) => args.at(-1)(span) }
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'slow-fail', inputSchema: Type.Object({}) }, async (_args: any, context: any) => {
+        context.sendProgress(1)
+        await new Promise(resolve => setTimeout(resolve, 300))
+        throw new Error('boom')
+      })
+    }, { telemetry: { tracer } })
+    const params = { name: 'slow-fail', arguments: {} }
+    const body = modernBody('tools/call', { params })
+    ;(body.params._meta as Record<string, unknown>).progressToken = 'p'
+    const response = await app.inject({ method: 'POST', url: '/mcp', headers: modernHeaders('tools/call', { params }), payload: body })
+    t.assert.strictEqual(response.headers['content-type'], 'text/event-stream')
+    t.assert.strictEqual(attributes['error.type'], 'tool_error')
+  })
+
+  test('a task still being created when the server closes never starts', async (t: TestContext) => {
+    let started = false
+    const original = MemoryTaskStore.prototype.create
+    t.mock.method(MemoryTaskStore.prototype, 'create', async function (this: MemoryTaskStore, ...args: Parameters<MemoryTaskStore['create']>) {
+      await new Promise(resolve => setTimeout(resolve, 200))
+      return await original.apply(this, args)
+    })
+    const app = Fastify()
+    await app.register(mcpPlugin, { serverInfo: { name: 'test-server', version: '1.0.0' }, enableTasks: true, taskShutdownTimeoutMs: 50 })
+    app.mcpAddTool({ name: 'work', inputSchema: Type.Object({}), execution: { taskSupport: 'required' } } as any, async () => {
+      started = true
+      return { content: [{ type: 'text', text: 'done' }] }
+    })
+    await app.ready()
+
+    const pending = call(app, 'tools/call', {
+      params: { name: 'work', arguments: {} },
+      capabilities: { extensions: { [TASKS_EXTENSION]: {} } }
+    })
+    await new Promise(resolve => setTimeout(resolve, 50))
+    await app.close()
+    await pending.catch(() => {})
+    await new Promise(resolve => setTimeout(resolve, 100))
+    t.assert.strictEqual(started, false)
+  })
+
+  test('a task ttl beyond the timer range does not cut input rounds short', async (t: TestContext) => {
+    const thirtyDays = 30 * 24 * 60 * 60 * 1000
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'confirm', inputSchema: Type.Object({}), execution: { taskSupport: 'required' } } as any, async (_args: any, context: any) => {
+        if (!context.inputResponses?.ok) {
+          throw new InputRequired({ inputRequests: { ok: elicitForm('Confirm?', { type: 'object', properties: {} }) } })
+        }
+        return { content: [{ type: 'text', text: 'done' }] }
+      })
+    }, { enableTasks: true, taskDefaultTtlMs: thirtyDays, taskMaxTtlMs: thirtyDays })
+    const capabilities: ClientCapabilities = { extensions: { [TASKS_EXTENSION]: {} }, elicitation: { form: {} } }
+    const created = (await call(app, 'tools/call', { params: { name: 'confirm', arguments: {} }, capabilities })).json().result
+
+    const status = async () => (await call(app, 'tasks/get', { params: { taskId: created.taskId }, capabilities })).json().result.status
+    let current = await status()
+    for (let attempt = 0; attempt < 20 && current === 'working'; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 10))
+      current = await status()
+    }
+    await new Promise(resolve => setTimeout(resolve, 100))
+    t.assert.strictEqual(await status(), 'input_required')
+    await call(app, 'tasks/cancel', { params: { taskId: created.taskId }, capabilities })
+  })
+
+  test('tasks/update ignores responses for keys nobody asked about', async (t: TestContext) => {
+    let received: unknown
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'confirm', inputSchema: Type.Object({}), execution: { taskSupport: 'required' } } as any, async (_args: any, context: any) => {
+        if (!context.inputResponses?.ok) {
+          throw new InputRequired({ inputRequests: { ok: elicitForm('Confirm?', { type: 'object', properties: {} }) } })
+        }
+        received = context.inputResponses.ok
+        return { content: [{ type: 'text', text: 'done' }] }
+      })
+    }, { enableTasks: true })
+    const capabilities: ClientCapabilities = { extensions: { [TASKS_EXTENSION]: {} }, elicitation: { form: {} } }
+    const created = (await call(app, 'tools/call', { params: { name: 'confirm', arguments: {} }, capabilities })).json().result
+    let task: any
+    for (let attempt = 0; attempt < 20 && task?.status !== 'input_required'; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 25))
+      task = (await call(app, 'tasks/get', { params: { taskId: created.taskId }, capabilities })).json().result
+    }
+
+    const update = await call(app, 'tasks/update', {
+      params: { taskId: created.taskId, inputResponses: { ok: { action: 'accept', content: {} }, junk: 'x' } },
+      capabilities
+    })
+    t.assert.strictEqual(update.json().error, undefined, update.body)
+    await until(() => received !== undefined)
+    t.assert.deepStrictEqual(received, { action: 'accept', content: {} })
+  })
+
+  test('the client mirrors only arguments that are its own properties', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({
+        name: 'ctor-tool',
+        inputSchema: { type: 'object', properties: { constructor: { type: 'string', 'x-mcp-header': 'Ctor' } } }
+      }, async () => ({ content: [{ type: 'text', text: 'ran' }] }))
+    })
+    const client = app.mcpClient({ protocolVersion: LATEST_PROTOCOL_VERSION })
+    // Listing tells the client which arguments the headers mirror.
+    await client.listTools()
+    const response = await client.callTool('ctor-tool', {})
+    t.assert.strictEqual((response as any).body?.result?.content?.[0]?.text, 'ran', JSON.stringify(response))
+  })
+
+  test('stdio requests skip resolveAuthorizationContext, and hooks can tell them apart', async (t: TestContext) => {
+    const marked: boolean[] = []
+    const app = Fastify()
+    t.after(() => app.close())
+    await app.register(mcpPlugin, {
+      serverInfo: { name: 'test-server', version: '1.0.0' },
+      // The README pattern: it reads what an authentication hook set.
+      resolveAuthorizationContext: async (request: any) => ({ userId: request.user.id })
+    })
+    app.addHook('preHandler', async (request) => { marked.push(isStdioRequest(request)) })
+    await app.ready()
+
+    const { input, waitFor } = stdioHarness(t, app)
+    input.write(JSON.stringify(modernBody('server/discover', { id: 'd' })) + '\n')
+    const answer = await waitFor(line => line.id === 'd')
+    t.assert.ok(answer?.result, JSON.stringify(answer))
+    t.assert.deepStrictEqual(marked, [true])
   })
 })

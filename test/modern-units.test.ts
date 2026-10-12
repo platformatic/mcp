@@ -378,6 +378,21 @@ describe('subscription filters', () => {
 })
 
 describe('task input channel lifecycle', () => {
+  test('a retention beyond the timer range does not spin the expiry timer', async (t: TestContext) => {
+    const channel = new TaskInputChannel(30 * 24 * 60 * 60 * 1000)
+    t.after(() => channel.close())
+    let armed = 0
+    const original = globalThis.setTimeout
+    t.mock.method(globalThis, 'setTimeout', (callback: () => void, ms?: number) => {
+      armed++
+      return original(callback, ms)
+    })
+    channel.abort('task-1')
+    channel.markConsumed('task-1', 'delivery-1')
+    await new Promise<void>(resolve => { original(resolve, 200) })
+    t.assert.ok(armed < 5, `armed ${armed} timers in 200ms`)
+  })
+
   test('cancellation rejects a parked waiter immediately', async (t: TestContext) => {
     const channel = new TaskInputChannel()
     const waiting = channel.wait('task-1')

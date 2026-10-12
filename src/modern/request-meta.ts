@@ -102,6 +102,10 @@ export function parseRequestContext (params: unknown): RequestContextResult {
       typeof rawCapabilities !== 'object' || Array.isArray(rawCapabilities)) {
     return { ok: false, message: `Missing required "_meta.${META_CLIENT_CAPABILITIES}"` }
   }
+  const invalidCapability = invalidCapabilityMember(rawCapabilities as Record<string, unknown>)
+  if (invalidCapability !== undefined) {
+    return { ok: false, message: `Invalid "_meta.${META_CLIENT_CAPABILITIES}.${invalidCapability}": expected an object` }
+  }
 
   const rawClientInfo = record[META_CLIENT_INFO]
   let clientInfo: Implementation | undefined
@@ -140,6 +144,37 @@ export function parseRequestContext (params: unknown): RequestContextResult {
       progressToken
     }
   }
+}
+
+/** Capabilities the server reads members of, and the members it reads. */
+const OBJECT_CAPABILITIES: Record<string, string[]> = {
+  elicitation: ['form', 'url'],
+  sampling: ['tools', 'context'],
+  roots: [],
+  experimental: [],
+  extensions: []
+}
+
+function isObject (value: unknown): boolean {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/**
+ * The path of the first declared capability the server reads that is not an
+ * object (`{ "elicitation": null }`, say), so it is refused up front rather
+ * than failing wherever it is first used.
+ */
+function invalidCapabilityMember (capabilities: Record<string, unknown>): string | undefined {
+  for (const [name, members] of Object.entries(OBJECT_CAPABILITIES)) {
+    const declared = capabilities[name]
+    if (declared === undefined) continue
+    if (!isObject(declared)) return name
+    for (const member of members) {
+      const value = (declared as Record<string, unknown>)[member]
+      if (value !== undefined && !isObject(value)) return `${name}.${member}`
+    }
+  }
+  return undefined
 }
 
 /**

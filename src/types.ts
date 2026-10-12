@@ -20,6 +20,7 @@ import type { Static, TSchema, TObject, TString } from '@sinclair/typebox'
 import type { AuthorizationConfig, AuthorizationContext } from './types/auth-types.ts'
 import type { AllowedOrigins } from './security.ts'
 import type { CacheHint } from './modern/handlers.ts'
+import type { InputRequests } from './schema-2026.ts'
 
 export type { CacheHint }
 
@@ -289,6 +290,12 @@ export type McpCallToolOutcome =
   | { ok: false, reason: 'access-denied' }
   | { ok: false, reason: 'invalid-arguments', detail: string }
   | { ok: false, reason: 'task-required' }
+  /**
+   * The handler threw `InputRequired`: it needs the client to answer
+   * `inputRequests` first. In-process there is no client to ask, so the call
+   * cannot complete.
+   */
+  | { ok: false, reason: 'input-required', inputRequests: InputRequests }
 
 interface MCPToolCallCompleteEventBase {
   toolName: string
@@ -346,15 +353,18 @@ export interface MCPPluginOptions {
    */
   taskMaxTtlMs?: number
   /**
-   * Most 2026-07-28 tasks one instance runs in the background at once
-   * (default 1000). Past it, a tool that only optionally supports tasks runs
-   * synchronously, and one that requires a task is refused.
+   * Most tasks one instance runs in the background at once, for both protocol
+   * eras (default 1000). A task counts until its handler settles, even past
+   * its ttl. Past the limit, a 2026-07-28 tool that only optionally supports
+   * tasks runs synchronously, and a task is otherwise refused.
    */
   taskMaxConcurrent?: number
   /**
-   * Most 2026-07-28 tasks one caller (user, client and issuer; unidentified
-   * callers share one allowance) may run on an instance at once (default 100).
-   * Past it, the same fallback as `taskMaxConcurrent` applies.
+   * Most tasks one caller (a user at an issuer, whichever OAuth client they
+   * come through) may run on an instance at once, for both protocol eras
+   * (default 100). Not applied to callers the deployment cannot identify,
+   * who are bounded by `taskMaxConcurrent` only. Past it, the same fallback
+   * as `taskMaxConcurrent` applies.
    */
   taskMaxPerPrincipal?: number
   /**
@@ -372,15 +382,17 @@ export interface MCPPluginOptions {
   /** Most `subscriptions/listen` streams one instance holds open (default 1000). */
   subscriptionMaxStreams?: number
   /**
-   * Most `subscriptions/listen` streams one caller (user, client and issuer;
-   * unidentified callers share one allowance) may hold open on an instance
-   * (default 10). Further streams are refused with HTTP 429.
+   * Most `subscriptions/listen` streams one caller (a user at an issuer,
+   * whichever OAuth client they come through) may hold open on an instance
+   * (default 10). Not applied to callers the deployment cannot identify, who
+   * are bounded by `subscriptionMaxStreams` only. Further streams are refused
+   * with HTTP 429.
    */
   subscriptionMaxStreamsPerPrincipal?: number
   /** Most `resourceSubscriptions` URIs one stream may name (default 1000). */
   subscriptionMaxResourceUris?: number
   /**
-   * On close, how long to wait for running 2026-07-28 tasks to finish before
+   * On close, how long to wait for running tasks (both eras) to finish before
    * aborting them and recording them as failed, in milliseconds (default
    * 5000). Fastify bounds close hooks by its `pluginTimeout` (10s by default),
    * so keep this comfortably below it.

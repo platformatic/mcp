@@ -638,3 +638,65 @@ describe('round 4: legacy capabilities without SSE', () => {
     }
   })
 })
+
+describe('round 5: legacy task slots', () => {
+  test('a task past its ttl keeps its slot until its handler settles', async (t: TestContext) => {
+    const app = Fastify({ logger: false })
+    t.after(() => app.close())
+    await app.register(mcpPlugin, { enableTasks: true, taskMaxConcurrent: 1 })
+    let running = 0
+    app.mcpAddTool({
+      name: 'stubborn',
+      description: 'Ignores its signal',
+      inputSchema: Type.Object({}),
+      execution: { taskSupport: 'optional' }
+    } as any, async (): Promise<CallToolResult> => {
+      running++
+      await new Promise(resolve => setTimeout(resolve, 400))
+      running--
+      return { content: [{ type: 'text', text: 'late' }] }
+    })
+    await app.ready()
+
+    const first = await call(app, 'tools/call', { name: 'stubborn', arguments: {}, task: { ttl: 50 } })
+    t.assert.ok(first.result?.task?.taskId, JSON.stringify(first))
+    await new Promise(resolve => setTimeout(resolve, 150))
+
+    // Expired, but its handler is still running: no room for another.
+    t.assert.strictEqual(running, 1)
+    const second = await call(app, 'tools/call', { name: 'stubborn', arguments: {}, task: { ttl: 50 } }, 2)
+    t.assert.match(second.error?.message ?? '', /Task limit reached/, JSON.stringify(second))
+
+    await until(() => running === 0)
+    const third = await call(app, 'tools/call', { name: 'stubborn', arguments: {}, task: {} }, 3)
+    t.assert.ok(third.result?.task?.taskId, JSON.stringify(third))
+  })
+
+  test('a task still being created when the server closes never starts', async (t: TestContext) => {
+    let started = false
+    const original = MemoryTaskStore.prototype.create
+    t.mock.method(MemoryTaskStore.prototype, 'create', async function (this: MemoryTaskStore, ...args: Parameters<MemoryTaskStore['create']>) {
+      await new Promise(resolve => setTimeout(resolve, 200))
+      return await original.apply(this, args)
+    })
+    const app = Fastify({ logger: false })
+    await app.register(mcpPlugin, { enableTasks: true, taskShutdownTimeoutMs: 50 })
+    app.mcpAddTool({
+      name: 'work',
+      description: 'Records that it ran',
+      inputSchema: Type.Object({}),
+      execution: { taskSupport: 'optional' }
+    } as any, async (): Promise<CallToolResult> => {
+      started = true
+      return { content: [{ type: 'text', text: 'done' }] }
+    })
+    await app.ready()
+
+    const pending = call(app, 'tools/call', { name: 'work', arguments: {}, task: {} })
+    await new Promise(resolve => setTimeout(resolve, 50))
+    await app.close()
+    await pending.catch(() => {})
+    await new Promise(resolve => setTimeout(resolve, 100))
+    t.assert.strictEqual(started, false)
+  })
+})

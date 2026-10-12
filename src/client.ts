@@ -368,7 +368,9 @@ function isModernProtocolVersion (protocolVersion: string | null): protocolVersi
 function valueAtPath (root: unknown, path: string[]): unknown {
   let current = root
   for (const segment of path) {
-    if (!isRecord(current) || Array.isArray(current)) return undefined
+    // Own properties only, as the server reads them: an argument named like
+    // an Object.prototype member (`constructor`) must not mirror a function.
+    if (!isRecord(current) || Array.isArray(current) || !Object.hasOwn(current, segment)) return undefined
     current = current[segment]
   }
   return current

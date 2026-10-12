@@ -448,6 +448,20 @@ requests for you. Return a stable `userId` so `requestState`, modern and legacy 
 access hooks, and handler contexts all use the same principal. If the resolver returns no
 `userId`, principal-bound request state is refused and the caller owns no tasks.
 
+The resolver is not called for requests from the stdio transport, which carry no HTTP
+credentials (see [stdio](#stdio-transport)). An authentication hook of your own should let them
+through; `isStdioRequest(request)` tells them apart in hooks added after the plugin is
+registered:
+
+```typescript
+import { isStdioRequest } from '@platformatic/mcp'
+
+app.addHook('preHandler', async (request, reply) => {
+  if (isStdioRequest(request)) return
+  request.user = await authenticateRequest(request, reply)
+})
+```
+
 ## Subscriptions (2026-07-28)
 
 `subscriptions/listen` replaces both the standalone `GET` stream and `resources/subscribe`.
@@ -490,7 +504,8 @@ Resource subscriptions go through the same handlers as the legacy `resources/sub
 subscribe handler runs for each requested URI with the caller's `authContext`, and a URI whose
 handler throws is left out of the acknowledgement. Throw there for resources the caller may not
 watch; update notifications reveal what changed and when. The unsubscribe handler runs for each
-accepted URI when the stream ends, however it ends.
+accepted URI when the stream ends, however it ends. Without a subscribe handler nothing can
+check access, so no URI is accepted, even when `capabilities` declares `resources.subscribe`.
 
 ```typescript
 app.mcpSetResourceSubscribeHandler(async ({ uri }, { authContext }) => {
@@ -1004,8 +1019,7 @@ Set `validateJsonSchemaInputs: {}` to validate plain-JSON-Schema tool inputs wit
 ```typescript
 await app.register(mcpPlugin, {
   validateJsonSchemaInputs: {
-    allErrors: true,
-    useDefaults: false
+    allErrors: true
   }
 })
 ```
@@ -1013,7 +1027,7 @@ await app.register(mcpPlugin, {
 Behavior when enabled:
 
 - Invalid arguments return a tool execution error (`isError: true` with an `Invalid tool arguments: ...` message, capped at 5 reported errors), not a protocol error — the same SEP-1303 semantics as TypeBox validation.
-- Validation is non-mutating: no type coercion, no defaults injection, no property removal. Handlers receive the arguments exactly as the client sent them. `format` keywords are annotation-only (JSON Schema 2020-12's own default).
+- Validation is non-mutating: no type coercion, no defaults injection, no property removal, and the `coerceTypes`, `useDefaults` and `removeAdditional` options cannot turn them back on. Handlers receive the arguments exactly as the client sent them. `format` keywords are annotation-only (JSON Schema 2020-12's own default).
 - A plain JSON Schema that AJV cannot compile makes `mcpAddTool` throw, so a misconfigured tool fails at startup instead of running unvalidated.
 - Compiled validators are cached per schema, and the option also applies to stdio transports and task-augmented (`task: {}`) calls.
 
@@ -1490,7 +1504,8 @@ The plugin includes a built-in stdio transport utility for MCP communication ove
   the stdio transport take credentials from its environment. Pass the identity they act as with
   `runStdioServer(app, { authContext: { userId: process.env.USER } })`; without one they are
   anonymous, and with authorization enabled multi round-trip requests and tasks (which need an
-  identified caller) are refused
+  identified caller) are refused. `resolveAuthorizationContext` is not called for them, and
+  `isStdioRequest(request)` lets your own authentication hooks skip them
 - **Comprehensive error handling** with proper JSON-RPC error responses
 - **Batch request support** for the legacy revisions that allow it
 - **Debug logging** to stderr without interfering with the stdio protocol
@@ -1945,7 +1960,7 @@ await app.register(mcpPlugin, {
 })
 ```
 
-The hook fires exactly once per tool call, after it settles: for JSON-RPC `tools/call`, for `app.mcpCallTool()`, and for a task-augmented call once execution finishes (not when the task is merely accepted). It also fires for access denial, unknown tools, invalid arguments, and task-required outcomes. It does not fire for `tools/list`, initialization/ping, or malformed requests where no tool name was resolved.
+The hook fires exactly once per tool call, after it settles: for JSON-RPC `tools/call`, for `app.mcpCallTool()`, and for a task-augmented call once execution finishes (not when the task is merely accepted). It also fires for access denial, unknown tools, invalid arguments, task-required outcomes, and a handler asking for client input (`reason: 'input-required'`; a multi round-trip retry is a new call and fires again). It does not fire for `tools/list`, initialization/ping, or malformed requests where no tool name was resolved.
 
 `event.source` is `'json-rpc'`, `'in-process'`, or `'task'`. `event.outcome` is the same `McpCallToolOutcome` returned by `mcpCallTool()`. The hook is awaited before the response is sent, so keep it fast; a throwing or rejecting hook is logged and otherwise ignored — it never changes the tool response.
 
@@ -2244,11 +2259,12 @@ await app.register(import('@fastify/bearer-auth'), {
     - `maxRetries`: Maximum refresh attempts
 - `requestStateSecret`: Secret (at least 32 bytes) that seals multi round-trip
   `requestState`. Required when `redis` is configured, since any instance may serve a retry
-- `requestStateTtlMs`: How long sealed state stays valid (default 5 minutes)
+- `requestStateTtlMs`: How long sealed state stays valid (default 5 minutes). Must be a positive integer; anything else throws at startup
 - `caching`: Freshness hints per cacheable operation (default `{ ttlMs: 0, cacheScope: 'private' }`)
 - `enableTasks`: Enable tasks (the 2025-11-25 core tasks and the 2026-07-28 extension)
 - `taskDefaultTtlMs` / `taskMaxTtlMs`: Task retention (defaults 60000 / 3600000)
-- `taskMaxConcurrent`: Most tasks one instance runs at once, for both protocol eras (default 1000)
+- `taskMaxConcurrent`: Most tasks one instance runs at once, for both protocol eras (default 1000).
+  A task counts until its handler settles, even when that is past its ttl
 - `taskMaxPerPrincipal`: Most tasks one caller (a user at an issuer) runs on an instance
   (default 100). Not applied to callers the deployment cannot identify
 - `taskStoreMaxTasks`: Capacity of the in-memory task store, finished tasks included until their
@@ -2310,10 +2326,13 @@ switch (outcome.reason) {
   case 'task-required':
     reply.code(409)
     return { error: 'Tool must be invoked through task-augmented tools/call' }
+  case 'input-required':
+    reply.code(409)
+    return { error: 'Tool needs client input', inputRequests: outcome.inputRequests }
 }
 ```
 
-The `canAccessTool` hook still runs before validation and before the handler, and receives the same `request` object passed to `mcpCallTool()`. Unlike the JSON-RPC `tools/call` path — which always answers a denied tool exactly like an unknown one, so a remote client cannot probe for tools it is not allowed to see — `mcpCallTool()` is a trusted in-process call and reports the precise reason: `{ ok: false, reason: 'not-found' }` when the tool is not registered, `{ ok: false, reason: 'access-denied' }` when it is registered but `canAccessTool` denied it (existence takes precedence, so an unknown name is always `not-found` even if the hook would also have denied it). Pass the route's real `reply` so tool handlers can use the full Fastify reply API. Pass `authContext` when the in-process caller has one so access hooks and handlers see the same authorization context they would receive over HTTP. If the tool handler throws, the outcome is `{ ok: true, result }` with `result.isError: true`, matching the JSON-RPC `tools/call` path. Every argument rejection that happens before the handler runs — TypeBox validation, AJV validation, or argument sanitization — is reported as `{ ok: false, reason: 'invalid-arguments', detail }`; the handler is never invoked for those.
+The `canAccessTool` hook still runs before validation and before the handler, and receives the same `request` object passed to `mcpCallTool()`. Unlike the JSON-RPC `tools/call` path — which always answers a denied tool exactly like an unknown one, so a remote client cannot probe for tools it is not allowed to see — `mcpCallTool()` is a trusted in-process call and reports the precise reason: `{ ok: false, reason: 'not-found' }` when the tool is not registered, `{ ok: false, reason: 'access-denied' }` when it is registered but `canAccessTool` denied it (existence takes precedence, so an unknown name is always `not-found` even if the hook would also have denied it). Pass the route's real `reply` so tool handlers can use the full Fastify reply API. Pass `authContext` when the in-process caller has one so access hooks and handlers see the same authorization context they would receive over HTTP. If the tool handler throws, the outcome is `{ ok: true, result }` with `result.isError: true`, matching the JSON-RPC `tools/call` path. The exception is `InputRequired`: there is no client to answer it in-process, so the outcome is `{ ok: false, reason: 'input-required', inputRequests }`. Every argument rejection that happens before the handler runs — TypeBox validation, AJV validation, or argument sanitization — is reported as `{ ok: false, reason: 'invalid-arguments', detail }`; the handler is never invoked for those.
 
 #### Type-Safe Resource Registration
 
@@ -2645,12 +2664,12 @@ When using the elicitation feature (server-to-client information requests):
 
 #### Tool Parameters
 
-The plugin automatically sanitizes tool parameters to prevent common attacks:
+The plugin automatically checks tool parameters to prevent common attacks:
 
 - **String length limits:** Maximum 10,000 characters per string
 - **Object depth limits:** Maximum 10 levels of nesting
 - **Property count limits:** Maximum 100 properties per object
-- **Control character removal:** Strips null bytes and control characters
+- **Control character rejection:** Arguments whose keys or string values contain null bytes or other control characters (tabs and newlines excepted) are refused, never rewritten, so the handler sees exactly what the client sent
 - **Circular reference detection:** Prevents infinite loops
 
 #### Schema Validation
@@ -2925,14 +2944,25 @@ the changes to the plugin's own API and defaults:
 - **Invalid `caching` values throw at startup** instead of being clamped.
 - **An argument sanitization failure** is reported by `mcpCallTool()` as
   `{ ok: false, reason: 'invalid-arguments' }`.
+- **`McpCallToolOutcome` has an `input-required` variant**: a tool that throws `InputRequired`
+  under `mcpCallTool()` now returns `{ ok: false, reason: 'input-required', inputRequests }`
+  instead of rejecting, and `onToolCallComplete` fires with it. Exhaustive `switch` statements
+  over `outcome.reason` need the new case.
+- **Tool arguments are never rewritten.** Keys or string values containing control characters
+  (other than tab, newline and carriage return) are refused as invalid arguments instead of
+  being stripped, and `validateJsonSchemaInputs` no longer coerces types, injects defaults or
+  removes properties (the `coerceTypes`, `useDefaults` and `removeAdditional` AJV options are
+  ignored).
 - **stdio requests skip HTTP authorization.** stdio has no bearer token: the client is whoever
   started the process. With authorization enabled, stdio requests used to be refused with `401`;
   now they run as the identity passed to `runStdioServer(app, { authContext })`, or anonymously
   without one (then multi round-trip requests and tasks are refused, since they need an
-  identified caller).
+  identified caller). `resolveAuthorizationContext` is not called for them; use the exported
+  `isStdioRequest(request)` to let them through your own authentication hooks.
 - **`subscriptions/listen` calls the resource subscribe handlers**: `mcpSetResourceSubscribeHandler`
   runs for each requested URI (a throw drops the URI), and the unsubscribe handler when the stream
-  ends.
+  ends. Without a subscribe handler no resource URI is accepted, as `resources/subscribe` answers
+  `-32601` then.
 - **Legacy clients without `enableSSE` no longer see `resources.subscribe`**, since updates could
   never reach them.
 - **`GET` and `DELETE /mcp` answer `405` with `Allow: POST`** when `enableSSE` is off (`DELETE`

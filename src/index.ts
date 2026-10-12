@@ -200,6 +200,12 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     }
   }
 
+  // A NaN (say, an unset environment variable through `Number()`) would make
+  // every retry fail as expired, silently.
+  if (opts.requestStateTtlMs !== undefined && (!Number.isSafeInteger(opts.requestStateTtlMs) || opts.requestStateTtlMs <= 0)) {
+    throw new Error('requestStateTtlMs must be a positive integer')
+  }
+
   const sealer = new RequestStateSealer({
     secret: opts.requestStateSecret,
     audience: serverInfo.name,
@@ -432,6 +438,8 @@ export {
 export type {
   StdioTransportOptions
 } from './stdio.ts'
+
+export { isStdioRequest } from './stdio-trust.ts'
 
 // Export message broker implementations and interface
 export {

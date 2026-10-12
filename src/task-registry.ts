@@ -28,6 +28,10 @@ export interface LiveTask {
   /** Whose allowance the task counts against; absent for unidentified callers. */
   quotaKey?: string
   stop: (reason: TaskStopped) => void
+  /**
+   * Settles when the slot is released. A task still being created already
+   * holds its slot, so the shutdown drain waits for it like any other.
+   */
   done: Promise<void>
 }
 
@@ -83,15 +87,37 @@ export function reserveTask (
     if (mine >= maxPerPrincipal) return { ok: false, reason: 'Per-caller task limit reached' }
   }
 
-  const live: LiveTask = { quotaKey, stop: () => {}, done: Promise.resolve() }
+  let settle!: () => void
+  const done = new Promise<void>(resolve => { settle = resolve })
+  const live: LiveTask = { quotaKey, stop: () => {}, done }
   registry.live.set(taskId, live)
   return {
     ok: true,
     live,
     release: () => {
       if (registry.live.get(taskId) === live) registry.live.delete(taskId)
+      settle()
     }
   }
+}
+
+/**
+ * Set a timer for a delay that may exceed Node's timer range, which would
+ * otherwise fire after 1ms. Long delays are re-armed in steps.
+ */
+export function setLongTimeout (callback: () => void, delayMs: number): { clear: () => void } {
+  const deadline = Date.now() + delayMs
+  let timer: NodeJS.Timeout
+  const arm = () => {
+    const remaining = deadline - Date.now()
+    if (remaining > MAX_TIMER_MS) {
+      timer = setTimeout(arm, MAX_TIMER_MS).unref()
+    } else {
+      timer = setTimeout(callback, Math.max(0, remaining)).unref()
+    }
+  }
+  arm()
+  return { clear: () => clearTimeout(timer) }
 }
 
 export function sleep (ms: number): Promise<void> {
