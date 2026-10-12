@@ -1,11 +1,10 @@
 import type { Redis } from 'ioredis'
 import type { TaskStatus } from '../schema.ts'
-import type { TaskStore, TaskRecord, TaskOutcome, TaskListOptions, TaskListPage } from './task-store.ts'
+import type { TaskStore, TaskRecord, TaskOutcome, TaskListOptions, TaskListPage, TaskCursorPosition } from './task-store.ts'
 import {
   canTransition,
   decodeTaskCursor,
   encodeTaskCursor,
-  isAfterTaskCursor,
   isTerminal,
   taskPageLimit
 } from './task-store.ts'
@@ -33,6 +32,14 @@ else
 end
 return 1
 `
+
+/**
+ * Order task ids the way Redis orders members that share a score: by their
+ * bytes, not by UTF-16 code units as `<` on strings would.
+ */
+function compareIds (a: string, b: string): number {
+  return Buffer.compare(Buffer.from(a), Buffer.from(b))
+}
 
 /**
  * Redis-backed task store, so tasks created on one instance can be polled from
@@ -161,29 +168,42 @@ export class RedisTaskStore implements TaskStore {
   }
 
   async list (authSubject?: string, options: TaskListOptions = {}): Promise<TaskListPage> {
-    const after = options.cursor === undefined ? undefined : decodeTaskCursor(options.cursor)
     const limit = taskPageLimit(options.limit)
     const indexKey = this.indexKey(authSubject)
 
-    // Walk the owner's index newest first from the cursor's score. Entries that
-    // share the cursor's score but sort at or before it are skipped by id. One
-    // extra live task is fetched to know whether another page follows.
-    const max = after ? after.createdAt : '+inf'
+    // Walk the owner's index newest first. Each batch resumes from the last
+    // (score, id) pair scanned, never from an offset, so entries removed by a
+    // concurrent request between batches cannot make the walk skip live tasks.
+    // One extra live task is fetched to know whether another page follows.
+    let position: TaskCursorPosition | undefined =
+      options.cursor === undefined ? undefined : decodeTaskCursor(options.cursor)
+    // Whether the members sharing the position's score still have to be read
+    let tiesPending = position !== undefined
     const tasks: TaskRecord[] = []
     const stale: string[] = []
-    let offset = 0
 
     while (tasks.length <= limit) {
-      const count = limit + 1 - tasks.length
-      const entries = await this.redis.zrevrangebyscore(indexKey, max, '-inf', 'WITHSCORES', 'LIMIT', offset, count)
-      if (entries.length === 0) break
-      offset += entries.length / 2
-
-      const ids: string[] = []
-      for (let i = 0; i < entries.length; i += 2) {
-        const id = entries[i]
-        if (after && !isAfterTaskCursor(Number(entries[i + 1]), id, after)) continue
-        ids.push(id)
+      let ids: string[]
+      if (position && tiesPending) {
+        // Members with the same score sort by id, which a score range cannot
+        // express, so read the whole same-millisecond group and keep the ids
+        // after the position. Such groups are small: one owner's tasks created
+        // within a single millisecond.
+        const tied = await this.redis.zrevrangebyscore(indexKey, position.createdAt, position.createdAt)
+        const after = position.taskId
+        ids = tied.filter(id => compareIds(id, after) < 0)
+        tiesPending = false
+      } else {
+        const count = limit + 1 - tasks.length
+        const max = position ? `(${position.createdAt}` : '+inf'
+        const entries = await this.redis.zrevrangebyscore(indexKey, max, '-inf', 'WITHSCORES', 'LIMIT', 0, count)
+        if (entries.length === 0) break
+        ids = []
+        for (let i = 0; i < entries.length; i += 2) ids.push(entries[i])
+        // The batch may stop part way through a same-score group; the next
+        // iteration picks up the rest of it before moving to older scores.
+        position = { createdAt: Number(entries[entries.length - 1]), taskId: ids[ids.length - 1] }
+        tiesPending = true
       }
       if (ids.length === 0) continue
 
@@ -191,6 +211,7 @@ export class RedisTaskStore implements TaskStore {
       for (let i = 0; i < ids.length; i++) {
         const raw = raws[i]
         if (!raw) {
+          // Expiry is decided by Redis alone (see get), so only a missing key is stale
           stale.push(ids[i])
           continue
         }
@@ -206,7 +227,6 @@ export class RedisTaskStore implements TaskStore {
       }
     }
 
-    // Pruned after the walk so removals do not shift the offsets used above
     if (stale.length > 0) {
       await this.redis.zrem(indexKey, ...stale)
     }

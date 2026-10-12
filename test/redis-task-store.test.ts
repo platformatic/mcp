@@ -219,6 +219,38 @@ describe('RedisTaskStore', () => {
     t.assert.deepStrictEqual(seen, [...ids].reverse())
   })
 
+  for (const tied of [false, true]) {
+    test(`list does not skip live tasks when index entries are removed between batches${tied ? ' (same creation time)' : ''}`, async (t: TestContext) => {
+      const base = Date.now()
+      const ids = ['t0', 't1', 't2', 't3', 't4', 't5']
+      for (let i = 0; i < ids.length; i++) {
+        const createdAt = new Date(tied ? base : base + i).toISOString()
+        await store.create(record({ taskId: ids[i], authSubject: 'user-1', createdAt }))
+      }
+      // The two newest tasks have expired, but their index entries remain, so
+      // the first batch yields only one live task and a second batch is needed
+      await redis.del('mcp:task:t5', 'mcp:task:t4')
+
+      // Between the two batches another request prunes those stale entries, as
+      // a concurrent list or delete would
+      const original = redis.zrevrangebyscore.bind(redis)
+      let calls = 0
+      t.mock.method(redis, 'zrevrangebyscore', async (...args: any[]) => {
+        if (++calls === 2) await redis.zrem('mcp:tasks:owner:user-1', 't5', 't4')
+        return (original as any)(...args)
+      })
+
+      const first = await store.list('user-1', { limit: 2 })
+      t.assert.ok(calls >= 2, 'the walk should have needed a second batch')
+      t.assert.deepStrictEqual(first.tasks.map(x => x.taskId), ['t3', 't2'])
+      t.assert.ok(first.nextCursor)
+
+      const second = await store.list('user-1', { cursor: first.nextCursor, limit: 2 })
+      t.assert.deepStrictEqual(second.tasks.map(x => x.taskId), ['t1', 't0'])
+      t.assert.strictEqual(second.nextCursor, undefined)
+    })
+  }
+
   test('list rejects an invalid cursor', async (t: TestContext) => {
     await t.assert.rejects(store.list('user-1', { cursor: 'not-a-cursor' }), InvalidTaskCursorError)
   })
