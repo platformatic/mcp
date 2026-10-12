@@ -178,4 +178,67 @@ describe('body-parser errors on POST /mcp', () => {
     t.assert.strictEqual(response.statusCode, 400)
     t.assert.deepStrictEqual(response.json(), { custom: true, code: 'FST_ERR_CTP_INVALID_JSON_BODY' })
   })
+  const nonErrorThrows = [
+    {
+      name: 'a string thrown from a preHandler hook',
+      hook: (): void => { throw 'secret: db password is hunter2' }, // eslint-disable-line no-throw-literal
+      secret: 'hunter2'
+    },
+    {
+      name: 'a plain object rejected from an async preHandler hook',
+      hook: async (): Promise<void> => {
+        throw { statusCode: 200, message: 'secret internal detail', stack: 'at /srv/internal.js:1' } // eslint-disable-line no-throw-literal
+      },
+      secret: 'internal'
+    }
+  ]
+
+  for (const { name, hook, secret } of nonErrorThrows) {
+    test(`${name} on POST /mcp goes through the user error handler`, async (t: TestContext) => {
+      const app = Fastify()
+      t.after(() => app.close())
+      const seen: unknown[] = []
+      app.setErrorHandler((error, _request, reply) => {
+        seen.push(error)
+        reply.code(503).send({ custom: true })
+      })
+      app.addHook('preHandler', hook)
+      await app.register(mcpPlugin)
+      await app.ready()
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/mcp',
+        payload: { jsonrpc: JSONRPC_VERSION, id: 1, method: 'ping' }
+      })
+
+      t.assert.strictEqual(response.statusCode, 503)
+      t.assert.deepStrictEqual(response.json(), { custom: true })
+      t.assert.strictEqual(seen.length, 1)
+      t.assert.ok(seen[0] instanceof Error)
+      t.assert.ok(!response.body.includes(secret))
+    })
+
+    test(`${name} on POST /mcp goes through the default error handler`, async (t: TestContext) => {
+      const app = Fastify()
+      t.after(() => app.close())
+      app.addHook('preHandler', hook)
+      await app.register(mcpPlugin)
+      await app.ready()
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/mcp',
+        payload: { jsonrpc: JSONRPC_VERSION, id: 1, method: 'ping' }
+      })
+
+      t.assert.strictEqual(response.statusCode, 500)
+      t.assert.deepStrictEqual(response.json(), {
+        statusCode: 500,
+        error: 'Internal Server Error',
+        message: 'Internal Server Error'
+      })
+      t.assert.ok(!response.body.includes(secret))
+    })
+  }
 })
