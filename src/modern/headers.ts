@@ -35,13 +35,20 @@ export function decodeHeaderValue (raw: string): string | null {
   if (!raw.startsWith(BASE64_PREFIX) || !raw.endsWith(BASE64_SUFFIX)) {
     return raw
   }
+  // `=?base64?=` matches both markers by sharing the `?`, but is no wrapper.
+  // A conforming client never sends it: it would encode such a value.
+  if (raw.length < BASE64_PREFIX.length + BASE64_SUFFIX.length) {
+    return null
+  }
 
   const encoded = raw.slice(BASE64_PREFIX.length, raw.length - BASE64_SUFFIX.length)
   try {
     const buffer = Buffer.from(encoded, 'base64')
     // Buffer.from is lenient: round-trip to catch input that was not valid
-    // base64 rather than silently accepting a truncated value.
-    if (buffer.toString('base64').replace(/=+$/, '') !== encoded.replace(/=+$/, '')) {
+    // base64 rather than silently accepting a truncated value. Padding may be
+    // omitted, but not added where none belongs.
+    const canonical = buffer.toString('base64')
+    if (encoded !== canonical && encoded !== canonical.replace(/=+$/, '')) {
       return null
     }
     return UTF8_DECODER.decode(buffer)

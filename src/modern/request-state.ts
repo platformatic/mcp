@@ -33,6 +33,12 @@ export interface RequestStateClaims {
    * each answer must have the shape of a result to that method.
    */
   inputs?: Record<string, string>
+  /**
+   * Answers the client gave in earlier rounds, keyed as the handler asked for
+   * them, so a handler that asks in several steps sees every answer on the
+   * retry, as it would in a task.
+   */
+  answers?: Record<string, unknown>
 }
 
 /** Sealing was refused because the deployment identifies callers and this one is not. */
@@ -137,6 +143,7 @@ export class RequestStateSealer {
     params: unknown
     payload?: unknown
     inputs?: Record<string, string>
+    answers?: Record<string, unknown>
     ttlMs?: number
   }): string {
     if (this.#requirePrincipal && input.principal === undefined) {
@@ -155,7 +162,8 @@ export class RequestStateSealer {
       // Omitted, not null, when the handler saved nothing, so the retry sees
       // `requestState` exactly as the first attempt did.
       payload: input.payload,
-      ...(input.inputs ? { inputs: input.inputs } : {})
+      ...(input.inputs ? { inputs: input.inputs } : {}),
+      ...(input.answers && Object.keys(input.answers).length > 0 ? { answers: input.answers } : {})
     }
 
     const body = Buffer.from(JSON.stringify(claims), 'utf8').toString('base64url')

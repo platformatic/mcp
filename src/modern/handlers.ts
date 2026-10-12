@@ -446,6 +446,19 @@ function inputMethods (inputRequests: Record<string, unknown> | undefined): Reco
 }
 
 /**
+ * The answers to seal for the next retry: everything the handler was given
+ * this round, except keys it is asking again, whose fresh answer is the one
+ * that counts.
+ */
+function answersToCarry (
+  given: Record<string, unknown> | undefined,
+  asking: Record<string, unknown> | undefined
+): Record<string, unknown> | undefined {
+  if (given === undefined) return undefined
+  return Object.fromEntries(Object.entries(given).filter(([key]) => !Object.hasOwn(asking ?? {}, key)))
+}
+
+/**
  * Turn a handler's {@link InputRequired} into the wire result.
  *
  * The state is sealed here rather than by the handler so that integrity,
@@ -475,7 +488,8 @@ function inputRequired (
       method: request.method,
       params: request.params,
       payload: thrown.state,
-      inputs: inputMethods(thrown.inputRequests)
+      inputs: inputMethods(thrown.inputRequests),
+      answers: answersToCarry(dependencies.mrtr?.inputResponses, thrown.inputRequests)
     })
   } catch (error) {
     if (error instanceof RequestTooDeepError) {
@@ -517,7 +531,7 @@ function inputRequired (
 function openRequestState (
   request: JSONRPCRequest,
   dependencies: ModernDependencies
-): { ok: true, payload: unknown, inputs?: Record<string, string> } | { ok: false, error: JSONRPCError } {
+): { ok: true, payload: unknown, inputs?: Record<string, string>, answers?: Record<string, unknown> } | { ok: false, error: JSONRPCError } {
   const state = (request.params as { requestState?: unknown } | undefined)?.requestState
   if (state === undefined) return { ok: true, payload: undefined }
 
@@ -536,7 +550,7 @@ function openRequestState (
     return { ok: false, error: createError(request.id, INVALID_PARAMS, `Invalid "requestState": ${opened.reason}`) }
   }
 
-  return { ok: true, payload: opened.claims.payload, inputs: opened.claims.inputs ?? {} }
+  return { ok: true, payload: opened.claims.payload, inputs: opened.claims.inputs ?? {}, answers: opened.claims.answers }
 }
 
 /**
@@ -546,18 +560,22 @@ function openRequestState (
  * two are easy to confuse here because `dependencies.request` is the Fastify
  * one. Only answers to keys the server actually asked for, as recorded in the
  * sealed state, reach the handler; anything else is information the server
- * does not recognise and ignores.
+ * does not recognise and ignores. Answers from earlier rounds, carried in the
+ * sealed state, come first, so a fresh answer to a key asked again wins.
  */
 function withMrtrContext (
   request: JSONRPCRequest,
   dependencies: ModernDependencies,
-  opened: { payload: unknown, inputs?: Record<string, string> }
+  opened: { payload: unknown, inputs?: Record<string, string>, answers?: Record<string, unknown> }
 ): ModernDependencies {
   const params = request.params as { inputResponses?: Record<string, unknown> } | undefined
   const asked = opened.inputs ?? {}
-  const inputResponses = params?.inputResponses === undefined
+  const answered = params?.inputResponses === undefined
     ? undefined
     : Object.fromEntries(Object.entries(params.inputResponses).filter(([key]) => Object.hasOwn(asked, key)))
+  const inputResponses = opened.answers === undefined
+    ? answered
+    : Object.fromEntries([...Object.entries(opened.answers), ...Object.entries(answered ?? {})])
 
   return {
     ...dependencies,
@@ -990,7 +1008,8 @@ function assignWireKeys (
 async function runAsTask (
   request: JSONRPCRequest,
   execute: (resume: TaskResume | undefined, signal: AbortSignal) => Promise<JSONRPCResponse | JSONRPCError>,
-  dependencies: ModernDependencies
+  dependencies: ModernDependencies,
+  settled?: () => Promise<void>
 ): Promise<JSONRPCResponse | JSONRPCError | undefined> {
   const { taskStore, taskWaiters, taskInputs, app, opts } = dependencies
 
@@ -1085,10 +1104,11 @@ async function runAsTask (
     // Answers gathered so far, keyed as the handler asked for them. A handler
     // may ask more than once, so they accumulate across rounds, and a later
     // answer to a key the handler asked again replaces the earlier one.
-    let gathered: Record<string, unknown> | undefined
+    // A sync retry that became a task brings the answers it already has.
+    let gathered: Record<string, unknown> | undefined = dependencies.mrtr?.inputResponses
     // What the handler saved in `InputRequired.state` before its last round,
     // handed back as `context.requestState` exactly as an MRTR retry would.
-    let state: unknown
+    let state: unknown = dependencies.mrtr?.requestState
     const usedWireKeys = new Set<string>()
 
     const fail = (message: string, error?: JSONRPCError) => {
@@ -1111,8 +1131,9 @@ async function runAsTask (
           // A completed task's `result` is what the call would have returned
           // synchronously, envelope included.
           const response = adapt(
+            // Round 0 runs with the request's own context, as a sync call would.
             await execute(
-              (gathered || state !== undefined) ? { inputResponses: gathered ?? {}, requestState: state } : undefined,
+              round > 0 ? { inputResponses: gathered ?? {}, requestState: state } : undefined,
               stopped
             ),
             dependencies.serverInfo
@@ -1167,7 +1188,7 @@ async function runAsTask (
             break
           }
 
-          const { wire, handlerKeys } = assignWireKeys(requests as Record<string, unknown>, usedWireKeys)
+          const { wire, handlerKeys } = assignWireKeys(withoutLegacyFields(requests) as Record<string, unknown>, usedWireKeys)
           try {
             const parked = await taskStore!.updateStatus(record.taskId, 'input_required', {
               statusMessage: error.message,
@@ -1219,6 +1240,7 @@ async function runAsTask (
       stopListening?.()
       taskInputs?.forget(record.taskId)
     }
+    await settled?.()
   })()
 
   // Nothing awaits `execution`; the guard keeps an unexpected throw from
@@ -1316,7 +1338,7 @@ async function modernToolsCall (
 
   const run = (
     resume: TaskResume | undefined,
-    observation: { source: 'json-rpc' | 'task', startedAt: number },
+    observation: Parameters<typeof executeToolCall>[5],
     signal?: AbortSignal
   ) => executeToolCall(
     request,
@@ -1340,10 +1362,24 @@ async function modernToolsCall (
   // 2026-07-28 lets the server decide: a client that declared the extension may
   // get a task handle back without having asked for one per request.
   if (tasksAvailable && clientHasTasks && taskSupport !== 'forbidden') {
+    // A task is one call however many input rounds it takes: the hook fires
+    // once, with the final outcome, timed from the task's start. A round that
+    // asks for input only reports if no later round runs (the task timed out
+    // or was cancelled while waiting).
+    const taskStartedAt = performance.now()
+    let unreported: (() => Promise<void>) | undefined
     const task = await runAsTask(
       request,
-      (resume, signal) => run(resume, { source: 'task', startedAt: performance.now() }, signal),
-      dependencies
+      (resume, signal) => {
+        unreported = undefined
+        return run(resume, {
+          source: 'task',
+          startedAt: taskStartedAt,
+          deferInputRequired: (emit) => { unreported = emit }
+        }, signal)
+      },
+      dependencies,
+      async () => { await unreported?.() }
     )
     if (task) return task
     // No task could be created right now. A tool that merely supports tasks

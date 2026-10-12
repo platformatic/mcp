@@ -4104,3 +4104,212 @@ describe('round 5: arguments, subscriptions, input rounds and stdio', () => {
     t.assert.deepStrictEqual(marked, [true])
   })
 })
+
+describe('round 6: input rounds, hooks, client retries and stdio', () => {
+  const formCapabilities: ClientCapabilities = { elicitation: { form: {} } }
+  const taskCapabilities: ClientCapabilities = { extensions: { [TASKS_EXTENSION]: {} }, elicitation: { form: {} } }
+  const accept = (value: string) => ({ action: 'accept', content: { value } })
+
+  /** Asks for `a`, then once that is answered for `b`, then joins both. */
+  function twoStepTool (app: FastifyInstance, taskSupport?: 'optional' | 'required') {
+    app.mcpAddTool({
+      name: 'two',
+      inputSchema: Type.Object({}),
+      ...(taskSupport ? { execution: { taskSupport } } : {})
+    } as any, async (_args: any, context: any) => {
+      const answers = context.inputResponses ?? {}
+      if (!answers.a) throw new InputRequired({ inputRequests: { a: elicitForm('A?', { type: 'object', properties: {} }) }, state: 1 })
+      if (!answers.b) throw new InputRequired({ inputRequests: { b: elicitForm('B?', { type: 'object', properties: {} }) }, state: 2 })
+      return { content: [{ type: 'text', text: `${answers.a.content.value}+${answers.b.content.value}` }] }
+    })
+  }
+
+  async function awaitStatus (app: FastifyInstance, taskId: string, status: string) {
+    let task: any
+    for (let attempt = 0; attempt < 100 && task?.status !== status; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 10))
+      task = (await call(app, 'tasks/get', { params: { taskId }, capabilities: taskCapabilities })).json().result
+    }
+    return task
+  }
+
+  test('a sync retry sees the answers of every earlier round', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => twoStepTool(app))
+    const first = (await call(app, 'tools/call', { params: { name: 'two', arguments: {} }, capabilities: formCapabilities })).json().result
+    t.assert.deepStrictEqual(Object.keys(first.inputRequests), ['a'])
+
+    const second = (await call(app, 'tools/call', {
+      id: 2,
+      capabilities: formCapabilities,
+      params: { name: 'two', arguments: {}, requestState: first.requestState, inputResponses: { a: accept('x') } }
+    })).json().result
+    t.assert.deepStrictEqual(Object.keys(second.inputRequests), ['b'])
+
+    // Only the latest round's answer is sent, as the spec's client would.
+    const third = await call(app, 'tools/call', {
+      id: 3,
+      capabilities: formCapabilities,
+      params: { name: 'two', arguments: {}, requestState: second.requestState, inputResponses: { b: accept('y') } }
+    })
+    t.assert.strictEqual(third.json().result?.content?.[0]?.text, 'x+y', third.body)
+  })
+
+  test('a key asked again takes its new answer', async (t: TestContext) => {
+    const seen: unknown[] = []
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'again', inputSchema: Type.Object({}) }, async (_args: any, context: any) => {
+        const answer = context.inputResponses?.a
+        seen.push(answer?.content?.value)
+        if (answer?.content?.value !== 'good') {
+          throw new InputRequired({ inputRequests: { a: elicitForm('A?', { type: 'object', properties: {} }) } })
+        }
+        return { content: [{ type: 'text', text: 'ok' }] }
+      })
+    })
+    const first = (await call(app, 'tools/call', { params: { name: 'again', arguments: {} }, capabilities: formCapabilities })).json().result
+    const second = (await call(app, 'tools/call', {
+      id: 2,
+      capabilities: formCapabilities,
+      params: { name: 'again', arguments: {}, requestState: first.requestState, inputResponses: { a: accept('bad') } }
+    })).json().result
+    t.assert.strictEqual(second.resultType, 'input_required')
+    // The retry answers nothing: the rejected answer must not come back.
+    const third = (await call(app, 'tools/call', {
+      id: 3,
+      capabilities: formCapabilities,
+      params: { name: 'again', arguments: {}, requestState: second.requestState, inputResponses: {} }
+    })).json().result
+    t.assert.strictEqual(third.resultType, 'input_required')
+    t.assert.deepStrictEqual(seen, [undefined, 'bad', undefined])
+  })
+
+  test('a sync retry that becomes a task keeps the answers it brought', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => twoStepTool(app, 'optional'), { enableTasks: true })
+    // Without the extension the call runs synchronously and asks for `a`.
+    const first = (await call(app, 'tools/call', { params: { name: 'two', arguments: {} }, capabilities: formCapabilities })).json().result
+    t.assert.strictEqual(first.resultType, 'input_required')
+
+    const created = (await call(app, 'tools/call', {
+      id: 2,
+      capabilities: taskCapabilities,
+      params: { name: 'two', arguments: {}, requestState: first.requestState, inputResponses: { a: accept('x') } }
+    })).json().result
+    t.assert.strictEqual(created.resultType, 'task')
+
+    const waiting = await awaitStatus(app, created.taskId, 'input_required')
+    t.assert.deepStrictEqual(Object.keys(waiting.inputRequests), ['b'])
+    await call(app, 'tasks/update', { params: { taskId: created.taskId, inputResponses: { b: accept('y') } }, capabilities: taskCapabilities })
+    const done = await awaitStatus(app, created.taskId, 'completed')
+    t.assert.strictEqual(done?.result?.content?.[0]?.text, 'x+y', JSON.stringify(done))
+  })
+
+  test('task input requests drop the fields 2026-07-28 removed', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'go', inputSchema: Type.Object({}), execution: { taskSupport: 'required' } } as any, async () => {
+        const request = elicitUrl('Go', 'https://example.com/x')
+        throw new InputRequired({ inputRequests: { u: { ...request, params: { ...request.params, elicitationId: 'legacy-id' } } as any } })
+      })
+    }, { enableTasks: true })
+    const capabilities: ClientCapabilities = { extensions: { [TASKS_EXTENSION]: {} }, elicitation: { url: {} } }
+    const created = (await call(app, 'tools/call', { params: { name: 'go', arguments: {} }, capabilities })).json().result
+    let task: any
+    for (let attempt = 0; attempt < 100 && task?.status !== 'input_required'; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 10))
+      task = (await call(app, 'tasks/get', { params: { taskId: created.taskId }, capabilities })).json().result
+    }
+    t.assert.strictEqual(task.inputRequests.u.params.url, 'https://example.com/x')
+    t.assert.strictEqual('elicitationId' in task.inputRequests.u.params, false)
+    await call(app, 'tasks/cancel', { params: { taskId: created.taskId }, capabilities })
+  })
+
+  test('onToolCallComplete fires once for a task that asked for input, timed from its start', async (t: TestContext) => {
+    const events: any[] = []
+    const app = await buildServer(t, (app) => twoStepTool(app, 'required'), {
+      enableTasks: true,
+      onToolCallComplete: (event: any) => { events.push(event) }
+    })
+    const created = (await call(app, 'tools/call', { params: { name: 'two', arguments: {} }, capabilities: taskCapabilities })).json().result
+    await awaitStatus(app, created.taskId, 'input_required')
+    await new Promise(resolve => setTimeout(resolve, 50))
+    await call(app, 'tasks/update', { params: { taskId: created.taskId, inputResponses: { a: accept('x') } }, capabilities: taskCapabilities })
+    await awaitStatus(app, created.taskId, 'input_required')
+    await call(app, 'tasks/update', { params: { taskId: created.taskId, inputResponses: { b: accept('y') } }, capabilities: taskCapabilities })
+    await awaitStatus(app, created.taskId, 'completed')
+    await until(() => events.length > 0)
+
+    t.assert.deepStrictEqual(events.map(event => [event.source, event.outcome.ok]), [['task', true]])
+    t.assert.ok(events[0].durationMs >= 50, `durationMs ${events[0].durationMs}`)
+  })
+
+  test('onToolCallComplete reports the input round of a task cancelled while waiting', async (t: TestContext) => {
+    const events: any[] = []
+    const app = await buildServer(t, (app) => twoStepTool(app, 'required'), {
+      enableTasks: true,
+      onToolCallComplete: (event: any) => { events.push(event) }
+    })
+    const created = (await call(app, 'tools/call', { params: { name: 'two', arguments: {} }, capabilities: taskCapabilities })).json().result
+    await awaitStatus(app, created.taskId, 'input_required')
+    t.assert.strictEqual(events.length, 0)
+    await call(app, 'tasks/cancel', { params: { taskId: created.taskId }, capabilities: taskCapabilities })
+    await until(() => events.length > 0)
+    t.assert.deepStrictEqual(events.map(event => [event.source, event.outcome.reason]), [['task', 'input-required']])
+  })
+
+  test('a header value that only looks like the Base64 sentinel is a mismatch', async (t: TestContext) => {
+    const seen: unknown[] = []
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({
+        name: 'tenant-tool',
+        inputSchema: { type: 'object', properties: { tenant: { type: 'string', 'x-mcp-header': 'Tenant' } } }
+      }, async (args: any) => {
+        seen.push(args.tenant)
+        return { content: [{ type: 'text', text: 'ran' }] }
+      })
+    })
+    const response = await call(app, 'tools/call', {
+      params: { name: 'tenant-tool', arguments: { tenant: '' } },
+      headers: { 'mcp-param-tenant': '=?base64?=' }
+    })
+    t.assert.strictEqual(response.statusCode, 400)
+    t.assert.strictEqual(response.json().error.code, HEADER_MISMATCH)
+    t.assert.deepStrictEqual(seen, [])
+  })
+
+  test('the client refreshes tools/list and retries once after a header mismatch', async (t: TestContext) => {
+    const methods: string[] = []
+    const app = await buildServer(t, (app) => {
+      app.addHook('preHandler', async (request) => { methods.push((request.body as any)?.method) })
+      app.mcpAddTool({
+        name: 'geo',
+        inputSchema: { type: 'object', properties: { region: { type: 'string', 'x-mcp-header': 'Region' } } }
+      }, async (args: any) => ({ content: [{ type: 'text', text: `in ${args.region}` }] }))
+    })
+    const client = app.mcpClient({ protocolVersion: LATEST_PROTOCOL_VERSION })
+    // No listTools() first: the client cannot know the header yet.
+    const response = await client.callTool('geo', { region: 'eu' })
+    t.assert.strictEqual((response as any).body?.result?.content?.[0]?.text, 'in eu', JSON.stringify(response.body))
+    t.assert.deepStrictEqual(methods, ['tools/call', 'tools/list', 'tools/call'])
+
+    // A mismatch the refresh cannot fix is returned, not retried.
+    methods.length = 0
+    const forced = await client.callTool('geo', { region: 'eu' }, { headers: { 'mcp-param-region': 'us' } })
+    t.assert.strictEqual((forced as any).body?.error?.code, HEADER_MISMATCH)
+    t.assert.deepStrictEqual(methods, ['tools/call', 'tools/list'])
+  })
+
+  test('stdio initialize does not advertise notifications it cannot deliver', async (t: TestContext) => {
+    const app = await buildServer(t, undefined, {
+      enableSSE: true,
+      capabilities: { tools: { listChanged: true }, resources: { subscribe: true, listChanged: true } }
+    })
+    const { input, waitFor } = stdioHarness(t, app)
+    input.write(JSON.stringify({
+      jsonrpc: '2.0',
+      id: 'init',
+      method: 'initialize',
+      params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'c', version: '1' } }
+    }) + '\n')
+    const answer = await waitFor(line => line.id === 'init')
+    t.assert.deepStrictEqual(answer?.result?.capabilities, { tools: {}, resources: {} }, JSON.stringify(answer))
+  })
+})

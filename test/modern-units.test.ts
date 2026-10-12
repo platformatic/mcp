@@ -48,6 +48,15 @@ describe('header value encoding', () => {
     t.assert.strictEqual(decodeHeaderValue('=?base64?not!valid!?='), null)
   })
 
+  test('a value that only looks like the sentinel, or pads where none belongs, is rejected', (t: TestContext) => {
+    for (const raw of ['=?base64?=', '=?base64?=?=', '=?base64?====?=', '=?base64?SGk==?=']) {
+      t.assert.strictEqual(decodeHeaderValue(raw), null, raw)
+    }
+    t.assert.strictEqual(decodeHeaderValue('=?base64?SGk=?='), 'Hi')
+    t.assert.strictEqual(decodeHeaderValue('=?base64?SGk?='), 'Hi')
+    t.assert.strictEqual(decodeHeaderValue('=?base64??='), '')
+  })
+
   test('malformed UTF-8 inside the sentinel is rejected', (t: TestContext) => {
     t.assert.strictEqual(decodeHeaderValue('=?base64?/w==?='), null)
   })

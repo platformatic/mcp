@@ -255,7 +255,11 @@ async function handleInitialize (
     protocolVersion,
     // Never advertise a capability the agreed revision cannot express, nor a
     // list-change notification a legacy client has no SSE channel to receive.
-    capabilities: withoutUndeliverableNotifications(capabilitiesForRevision(capabilities, protocolVersion), opts.enableSSE === true),
+    // stdio has none either: its client never opens a GET stream.
+    capabilities: withoutUndeliverableNotifications(
+      capabilitiesForRevision(capabilities, protocolVersion),
+      opts.enableSSE === true && !isStdioRequest(dependencies.request)
+    ),
     serverInfo,
     instructions: opts.instructions
   }
@@ -612,6 +616,12 @@ export async function callRegisteredTool (
 interface ToolCallObservationContext {
   source: MCPToolCallCompleteEvent['source']
   startedAt: number
+  /**
+   * A task's handler asking for input is a round, not the end of the call:
+   * the event is handed here instead, to be emitted only if no later round
+   * produces the outcome.
+   */
+  deferInputRequired?: (emit: () => Promise<void>) => void
 }
 
 export async function executeToolCall (
@@ -627,7 +637,12 @@ export async function executeToolCall (
 
   const callDependencies = { ...dependencies, sessionId }
   const outcome = await executeRegisteredTool(tool, toolName, args, callDependencies)
-  await emitToolCallComplete(observation.source, toolName, args, outcome, observation.startedAt, callDependencies)
+  const emit = () => emitToolCallComplete(observation.source, toolName, args, outcome, observation.startedAt, callDependencies)
+  if (observation.deferInputRequired && !outcome.ok && outcome.reason === 'input-required') {
+    observation.deferInputRequired(emit)
+  } else {
+    await emit()
+  }
   return toolCallOutcomeToJsonRpc(request.id, toolName, outcome)
 }
 

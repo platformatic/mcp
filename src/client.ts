@@ -8,6 +8,7 @@ import type {
   JSONRPCResponse
 } from './schema.ts'
 import {
+  HEADER_MISMATCH,
   JSONRPC_VERSION,
   LATEST_LEGACY_PROTOCOL_VERSION,
   MODERN_PROTOCOL_VERSIONS
@@ -413,6 +414,16 @@ function withModernMetadata (
   }
 }
 
+function isHeaderMismatch (response: McpClientResponse): boolean {
+  const body = response.body as { error?: { code?: unknown } } | undefined
+  return body?.error?.code === HEADER_MISMATCH
+}
+
+function sameHeaders (a: Record<string, string>, b: Record<string, string>): boolean {
+  const keys = Object.keys(a)
+  return keys.length === Object.keys(b).length && keys.every(key => Object.hasOwn(b, key) && a[key] === b[key])
+}
+
 export function createMcpClient (
   app: FastifyInstance,
   options: McpClientOptions = {}
@@ -584,6 +595,35 @@ export function createMcpClient (
     }
   }
 
+  async function listTools (requestOptions?: McpClientRequestOptions & { cursor?: string }): Promise<McpClientResponse> {
+    const id = getRequestId(requestOptions?.id)
+
+    const request: JSONRPCRequest = {
+      jsonrpc: JSONRPC_VERSION,
+      id,
+      method: 'tools/list',
+      ...(requestOptions?.cursor === undefined ? {} : { params: { cursor: requestOptions.cursor } })
+    }
+
+    const response = await send(request, requestOptions)
+    return filterAndRememberToolSchemas(
+      response,
+      isModernProtocolVersion(effectiveProtocolVersion(requestOptions))
+    )
+  }
+
+  /** Re-read every page of `tools/list`, so cached schemas are current. */
+  async function refreshToolSchemas (requestOptions: McpClientRequestOptions): Promise<void> {
+    const seen = new Set<string>()
+    let cursor: string | undefined
+    do {
+      const page = await listTools({ headers: requestOptions.headers, protocolVersion: requestOptions.protocolVersion, cursor })
+      const result = 'result' in page.body && isRecord(page.body.result) ? page.body.result : undefined
+      cursor = typeof result?.nextCursor === 'string' && !seen.has(result.nextCursor) ? result.nextCursor : undefined
+      if (cursor !== undefined) seen.add(cursor)
+    } while (cursor !== undefined)
+  }
+
   return {
     get sessionId () {
       return storedSessionId
@@ -662,22 +702,7 @@ export function createMcpClient (
       }, requestOptions)
     },
 
-    async listTools (requestOptions?: McpClientRequestOptions & { cursor?: string }): Promise<McpClientResponse> {
-      const id = getRequestId(requestOptions?.id)
-
-      const request: JSONRPCRequest = {
-        jsonrpc: JSONRPC_VERSION,
-        id,
-        method: 'tools/list',
-        ...(requestOptions?.cursor === undefined ? {} : { params: { cursor: requestOptions.cursor } })
-      }
-
-      const response = await send(request, requestOptions)
-      return filterAndRememberToolSchemas(
-        response,
-        isModernProtocolVersion(effectiveProtocolVersion(requestOptions))
-      )
-    },
+    listTools,
 
     async callTool (
       name: string,
@@ -692,9 +717,14 @@ export function createMcpClient (
         ...baseRequestOptions
       } = requestOptions ?? {}
 
-      const request: JSONRPCRequest = {
+      const modern = isModernProtocolVersion(effectiveProtocolVersion(requestOptions))
+      const paramHeaders = () => {
+        const schema = toolSchemas.get(name)
+        return modern && schema !== undefined ? toolParamHeaders(schema, args) : {}
+      }
+      const attempt = (requestId: string | number, generatedHeaders: Record<string, string>) => send({
         jsonrpc: JSONRPC_VERSION,
-        id,
+        id: requestId,
         method: 'tools/call',
         params: {
           name,
@@ -703,20 +733,25 @@ export function createMcpClient (
           ...(inputResponses === undefined ? {} : { inputResponses }),
           ...(meta === undefined ? {} : { _meta: meta })
         }
-      }
-
-      const schema = toolSchemas.get(name)
-      const generatedHeaders = isModernProtocolVersion(effectiveProtocolVersion(requestOptions)) && schema !== undefined
-        ? toolParamHeaders(schema, args)
-        : {}
-
-      return await send(request, {
+      }, {
         ...baseRequestOptions,
+        id: requestId,
         headers: {
           ...generatedHeaders,
           ...(requestOptions?.headers ?? {})
         }
       })
+
+      const sentHeaders = paramHeaders()
+      const response = await attempt(id, sentHeaders)
+      if (!modern || !isHeaderMismatch(response)) return response
+
+      // The tool's schema may have changed, or was never listed: the spec has
+      // the client refresh it and retry once with the headers it now implies.
+      await refreshToolSchemas(baseRequestOptions)
+      const refreshed = paramHeaders()
+      if (sameHeaders(sentHeaders, refreshed)) return response
+      return await attempt(getRequestId(undefined), refreshed)
     }
   }
 }

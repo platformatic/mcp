@@ -62,7 +62,10 @@ import type {
   CreateTaskResult,
   ListTasksResult,
   ElicitRequestFormParams,
-  ElicitRequestURLParams
+  ElicitRequestURLParams,
+  ElicitResult,
+  CreateMessageResult,
+  ListRootsResult
 } from './schema.ts'
 
 const REDIS_QUIT_TIMEOUT_MS = 2000
@@ -525,7 +528,10 @@ export type {
   CreateTaskResult,
   ListTasksResult,
   ElicitRequestFormParams,
-  ElicitRequestURLParams
+  ElicitRequestURLParams,
+  ElicitResult,
+  CreateMessageResult,
+  ListRootsResult
 }
 
 // Protocol constants, so consumers can negotiate and branch on the revision
@@ -579,6 +585,7 @@ export type {
   DiscoverResult,
   CacheableResult,
   InputRequests,
+  InputResponse,
   InputResponses,
   InputRequiredResult,
   RequestMetaObject,

@@ -374,13 +374,15 @@ ends the request with an interim result, and the client comes back with the answ
 one. Handlers express this by throwing `InputRequired`:
 
 ```typescript
-import mcpPlugin, { InputRequired, elicitForm } from '@platformatic/mcp'
+import mcpPlugin, { InputRequired, elicitForm, type ElicitResult } from '@platformatic/mcp'
 
 app.mcpAddTool({
   name: 'create-issue',
   inputSchema: Type.Object({ title: Type.String() })
 }, async (args, context) => {
-  const answer = context.inputResponses?.repo
+  // Each answer is the result of the method it asked with: an elicitation
+  // answer is an `ElicitResult`, a sampling answer a `CreateMessageResult`.
+  const answer = context.inputResponses?.repo as ElicitResult | undefined
 
   if (!answer) {
     throw new InputRequired({
@@ -399,9 +401,13 @@ app.mcpAddTool({
 
   // On the retry, `requestState` is the value above, verified and unsealed.
   const { title } = context.requestState as { title: string }
-  return { content: [{ type: 'text', text: `Created "${title}" in ${answer.content.name}` }] }
+  return { content: [{ type: 'text', text: `Created "${title}" in ${answer.content?.name}` }] }
 })
 ```
+
+A handler may ask in several steps. Each retry hands it every answer given so far, not just
+the latest round's, so the second step still sees the first answer, as it would when running
+as a task. A key asked again is replaced by its new answer.
 
 `elicitForm`, `elicitUrl`, `requestSampling` and `requestRoots` build the entries. The
 dispatcher refuses to send a request the client did not declare support for, answering
@@ -649,6 +655,10 @@ tool that permits one — the server decides, and there is no per-call opt-in:
 A tool declaring `taskSupport: 'required'` refuses a client that did not declare the
 extension, with `-32021`.
 
+While a task waits in `input_required`, `tasks/get` shows the input requests its handler made,
+which were checked against the capabilities of the request that created the task. Poll with
+the same capabilities you created it with.
+
 On `2025-11-25`, the client opts in per call instead:
 
 ```jsonc
@@ -677,7 +687,8 @@ Tasks are stored in memory by default and in Redis when a `redis` option is give
 instance can serve a poll for a task created on another.
 
 **Security**: when built-in authorization or `resolveAuthorizationContext` is configured,
-tasks are bound to the resolved `userId` and a requestor can only reach its own. Without an
+tasks are bound to the resolved principal (user, OAuth client and issuer) and a requestor can
+only reach its own. Without an
 identity resolver no requestor can be identified, so tasks are reachable by anyone holding
 the (random UUID) task id, and `tasks/list` is both unadvertised **and refused** — otherwise
 it would hand every anonymous task's id to any caller and defeat that model.
@@ -1088,6 +1099,8 @@ const app = Fastify({ logger: true })
 
 await app.register(mcpPlugin, {
   enableSSE: true,
+  // Required with redis: every instance must verify the request state the others seal
+  requestStateSecret: process.env.MCP_REQUEST_STATE_SECRET,
   redis: {
     host: process.env.REDIS_HOST || 'localhost',
     port: parseInt(process.env.REDIS_PORT || '6379'),
@@ -1591,6 +1604,8 @@ Starts a Fastify MCP server in stdio mode.
 - `input` - Custom input stream (default: process.stdin)
 - `output` - Custom output stream (default: process.stdout)
 - `error` - Custom error stream (default: process.stderr)
+- `authContext` - Authorization context every request on this stream runs as (stdio has no
+  bearer token, so `resolveAuthorizationContext` is not called)
 
 #### `createStdioTransport(app, options)`
 
@@ -1681,7 +1696,8 @@ await app.register(mcpPlugin, {
       validateAudience: true
     }
   },
-  // Redis for session persistence (recommended)
+  // Redis for session persistence (recommended), with the shared secret it requires
+  requestStateSecret: process.env.MCP_REQUEST_STATE_SECRET,
   redis: {
     host: process.env.REDIS_HOST || 'localhost',
     port: parseInt(process.env.REDIS_PORT || '6379')
@@ -1962,13 +1978,13 @@ await app.register(mcpPlugin, {
 })
 ```
 
-The hook fires exactly once per tool call, after it settles: for JSON-RPC `tools/call`, for `app.mcpCallTool()`, and for a task-augmented call once execution finishes (not when the task is merely accepted). It also fires for access denial, unknown tools, invalid arguments, task-required outcomes, and a handler asking for client input (`reason: 'input-required'`; a multi round-trip retry is a new call and fires again). It does not fire for `tools/list`, initialization/ping, or malformed requests where no tool name was resolved.
+The hook fires exactly once per tool call, after it settles: for JSON-RPC `tools/call`, for `app.mcpCallTool()`, and for a task-augmented call once execution finishes (not when the task is merely accepted). It also fires for access denial, unknown tools, invalid arguments, task-required outcomes, and a handler asking for client input (`reason: 'input-required'`; a multi round-trip retry is a new call and fires again). A task that pauses for client input is still one call: the hook fires once, with the final outcome. It does not fire for `tools/list`, initialization/ping, or malformed requests where no tool name was resolved.
 
 `event.source` is `'json-rpc'`, `'in-process'`, or `'task'`. `event.outcome` is the same `McpCallToolOutcome` returned by `mcpCallTool()`. The hook is awaited before the response is sent, so keep it fast; a throwing or rejecting hook is logged and otherwise ignored — it never changes the tool response.
 
 Synchronous sources (`'json-rpc'` and `'in-process'`) expose the active `request`/`reply`. Task events never do: a task can finish after the original HTTP response has already completed, so `request`/`reply` are absent on `source: 'task'` events. Every event, regardless of source, carries `requestId` for correlation.
 
-Duration semantics also differ by source: `'json-rpc'` and `'in-process'` durations include authorization, validation, sanitization, and execution. Task durations measure only actual execution — validation, sanitization, and the tool call — excluding the time the task spent queued.
+Duration semantics also differ by source: `'json-rpc'` and `'in-process'` durations include authorization, validation, sanitization, and execution. Task durations measure execution — validation, sanitization, and the tool call — excluding the time the task spent queued; for a task that paused for client input, they run from its first round to its last, waits included.
 
 `event.arguments` are the raw, unredacted tool arguments. Redact sensitive values yourself before logging or persisting them.
 
@@ -2459,7 +2475,8 @@ All handlers receive a consistent context object containing:
   - `body`: Request body (when applicable)
 - `context.reply`: Fastify reply object for setting response headers
 - `context.sessionId`: Session identifier (when using SSE)
-- `context.authContext`: Authorization context (when OAuth is enabled)
+- `context.authContext`: Authorization context, from built-in OAuth, `resolveAuthorizationContext`,
+  or the stdio transport's `authContext` option
 - `context.signal`: `AbortSignal` that aborts when the request is cancelled: a 2026-07-28 client
   disconnecting before the response, `notifications/cancelled` on stdio, or `tasks/cancel` for a
   handler running as a task (in either era). Pass it to `fetch` or check it between steps to stop
@@ -2584,7 +2601,9 @@ type PromptHandler = (name: string, args: any, context: HandlerContext) => Promi
 The plugin exposes the following endpoints using a dual-endpoint architecture:
 
 - `POST /mcp`: Handles all JSON-RPC 2.0 MCP protocol messages
-  - Always returns `Content-Type: application/json; charset=utf-8`
+  - Returns `Content-Type: application/json; charset=utf-8`, except for 2026-07-28 requests
+    answered as a stream: `subscriptions/listen`, and requests that report progress or logs
+    and accept `text/event-stream`
   - Processes initialize, tool calls, resource reads, prompt gets, etc.
   - Creates and manages session IDs when SSE is enabled
   - Authorization-aware when OAuth is enabled
@@ -2755,6 +2774,7 @@ When using Redis for horizontal scaling:
 ```typescript
 await app.register(mcpPlugin, {
   enableSSE: true,
+  requestStateSecret: process.env.MCP_REQUEST_STATE_SECRET, // at least 32 bytes
   redis: {
     host: 'your-redis-host',
     port: 6379,
@@ -2933,6 +2953,9 @@ the changes to the plugin's own API and defaults:
   versions never misread each other's tasks. Tasks in flight during an upgrade are only
   visible to instances of the version that created them.
 - **Tasks are bound to user, OAuth client and issuer**, not the user alone, in both eras.
+  `TaskRecord.authSubject` now holds that principal as a JSON string rather than a bare user
+  id, so custom `TaskStore` implementations and callers of `taskStore.list(subject)` must pass
+  it through unchanged.
 - **Task limits apply to both eras**: 2025-11-25 tasks count against `taskMaxConcurrent` and
   `taskMaxPerPrincipal`, are aborted at their ttl and are drained on shutdown.
 - **A full in-memory task store refuses new tasks** instead of dropping finished results.
@@ -2979,8 +3002,10 @@ the changes to the plugin's own API and defaults:
 
 ### Upgrading to MCP 2026-07-28
 
-Existing deployments keep working: the handshake path is untouched, and clients that speak
-`2025-11-25` or earlier need no changes. Adopting the new revision is opt-in per client.
+Clients that speak `2025-11-25` or earlier need no changes, and adopting the new revision is
+opt-in per client. Deployments may need a configuration change: a `redis` deployment must now
+set `requestStateSecret`, or it fails at startup, and the other items under
+[Breaking changes](#breaking-changes-in-300) apply to the legacy path too.
 
 **What is new**
 
