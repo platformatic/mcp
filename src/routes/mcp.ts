@@ -20,6 +20,7 @@ import type { MessageBroker } from '../brokers/message-broker.ts'
 import type { AuthorizationContext } from '../types/auth-types.ts'
 import type { JsonSchemaValidator } from '../validation/json-schema-validator.ts'
 import { processMessage } from '../handlers.ts'
+import { isStdioRequest } from '../stdio-marker.ts'
 
 interface MCPPubSubRoutesOptions {
   enableSSE: boolean
@@ -407,8 +408,10 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
         // Sessions belong to Streamable HTTP, not to SSE. Without SSE we only open
         // one on initialize: other requests keep working statelessly as before,
-        // and stateless clients do not each leave a session behind.
-        if (!existingSession && (enableSSE || isInitializeRequest(message))) {
+        // and stateless clients do not each leave a session behind. Stdio
+        // requests never carry a session id or open a GET stream, so a session
+        // created for them would never be freed.
+        if (!existingSession && !isStdioRequest(request) && (enableSSE || isInitializeRequest(message))) {
           const session = await createSession(request)
           reply.header('Mcp-Session-Id', session.id)
           sessionId = session.id

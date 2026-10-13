@@ -6,6 +6,7 @@ import { PassThrough } from 'node:stream'
 import { createInterface } from 'node:readline'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { createStdioTransport, runStdioServer } from '../src/stdio.ts'
+import { MemoryMessageBroker } from '../src/brokers/memory-message-broker.ts'
 
 // Note: These tests are placeholders.
 // The actual stdio functionality is tested in stdio-simple.test.ts using subprocess integration.
@@ -212,4 +213,67 @@ test('stdio transport - concurrent stop() calls share the same close promise', a
 
   await second
   assert.strictEqual(onCloseDone, true, 'second stop() should wait for app.close()')
+})
+
+test('stdio transport - does not create SSE sessions when enableSSE is on', async (t) => {
+  const subscriptions: string[] = []
+  const original = MemoryMessageBroker.prototype.subscribe
+  t.mock.method(MemoryMessageBroker.prototype, 'subscribe', function (this: MemoryMessageBroker, topic: string, handler: any) {
+    subscriptions.push(topic)
+    return original.call(this, topic, handler)
+  })
+
+  const app = fastify({ logger: false })
+  await app.register(mcpPlugin, {
+    serverInfo: { name: 'test-server', version: '1.0.0' },
+    capabilities: { tools: {} },
+    enableSSE: true
+  })
+  await app.ready()
+
+  const input = new PassThrough()
+  const output = new PassThrough()
+  const transport = createStdioTransport(app, { input, output, error: new PassThrough() })
+  transport.start()
+  t.after(() => transport.stop())
+
+  const lines = createInterface({ input: output })[Symbol.asyncIterator]()
+  async function send (message: unknown): Promise<any> {
+    input.write(JSON.stringify(message) + '\n')
+    const { value } = await lines.next()
+    return JSON.parse(value as string)
+  }
+
+  const init = await send(initialize(1, '2025-06-18'))
+  assert.ok(init.result)
+  for (let i = 0; i < 50; i++) {
+    const pong = await send({ jsonrpc: '2.0', id: i + 2, method: 'ping' })
+    assert.deepStrictEqual(pong.result, {})
+  }
+
+  const sessionTopics = subscriptions.filter(topic => topic.startsWith('mcp/session/'))
+  assert.deepStrictEqual(sessionTopics, [])
+})
+
+test('stdio transport - the stdio marker header alone does not skip SSE sessions', async (t) => {
+  const app = fastify({ logger: false })
+  await app.register(mcpPlugin, {
+    serverInfo: { name: 'test-server', version: '1.0.0' },
+    capabilities: { tools: {} },
+    enableSSE: true
+  })
+  t.after(() => app.close())
+
+  // Any HTTP client can send this header, so it must not be trusted on its own
+  const response = await app.inject({
+    method: 'POST',
+    url: '/mcp',
+    headers: {
+      'content-type': 'application/json',
+      'x-platformatic-mcp-transport': 'stdio'
+    },
+    payload: { jsonrpc: '2.0', id: 1, method: 'ping' }
+  })
+  assert.strictEqual(response.statusCode, 200)
+  assert.ok(response.headers['mcp-session-id'])
 })
