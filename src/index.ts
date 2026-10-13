@@ -316,6 +316,8 @@ export type {
   TracerLike
 } from './types.ts'
 
+export type { AllowedOrigins } from './security.ts'
+
 // Export telemetry utilities for advanced consumers
 export { MCP_ATTR, buildSpanAttributes } from './telemetry-constants.ts'
 export { withSpan } from './telemetry.ts'
