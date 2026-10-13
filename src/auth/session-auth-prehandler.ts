@@ -2,7 +2,7 @@ import type { FastifyRequest, FastifyReply, preHandlerHookHandler } from 'fastif
 import type { AuthorizationConfig } from '../types/auth-types.ts'
 import type { SessionStore } from '../stores/session-store.ts'
 import { TokenValidator } from './token-validator.ts'
-import { generateWWWAuthenticateHeader, sendInvalidToken } from './prehandler.ts'
+import { BEARER_SCHEME, generateWWWAuthenticateHeader, sendInvalidToken } from './prehandler.ts'
 import { hashToken, createAuthorizationContext, createTokenRefreshInfo, shouldAttemptRefresh } from './token-utils.ts'
 
 export interface SessionAuthPreHandlerOptions {
@@ -46,11 +46,13 @@ export function createSessionAuthPreHandler (
       })
     }
 
-    if (!authHeader.startsWith('Bearer ')) {
+    // The auth-scheme is case-insensitive (RFC 7235 Section 2.1, RFC 6750 Section 2.1)
+    const match = BEARER_SCHEME.exec(authHeader)
+    if (!match) {
       return sendInvalidToken(reply, config, 'Authorization header must use Bearer scheme')
     }
 
-    const token = authHeader.substring(7) // Remove 'Bearer ' prefix
+    const token = match[1]
     if (!token) {
       return sendInvalidToken(reply, config, 'Bearer token is empty')
     }

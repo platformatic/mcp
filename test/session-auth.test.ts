@@ -429,6 +429,54 @@ describe('Session-Based Authorization', () => {
       )
     })
 
+    for (const scheme of ['Bearer', 'bearer', 'BEARER']) {
+      test(`should accept the ${scheme} auth-scheme case-insensitively`, async (t) => {
+        const fastify = Fastify()
+        t.after(async () => {
+          await fastify.close()
+        })
+
+        const config = {
+          enabled: true,
+          authorizationServers: ['https://auth.example.com'],
+          resourceUri: 'https://api.example.com',
+          tokenValidation: {
+            jwksUri: 'https://auth.example.com/.well-known/jwks.json',
+            validateAudience: true
+          }
+        }
+
+        const sessionStore = new MemorySessionStore(100)
+        const validatedTokens: string[] = []
+        const tokenValidator = {
+          validateToken: async (token: string) => {
+            validatedTokens.push(token)
+            return { valid: true, payload: { sub: 'test-user' } }
+          }
+        } as unknown as TokenValidator
+
+        const preHandler = createSessionAuthPreHandler({
+          config,
+          tokenValidator,
+          sessionStore
+        })
+
+        fastify.addHook('preHandler', preHandler)
+        fastify.get('/test', async () => ({ message: 'success' }))
+
+        const response = await fastify.inject({
+          method: 'GET',
+          url: '/test',
+          headers: {
+            authorization: `${scheme} test-token`
+          }
+        })
+
+        assert.strictEqual(response.statusCode, 200)
+        assert.deepStrictEqual(validatedTokens, ['test-token'])
+      })
+    }
+
     test('should handle empty bearer token', async (t) => {
       const fastify = Fastify()
       t.after(async () => {
