@@ -1,8 +1,8 @@
 import { randomUUID } from 'crypto'
-import type { FastifyRequest, FastifyReply, FastifyPluginAsync, FastifySchema, preHandlerHookHandler } from 'fastify'
+import type { FastifyRequest, FastifyReply, FastifyPluginAsync, FastifySchema, FastifyError, FastifyInstance, preHandlerHookHandler } from 'fastify'
 import fp from 'fastify-plugin'
 import type { JSONRPCMessage } from '../schema.ts'
-import { JSONRPC_VERSION, INTERNAL_ERROR, SUPPORTED_PROTOCOL_VERSIONS, DEFAULT_NEGOTIATED_PROTOCOL_VERSION } from '../schema.ts'
+import { JSONRPC_VERSION, INTERNAL_ERROR, PARSE_ERROR, INVALID_REQUEST, SUPPORTED_PROTOCOL_VERSIONS, DEFAULT_NEGOTIATED_PROTOCOL_VERSION } from '../schema.ts'
 import { isOriginAllowed } from '../security.ts'
 import type {
   MCPPluginOptions,
@@ -73,6 +73,46 @@ function resolveMcpRouteSchema (
   }
 
   return transformed
+}
+
+// Body-parser failures happen before the handler runs, so without this they
+// would surface as Fastify's default error body instead of a JSON-RPC error.
+const BODY_PARSER_ERRORS: Record<string, { code: number, message: string }> = {
+  FST_ERR_CTP_INVALID_JSON_BODY: { code: PARSE_ERROR, message: 'Parse error' },
+  FST_ERR_CTP_EMPTY_JSON_BODY: { code: PARSE_ERROR, message: 'Parse error' },
+  FST_ERR_CTP_BODY_TOO_LARGE: { code: INVALID_REQUEST, message: 'Invalid Request' },
+  FST_ERR_CTP_INVALID_MEDIA_TYPE: { code: INVALID_REQUEST, message: 'Invalid Request' }
+}
+
+// A hook or parser can throw/reject with a non-Error value (a string, a plain
+// object). Fastify would send such a value as the response body, so give the
+// parent handler a generic Error instead and keep the original as `cause`.
+function toError (value: unknown): FastifyError {
+  if (value instanceof Error) {
+    return value as FastifyError
+  }
+  const error = new Error('Internal Server Error', { cause: value }) as FastifyError
+  error.statusCode = 500
+  return error
+}
+
+function buildMcpPostErrorHandler (app: FastifyInstance) {
+  return function mcpPostErrorHandler (thrown: unknown, request: FastifyRequest, reply: FastifyReply) {
+    const error = toError(thrown)
+    const mapped = error.code ? BODY_PARSER_ERRORS[error.code] : undefined
+    if (!mapped) {
+      // Call the encapsulating instance's handler (the user's setErrorHandler,
+      // or Fastify's default) directly: rethrowing only delegates for Errors.
+      return app.errorHandler(error, request, reply)
+    }
+
+    request.log.info({ err: error }, 'Rejected MCP request body')
+    return reply.code(error.statusCode ?? 400).type('application/json').send({
+      jsonrpc: JSONRPC_VERSION,
+      id: null,
+      error: mapped
+    })
+  }
 }
 
 const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async (app, options) => {
@@ -283,9 +323,10 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
       method: 'POST',
       url: mcpUrl
     }, opts.transformRouteSchema)
+    const mcpPostErrorHandler = buildMcpPostErrorHandler(app)
     const routeOptions = schema === undefined
-      ? { onRequest: mcpOnRequest, preHandler: mcpPreHandler }
-      : { onRequest: mcpOnRequest, preHandler: mcpPreHandler, schema }
+      ? { onRequest: mcpOnRequest, preHandler: mcpPreHandler, errorHandler: mcpPostErrorHandler }
+      : { onRequest: mcpOnRequest, preHandler: mcpPreHandler, errorHandler: mcpPostErrorHandler, schema }
 
     app.post('/mcp', routeOptions, async (request: FastifyRequest, reply: FastifyReply) => {
       try {
