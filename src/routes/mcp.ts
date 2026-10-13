@@ -19,7 +19,7 @@ import type { TaskStore, TaskWaiters } from '../stores/task-store.ts'
 import type { MessageBroker } from '../brokers/message-broker.ts'
 import type { AuthorizationContext } from '../types/auth-types.ts'
 import type { JsonSchemaValidator } from '../validation/json-schema-validator.ts'
-import { processMessage } from '../handlers.ts'
+import { processMessage, checkRequestId } from '../handlers.ts'
 import { isStdioRequest } from '../stdio-marker.ts'
 
 interface MCPPubSubRoutesOptions {
@@ -427,6 +427,11 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
       try {
         const message = request.body as JSONRPCMessage
+        const idError = checkRequestId(message)
+        if (idError) {
+          return reply.code(400).type('application/json').send(idError)
+        }
+
         let sessionId = request.headers['mcp-session-id'] as string | undefined
         const existingSession = sessionId ? await sessionStore.get(sessionId) : null
 
