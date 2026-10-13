@@ -190,6 +190,9 @@ test('runStdioServer - resolves only after app.close() completes on input EOF', 
 
   await app.ready()
 
+  const sigintBaseline = process.listenerCount('SIGINT')
+  const sigtermBaseline = process.listenerCount('SIGTERM')
+
   const input = new PassThrough()
   const running = runStdioServer(app, {
     input,
@@ -200,6 +203,8 @@ test('runStdioServer - resolves only after app.close() completes on input EOF', 
 
   await running
   assert.strictEqual(onCloseDone, true, 'onClose hook should complete before runStdioServer resolves')
+  assert.strictEqual(process.listenerCount('SIGINT'), sigintBaseline, 'SIGINT listeners should be removed')
+  assert.strictEqual(process.listenerCount('SIGTERM'), sigtermBaseline, 'SIGTERM listeners should be removed')
 })
 
 test('stdio transport - concurrent stop() calls share the same close promise', async () => {
@@ -296,4 +301,70 @@ test('stdio transport - the stdio marker header alone does not skip SSE sessions
   })
   assert.strictEqual(response.statusCode, 200)
   assert.ok(response.headers['mcp-session-id'])
+})
+
+test('stdio transport - stop() removes the SIGINT/SIGTERM listeners', async () => {
+  const sigintBaseline = process.listenerCount('SIGINT')
+  const sigtermBaseline = process.listenerCount('SIGTERM')
+
+  const transports = []
+  for (let i = 0; i < 3; i++) {
+    const app = fastify({ logger: false })
+    await app.register(mcpPlugin, {
+      serverInfo: {
+        name: 'test-server',
+        version: '1.0.0'
+      }
+    })
+    await app.ready()
+
+    const transport = createStdioTransport(app, {
+      input: new PassThrough(),
+      output: new PassThrough(),
+      error: new PassThrough()
+    })
+    transport.start()
+    transports.push(transport)
+  }
+
+  assert.strictEqual(process.listenerCount('SIGINT'), sigintBaseline + 3)
+  assert.strictEqual(process.listenerCount('SIGTERM'), sigtermBaseline + 3)
+
+  for (const transport of transports) {
+    await transport.stop()
+  }
+
+  assert.strictEqual(process.listenerCount('SIGINT'), sigintBaseline)
+  assert.strictEqual(process.listenerCount('SIGTERM'), sigtermBaseline)
+})
+
+test('stdio transport - a signal removes both signal listeners', async () => {
+  const sigintBaseline = process.listenerCount('SIGINT')
+  const sigtermBaseline = process.listenerCount('SIGTERM')
+
+  const app = fastify({ logger: false })
+  await app.register(mcpPlugin, {
+    serverInfo: {
+      name: 'test-server',
+      version: '1.0.0'
+    }
+  })
+  await app.ready()
+
+  const transport = createStdioTransport(app, {
+    input: new PassThrough(),
+    output: new PassThrough(),
+    error: new PassThrough()
+  })
+  transport.start()
+
+  // Invoke the transport's own SIGINT handler directly rather than sending a
+  // real signal to the test runner
+  const handler = process.listeners('SIGINT').at(-1) as () => void
+  handler()
+
+  assert.strictEqual(process.listenerCount('SIGINT'), sigintBaseline)
+  assert.strictEqual(process.listenerCount('SIGTERM'), sigtermBaseline)
+
+  await transport.stop()
 })
