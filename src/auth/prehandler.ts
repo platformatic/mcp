@@ -1,6 +1,7 @@
 import type { FastifyRequest, FastifyReply, preHandlerHookHandler } from 'fastify'
 import type { AuthorizationConfig, ScopeImplies } from '../types/auth-types.ts'
 import { TokenValidator } from './token-validator.ts'
+import { getResourceMetadataUrl } from './resource-metadata.ts'
 
 export function createAuthPreHandler (
   config: AuthorizationConfig,
@@ -157,7 +158,7 @@ export function generateWWWAuthenticateHeader (config: AuthorizationConfig, chal
   if (!config.enabled) {
     throw new Error('Authorization is disabled')
   }
-  const resourceMetadataUrl = `${config.resourceUri}/.well-known/oauth-protected-resource`
+  const resourceMetadataUrl = getResourceMetadataUrl(config.resourceUri)
   const params = ['realm="MCP Server"', `resource_metadata="${resourceMetadataUrl}"`]
 
   if (challenge.error) {
