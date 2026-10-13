@@ -10,6 +10,22 @@ import {
   generateMockJWKSResponse
 } from './auth-test-utils.ts'
 
+// The stream's close timer is unref'd, so a ref'd timer has to keep the event
+// loop alive while the test waits for it to fire
+async function waitForEnd (stream: NodeJS.ReadableStream, ms = 5000): Promise<void> {
+  let timer: NodeJS.Timeout | undefined
+  try {
+    await Promise.race([
+      once(stream, 'end'),
+      new Promise((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`stream did not end within ${ms}ms`)), ms)
+      })
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 function countRefedTimeouts (): number {
   return process.getActiveResourcesInfo().filter(r => r === 'Timeout').length
 }
@@ -47,7 +63,7 @@ describe('SSE streams close when the opening token expires', () => {
 
     const stream = response.stream()
     stream.resume()
-    await once(stream, 'end', { signal: AbortSignal.timeout(5000) })
+    await waitForEnd(stream)
 
     const closedAt = Date.now()
     t.assert.ok(closedAt >= exp * 1000 - 50, `closed ${exp * 1000 - closedAt}ms before exp`)
@@ -106,6 +122,6 @@ describe('SSE streams close when the opening token expires', () => {
 
     const stream = response.stream()
     stream.resume()
-    await once(stream, 'end', { signal: AbortSignal.timeout(5000) })
+    await waitForEnd(stream)
   })
 })
