@@ -50,6 +50,8 @@ export class TokenValidator {
       return { valid: false, error: 'Authorization is disabled' }
     }
 
+    let jwtFailure: string | undefined
+
     try {
       // Try JWT validation first if JWKS is configured
       if (this.jwtVerifier) {
@@ -72,12 +74,17 @@ export class TokenValidator {
           }
         } catch (jwtError) {
           this.fastify.log.warn({ err: jwtError }, 'JWT validation failed, trying introspection')
+          jwtFailure = describeJwtError(jwtError)
         }
       }
 
       // Fall back to token introspection if available
       if (this.config.tokenValidation.introspectionEndpoint) {
         return await this.introspectToken(token)
+      }
+
+      if (jwtFailure) {
+        return { valid: false, error: jwtFailure }
       }
 
       return {
@@ -192,5 +199,21 @@ export class TokenValidator {
     if (this.getJwks) {
       // get-jwks doesn't expose a close method, but the cache will be garbage collected
     }
+  }
+}
+
+// Map fast-jwt failures to fixed descriptions: the library messages can
+// include claim values from the token, which must not be echoed to clients.
+function describeJwtError (err: unknown): string {
+  switch ((err as { code?: string } | null)?.code) {
+    case 'FAST_JWT_EXPIRED':
+      return 'Token expired'
+    case 'FAST_JWT_INACTIVE':
+      return 'Token not yet valid'
+    case 'FAST_JWT_INVALID_SIGNATURE':
+    case 'FAST_JWT_MISSING_SIGNATURE':
+      return 'Invalid token signature'
+    default:
+      return 'Invalid token'
   }
 }
