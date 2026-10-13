@@ -34,6 +34,7 @@ interface MCPPubSubRoutesOptions {
   localStreams: Map<string, Set<any>>
   taskStore?: TaskStore
   taskWaiters?: TaskWaiters
+  shutdownSignal?: AbortSignal
   jsonSchemaValidator?: JsonSchemaValidator
   authPreHandler?: preHandlerHookHandler
 }
@@ -76,7 +77,7 @@ function resolveMcpRouteSchema (
 }
 
 const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async (app, options) => {
-  const { enableSSE, opts, capabilities, serverInfo, tools, resources, prompts, resourceHandlers, sessionStore, messageBroker, localStreams, taskStore, taskWaiters, jsonSchemaValidator, authPreHandler } = options
+  const { enableSSE, opts, capabilities, serverInfo, tools, resources, prompts, resourceHandlers, sessionStore, messageBroker, localStreams, taskStore, taskWaiters, shutdownSignal, jsonSchemaValidator, authPreHandler } = options
   const mcpUrl = resolveRouteUrl(app.prefix, '/mcp')
 
   const allowedOrigins = opts.allowedOrigins
@@ -349,6 +350,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
           sessionStore,
           taskStore,
           taskWaiters,
+          shutdownSignal,
           jsonSchemaValidator,
           sessionId,
           protocolVersion: (request as any).mcpProtocolVersion ?? DEFAULT_NEGOTIATED_PROTOCOL_VERSION

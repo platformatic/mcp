@@ -124,6 +124,14 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
   // tasks/result request needs to be woken when that task finishes.
   const taskWaiters = new TaskWaiters()
 
+  // Aborted in preClose so calls blocked on work this instance does not own
+  // (e.g. tasks/result for a task running elsewhere) give up instead of
+  // holding the server open until that work finishes.
+  const shutdownController = new AbortController()
+  app.addHook('preClose', async () => {
+    shutdownController.abort()
+  })
+
   if (enableTasks) {
     // Advertise which task operations we support. `tasks/list` is only offered
     // when authorization is on, because without an identifiable requestor it
@@ -211,6 +219,7 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     localStreams,
     taskStore,
     taskWaiters,
+    shutdownSignal: shutdownController.signal,
     jsonSchemaValidator,
     authPreHandler: mcpAuthPreHandler
   })

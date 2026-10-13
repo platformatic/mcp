@@ -279,6 +279,9 @@ A client opts in per call by adding a `task` field:
 
 Supported operations: `tasks/get`, `tasks/result` (blocks until the task is terminal),
 `tasks/list` and `tasks/cancel`, plus optional `notifications/tasks/status` pushes over SSE.
+A blocked `tasks/result` stops waiting when its client disconnects, and when the server
+closes it answers with a JSON-RPC `-32603` "Server shutting down" error, so `app.close()`
+never waits on a task running on another instance.
 
 Retention defaults to 60 seconds when the client does not request a `ttl`. Tasks are meant
 for long-running work, so if your tools can outlive that, raise the bounds — otherwise a task

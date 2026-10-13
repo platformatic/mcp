@@ -71,6 +71,8 @@ export type HandlerDependencies = {
   sessionStore?: SessionStore
   taskStore?: TaskStore
   taskWaiters?: TaskWaiters
+  /** Aborted when the plugin starts closing, to release blocked calls */
+  shutdownSignal?: AbortSignal
   jsonSchemaValidator?: JsonSchemaValidator
   sessionId?: string
   /** The revision this client negotiated; responses are shaped to match it */
@@ -1035,16 +1037,36 @@ async function handleTasksResult (
   // `tasks/result` blocks until the task is terminal. Works across instances:
   // see awaitTaskTerminal.
   if (!isTerminal(task.status)) {
+    // Watch the response, not the request: the IncomingMessage emits 'close'
+    // as soon as its body is consumed, long before this handler runs.
+    const res = dependencies.reply.raw
     const controller = new AbortController()
-    dependencies.request.raw.on('close', () => controller.abort())
+    const onClose = () => controller.abort()
+    res.on('close', onClose)
+    if (res.destroyed || res.socket?.destroyed) controller.abort()
+    const { shutdownSignal } = dependencies
+    const signal = shutdownSignal
+      ? AbortSignal.any([controller.signal, shutdownSignal])
+      : controller.signal
     try {
-      const settled = await awaitTaskTerminal(taskId, task, dependencies, controller.signal)
+      const settled = await awaitTaskTerminal(taskId, task, dependencies, signal)
       if (!settled) {
         return createError(request.id, INVALID_PARAMS, 'Failed to retrieve task: Task not found')
       }
       task = settled
     } catch {
+      if (shutdownSignal?.aborted) {
+        // The server is past closing idle sockets; don't leave a keep-alive
+        // connection behind for close() to wait on.
+        dependencies.reply.header('connection', 'close')
+        return createError(request.id, INTERNAL_ERROR, 'Server shutting down')
+      }
       return createError(request.id, INTERNAL_ERROR, 'Client disconnected while awaiting task result')
+    } finally {
+      res.removeListener('close', onClose)
+      // Release the TaskWaiters entry: it is only removed by a local notify()
+      // or an abort, and polling may have answered this call instead.
+      controller.abort()
     }
   }
 
