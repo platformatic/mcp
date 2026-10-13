@@ -186,20 +186,26 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
     // Subscribe to messages for this session
     await messageBroker.subscribe(`mcp/session/${sessionId}/message`, async (message: JSONRPCMessage) => {
-      const streams = localStreams.get(sessionId)
-      if (streams && streams.size > 0) {
-        app.log.debug({ sessionId, message }, 'Received message for session via broker, sending to streams')
-        sendSSEToStreams(sessionId, message, streams)
-      } else {
-        app.log.debug({ sessionId }, 'Received message for session via broker, storing in history without active streams')
-        // Store message in history even without active streams for session persistence
-        const session = await sessionStore.get(sessionId)
-        if (session) {
-          const eventId = (++session.eventId).toString()
-          session.lastEventId = eventId
-          session.lastActivity = new Date()
-          await sessionStore.addMessage(sessionId, eventId, message)
+      // Brokers do not await this handler, so any rejection must be caught
+      // here or it becomes an unhandled rejection that crashes the process
+      try {
+        const streams = localStreams.get(sessionId)
+        if (streams && streams.size > 0) {
+          app.log.debug({ sessionId, message }, 'Received message for session via broker, sending to streams')
+          await sendSSEToStreams(sessionId, message, streams)
+        } else {
+          app.log.debug({ sessionId }, 'Received message for session via broker, storing in history without active streams')
+          // Store message in history even without active streams for session persistence
+          const session = await sessionStore.get(sessionId)
+          if (session) {
+            const eventId = (++session.eventId).toString()
+            session.lastEventId = eventId
+            session.lastActivity = new Date()
+            await sessionStore.addMessage(sessionId, eventId, message)
+          }
         }
+      } catch (error) {
+        app.log.error({ err: error, sessionId }, 'Failed to deliver message to session')
       }
     })
 
@@ -469,7 +475,9 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
                 sessionId: session.id
               }, 'Last SSE stream closed, cleaning up session')
               localStreams.delete(session.id)
-              messageBroker.unsubscribe(`mcp/session/${session.id}/message`)
+              messageBroker.unsubscribe(`mcp/session/${session.id}/message`).catch((error) => {
+                app.log.error({ err: error, sessionId: session.id }, 'Failed to unsubscribe session from message broker')
+              })
             }
           }
         })
@@ -596,7 +604,9 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
           }
         }
 
-        sendSSEToStreams(sessionId, notification, streams)
+        sendSSEToStreams(sessionId, notification, streams).catch((error) => {
+          app.log.error({ err: error, sessionId }, 'Failed to deliver broadcast notification to session')
+        })
       }
     })
   }
