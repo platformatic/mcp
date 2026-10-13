@@ -265,16 +265,21 @@ await app.register(mcpPlugin, {
 
 ## Request Body Errors
 
-Body-parser failures on `POST /mcp` are answered with a JSON-RPC error (with `id: null`)
-while keeping the HTTP status code:
+Body-parser failures and bodies that are not JSON-RPC messages on `POST /mcp` are answered
+with a JSON-RPC error (with `id: null`) while keeping the HTTP status code:
 
 | Cause | Status | JSON-RPC error |
 | --- | --- | --- |
 | Malformed or empty JSON | `400` | `-32700` Parse error |
 | Body larger than Fastify's `bodyLimit` | `413` | `-32600` Invalid Request |
 | Unsupported `Content-Type` | `415` | `-32600` Invalid Request |
+| Not a JSON-RPC request, notification or response (`null`, a number, a string, a `text/plain` body, or an object with none of `method`, `result` or `error`) | `400` | `-32600` Invalid Request |
 
-The handler is scoped to the `POST /mcp` route. Any other error on that route, and every
+A body that is not a JSON-RPC message is rejected before any SSE session is created for it.
+A JSON-RPC response posted by the client is answered with `202` and handed to
+`onClientResponse`.
+
+The body-parser error handler is scoped to the `POST /mcp` route. Any other error on that route, and every
 error on your other routes, still goes to your own (or Fastify's default) error handler.
 
 ## Origin Validation

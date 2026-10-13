@@ -262,6 +262,17 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     }
   }
 
+  /**
+   * Whether a POST body can be handed to `processMessage`: a request, a
+   * notification, a response to a server-initiated request, or a batch (which
+   * `processMessage` refuses itself).
+   */
+  function isJSONRPCMessageShape (body: unknown): boolean {
+    if (Array.isArray(body)) return true
+    if (typeof body !== 'object' || body === null) return false
+    return 'method' in body || 'result' in body || 'error' in body
+  }
+
   async function createSession (request: FastifyRequest): Promise<SessionMetadata> {
     const sessionId = randomUUID()
     const session: SessionMetadata = {
@@ -401,6 +412,19 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
       : { onRequest: mcpOnRequest, preHandler: mcpPreHandler, errorHandler: mcpPostErrorHandler, schema }
 
     app.post('/mcp', routeOptions, async (request: FastifyRequest, reply: FastifyReply) => {
+      // null, numbers, strings, a text/plain body, ... are not JSON-RPC
+      // messages; answer before a session is created for them.
+      if (!isJSONRPCMessageShape(request.body)) {
+        return reply.type('application/json').code(400).send({
+          jsonrpc: JSONRPC_VERSION,
+          id: null,
+          error: {
+            code: INVALID_REQUEST,
+            message: 'Invalid Request: body is not a JSON-RPC message'
+          }
+        })
+      }
+
       try {
         const message = request.body as JSONRPCMessage
         let sessionId = request.headers['mcp-session-id'] as string | undefined

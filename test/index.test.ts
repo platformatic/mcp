@@ -20,8 +20,8 @@ import {
   LATEST_PROTOCOL_VERSION,
   METHOD_NOT_FOUND,
   INVALID_PARAMS,
-  INTERNAL_ERROR,
-  RESOURCE_NOT_FOUND
+  RESOURCE_NOT_FOUND,
+  INVALID_REQUEST
 } from '../src/schema.ts'
 
 describe('MCP Fastify Plugin', () => {
@@ -390,10 +390,10 @@ describe('MCP Fastify Plugin', () => {
         payload: invalidMessage
       })
 
-      t.assert.strictEqual(response.statusCode, 500)
+      t.assert.strictEqual(response.statusCode, 400)
       const body = response.json() as JSONRPCError
       t.assert.strictEqual(body.jsonrpc, JSONRPC_VERSION)
-      t.assert.strictEqual(body.error.code, INTERNAL_ERROR)
+      t.assert.strictEqual(body.error.code, INVALID_REQUEST)
     })
   })
 
