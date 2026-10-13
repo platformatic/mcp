@@ -296,6 +296,9 @@ await app.register(mcpPlugin, {
 Requests without an `Origin` header are always accepted — the header is set by browsers, so
 its absence means the request did not come from one.
 
+`allowedOrigins` must be `true`, `'*'` or an array of strings; any other value (including a
+single origin string) makes registration throw. Wrap a single origin in an array.
+
 ## CORS
 
 The plugin does not set CORS headers on `/mcp`; browser clients need the application to
