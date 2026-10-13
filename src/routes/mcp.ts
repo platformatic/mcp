@@ -22,6 +22,8 @@ import type { JsonSchemaValidator } from '../validation/json-schema-validator.ts
 import { processMessage, checkRequestId } from '../handlers.ts'
 import { isStdioRequest } from '../stdio-marker.ts'
 
+const MAX_TIMER_DELAY_MS = 2 ** 31 - 1
+
 interface MCPPubSubRoutesOptions {
   enableSSE: boolean
   opts: MCPPluginOptions
@@ -609,19 +611,30 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         // SEP-1699: servers may end an SSE stream whenever they like, turning the
         // stream into a polling channel. The client reconnects with Last-Event-ID
         // on GET and we replay whatever it missed, so closing here loses nothing.
-        let maxDurationTimer: NodeJS.Timeout | undefined
-        if (opts.sseMaxConnectionMs) {
-          maxDurationTimer = setTimeout(() => {
+        // Access is only checked when the stream opens, so never let it outlive the
+        // token that opened it: close at exp and the client reconnects with a fresh one.
+        const tokenExp = request.tokenPayload?.exp
+        const msUntilTokenExp = typeof tokenExp === 'number' ? Math.max(0, tokenExp * 1000 - Date.now()) : undefined
+        let closeAfterMs = opts.sseMaxConnectionMs || undefined
+        let closeReason = 'Closing SSE stream to let the client poll; it may resume with Last-Event-ID'
+        if (msUntilTokenExp !== undefined && (closeAfterMs === undefined || msUntilTokenExp < closeAfterMs)) {
+          closeAfterMs = msUntilTokenExp
+          closeReason = 'Closing SSE stream because the token that opened it expired; it may reconnect with a fresh token'
+        }
+
+        // setTimeout fires immediately on delays past 2^31-1 ms (~24.8 days)
+        if (closeAfterMs !== undefined && closeAfterMs <= MAX_TIMER_DELAY_MS) {
+          const maxDurationTimer = setTimeout(() => {
             app.log.info({
               sessionId: session.id,
-              afterMs: opts.sseMaxConnectionMs
-            }, 'Closing SSE stream to let the client poll; it may resume with Last-Event-ID')
+              afterMs: closeAfterMs
+            }, closeReason)
             try {
               reply.raw.end()
             } catch {
             // already gone
             }
-          }, opts.sseMaxConnectionMs)
+          }, closeAfterMs)
           maxDurationTimer.unref()
 
           reply.raw.on('close', () => clearTimeout(maxDurationTimer))
