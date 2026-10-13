@@ -1975,9 +1975,9 @@ All inputs undergo automatic security processing:
 
 ```typescript
 // Automatic security measures applied:
-// ✅ String length limits (max 10,000 chars)
-// ✅ Object depth limits (max 10 levels)
-// ✅ Property count limits (max 100 per object)
+// ✅ String length limits (default max 10,000 chars)
+// ✅ Object depth limits (default max 10 levels)
+// ✅ Property count limits (default max 100 per object, arrays not counted)
 // ✅ Control character removal
 // ✅ Circular reference detection
 // ✅ Schema complexity validation
@@ -2075,6 +2075,7 @@ await app.register(import('@fastify/bearer-auth'), {
 - `enableSSE`: Enable Server-Sent Events support on `GET /mcp` (default: false). Sessions and `DELETE /mcp` work either way.
 - `canAccessTool`: Per-request tool authorization hook consulted by `tools/list` and `tools/call` (optional)
 - `onToolCallComplete`: Transport-neutral hook fired once after every tool call settles, across JSON-RPC, `mcpCallTool()`, and tasks (optional)
+- `toolArgumentLimits`: Limits applied to tool arguments before the handler runs (optional): `maxStringLength` (default 10000), `maxObjectProperties` (default 100, arrays not counted), `maxArrayLength` (default unlimited), `maxDepth` (default 10). `Infinity` disables a limit
 - `onClientResponse`: Receives the JSON-RPC responses clients POST back for server-initiated requests, such as elicitation results (optional)
 - `authorization`: OAuth 2.1 authorization configuration (optional)
   - `enabled`: Enable OAuth 2.1 authorization (default: false)
@@ -2463,9 +2464,25 @@ The plugin automatically sanitizes tool parameters to prevent common attacks:
 
 - **String length limits:** Maximum 10,000 characters per string
 - **Object depth limits:** Maximum 10 levels of nesting
-- **Property count limits:** Maximum 100 properties per object
+- **Property count limits:** Maximum 100 properties per object (array items are not counted)
+- **Array length limits:** Unlimited by default
 - **Control character removal:** Strips null bytes and control characters
 - **Circular reference detection:** Prevents infinite loops
+
+The limits are configurable with the `toolArgumentLimits` option. Pass `Infinity` to disable one;
+Fastify's `bodyLimit` still caps the total request size. Arguments over a limit are refused with an
+`isError: true` result and the tool handler is not called.
+
+```typescript
+await app.register(mcpPlugin, {
+  toolArgumentLimits: {
+    maxStringLength: 1_000_000, // default 10000
+    maxObjectProperties: 500,   // default 100
+    maxArrayLength: 10_000,     // default Infinity
+    maxDepth: 10                // default 10
+  }
+})
+```
 
 #### Schema Validation
 

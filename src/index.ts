@@ -341,6 +341,8 @@ export type {
   MessageBroker
 } from './brokers/message-broker.ts'
 
+export type { ToolArgumentLimits } from './security.ts'
+
 // Export plugin types
 export type {
   MCPPluginOptions,

@@ -18,17 +18,32 @@ const MAX_OBJECT_DEPTH = 10
 const MAX_OBJECT_PROPERTIES = 100
 
 /**
+ * Limits applied to tool arguments by `sanitizeToolParams`.
+ * Use `Infinity` to disable a limit.
+ */
+export interface ToolArgumentLimits {
+  /** Maximum length of any string, including object keys (default 10000) */
+  maxStringLength?: number
+  /** Maximum number of keys in a single object; arrays are not counted (default 100) */
+  maxObjectProperties?: number
+  /** Maximum number of items in a single array (default unlimited) */
+  maxArrayLength?: number
+  /** Maximum nesting depth (default 10) */
+  maxDepth?: number
+}
+
+/**
  * Sanitize a string by removing potentially dangerous characters
  * and limiting length to prevent DoS attacks
  */
-export function sanitizeString (input: string): string {
+export function sanitizeString (input: string, maxLength: number = MAX_STRING_LENGTH): string {
   if (typeof input !== 'string') {
     throw new Error('Input must be a string')
   }
 
   // Limit string length
-  if (input.length > MAX_STRING_LENGTH) {
-    throw new Error(`String length exceeds maximum allowed length of ${MAX_STRING_LENGTH}`)
+  if (input.length > maxLength) {
+    throw new Error(`String length exceeds maximum allowed length of ${maxLength}`)
   }
 
   // Remove null bytes and other control characters (except newlines and tabs)
@@ -39,7 +54,12 @@ export function sanitizeString (input: string): string {
 /**
  * Validate object depth to prevent stack overflow attacks
  */
-export function validateObjectDepth (obj: any, maxDepth: number = MAX_OBJECT_DEPTH): void {
+export function validateObjectDepth (
+  obj: any,
+  maxDepth: number = MAX_OBJECT_DEPTH,
+  maxProperties: number = MAX_OBJECT_PROPERTIES,
+  maxArrayLength: number = Infinity
+): void {
   function checkDepth (current: any, depth: number): void {
     if (depth > maxDepth) {
       throw new Error(`Object nesting depth exceeds maximum allowed depth of ${maxDepth}`)
@@ -52,10 +72,14 @@ export function validateObjectDepth (obj: any, maxDepth: number = MAX_OBJECT_DEP
       }
       seen.add(current)
 
-      // Check number of properties
+      // Arrays are bounded by their own limit, not counted as properties
       const keys = Object.keys(current)
-      if (keys.length > MAX_OBJECT_PROPERTIES) {
-        throw new Error(`Object has too many properties (${keys.length} > ${MAX_OBJECT_PROPERTIES})`)
+      if (Array.isArray(current)) {
+        if (current.length > maxArrayLength) {
+          throw new Error(`Array has too many items (${current.length} > ${maxArrayLength})`)
+        }
+      } else if (keys.length > maxProperties) {
+        throw new Error(`Object has too many properties (${keys.length} > ${maxProperties})`)
       }
 
       for (const key of keys) {
@@ -73,26 +97,33 @@ export function validateObjectDepth (obj: any, maxDepth: number = MAX_OBJECT_DEP
 /**
  * Sanitize tool parameters from untrusted sources
  */
-export function sanitizeToolParams (params: Record<string, any>): Record<string, any> {
+export function sanitizeToolParams (params: Record<string, any>, limits: ToolArgumentLimits = {}): Record<string, any> {
+  const maxStringLength = limits.maxStringLength ?? MAX_STRING_LENGTH
+
   // Validate object structure first
-  validateObjectDepth(params)
+  validateObjectDepth(
+    params,
+    limits.maxDepth ?? MAX_OBJECT_DEPTH,
+    limits.maxObjectProperties ?? MAX_OBJECT_PROPERTIES,
+    limits.maxArrayLength ?? Infinity
+  )
 
   const sanitized: Record<string, any> = {}
 
   for (const [key, value] of Object.entries(params)) {
     // Sanitize key
-    const sanitizedKey = sanitizeString(key)
+    const sanitizedKey = sanitizeString(key, maxStringLength)
 
     // Sanitize value based on type
     if (typeof value === 'string') {
-      sanitized[sanitizedKey] = sanitizeString(value)
+      sanitized[sanitizedKey] = sanitizeString(value, maxStringLength)
     } else if (typeof value === 'object' && value !== null) {
       if (Array.isArray(value)) {
         sanitized[sanitizedKey] = value.map(item =>
-          typeof item === 'string' ? sanitizeString(item) : item
+          typeof item === 'string' ? sanitizeString(item, maxStringLength) : item
         )
       } else {
-        sanitized[sanitizedKey] = sanitizeToolParams(value)
+        sanitized[sanitizedKey] = sanitizeToolParams(value, limits)
       }
     } else {
       sanitized[sanitizedKey] = value

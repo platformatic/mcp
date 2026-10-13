@@ -660,7 +660,7 @@ async function executeRegisteredTool (
 
   try {
     // Sanitize arguments to prevent injection attacks
-    toolArguments = sanitizeToolParams(toolArguments)
+    toolArguments = sanitizeToolParams(toolArguments, dependencies.opts.toolArgumentLimits)
   } catch (sanitizeError) {
     dependencies.app.log.warn({
       tool: toolName,
