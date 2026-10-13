@@ -28,7 +28,8 @@ import {
   METHOD_NOT_FOUND,
   INTERNAL_ERROR,
   INVALID_PARAMS,
-  INVALID_REQUEST
+  INVALID_REQUEST,
+  RESOURCE_NOT_FOUND
 } from './schema.ts'
 import type { RequestId } from './schema.ts'
 
@@ -457,7 +458,8 @@ function toolCallOutcomeToJsonRpc (
     }
     case 'not-found':
     case 'access-denied':
-      return createError(id, METHOD_NOT_FOUND, `Tool '${toolName}' not found`)
+      // tools.md, Error Handling: unknown tools are an Invalid params protocol error
+      return createError(id, INVALID_PARAMS, `Tool '${toolName}' not found`)
     // Unreachable from the JSON-RPC path today (handleToolsCall resolves task
     // augmentation itself), but kept in the mapping so the two paths stay
     // consistent if they ever converge. Mirrors resolveTaskAugmentation's error.
@@ -672,7 +674,8 @@ async function handleResourcesRead (
   }
 
   if (!resource) {
-    return createError(request.id, METHOD_NOT_FOUND, `Resource '${uri}' not found`)
+    // resources.md, Error Handling: "Resource not found: -32002"
+    return createError(request.id, RESOURCE_NOT_FOUND, `Resource '${uri}' not found`, { uri })
   }
 
   if (!resource.handler) {
@@ -734,7 +737,8 @@ async function handlePromptsGet (
 
   const prompt = prompts.get(promptName)
   if (!prompt) {
-    return createError(request.id, METHOD_NOT_FOUND, `Prompt '${promptName}' not found`)
+    // prompts.md, Error Handling: "Invalid prompt name: -32602 (Invalid params)"
+    return createError(request.id, INVALID_PARAMS, `Prompt '${promptName}' not found`)
   }
 
   if (!prompt.handler) {
