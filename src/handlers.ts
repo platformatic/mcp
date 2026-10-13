@@ -12,6 +12,8 @@ import type {
   ListToolsResult,
   ListResourcesResult,
   ListResourceTemplatesResult,
+  Resource,
+  ResourceTemplate,
   ListPromptsResult,
   CallToolResult,
   ReadResourceResult,
@@ -326,12 +328,33 @@ function matchUriTemplate (template: string, uri: string): Record<string, string
   return params
 }
 
+// Fields shared by the spec Resource and ResourceTemplate shapes. Anything else
+// on a registered definition (uriPattern, uriSchema, ...) is a registration
+// input and must not be listed: uriSchema would leak validation patterns.
+const RESOURCE_METADATA_FIELDS = ['name', 'title', 'description', 'mimeType', 'icons', 'annotations', '_meta'] as const
+
+function pickResourceMetadata (definition: Record<string, any>, fields: readonly string[]): Record<string, unknown> {
+  const picked: Record<string, unknown> = {}
+  for (const field of fields) {
+    if (definition[field] !== undefined) {
+      picked[field] = definition[field]
+    }
+  }
+  return picked
+}
+
 function handleResourcesList (request: JSONRPCRequest, dependencies: HandlerDependencies): JSONRPCResponse {
   const { resources, protocolVersion } = dependencies
   const result: ListResourcesResult = {
     resources: Array.from(resources.values())
       .filter(r => !isTemplateUri(r.definition.uri))
-      .map(r => trimDefinitionToRevision(r.definition, protocolVersion)),
+      .map(r => {
+        const definition = trimDefinitionToRevision(r.definition, protocolVersion)
+        return {
+          uri: definition.uri,
+          ...pickResourceMetadata(definition, [...RESOURCE_METADATA_FIELDS, 'size'])
+        } as Resource
+      }),
     nextCursor: undefined
   }
   return createResponse(request.id, result)
@@ -343,8 +366,11 @@ function handleResourceTemplatesList (request: JSONRPCRequest, dependencies: Han
     resourceTemplates: Array.from(resources.values())
       .filter(r => isTemplateUri(r.definition.uri))
       .map(r => {
-        const { uri, ...rest } = trimDefinitionToRevision(r.definition, protocolVersion)
-        return { ...rest, uriTemplate: uri }
+        const definition = trimDefinitionToRevision(r.definition, protocolVersion)
+        return {
+          uriTemplate: definition.uri,
+          ...pickResourceMetadata(definition, RESOURCE_METADATA_FIELDS)
+        } as ResourceTemplate
       }),
     nextCursor: undefined
   }
