@@ -291,6 +291,36 @@ await app.register(mcpPlugin, {
 Requests without an `Origin` header are always accepted — the header is set by browsers, so
 its absence means the request did not come from one.
 
+## CORS
+
+The plugin does not set CORS headers on `/mcp`; browser clients need the application to
+configure CORS for it, for example with [`@fastify/cors`](https://github.com/fastify/fastify-cors):
+
+```typescript
+import cors from '@fastify/cors'
+
+await app.register(cors, {
+  origin: ['https://app.example.com'],
+  methods: ['GET', 'POST', 'DELETE'],
+  allowedHeaders: [
+    'Content-Type',
+    'Authorization',
+    'Last-Event-ID',
+    'Mcp-Session-Id',
+    'Mcp-Protocol-Version',
+    'Mcp-Method',
+    'Mcp-Name'
+  ],
+  exposedHeaders: ['Mcp-Session-Id']
+})
+await app.register(mcpPlugin, { /* ... */ })
+```
+
+`allowedHeaders` does not accept wildcards, so list any `Mcp-Param-*` headers your clients send.
+When authorization is enabled, the `/.well-known/*` discovery endpoints answer cross-origin
+requests from any origin on their own; that CORS handling is scoped to those routes and does not
+affect the rest of the application.
+
 ## Tasks (MCP 2025-11-25, experimental)
 
 Tasks let a tool call return immediately with a task handle while the work continues in the
@@ -1811,6 +1841,8 @@ Authorization-aware metadata endpoints:
 - `GET /health` - Health check (public)
 
 Authorization server metadata is not served by this plugin. Clients discover it from the authorization servers listed in `authorization_servers` of the protected resource metadata (RFC 8414 / OpenID Connect Discovery on the authorization server itself).
+
+These endpoints send CORS headers for any origin. This applies only to `/.well-known/*`; see [CORS](#cors) for `/mcp`.
 
 ### Security Considerations
 

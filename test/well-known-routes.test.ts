@@ -1,6 +1,8 @@
 import { test, describe, beforeEach, afterEach } from 'node:test'
 import type { TestContext } from 'node:test'
 import Fastify from 'fastify'
+import cors from '@fastify/cors'
+import mcpPlugin from '../src/index.ts'
 import wellKnownRoutes from '../src/routes/well-known.ts'
 import { createTestAuthConfig } from './auth-test-utils.ts'
 
@@ -316,6 +318,88 @@ describe('Well-known Routes', () => {
       })
 
       t.assert.ok(response.statusCode === 204)
+    })
+
+    test('should send CORS headers on well-known routes', async (t: TestContext) => {
+      const authConfig = createTestAuthConfig()
+
+      await app.register(wellKnownRoutes, { authConfig })
+      await app.ready()
+
+      const response = await app.inject({
+        method: 'GET',
+        url: '/.well-known/oauth-protected-resource',
+        headers: { origin: 'https://client.example.com' }
+      })
+
+      t.assert.strictEqual(response.statusCode, 200)
+      t.assert.strictEqual(response.headers['access-control-allow-origin'], 'https://client.example.com')
+    })
+
+    test('should not apply CORS to application routes', async (t: TestContext) => {
+      const authConfig = createTestAuthConfig()
+
+      await app.register(wellKnownRoutes, { authConfig })
+      app.get('/internal/data', async () => ({ secret: true }))
+      await app.ready()
+
+      const response = await app.inject({
+        method: 'GET',
+        url: '/internal/data',
+        headers: { origin: 'https://evil.example' }
+      })
+
+      t.assert.strictEqual(response.statusCode, 200)
+      t.assert.strictEqual(response.headers['access-control-allow-origin'], undefined)
+
+      const preflight = await app.inject({
+        method: 'OPTIONS',
+        url: '/internal/data',
+        headers: {
+          'access-control-request-method': 'GET',
+          origin: 'https://evil.example'
+        }
+      })
+
+      t.assert.strictEqual(preflight.headers['access-control-allow-origin'], undefined)
+    })
+
+    test('should start alongside an application-level @fastify/cors', async (t: TestContext) => {
+      await app.register(cors, {
+        origin: 'https://app.example.com',
+        methods: ['GET', 'POST', 'DELETE'],
+        allowedHeaders: ['Content-Type', 'Authorization', 'Mcp-Session-Id', 'Mcp-Protocol-Version'],
+        exposedHeaders: ['Mcp-Session-Id']
+      })
+      await app.register(mcpPlugin, {
+        serverInfo: { name: 'test-server', version: '1.0.0' },
+        authorization: createTestAuthConfig()
+      })
+      await app.ready()
+
+      const preflight = await app.inject({
+        method: 'OPTIONS',
+        url: '/mcp',
+        headers: {
+          'access-control-request-method': 'POST',
+          'access-control-request-headers': 'content-type, authorization, mcp-protocol-version',
+          origin: 'https://app.example.com'
+        }
+      })
+
+      t.assert.strictEqual(preflight.statusCode, 204)
+      t.assert.strictEqual(preflight.headers['access-control-allow-origin'], 'https://app.example.com')
+      t.assert.match(String(preflight.headers['access-control-allow-methods']), /POST/)
+
+      // The well-known routes keep their own permissive CORS and stay public
+      const metadata = await app.inject({
+        method: 'GET',
+        url: '/.well-known/oauth-protected-resource',
+        headers: { origin: 'https://client.example.com' }
+      })
+
+      t.assert.strictEqual(metadata.statusCode, 200)
+      t.assert.strictEqual(metadata.headers['access-control-allow-origin'], 'https://client.example.com')
     })
 
     test('should not include cache headers for metadata endpoint', async (t: TestContext) => {
