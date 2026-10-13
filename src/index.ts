@@ -68,11 +68,17 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     version: '1.0.0'
   }
 
-  const capabilities: ServerCapabilities = opts.capabilities ?? {
+  // completion/complete is not implemented, so never advertise `completions`:
+  // clients that negotiate on it would only get -32601 back.
+  const { completions, ...configuredCapabilities } = opts.capabilities ?? {
     tools: {},
     resources: {},
     prompts: {}
   }
+  if (completions !== undefined) {
+    app.log.warn('The "completions" capability is not supported (completion/complete is not implemented) and will not be advertised')
+  }
+  const capabilities: ServerCapabilities = configuredCapabilities
 
   app.decorate('mcpClient', (clientOptions?: McpClientOptions) => {
     return createMcpClient(app, clientOptions)
