@@ -302,6 +302,7 @@ export type {
   MCPPrompt,
   ToolHandler,
   ResourceHandler,
+  ResourceHandlerContext,
   PromptHandler,
   UnsafeMCPTool,
   UnsafeMCPResource,

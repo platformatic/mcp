@@ -12,6 +12,17 @@ export interface SessionMetadata {
   /** Capabilities the client declared during `initialize`, if the handshake has happened */
   clientCapabilities?: ClientCapabilities
   authSession?: any // OAuth session data (legacy - for Phase 2 compatibility)
+  /**
+   * Subject (`sub`) of the verified access token that created the session.
+   * When set, only requests bearing a token for the same issuer and subject
+   * may use the session. Unset when authorization is disabled.
+   */
+  ownerSub?: string
+  /**
+   * Issuer identity of that token (see TokenValidationResult.issuer). A subject
+   * is only unique per issuer, so the owner is the (ownerIss, ownerSub) pair.
+   */
+  ownerIss?: string
 
   // Enhanced authorization context
   authorization?: AuthorizationContext

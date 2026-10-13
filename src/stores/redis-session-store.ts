@@ -34,6 +34,13 @@ export class RedisSessionStore implements SessionStore {
       sessionData.clientCapabilities = JSON.stringify(metadata.clientCapabilities)
     }
 
+    if (metadata.ownerSub !== undefined) {
+      sessionData.ownerSub = metadata.ownerSub
+    }
+    if (metadata.ownerIss !== undefined) {
+      sessionData.ownerIss = metadata.ownerIss
+    }
+
     // Add authorization context if present
     if (metadata.authorization) {
       sessionData.authorization = JSON.stringify(metadata.authorization)
@@ -110,6 +117,13 @@ export class RedisSessionStore implements SessionStore {
       } catch (error) {
         // Ignore parsing errors for client capabilities
       }
+    }
+
+    if (result.ownerSub !== undefined) {
+      metadata.ownerSub = result.ownerSub
+    }
+    if (result.ownerIss !== undefined) {
+      metadata.ownerIss = result.ownerIss
     }
 
     // Parse authorization context if present

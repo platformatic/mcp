@@ -77,6 +77,7 @@ export function createAuthPreHandler (
     // Add token payload to request context for downstream handlers
     // @ts-ignore - Adding custom property to request
     request.tokenPayload = validationResult.payload
+    request.tokenIssuer = validationResult.issuer
 
     request.log.debug({ sub: validationResult.payload?.sub }, 'Token validation successful')
   }
@@ -181,5 +182,7 @@ export function generateWWWAuthenticateHeader (config: AuthorizationConfig, chal
 declare module 'fastify' {
   interface FastifyRequest {
     tokenPayload?: any
+    /** Canonical issuer identity of the validated token, see TokenValidationResult.issuer */
+    tokenIssuer?: string
   }
 }

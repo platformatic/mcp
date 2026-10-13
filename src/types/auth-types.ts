@@ -171,6 +171,13 @@ export type AuthorizationConfig =
 export interface TokenValidationResult {
   valid: boolean
   payload?: any
+  /**
+   * Who vouched for the token, in canonical form: the verified `iss` with any
+   * trailing slash removed or, for an introspection response without `iss`,
+   * `introspection:<introspectionEndpoint>`. Together with `sub` it identifies
+   * the user, since two issuers may hand out the same subject.
+   */
+  issuer?: string
   error?: string
 }
 
