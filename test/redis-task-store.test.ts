@@ -347,4 +347,47 @@ describe('RedisTaskStore', () => {
     t.assert.strictEqual(task?.taskId, 'task-1')
     t.assert.deepStrictEqual((await other.list('user-1')).tasks.map(x => x.taskId), ['task-1'])
   })
+
+  test('fails a task whose lease has lapsed, keeping its retention', async (t: TestContext) => {
+    await store.create(record({ leaseExpiresAt: Date.now() - 1 }))
+    const ttlBefore = await redis.pttl('mcp:task:task-1')
+    const outcome = { jsonrpc: '2.0' as const, id: 1, error: { code: -32603, message: 'lost' } }
+
+    const failed = await store.failExpiredLease('task-1', { statusMessage: 'Task owner lost', outcome })
+    t.assert.strictEqual(failed?.status, 'failed')
+    t.assert.strictEqual(failed?.statusMessage, 'Task owner lost')
+    t.assert.deepStrictEqual(failed?.outcome, outcome)
+    t.assert.deepStrictEqual(await store.get('task-1'), failed)
+    const ttlAfter = await redis.pttl('mcp:task:task-1')
+    t.assert.ok(ttlAfter > 0 && ttlAfter <= ttlBefore)
+    // Once terminal the lease can no longer be renewed
+    t.assert.strictEqual(await store.renewLease('task-1', 1000), false)
+  })
+
+  test('a renewed lease is not reaped', async (t: TestContext) => {
+    await store.create(record({ leaseExpiresAt: Date.now() - 1 }))
+    const outcome = { jsonrpc: '2.0' as const, id: 1, error: { code: -32603, message: 'lost' } }
+
+    t.assert.strictEqual(await store.renewLease('task-1', 60_000), true)
+    const task = await store.get('task-1')
+    t.assert.ok(task!.leaseExpiresAt! > Date.now())
+    t.assert.strictEqual(task!.ttl, 60_000)
+
+    const after = await store.failExpiredLease('task-1', { statusMessage: 'x', outcome })
+    t.assert.strictEqual(after?.status, 'working')
+  })
+
+  test('tasks without a lease, terminal or missing tasks are not reaped', async (t: TestContext) => {
+    const outcome = { jsonrpc: '2.0' as const, id: 1, error: { code: -32603, message: 'lost' } }
+    await store.create(record({ taskId: 'none', ttl: null }))
+    await store.create(record({ taskId: 'done', leaseExpiresAt: Date.now() - 1 }))
+    await store.updateStatus('done', 'completed')
+
+    const none = await store.failExpiredLease('none', { statusMessage: 'x', outcome })
+    t.assert.strictEqual(none?.status, 'working')
+    t.assert.strictEqual(none?.ttl, null)
+    t.assert.strictEqual((await store.failExpiredLease('done', { statusMessage: 'x', outcome }))?.status, 'completed')
+    t.assert.strictEqual(await store.failExpiredLease('missing', { statusMessage: 'x', outcome }), null)
+    t.assert.strictEqual(await store.renewLease('missing', 1000), false)
+  })
 })

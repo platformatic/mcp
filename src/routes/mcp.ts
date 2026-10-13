@@ -15,7 +15,7 @@ import type {
 } from '../types.ts'
 import type { SessionStore, SessionMetadata } from '../stores/session-store.ts'
 import { DEFAULT_SESSION_TTL_MS } from '../stores/memory-session-store.ts'
-import type { TaskStore, TaskWaiters } from '../stores/task-store.ts'
+import type { TaskStore, TaskWaiters, TaskLeases } from '../stores/task-store.ts'
 import type { MessageBroker } from '../brokers/message-broker.ts'
 import type { AuthorizationContext } from '../types/auth-types.ts'
 import type { JsonSchemaValidator } from '../validation/json-schema-validator.ts'
@@ -37,6 +37,7 @@ interface MCPPubSubRoutesOptions {
   taskStore?: TaskStore
   taskWaiters?: TaskWaiters
   shutdownSignal?: AbortSignal
+  taskLeases?: TaskLeases
   jsonSchemaValidator?: JsonSchemaValidator
   authPreHandler?: preHandlerHookHandler
 }
@@ -119,7 +120,7 @@ function buildMcpPostErrorHandler (app: FastifyInstance) {
 }
 
 const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async (app, options) => {
-  const { enableSSE, opts, capabilities, serverInfo, tools, resources, prompts, resourceHandlers, sessionStore, messageBroker, localStreams, taskStore, taskWaiters, shutdownSignal, jsonSchemaValidator, authPreHandler } = options
+  const { enableSSE, opts, capabilities, serverInfo, tools, resources, prompts, resourceHandlers, sessionStore, messageBroker, localStreams, taskStore, taskWaiters, shutdownSignal, taskLeases, jsonSchemaValidator, authPreHandler } = options
   const mcpUrl = resolveRouteUrl(app.prefix, '/mcp')
 
   const allowedOrigins = opts.allowedOrigins
@@ -479,6 +480,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
           taskStore,
           taskWaiters,
           shutdownSignal,
+          taskLeases,
           jsonSchemaValidator,
           sessionId,
           protocolVersion: (request as any).mcpProtocolVersion ?? DEFAULT_NEGOTIATED_PROTOCOL_VERSION

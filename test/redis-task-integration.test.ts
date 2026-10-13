@@ -132,4 +132,91 @@ describe('Redis task integration (multi-instance)', () => {
     const result = await call(app, 'tasks/result', { taskId })
     assert.strictEqual(result.result.content[0].text, 'ok')
   })
+
+  testWithRedis('a task whose instance dies is reported failed by another instance', async (redis, t) => {
+    const redisOpts = {
+      host: redis.options.host!,
+      port: redis.options.port!,
+      db: redis.options.db!
+    }
+    const taskLeaseMs = 150
+
+    // The tool on A never finishes on its own; A will go away mid-run.
+    let release!: () => void
+    const hang = new Promise<void>(resolve => { release = resolve })
+    t.after(() => release())
+
+    const a = fastify()
+    t.after(() => a.close())
+    await a.register(mcpPlugin, { enableTasks: true, redis: redisOpts, taskLeaseMs })
+    a.mcpAddTool({
+      name: 'hang',
+      description: 'Runs until released',
+      inputSchema: Type.Object({}),
+      execution: { taskSupport: 'optional' }
+    } as any, async (): Promise<CallToolResult> => {
+      await hang
+      return { content: [{ type: 'text', text: 'late' }] }
+    })
+    await a.ready()
+
+    const b = fastify()
+    t.after(() => b.close())
+    await b.register(mcpPlugin, { enableTasks: true, redis: redisOpts, taskLeaseMs })
+    await b.ready()
+
+    const created = await call(a, 'tools/call', { name: 'hang', arguments: {}, task: { ttl: 60_000 } })
+    const taskId = (created.result as CreateTaskResult).task.taskId
+
+    // While A is alive it keeps renewing, so B sees the task as working
+    await new Promise(resolve => setTimeout(resolve, taskLeaseMs * 2))
+    assert.strictEqual((await call(b, 'tasks/get', { taskId })).result.status, 'working')
+
+    // B starts waiting for the result, then A goes away without finishing
+    const started = Date.now()
+    const pending = call(b, 'tasks/result', { taskId }, 2)
+    await a.close()
+
+    // tasks/result answers long before the 60s ttl
+    const result = await pending
+    assert.ok(Date.now() - started < 5_000)
+    assert.strictEqual(result.id, 2)
+    assert.match(result.error.message, /Task owner lost/)
+
+    const task = (await call(b, 'tasks/get', { taskId })).result
+    assert.strictEqual(task.status, 'failed')
+    assert.match(task.statusMessage, /Task owner lost/)
+  })
+
+  testWithRedis('tasks/get fails a task left behind with an expired lease', async (redis, t) => {
+    const app = fastify()
+    t.after(() => app.close())
+    await app.register(mcpPlugin, {
+      enableTasks: true,
+      redis: { host: redis.options.host!, port: redis.options.port!, db: redis.options.db! }
+    })
+    await app.ready()
+
+    // As written by an instance that died right after its last renewal
+    const now = new Date().toISOString()
+    await redis.set('mcp:task:orphan', JSON.stringify({
+      taskId: 'orphan',
+      status: 'working',
+      createdAt: now,
+      lastUpdatedAt: now,
+      ttl: 60_000,
+      pollInterval: 1000,
+      method: 'tools/call',
+      leaseExpiresAt: Date.now() - 1
+    }), 'EX', 60)
+
+    const task = (await call(app, 'tasks/get', { taskId: 'orphan' })).result
+    assert.strictEqual(task.status, 'failed')
+    assert.match(task.statusMessage, /Task owner lost/)
+    assert.strictEqual('leaseExpiresAt' in task, false)
+
+    const result = await call(app, 'tasks/result', { taskId: 'orphan' }, 3)
+    assert.strictEqual(result.id, 3)
+    assert.match(result.error.message, /Task owner lost/)
+  })
 })

@@ -325,6 +325,13 @@ export interface MCPPluginOptions {
    */
   taskMaxRetainedPerPrincipal?: number
   /**
+   * Lease on a running task, in milliseconds (default 30000). The instance
+   * executing a task renews it every third of this period; if the instance dies
+   * the lease lapses and the task is reported `failed` instead of staying
+   * `working` until its ttl runs out.
+   */
+  taskLeaseMs?: number
+  /**
    * Origins accepted on the MCP endpoints, to prevent DNS rebinding attacks.
    * Omit to disable validation (non-browser deployments), pass `'*'` or `true`
    * to accept any origin, or list exact origins to allow.

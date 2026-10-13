@@ -9,6 +9,7 @@ import {
   isAfterTaskCursor,
   isTerminal,
   taskHasExpired,
+  taskLeaseExpired,
   taskPageLimit,
   validateTaskLimit
 } from './task-store.ts'
@@ -138,6 +139,36 @@ export class MemoryTaskStore implements TaskStore {
 
     this.tasks.set(taskId, updated)
     return { ...updated }
+  }
+
+  async renewLease (taskId: string, leaseMs: number): Promise<boolean> {
+    const task = this.tasks.get(taskId)
+    if (!task || taskHasExpired(task) || isTerminal(task.status)) return false
+    this.tasks.set(taskId, { ...task, leaseExpiresAt: Date.now() + leaseMs })
+    return true
+  }
+
+  async failExpiredLease (
+    taskId: string,
+    options: { statusMessage: string, outcome: TaskOutcome }
+  ): Promise<TaskRecord | null> {
+    // Check and write with no intervening await, so a renewal cannot interleave
+    const task = this.tasks.get(taskId)
+    if (!task || taskHasExpired(task)) {
+      this.tasks.delete(taskId)
+      return null
+    }
+    if (!taskLeaseExpired(task)) return { ...task }
+
+    const failed: TaskRecord = {
+      ...task,
+      status: 'failed',
+      statusMessage: options.statusMessage,
+      outcome: options.outcome,
+      lastUpdatedAt: new Date().toISOString()
+    }
+    this.tasks.set(taskId, failed)
+    return { ...failed }
   }
 
   async list (authSubject?: string, options: TaskListOptions = {}): Promise<TaskListPage> {

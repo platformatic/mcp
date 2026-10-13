@@ -218,6 +218,66 @@ export class RedisTaskStore implements TaskStore {
     return updated
   }
 
+  async renewLease (taskId: string, leaseMs: number): Promise<boolean> {
+    // The expiry is computed from the Redis server clock, as is the check in
+    // failExpiredLease, so clock skew between instances cannot fail a live task.
+    const result = await this.redis.eval(
+      `local raw = redis.call('GET', KEYS[1])
+       if not raw then return 0 end
+       local ok, cur = pcall(cjson.decode, raw)
+       if not ok then return 0 end
+       local s = cur.status
+       if s == 'completed' or s == 'failed' or s == 'cancelled' then return 0 end
+       local t = redis.call('TIME')
+       cur.leaseExpiresAt = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000) + tonumber(ARGV[1])
+       redis.call('SET', KEYS[1], cjson.encode(cur), 'KEEPTTL')
+       return 1`,
+      1,
+      this.key(taskId),
+      String(leaseMs)
+    )
+    return result === 1
+  }
+
+  async failExpiredLease (
+    taskId: string,
+    options: { statusMessage: string, outcome: TaskOutcome }
+  ): Promise<TaskRecord | null> {
+    // Compare-and-set in one script: only a non-terminal task whose lease has
+    // lapsed is failed, so a renewal (or completion) that lands first wins.
+    const raw = await this.redis.eval(
+      `local raw = redis.call('GET', KEYS[1])
+       if not raw then return false end
+       local ok, cur = pcall(cjson.decode, raw)
+       if not ok then return false end
+       local s = cur.status
+       if s == 'completed' or s == 'failed' or s == 'cancelled' then return raw end
+       if type(cur.leaseExpiresAt) ~= 'number' then return raw end
+       local t = redis.call('TIME')
+       local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+       if cur.leaseExpiresAt > now then return raw end
+       cur.status = 'failed'
+       cur.statusMessage = ARGV[1]
+       cur.outcome = cjson.decode(ARGV[2])
+       cur.lastUpdatedAt = ARGV[3]
+       local updated = cjson.encode(cur)
+       redis.call('SET', KEYS[1], updated, 'KEEPTTL')
+       return updated`,
+      1,
+      this.key(taskId),
+      options.statusMessage,
+      JSON.stringify(options.outcome),
+      new Date().toISOString()
+    ) as string | null
+
+    if (!raw) return null
+    try {
+      return JSON.parse(raw)
+    } catch {
+      return null
+    }
+  }
+
   async list (authSubject?: string, options: TaskListOptions = {}): Promise<TaskListPage> {
     const limit = taskPageLimit(options.limit)
     const indexKey = this.indexKey(authSubject)

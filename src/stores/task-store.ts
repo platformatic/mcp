@@ -18,6 +18,11 @@ export interface TaskRecord extends Task {
   method: string
   /** Terminal outcome, present once the task reaches completed/failed/cancelled */
   outcome?: TaskOutcome
+  /**
+   * Epoch milliseconds at which the instance running the task loses its claim
+   * on it unless it renews the lease first. Absent for tasks with no lease.
+   */
+  leaseExpiresAt?: number
 }
 
 /**
@@ -163,6 +168,80 @@ export interface TaskStore {
   /** Drop tasks whose ttl has elapsed */
   cleanup(): Promise<void>
   close?(): Promise<void>
+  /**
+   * Extend the lease of a non-terminal task to `leaseMs` from now. Returns false
+   * when the task is gone or already terminal, so the owner can stop renewing.
+   */
+  renewLease?(taskId: string, leaseMs: number): Promise<boolean>
+  /**
+   * Atomically move a non-terminal task whose lease has lapsed to `failed`. A
+   * task with a live (or no) lease is left untouched. Returns the task as it now
+   * stands, or null if it is gone.
+   */
+  failExpiredLease?(taskId: string, options: { statusMessage: string, outcome: TaskOutcome }): Promise<TaskRecord | null>
+}
+
+/**
+ * Keeps the leases of the tasks this instance is running alive. If the instance
+ * dies (or closes) the renewals stop, the lease lapses, and whichever instance
+ * next reads the task marks it failed instead of reporting `working` until the
+ * task's ttl runs out.
+ */
+export class TaskLeases {
+  private timers = new Map<string, ReturnType<typeof setInterval>>()
+  private closed = false
+  private readonly store: TaskStore
+  readonly leaseMs: number
+  private readonly onError?: (error: unknown, taskId: string) => void
+
+  constructor (store: TaskStore, leaseMs: number, onError?: (error: unknown, taskId: string) => void) {
+    this.store = store
+    this.leaseMs = leaseMs
+    this.onError = onError
+  }
+
+  /** Take the lease on a freshly created task and keep renewing it until `stop()` */
+  async start (taskId: string): Promise<void> {
+    // A store must support both halves; a lease nobody can reap is pointless,
+    // and one nobody renews would fail live tasks.
+    const { store } = this
+    if (this.closed || !store.renewLease || !store.failExpiredLease) return
+
+    await store.renewLease(taskId, this.leaseMs)
+    if (this.closed) return
+
+    const timer = setInterval(() => {
+      store.renewLease!(taskId, this.leaseMs).then((renewed) => {
+        if (!renewed) this.stop(taskId)
+      }, (error) => {
+        this.onError?.(error, taskId)
+      })
+    }, Math.max(1, Math.floor(this.leaseMs / 3)))
+    timer.unref()
+    this.timers.set(taskId, timer)
+  }
+
+  stop (taskId: string): void {
+    const timer = this.timers.get(taskId)
+    if (timer) {
+      clearInterval(timer)
+      this.timers.delete(taskId)
+    }
+  }
+
+  /** Stop renewing everything, e.g. when the server shuts down */
+  close (): void {
+    this.closed = true
+    for (const timer of this.timers.values()) {
+      clearInterval(timer)
+    }
+    this.timers.clear()
+  }
+}
+
+/** Whether a task's lease has lapsed, so its owner is presumed dead */
+export function taskLeaseExpired (task: TaskRecord, now: number = Date.now()): boolean {
+  return !isTerminal(task.status) && typeof task.leaseExpiresAt === 'number' && task.leaseExpiresAt <= now
 }
 
 /**
@@ -221,6 +300,6 @@ export function taskHasExpired (task: TaskRecord, now: number = Date.now()): boo
  * Strip storage-only fields so a record can go on the wire as a spec `Task`.
  */
 export function toWireTask (task: TaskRecord): Task {
-  const { authSubject, method, outcome, ...wire } = task
+  const { authSubject, method, outcome, leaseExpiresAt, ...wire } = task
   return wire
 }
