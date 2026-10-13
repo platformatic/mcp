@@ -412,7 +412,9 @@ const elicitationId = await app.mcpElicitUrl(
 )
 
 // Later, once the out-of-band interaction finishes
-await app.mcpNotifyElicitationComplete(sessionId, elicitationId)
+if (elicitationId) {
+  await app.mcpNotifyElicitationComplete(sessionId, elicitationId)
+}
 ```
 
 Servers **MUST NOT** request passwords, API keys or payment details through form mode — use
@@ -519,8 +521,11 @@ const success = await app.mcpElicit(
       bio: { type: 'string', maxLength: 500, description: 'Short bio' },
       skills: {
         type: 'array',
-        items: { type: 'string' },
-        maxItems: 10,
+        items: {
+          type: 'string',
+          enum: ['typescript', 'rust', 'go', 'python']
+        },
+        maxItems: 4,
         description: 'Your skills'
       }
     }
@@ -828,9 +833,9 @@ await app.register(mcpPlugin, {
     port: parseInt(process.env.REDIS_PORT || '6379'),
     db: parseInt(process.env.REDIS_DB || '0'),
     password: process.env.REDIS_PASSWORD,
-    // Additional ioredis options
-    retryDelayOnFailover: 100,
-    maxRetriesPerRequest: 3
+    // Any other ioredis RedisOptions are accepted and passed through
+    maxRetriesPerRequest: 3,
+    retryStrategy: (times) => Math.min(times * 100, 2000)
   },
   serverInfo: {
     name: 'scalable-mcp-server',
@@ -1964,7 +1969,7 @@ All inputs undergo automatic security processing:
 Implement rate limiting for production deployments:
 
 ```typescript
-import { RateLimiter } from '@platformatic/mcp/security'
+import { RateLimiter } from '@platformatic/mcp'
 
 const rateLimiter = new RateLimiter(100, 60000) // 100 requests per minute
 
@@ -2078,7 +2083,7 @@ await app.register(import('@fastify/bearer-auth'), {
   - `port`: Redis server port
   - `db`: Redis database number
   - `password`: Redis authentication password
-  - Additional ioredis connection options supported
+  - Any other ioredis [`RedisOptions`](https://github.com/redis/ioredis/blob/main/lib/redis/RedisOptions.ts) (`tls`, `retryStrategy`, `sentinels`, ...); the object is passed to the ioredis constructor as-is
 
 ### Decorators
 
@@ -2504,7 +2509,7 @@ app.mcpAddTool({
 Implement rate limiting to prevent abuse:
 
 ```typescript
-import { RateLimiter } from '@platformatic/mcp/security'
+import { RateLimiter } from '@platformatic/mcp'
 
 const rateLimiter = new RateLimiter(100, 60000) // 100 requests per minute
 

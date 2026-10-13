@@ -381,6 +381,9 @@ export type {
 
 export { colonScopeHierarchy } from './auth/prehandler.ts'
 
+// Rate limiting helper
+export { RateLimiter } from './security.ts'
+
 export type {
   JSONRPCMessage,
   JSONRPCRequest,
