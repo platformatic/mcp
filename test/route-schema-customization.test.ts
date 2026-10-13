@@ -53,7 +53,7 @@ describe('MCP route schema customization', () => {
     t.assert.strictEqual(getRoute?.schema, undefined)
   })
 
-  test('transformer is called for POST only when SSE is disabled', async (t: TestContext) => {
+  test('transformer is called for POST and DELETE when SSE is disabled', async (t: TestContext) => {
     const app = Fastify()
     t.after(() => app.close())
 
@@ -71,10 +71,13 @@ describe('MCP route schema customization', () => {
     })
     await app.ready()
 
-    t.assert.strictEqual(contexts.length, 1)
+    t.assert.strictEqual(contexts.length, 2)
     t.assert.strictEqual(contexts[0].routeId, 'mcp.post')
     t.assert.strictEqual(contexts[0].method, 'POST')
     t.assert.strictEqual(contexts[0].url, '/mcp')
+    t.assert.strictEqual(contexts[1].routeId, 'mcp.delete')
+    t.assert.strictEqual(contexts[1].method, 'DELETE')
+    t.assert.strictEqual(contexts[1].url, '/mcp')
   })
 
   test('transformer is called for POST, GET and DELETE when SSE is enabled', async (t: TestContext) => {
@@ -122,8 +125,9 @@ describe('MCP route schema customization', () => {
 
     await app.ready()
 
-    t.assert.strictEqual(contexts.length, 1)
+    t.assert.strictEqual(contexts.length, 2)
     t.assert.strictEqual(contexts[0].url, '/v1/mcp')
+    t.assert.strictEqual(contexts[1].url, '/v1/mcp')
   })
 
   test('returned schema is used for route registration and can include OpenAPI metadata', async (t: TestContext) => {
@@ -196,7 +200,7 @@ describe('MCP route schema customization', () => {
     })
     await app.ready()
 
-    t.assert.strictEqual(calls, 1)
+    t.assert.strictEqual(calls, 2)
 
     const request = {
       jsonrpc: JSONRPC_VERSION,
@@ -209,7 +213,7 @@ describe('MCP route schema customization', () => {
 
     t.assert.strictEqual(first.statusCode, 200)
     t.assert.strictEqual(second.statusCode, 200)
-    t.assert.strictEqual(calls, 1)
+    t.assert.strictEqual(calls, 2)
   })
 
   test('thrown transformer error rejects plugin registration', async (t: TestContext) => {
@@ -327,7 +331,6 @@ describe('MCP route schema customization', () => {
     })
     await app.ready()
 
-    t.assert.strictEqual(contexts.length, 1)
-    t.assert.strictEqual(contexts[0].routeId, 'mcp.post')
+    t.assert.deepStrictEqual(contexts.map(c => c.routeId), ['mcp.post', 'mcp.delete'])
   })
 })

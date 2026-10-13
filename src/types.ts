@@ -293,6 +293,14 @@ export interface MCPPluginOptions {
    */
   sseMaxConnectionMs?: number
   /**
+   * Expire a session after this many milliseconds without activity (default
+   * 3600000, one hour). Any request carrying the session id and every SSE
+   * heartbeat count as activity, so sessions in use are kept; sessions a client
+   * abandons without `DELETE /mcp` are removed. Applies to both the memory and
+   * the Redis session store.
+   */
+  sessionTtlMs?: number
+  /**
    * Enable task-augmented execution (2025-11-25, experimental). Tools opt in
    * individually via `execution.taskSupport`.
    */

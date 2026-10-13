@@ -216,7 +216,7 @@ describe('Session DELETE', () => {
     t.assert.strictEqual(secondDelete.statusCode, 404)
   })
 
-  test('DELETE route is not registered when SSE is disabled', async (t: TestContext) => {
+  test('terminates a session when SSE is disabled', async (t: TestContext) => {
     const app = Fastify({ logger: false })
     t.after(() => app.close())
 
@@ -226,13 +226,36 @@ describe('Session DELETE', () => {
     })
     await app.ready()
 
-    const response = await app.inject({
-      method: 'DELETE',
+    const initResponse = await app.inject({
+      method: 'POST',
       url: '/mcp',
-      headers: { 'mcp-session-id': 'some-session' }
+      payload: {
+        jsonrpc: JSONRPC_VERSION,
+        id: 1,
+        method: 'initialize',
+        params: {
+          protocolVersion: LATEST_PROTOCOL_VERSION,
+          capabilities: {},
+          clientInfo: { name: 'test-client', version: '1.0.0' }
+        }
+      }
     })
 
-    // Fastify returns 404 for unregistered routes
-    t.assert.strictEqual(response.statusCode, 404)
+    const sessionId = initResponse.headers['mcp-session-id'] as string
+    t.assert.ok(sessionId)
+
+    const deleteResponse = await app.inject({
+      method: 'DELETE',
+      url: '/mcp',
+      headers: { 'mcp-session-id': sessionId }
+    })
+    t.assert.strictEqual(deleteResponse.statusCode, 204)
+
+    const secondDelete = await app.inject({
+      method: 'DELETE',
+      url: '/mcp',
+      headers: { 'mcp-session-id': sessionId }
+    })
+    t.assert.strictEqual(secondDelete.statusCode, 404)
   })
 })

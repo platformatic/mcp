@@ -14,6 +14,7 @@ import type {
   MCPRouteSchemaTransformer
 } from '../types.ts'
 import type { SessionStore, SessionMetadata } from '../stores/session-store.ts'
+import { DEFAULT_SESSION_TTL_MS } from '../stores/memory-session-store.ts'
 import type { TaskStore, TaskWaiters } from '../stores/task-store.ts'
 import type { MessageBroker } from '../brokers/message-broker.ts'
 import type { AuthorizationContext } from '../types/auth-types.ts'
@@ -238,6 +239,10 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     ? [authPreHandler, enforceSessionOwner, reconcileProtocolVersion]
     : [enforceSessionOwner, reconcileProtocolVersion]
 
+  // Heartbeats refresh session activity, so they must come more often than the
+  // idle TTL or a live stream's session could expire between two of them
+  const heartbeatIntervalMs = Math.min(30_000, Math.max(1, Math.floor((opts.sessionTtlMs ?? DEFAULT_SESSION_TTL_MS) / 2)))
+
   function buildAuthContext (payload: any): AuthorizationContext {
     return {
       userId: payload.sub,
@@ -255,7 +260,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     }
   }
 
-  async function createSSESession (request: FastifyRequest): Promise<SessionMetadata> {
+  async function createSession (request: FastifyRequest): Promise<SessionMetadata> {
     const sessionId = randomUUID()
     const session: SessionMetadata = {
       id: sessionId,
@@ -275,6 +280,12 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     }
 
     await sessionStore.create(session)
+
+    // Without SSE there is no stream to deliver to, so skip the subscription
+    if (!enableSSE) {
+      return session
+    }
+
     localStreams.set(sessionId, new Set())
 
     // Subscribe to messages for this session
@@ -384,23 +395,22 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     app.post('/mcp', routeOptions, async (request: FastifyRequest, reply: FastifyReply) => {
       try {
         const message = request.body as JSONRPCMessage
-        let sessionId = request.headers['mcp-session-id'] as string
+        let sessionId = request.headers['mcp-session-id'] as string | undefined
+        const existingSession = sessionId ? await sessionStore.get(sessionId) : null
 
-        if (enableSSE) {
-          let session: SessionMetadata
-          if (sessionId) {
-            const existingSession = await sessionStore.get(sessionId)
-            if (existingSession) {
-              session = existingSession
-            } else {
-              session = await createSSESession(request)
-              reply.header('Mcp-Session-Id', session.id)
-            }
-          } else {
-            session = await createSSESession(request)
-            reply.header('Mcp-Session-Id', session.id)
-          }
+        // Sessions belong to Streamable HTTP, not to SSE. Without SSE we only open
+        // one on initialize: other requests keep working statelessly as before,
+        // and stateless clients do not each leave a session behind.
+        if (!existingSession && (enableSSE || isInitializeRequest(message))) {
+          const session = await createSession(request)
+          reply.header('Mcp-Session-Id', session.id)
           sessionId = session.id
+        }
+
+        // Each request on a session counts as activity, so sessions that are in
+        // use are not expired by the store's idle TTL
+        if (existingSession) {
+          await sessionStore.touch?.(existingSession.id)
         }
 
         // Build auth context from validated token payload
@@ -455,7 +465,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
   // GET endpoint for server-initiated communication via SSE
   if (!enableSSE) {
     app.get('/mcp', { onRequest: mcpOnRequest, preHandler: mcpPreHandler }, async (_request: FastifyRequest, reply: FastifyReply) => {
-      reply.type('application/json').code(405).send({ error: 'Method Not Allowed: SSE not enabled' })
+      reply.header('Allow', 'POST, DELETE').type('application/json').code(405).send({ error: 'Method Not Allowed: SSE not enabled' })
     })
   }
 
@@ -471,7 +481,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
     app.get('/mcp', routeOptions, async (request: FastifyRequest, reply: FastifyReply) => {
       if (!supportsSSE(request)) {
-        reply.type('application/json').code(405).send({ error: 'Method Not Allowed: SSE not supported' })
+        reply.header('Allow', 'GET, POST, DELETE').type('application/json').code(405).send({ error: 'Method Not Allowed: SSE not supported' })
         return
       }
 
@@ -502,12 +512,13 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
           const existingSession = await sessionStore.get(sessionId)
           if (existingSession) {
             session = existingSession
+            await sessionStore.touch?.(session.id)
           } else {
-            session = await createSSESession(request)
+            session = await createSession(request)
             raw.setHeader('Mcp-Session-Id', session.id)
           }
         } else {
-          session = await createSSESession(request)
+          session = await createSession(request)
           raw.setHeader('Mcp-Session-Id', session.id)
         }
 
@@ -577,10 +588,15 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         // Send initial heartbeat
         reply.raw.write(': heartbeat\n\n')
 
-        // Keep connection alive with periodic heartbeats
+        // Keep connection alive with periodic heartbeats. Each heartbeat also
+        // counts as session activity, so an open stream keeps its session from
+        // expiring even when no messages flow over it.
         const heartbeatInterval = setInterval(() => {
           try {
             reply.raw.write(': heartbeat\n\n')
+            sessionStore.touch?.(session.id)?.catch((err: unknown) => {
+              app.log.warn({ err, sessionId: session.id }, 'Failed to refresh session activity on heartbeat')
+            })
           } catch (error) {
             clearInterval(heartbeatInterval)
             const streams = localStreams.get(session.id)
@@ -588,7 +604,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
               streams.delete(reply)
             }
           }
-        }, 30000) // 30 second heartbeat
+        }, heartbeatIntervalMs)
         heartbeatInterval.unref()
 
         reply.raw.on('close', () => {
@@ -605,7 +621,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
   }
 
   // DELETE endpoint for explicit session termination (MCP spec)
-  if (enableSSE) {
+  {
     const schema = resolveMcpRouteSchema(undefined, {
       routeId: 'mcp.delete',
       method: 'DELETE',
