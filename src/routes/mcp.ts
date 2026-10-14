@@ -622,9 +622,10 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
           closeReason = 'Closing SSE stream because the token that opened it expired; it may reconnect with a fresh token'
         }
 
-        // setTimeout fires immediately on delays past 2^31-1 ms (~24.8 days)
-        if (closeAfterMs !== undefined && closeAfterMs <= MAX_TIMER_DELAY_MS) {
-          const maxDurationTimer = setTimeout(() => {
+        if (closeAfterMs !== undefined) {
+          const deadline = Date.now() + closeAfterMs
+          let maxDurationTimer: NodeJS.Timeout | undefined
+          const closeStream = () => {
             app.log.info({
               sessionId: session.id,
               afterMs: closeAfterMs
@@ -634,8 +635,21 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
             } catch {
             // already gone
             }
-          }, closeAfterMs)
-          maxDurationTimer.unref()
+          }
+          // setTimeout fires immediately on delays past 2^31-1 ms (~24.8 days), so
+          // wait in capped steps until the deadline is reached
+          const scheduleClose = () => {
+            const remaining = Math.max(0, deadline - Date.now())
+            maxDurationTimer = setTimeout(() => {
+              if (Date.now() >= deadline) {
+                closeStream()
+              } else {
+                scheduleClose()
+              }
+            }, Math.min(remaining, MAX_TIMER_DELAY_MS))
+            maxDurationTimer.unref()
+          }
+          scheduleClose()
 
           reply.raw.on('close', () => clearTimeout(maxDurationTimer))
         }
