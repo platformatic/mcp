@@ -15,6 +15,7 @@ import type {
   MCPResource,
   MCPPrompt,
   MCPPluginOptions,
+  AllowedOrigins,
   SSESession,
   UnsafeToolHandler,
   UnsafeResourceHandler,
@@ -261,8 +262,6 @@ expectAssignable<MCPPluginOptions>({
   capabilities: { tools: { listChanged: true } },
   instructions: 'test instructions',
   enableSSE: true,
-  sessionStore: 'redis',
-  messageBroker: 'redis',
   redis: {
     host: 'localhost',
     port: 6379,
@@ -273,11 +272,16 @@ expectAssignable<MCPPluginOptions>({
   authorization: { enabled: false },
 })
 
-// Invalid sessionStore value
-expectNotAssignable<MCPPluginOptions>({ sessionStore: 'invalid' })
+// sessionStore / messageBroker were never read; backends are selected by `redis`
+expectNotAssignable<MCPPluginOptions>({ sessionStore: 'redis' as const })
+expectNotAssignable<MCPPluginOptions>({ messageBroker: 'redis' as const })
 
-// Invalid messageBroker value
-expectNotAssignable<MCPPluginOptions>({ messageBroker: 'invalid' })
+// AllowedOrigins is exported and matches MCPPluginOptions['allowedOrigins']
+expectType<AllowedOrigins>({} as MCPPluginOptions['allowedOrigins'])
+expectAssignable<AllowedOrigins>(['https://example.com'])
+expectAssignable<AllowedOrigins>('*')
+expectAssignable<AllowedOrigins>(true)
+expectNotAssignable<AllowedOrigins>('https://example.com')
 
 // Redis config requires host and port
 expectNotAssignable<MCPPluginOptions>({ redis: { host: 'localhost' } })

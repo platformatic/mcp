@@ -375,8 +375,6 @@ export interface MCPPluginOptions {
    * Options override the default Fastify-compatible AJV configuration.
    */
   validateJsonSchemaInputs?: Options
-  sessionStore?: 'memory' | 'redis'
-  messageBroker?: 'memory' | 'redis'
   redis?: {
     host: string
     port: number
