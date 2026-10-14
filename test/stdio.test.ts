@@ -103,13 +103,16 @@ async function setupStdio () {
   transport.start()
 
   const lines = createInterface({ input: output })[Symbol.asyncIterator]()
-  async function send (message: unknown): Promise<any> {
-    input.write(JSON.stringify(message) + '\n')
+  async function sendRaw (line: string): Promise<any> {
+    input.write(line + '\n')
     const { value } = await lines.next()
     return JSON.parse(value as string)
   }
+  function send (message: unknown): Promise<any> {
+    return sendRaw(JSON.stringify(message))
+  }
 
-  return { send, stop: () => transport.stop() }
+  return { send, sendRaw, stop: () => transport.stop() }
 }
 
 function initialize (id: number, protocolVersion: string) {
@@ -150,6 +153,23 @@ test('stdio transport - re-initialize switches the negotiated version', async (t
   const tool = list.result.tools[0]
   assert.strictEqual(tool.icons, undefined)
   assert.strictEqual(tool.inputSchema.$schema, undefined)
+})
+
+test('stdio transport - rejects a numeric id that is not a safe integer', async (t) => {
+  const { sendRaw, stop } = await setupStdio()
+  t.after(stop)
+
+  // JSON.parse turns 9007199254740993 into 9007199254740992, so answering it
+  // would echo a different id than the client sent
+  const response = await sendRaw('{"jsonrpc":"2.0","id":9007199254740993,"method":"tools/list"}')
+  assert.strictEqual(response.id, null)
+  assert.strictEqual(response.error.code, -32600)
+  assert.strictEqual(response.result, undefined)
+
+  // 1e400 parses to Infinity, which would be re-serialized as null
+  const infinite = await sendRaw('{"jsonrpc":"2.0","id":1e400,"method":"tools/list"}')
+  assert.strictEqual(infinite.id, null)
+  assert.strictEqual(infinite.error.code, -32600)
 })
 
 test('runStdioServer - resolves only after app.close() completes on input EOF', async () => {

@@ -8,6 +8,7 @@ import type {
   JSONRPCRequest,
   JSONRPCNotification
 } from './schema.ts'
+import { checkRequestId } from './handlers.ts'
 import { STDIO_TRANSPORT_HEADER, STDIO_TOKEN_HEADER, STDIO_TOKEN } from './stdio-marker.ts'
 
 // Local batch types for JSON-RPC 2.0 compatibility
@@ -213,6 +214,11 @@ export class StdioTransport {
    */
   private async processMessage (message: JSONRPCMessage): Promise<JSONRPCResponse | JSONRPCError | null> {
     const isInitialize = (message as { method?: string }).method === 'initialize'
+
+    // Check before inject re-serializes the message: an id such as 1e400
+    // parses to Infinity, which JSON.stringify would turn into null
+    const idError = checkRequestId(message)
+    if (idError) return idError
 
     try {
       const headers: Record<string, string> = {

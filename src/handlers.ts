@@ -113,6 +113,21 @@ export function createError (id: string | number | null, code: number, message: 
 }
 
 /**
+ * Requests MUST carry a string or integer id, and responses MUST echo it. A
+ * numeric id outside the safe integer range has already lost precision in
+ * JSON.parse, so answering it would echo a different id; refuse it instead.
+ * Returns the error to send, or null if the id is acceptable.
+ */
+export function checkRequestId (message: unknown): JSONRPCError | null {
+  if (message === null || typeof message !== 'object' || Array.isArray(message)) return null
+  const id = (message as { id?: unknown }).id
+  if (typeof id === 'number' && !Number.isSafeInteger(id)) {
+    return createError(null, INVALID_REQUEST, 'Invalid Request: numeric id must be a safe integer')
+  }
+  return null
+}
+
+/**
  * Pick the protocol revision to use for this session.
  *
  * The spec requires that we echo back the client's requested version when we
