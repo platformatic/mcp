@@ -1,4 +1,5 @@
-import type { Task, TaskStatus, JSONRPCResultResponse, JSONRPCErrorResponse } from '../schema.ts'
+import type { Task, TaskStatus, JSONRPCResultResponse, JSONRPCErrorResponse, RequestId } from '../schema.ts'
+import { INTERNAL_ERROR, JSONRPC_VERSION } from '../schema.ts'
 
 /**
  * The final outcome of a task-augmented request, stored verbatim so that
@@ -238,6 +239,15 @@ export class TaskLeases {
     }
     this.timers.clear()
   }
+}
+
+/** Why a task whose running instance stopped renewing its lease was failed */
+export const TASK_OWNER_LOST = 'Task owner lost: the server instance running this task stopped responding'
+
+/** The outcome recorded on a task failed because its lease lapsed */
+export function ownerLostOutcome (): JSONRPCErrorResponse {
+  // The originating request id is long gone; JSON-RPC uses null for that
+  return { jsonrpc: JSONRPC_VERSION, id: null as unknown as RequestId, error: { code: INTERNAL_ERROR, message: TASK_OWNER_LOST } }
 }
 
 /**

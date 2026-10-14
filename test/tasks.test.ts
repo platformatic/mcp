@@ -6,7 +6,7 @@ import mcpPlugin from '../src/index.ts'
 import { JSONRPC_VERSION, LATEST_PROTOCOL_VERSION, METHOD_NOT_FOUND, INVALID_PARAMS } from '../src/schema.ts'
 import type { Task, CreateTaskResult, ListTasksResult, CallToolResult } from '../src/schema.ts'
 import { MemoryTaskStore } from '../src/stores/memory-task-store.ts'
-import { canTransition, isTerminal, taskHasExpired, toWireTask, InvalidTaskCursorError, DEFAULT_TASK_PAGE_SIZE, TaskLimitError, TASK_LIMIT_REACHED, TaskLeases } from '../src/stores/task-store.ts'
+import { canTransition, isTerminal, taskHasExpired, toWireTask, InvalidTaskCursorError, DEFAULT_TASK_PAGE_SIZE, TaskLimitError, TASK_LIMIT_REACHED, TaskLeases, TASK_OWNER_LOST } from '../src/stores/task-store.ts'
 import type { TaskRecord } from '../src/stores/task-store.ts'
 import { resolveTaskAugmentation, RELATED_TASK_META_KEY } from '../src/handlers.ts'
 import { createTestAuthConfig, createTestJWT, setupMockAgent, generateMockJWKSResponse } from './auth-test-utils.ts'
@@ -313,6 +313,42 @@ describe('task store', () => {
     t.assert.strictEqual(await store.get('b'), null)
     t.assert.ok(await store.get('c'))
     t.assert.ok(await store.get('d'))
+  })
+
+  test('MemoryTaskStore fails orphaned tasks so they stop holding the caller\'s quota', async (t: TestContext) => {
+    // 'a' was running on an instance that died: its lease lapsed, nobody polled it
+    const store = new MemoryTaskStore({ maxTasksPerPrincipal: 2 })
+    await store.create(record({ taskId: 'a', authSubject: 'user-1', leaseExpiresAt: Date.now() - 1 }))
+    await store.create(record({ taskId: 'b', authSubject: 'user-1', leaseExpiresAt: Date.now() + 60_000 }))
+
+    await store.create(record({ taskId: 'c', authSubject: 'user-1' }))
+
+    t.assert.strictEqual(await store.get('a'), null)
+    t.assert.strictEqual((await store.get('b'))?.status, 'working')
+    t.assert.ok(await store.get('c'))
+
+    // Live leases still count: 'b' and 'c' fill the quota
+    await t.assert.rejects(
+      () => store.create(record({ taskId: 'd', authSubject: 'user-1' })),
+      (err: any) => err instanceof TaskLimitError
+    )
+  })
+
+  test('MemoryTaskStore records orphaned tasks as failed when reclaiming quota', async (t: TestContext) => {
+    const store = new MemoryTaskStore({ maxTasksPerPrincipal: 3 })
+    await store.create(record({ taskId: 'a', authSubject: 'user-1' }))
+    await store.updateStatus('a', 'completed')
+    await store.create(record({ taskId: 'b', authSubject: 'user-1', leaseExpiresAt: Date.now() - 1 }))
+    await store.create(record({ taskId: 'c', authSubject: 'user-1' }))
+
+    await store.create(record({ taskId: 'd', authSubject: 'user-1' }))
+
+    // The oldest finished task makes room; the orphan stays, now failed
+    t.assert.strictEqual(await store.get('a'), null)
+    const orphan = await store.get('b')
+    t.assert.strictEqual(orphan?.status, 'failed')
+    t.assert.strictEqual(orphan?.statusMessage, TASK_OWNER_LOST)
+    t.assert.strictEqual((orphan?.outcome as any)?.error?.message, TASK_OWNER_LOST)
   })
 
   test('MemoryTaskStore frees store capacity held by another caller\'s finished tasks', async (t: TestContext) => {

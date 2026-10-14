@@ -38,7 +38,7 @@ import type { RequestId } from './schema.ts'
 import type { MCPTool, MCPResource, MCPPrompt, MCPPluginOptions, ResourceHandlers, McpCallToolOutcome, ToolAccessOperation, MCPToolCallCompleteEvent, TracerLike } from './types.ts'
 import type { SessionStore } from './stores/session-store.ts'
 import type { TaskStore, TaskRecord, TaskWaiters, TaskLeases } from './stores/task-store.ts'
-import { InvalidTaskCursorError, TaskLimitError, TASK_LIMIT_REACHED, decodeTaskCursor, isTerminal, toWireTask } from './stores/task-store.ts'
+import { InvalidTaskCursorError, TaskLimitError, TASK_LIMIT_REACHED, TASK_OWNER_LOST, decodeTaskCursor, isTerminal, ownerLostOutcome, toWireTask } from './stores/task-store.ts'
 import type { AuthorizationContext } from './types/auth-types.ts'
 import {
   supportsTasks,
@@ -931,9 +931,6 @@ const MAX_TASK_TTL = 3600_000
  */
 const MIN_TASK_TTL = 1000
 
-/** Why a task whose running instance stopped renewing its lease was failed */
-const TASK_OWNER_LOST = 'Task owner lost: the server instance running this task stopped responding'
-
 /**
  * The spec types `ttl` as a number of milliseconds. Anything else (a string,
  * NaN, a negative or fractional value) is rejected rather than coerced, since it
@@ -1090,7 +1087,7 @@ async function failIfOwnerLost (task: TaskRecord, dependencies: HandlerDependenc
 
   const current = await taskStore.failExpiredLease(task.taskId, {
     statusMessage: TASK_OWNER_LOST,
-    outcome: createError(null, INTERNAL_ERROR, TASK_OWNER_LOST)
+    outcome: ownerLostOutcome()
   })
   if (current && isTerminal(current.status)) {
     taskWaiters?.notify(current)

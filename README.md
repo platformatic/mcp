@@ -405,7 +405,9 @@ The instance running a task holds a lease on it and renews it every third of `ta
 (default 30 seconds). If that instance dies or shuts down before the task finishes, renewals
 stop. Once the lease lapses, the next `tasks/get` or `tasks/result` (including one already
 waiting) marks the task `failed` with the status message "Task owner lost", so the task no
-longer reads `working` until its ttl runs out. The check is a compare-and-set, so a renewal or
+longer reads `working` until its ttl runs out. A caller at `taskMaxRetainedPerPrincipal` gets
+the same treatment for their orphaned tasks when they create a new one, so tasks nobody polls
+cannot keep them locked out of their quota. The check is a compare-and-set, so a renewal or
 completion that lands first always wins. With Redis, the lease is set and checked against the
 Redis server clock, so clock skew between instances can never fail a task that is still running,
 nor delay failing one whose owner is gone:

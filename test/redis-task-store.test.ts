@@ -3,7 +3,7 @@ import type { TestContext } from 'node:test'
 import type { Redis } from 'ioredis'
 import { createTestRedis, cleanupRedis } from './redis-test-utils.ts'
 import { RedisTaskStore } from '../src/stores/redis-task-store.ts'
-import { TaskLimitError } from '../src/stores/task-store.ts'
+import { TaskLimitError, TASK_OWNER_LOST } from '../src/stores/task-store.ts'
 import type { TaskRecord } from '../src/stores/task-store.ts'
 import { InvalidTaskCursorError } from '../src/stores/task-store.ts'
 
@@ -335,6 +335,28 @@ describe('RedisTaskStore', () => {
 
     await store.create(record({ taskId: 'b', authSubject: 'user-1' }))
     t.assert.deepStrictEqual(await redis.zrange('mcp:tasks:owner:user-1', 0, -1), ['b'])
+  })
+
+  test('fails orphaned tasks so they stop holding the caller\'s quota', async (t: TestContext) => {
+    store = new RedisTaskStore({ redis, maxTasksPerPrincipal: 3 })
+    const base = Date.now()
+    const at = (ms: number) => new Date(base + ms).toISOString()
+    // 'b' was running on an instance that died: its lease lapsed, nobody polled it
+    await store.create(record({ taskId: 'a', authSubject: 'user-1', createdAt: at(0), leaseExpiresAt: base + 60_000 }))
+    await store.create(record({ taskId: 'b', authSubject: 'user-1', createdAt: at(1), leaseExpiresAt: base - 1 }))
+    await store.create(record({ taskId: 'c', authSubject: 'user-1', createdAt: at(2), leaseExpiresAt: base - 1 }))
+
+    await store.create(record({ taskId: 'd', authSubject: 'user-1', createdAt: at(3) }))
+
+    // 'b' was failed and, as the oldest finished task, evicted; 'c' stays, failed
+    t.assert.strictEqual((await store.get('a'))?.status, 'working')
+    t.assert.strictEqual(await store.get('b'), null)
+    const orphan = await store.get('c')
+    t.assert.strictEqual(orphan?.status, 'failed')
+    t.assert.strictEqual(orphan?.statusMessage, TASK_OWNER_LOST)
+    t.assert.strictEqual((orphan?.outcome as any)?.error?.message, TASK_OWNER_LOST)
+    t.assert.ok(await redis.ttl('mcp:task:c') > 0)
+    t.assert.ok(await store.get('d'))
   })
 
   test('tasks created on one store instance are visible from another', async (t: TestContext) => {

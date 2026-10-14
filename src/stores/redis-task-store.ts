@@ -4,10 +4,12 @@ import type { TaskStore, TaskRecord, TaskOutcome, TaskListOptions, TaskListPage,
 import {
   DEFAULT_TASK_MAX_PER_PRINCIPAL,
   TaskLimitError,
+  TASK_OWNER_LOST,
   canTransition,
   decodeTaskCursor,
   encodeTaskCursor,
   isTerminal,
+  ownerLostOutcome,
   taskPageLimit,
   validateTaskLimit
 } from './task-store.ts'
@@ -20,12 +22,15 @@ const ANONYMOUS_INDEX_KEY = 'mcp:tasks:anonymous'
 // concurrent creates on different instances cannot overshoot it.
 //
 // KEYS: task key, owner index
-// ARGV: task JSON, expiry seconds (-1 = none), score, task id, cap, task key prefix
+// ARGV: task JSON, expiry seconds (-1 = none), score, task id, cap, task key prefix,
+//       then the status message, outcome JSON and timestamp for orphaned tasks
 //
 // The owner index is a sorted set of task ids scored by creation time (the same
 // one `list` pages through). Ids whose task key has expired are pruned first;
-// then, at the cap, the oldest finished tasks are evicted. Returns 0 (storing
-// nothing) when the owner is at the cap with nothing finished to evict. Task
+// then, at the cap, tasks whose lease has lapsed (their instance died) are
+// failed, as failExpiredLease would, and the oldest finished tasks are evicted.
+// Returns 0 (storing nothing) when the owner is at the cap with nothing
+// finished to evict. Task
 // keys are derived from index members, so this needs a standalone Redis (or
 // every key in one slot).
 const CREATE_SCRIPT = `
@@ -42,13 +47,21 @@ end
 
 local need = #live - cap + 1
 if need > 0 then
+  local t = redis.call('TIME')
+  local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
   local victims = {}
   for _, id in ipairs(live) do
-    if #victims >= need then break end
     local ok, cur = pcall(cjson.decode, redis.call('GET', prefix .. id))
     local s = ok and type(cur) == 'table' and cur.status
     if s == 'completed' or s == 'failed' or s == 'cancelled' then
-      table.insert(victims, id)
+      if #victims < need then table.insert(victims, id) end
+    elseif s and type(cur.leaseExpiresAt) == 'number' and cur.leaseExpiresAt <= now then
+      cur.status = 'failed'
+      cur.statusMessage = ARGV[7]
+      cur.outcome = cjson.decode(ARGV[8])
+      cur.lastUpdatedAt = ARGV[9]
+      redis.call('SET', prefix .. id, cjson.encode(cur), 'KEEPTTL')
+      if #victims < need then table.insert(victims, id) end
     end
   end
   if #victims < need then return 0 end
@@ -141,7 +154,10 @@ export class RedisTaskStore implements TaskStore {
       new Date(task.createdAt).getTime(),
       task.taskId,
       this.maxTasksPerPrincipal,
-      TASK_KEY_PREFIX
+      TASK_KEY_PREFIX,
+      TASK_OWNER_LOST,
+      JSON.stringify(ownerLostOutcome()),
+      new Date().toISOString()
     )
     if (stored !== 1) {
       throw new TaskLimitError(this.maxTasksPerPrincipal)
