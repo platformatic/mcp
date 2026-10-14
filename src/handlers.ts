@@ -50,6 +50,7 @@ import { validate, CallToolRequestSchema, ReadResourceRequestSchema, GetPromptRe
 import type { JsonSchemaValidator } from './validation/json-schema-validator.ts'
 import { sanitizeToolParams, assessToolSecurity } from './security.ts'
 import { MCP_ATTR, type SpanAttributeValue } from './telemetry-constants.ts'
+import { isStdioRequest } from './stdio-marker.ts'
 
 // Lazy-loaded telemetry module — only imported when a tracer is configured
 let _telemetry: typeof import('./telemetry.ts') | undefined
@@ -1446,8 +1447,6 @@ async function handleResourcesUnsubscribe (
   }
 }
 
-const STDIO_TRANSPORT_HEADER = 'x-platformatic-mcp-transport'
-
 function mcpContextCarrier (params: unknown): Record<string, string | string[]> | undefined {
   if (typeof params !== 'object' || params === null || !('_meta' in params)) return undefined
   const meta = params._meta
@@ -1501,8 +1500,7 @@ async function withMcpServerSpan<T> (
     : dependencies.protocolVersion
   if (protocolVersion) extraAttrs[MCP_ATTR.PROTOCOL_VERSION] = protocolVersion
 
-  const isStdio = request.headers[STDIO_TRANSPORT_HEADER] === 'stdio'
-  if (isStdio) {
+  if (isStdioRequest(request)) {
     extraAttrs[MCP_ATTR.NETWORK_TRANSPORT] = 'pipe'
   } else {
     const httpVersion = request.raw.httpVersion

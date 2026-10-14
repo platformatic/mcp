@@ -8,6 +8,7 @@ import type {
   JSONRPCRequest,
   JSONRPCNotification
 } from './schema.ts'
+import { STDIO_TRANSPORT_HEADER, STDIO_TOKEN_HEADER, STDIO_TOKEN } from './stdio-marker.ts'
 
 // Local batch types for JSON-RPC 2.0 compatibility
 type JSONRPCBatchRequest = (JSONRPCRequest | JSONRPCNotification)[]
@@ -217,7 +218,8 @@ export class StdioTransport {
       const headers: Record<string, string> = {
         'content-type': 'application/json',
         accept: 'application/json', // Explicitly request JSON, not SSE
-        'x-platformatic-mcp-transport': 'stdio'
+        [STDIO_TRANSPORT_HEADER]: 'stdio',
+        [STDIO_TOKEN_HEADER]: STDIO_TOKEN
       }
       // `initialize` is the negotiation itself, so it never carries a version
       if (!isInitialize && this.protocolVersion) {
