@@ -362,15 +362,58 @@ never sees a field or method that revision does not define:
 | `$schema` on tool schemas | omitted | JSON Schema 2020-12 |
 | URL mode elicitation | refused | available |
 
-When SSE is enabled the negotiated revision is stored on the session and is **authoritative**:
+The negotiated revision is stored on the session and is **authoritative**:
 a request whose `MCP-Protocol-Version` header contradicts what the session agreed is rejected
 with `400`, so a client cannot opt into newer behaviour after negotiating an older revision.
 When the header is omitted the session's revision is used in preference to the `2025-03-26`
 default. `initialize` is exempt, so a client may re-negotiate on an existing session.
 
-> Without SSE there is no session to remember the negotiation, so each request is judged
-> solely by its header. A client that omits it falls back to `2025-03-26` and will not see
-> `2025-11-25` features. Compliant clients always send the header.
+> A request sent without an `Mcp-Session-Id` has no session to remember the negotiation, so it
+> is judged solely by its header. A client that omits it falls back to `2025-03-26` and will not
+> see `2025-11-25` features. Compliant clients always send the header.
+
+## Sessions
+
+Session management is part of the Streamable HTTP transport and works whether or not SSE is
+enabled:
+
+- `initialize` on `POST /mcp` creates a session and returns its id in the `Mcp-Session-Id`
+  response header. Clients send it back on later requests.
+- `DELETE /mcp` with the `Mcp-Session-Id` header terminates the session (`204`), answering
+  `404` for an unknown session and `400` when the header is missing.
+- `enableSSE` only controls `GET /mcp`. Without it, `GET /mcp` answers `405` with
+  `Allow: POST, DELETE`.
+
+With SSE disabled, requests that do not carry an `Mcp-Session-Id` keep working statelessly and
+no session is created for them. With SSE enabled, every request without a known session id gets
+a new session, as before.
+
+Sessions expire after `sessionTtlMs` milliseconds without activity (default `3600000`, one
+hour), so clients that disconnect without sending `DELETE` do not leave sessions behind. Every
+request carrying the session id, every message stored for it, and every heartbeat on an open SSE
+stream counts as activity, so a session in use is never expired from under a live connection.
+The Redis store applies this as the key TTL; the memory store checks it on every read and sweeps
+expired sessions on an unref'd timer that is cleared when the server closes.
+
+```typescript
+await app.register(mcpPlugin, {
+  sessionTtlMs: 15 * 60_000 // expire sessions after 15 idle minutes
+})
+```
+
+## Request Body Errors
+
+Body-parser failures on `POST /mcp` are answered with a JSON-RPC error (with `id: null`)
+while keeping the HTTP status code:
+
+| Cause | Status | JSON-RPC error |
+| --- | --- | --- |
+| Malformed or empty JSON | `400` | `-32700` Parse error |
+| Body larger than Fastify's `bodyLimit` | `413` | `-32600` Invalid Request |
+| Unsupported `Content-Type` | `415` | `-32600` Invalid Request |
+
+The handler is scoped to the `POST /mcp` route. Any other error on that route, and every
+error on your other routes, still goes to your own (or Fastify's default) error handler.
 
 ## Multi Round-Trip Requests (2026-07-28)
 
@@ -743,6 +786,11 @@ A client-requested `ttl` must be a non-negative integer number of milliseconds; 
 
 Tasks are stored in memory by default and in Redis when a `redis` option is given, so any
 instance can serve a poll for a task created on another.
+
+`tasks/list` returns the caller's tasks newest first, 50 per page. When more remain, the
+result carries an opaque `nextCursor`; pass it back as `params.cursor` to fetch the next
+page. An unrecognised cursor is rejected with `-32602` (Invalid params). The Redis store keeps
+a per-subject index, so a listing only reads the caller's own tasks.
 
 **Security**: when built-in authorization or `resolveAuthorizationContext` is configured,
 tasks are bound to the resolved principal (user, OAuth client and issuer) and a requestor can
@@ -1162,7 +1210,7 @@ The plugin supports Redis-backed session management and message broadcasting for
 **With Redis (Distributed):**
 - **Shared Session State**: All instances access the same session data from Redis
 - **Cross-Instance Broadcasting**: Messages sent from any instance reach all connected clients
-- **Session Persistence**: Sessions survive server restarts with 1-hour TTL
+- **Session Persistence**: Sessions survive server restarts, expiring after one idle hour by default (`sessionTtlMs`)
 - **High Availability**: Clients can reconnect to any instance and resume from last event
 - **True Horizontal Scaling**: Add more instances without architectural changes
 
@@ -1224,8 +1272,8 @@ const store: SessionStore = new MemorySessionStore()
 // or: new RedisSessionStore({ redis })
 ```
 
-- **`SessionStore`**: the interface the plugin uses to persist SSE session metadata, message history, token-to-session mappings, and per-session resource subscriptions (`addResourceSubscription` / `removeResourceSubscription`, exposed as `resourceSubscriptions` on the metadata).
-- **`MemorySessionStore`**: in-process implementation used automatically when no `redis` option is passed. Takes an optional `maxMessages` history cap (default 100).
+- **`SessionStore`**: the interface the plugin uses to persist SSE session metadata, message history, token-to-session mappings, and per-session resource subscriptions (`addResourceSubscription` / `removeResourceSubscription`, exposed as `resourceSubscriptions` on the metadata). The optional `touch(sessionId)` records activity so the session is not expired while in use.
+- **`MemorySessionStore`**: in-process implementation used automatically when no `redis` option is passed. Takes an optional `maxMessages` history cap (default 100) and `{ sessionTtlMs }` idle expiry (default 1 hour); call `cleanup()` periodically to free expired sessions when using it outside the plugin.
 - **`RedisSessionStore`**: distributed implementation used automatically when the `redis` option is passed; sessions and message history live in Redis so any instance can serve any client.
 
 These are the same store classes the plugin instantiates internally based on the `redis` option. Exporting them lets you construct or inspect one directly in tests and scripts.
@@ -1265,7 +1313,7 @@ connections through the Fastify logger, and ioredis keeps reconnecting. When con
 
 **Automatic Session Management:**
 - Sessions persist across server restarts
-- 1-hour session TTL with automatic cleanup
+- Idle session TTL (`sessionTtlMs`, default 1 hour) with automatic cleanup
 - Message history stored in Redis Streams
 
 **Message Replay:**
@@ -2214,6 +2262,8 @@ When `oauth2Client` is configured, the plugin registers these legacy server-side
 
 Authorization-aware metadata endpoints:
 
+- `GET /.well-known/oauth-protected-resource` - OAuth 2.0 Protected Resource Metadata (RFC 9728, public)
+- `GET /.well-known/oauth-protected-resource{path}` - Same metadata, served when `resourceUri` has a path (e.g. `resourceUri: 'https://mcp.example.com/mcp'` is served at `/.well-known/oauth-protected-resource/mcp`). This is the URL advertised in the `resource_metadata` parameter of `WWW-Authenticate` challenges, as required by RFC 9728 §3.1, and its `resource` field equals `resourceUri` exactly.
 - `GET /.well-known/mcp-server` - Server metadata (protected)
 - `GET /health` - Health check (public)
 
@@ -2416,16 +2466,16 @@ await app.register(import('@fastify/bearer-auth'), {
 - `serverInfo`: Server identification (name, version)
 - `capabilities`: MCP capabilities configuration
 - `instructions`: Optional server instructions
-- `enableSSE`: Enable Server-Sent Events support (default: false)
+- `enableSSE`: Enable Server-Sent Events support on `GET /mcp` (default: false). Sessions and `DELETE /mcp` work either way.
 - `resolveAuthorizationContext`: Maps identities established by upstream Fastify authentication hooks into MCP authorization context (optional)
 - `canAccessTool`: Per-request tool authorization hook consulted by `tools/list` and `tools/call` (optional)
 - `onToolCallComplete`: Transport-neutral hook fired once after every tool call settles, across JSON-RPC, `mcpCallTool()`, and tasks (optional)
 - `onClientResponse`: Receives the JSON-RPC responses clients POST back for server-initiated requests, such as elicitation results (optional)
 - `authorization`: OAuth 2.1 authorization configuration (optional)
   - `enabled`: Enable OAuth 2.1 authorization (default: false)
-  - `authorizationServers`: Authorization server URIs
-  - `resourceUri`: Resource URI
-  - `requiredScopes`: Scopes a token must carry (optional). Tokens missing any of them get a 403 `insufficient_scope` challenge. When set, the scopes are also advertised as `scopes_supported` in `/.well-known/oauth-protected-resource` metadata and as `scope="..."` in the `WWW-Authenticate` header of every 401 challenge
+  - `authorizationServers`: Authorization server URIs. JWTs must carry an `iss` matching one of these (a trailing slash difference is tolerated), plus `sub` and `exp`; introspection responses must carry `sub` and, if they report `iss`, a matching one
+  - `resourceUri`: Resource URI. May include a path; the protected resource metadata is then served at `/.well-known/oauth-protected-resource{path}` (RFC 9728 §3.1)
+  - `requiredScopes`: Scopes a token must carry (optional). Tokens missing any of them get a 403 `insufficient_scope` challenge. When set, the scopes are also advertised as `scopes_supported` in the protected resource metadata (every `/.well-known/oauth-protected-resource` route) and as `scope="..."` in the `WWW-Authenticate` header of every 401 challenge
   - `scopeImplies`: `(granted, required) => boolean` deciding whether a granted scope satisfies a required one (default: exact match; see `colonScopeHierarchy`)
   - `tokenValidation`: JWT token validation configuration
     - `jwksUri`: JWKS endpoint URL for JWT signature verification
@@ -2687,6 +2737,8 @@ app.mcpAddTool({
 
 Resource and prompt handlers also receive the same context object as tool handlers, enabling access to HTTP context and authorization information:
 
+When `uriPattern` contains `{name}` placeholders (an RFC 6570 level-1 template), `resources/read` for a concrete URI such as `context://data/42` is routed to it, and the values are available as `context.uriParams` (`{ id: '42' }`). Each placeholder matches a single non-empty segment that does not contain `/`; an exact `uri` registration always takes precedence over a template.
+
 ```typescript
 // Resource handler with context
 app.mcpAddResource({
@@ -2697,11 +2749,12 @@ app.mcpAddResource({
   // Access request information
   const userAgent = context.request.headers['user-agent']
   const authUser = context?.authContext?.userId
-  
+  const id = context.uriParams?.id
+
   return {
     contents: [{
       uri,
-      text: `Resource ${uri} accessed by ${authUser || 'anonymous'} from ${userAgent || 'unknown client'}`,
+      text: `Resource ${id} accessed by ${authUser || 'anonymous'} from ${userAgent || 'unknown client'}`,
       mimeType: 'text/plain'
     }]
   }
@@ -2975,6 +3028,7 @@ await app.register(mcpPlugin, {
 #### Session Management
 
 - **Session IDs are cryptographically secure:** Generated using Node.js crypto
+- **Sessions are bound to their owner:** With authorization enabled, a session remembers the issuer and `sub` of the token that created it; a subject is only unique per issuer, so both must match. Requests (POST, GET, DELETE) presenting that `Mcp-Session-Id` with a token from a different issuer or for a different subject get `404 Session not found`, the same answer as for an unknown session, so a leaked session ID cannot be used by another user. The issuer is the verified JWT `iss` (a trailing slash is ignored). Introspection responses may omit `iss` (RFC 7662); the issuer is then taken from configuration as `introspection:<introspectionEndpoint>`, the endpoint that vouched for the token, so such sessions never match a JWT or an introspection response that names an issuer
 - **Automatic cleanup:** Sessions expire after 1 hour by default
 - **Message history limits:** Prevents unbounded memory growth
 - **Cross-instance isolation:** Sessions are properly isolated between instances
@@ -3167,8 +3221,8 @@ the changes to the plugin's own API and defaults:
   `-32601` then.
 - **Legacy clients without `enableSSE` no longer see `resources.subscribe`**, since updates could
   never reach them.
-- **`GET` and `DELETE /mcp` answer `405` with `Allow: POST`** when `enableSSE` is off (`DELETE`
-  used to be a `404`).
+- **`GET /mcp` answers `405` with `Allow: POST, DELETE`** when `enableSSE` is off; a modern
+  caller's `GET` or `DELETE` gets `405` with `Allow: POST`.
 - **Body-parser errors on `/mcp` are JSON-RPC errors**: malformed JSON is `-32700`, a body over
   the size limit or with the wrong content type is `-32600`, with the same HTTP status as before.
 - **Legacy task responses only carry the spec's `Task` fields.**

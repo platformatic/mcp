@@ -3482,11 +3482,17 @@ describe('round 4: transport, input validation and stdio', () => {
     }
   })
 
-  test('without SSE, GET answers 405 with Allow: POST', async (t: TestContext) => {
+  test('without SSE, GET answers 405 naming the methods the caller may use', async (t: TestContext) => {
     const app = await buildServer(t)
+    // A legacy client can still end its session with DELETE.
     const response = await app.inject({ method: 'GET', url: '/mcp' })
     t.assert.strictEqual(response.statusCode, 405)
-    t.assert.strictEqual(response.headers.allow, 'POST')
+    t.assert.strictEqual(response.headers.allow, 'POST, DELETE')
+
+    // A modern client has no session, so only POST applies.
+    const modern = await app.inject({ method: 'GET', url: '/mcp', headers: { 'mcp-protocol-version': '2026-07-28' } })
+    t.assert.strictEqual(modern.statusCode, 405)
+    t.assert.strictEqual(modern.headers.allow, 'POST')
   })
 
   test('body-parser errors are JSON-RPC errors with their HTTP status', async (t: TestContext) => {

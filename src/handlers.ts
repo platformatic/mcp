@@ -47,7 +47,7 @@ import type {
 } from './types.ts'
 import type { SessionStore } from './stores/session-store.ts'
 import type { TaskStore, TaskRecord, TaskWaiters } from './stores/task-store.ts'
-import { isTerminal, toWireTask } from './stores/task-store.ts'
+import { InvalidTaskCursorError, decodeTaskCursor, isTerminal, toWireTask } from './stores/task-store.ts'
 import type { AuthorizationContext } from './types/auth-types.ts'
 import { principalOf } from './principal.ts'
 import { TaskStopped, quotaKeyOf, reserveTask, setLongTimeout } from './task-registry.ts'
@@ -391,6 +391,67 @@ const URI_TEMPLATE_REGEX = /\{[^}]+\}/
 
 function isTemplateUri (uri: string): boolean {
   return URI_TEMPLATE_REGEX.test(uri)
+}
+
+interface CompiledUriTemplate {
+  regex: RegExp
+  names: string[]
+}
+
+const compiledUriTemplates = new Map<string, CompiledUriTemplate | null>()
+
+/**
+ * Compile an RFC 6570 level-1 template (`{name}` placeholders only) into an
+ * anchored regex. Each placeholder matches one non-empty, slash-bounded
+ * segment; everything else must match literally. Templates using operators
+ * (`{+x}`, `{?x}`, ...) are not supported and never match.
+ */
+function compileUriTemplate (template: string): CompiledUriTemplate | null {
+  let compiled = compiledUriTemplates.get(template)
+  if (compiled !== undefined) return compiled
+
+  const names: string[] = []
+  let source = '^'
+  let lastIndex = 0
+  let supported = true
+  for (const match of template.matchAll(/\{([^}]*)\}/g)) {
+    const name = match[1]
+    if (!/^[A-Za-z0-9_]+$/.test(name)) {
+      supported = false
+      break
+    }
+    source += escapeRegExp(template.slice(lastIndex, match.index)) + '([^/]+)'
+    names.push(name)
+    lastIndex = match.index + match[0].length
+  }
+  source += escapeRegExp(template.slice(lastIndex)) + '$'
+
+  compiled = supported ? { regex: new RegExp(source), names } : null
+  compiledUriTemplates.set(template, compiled)
+  return compiled
+}
+
+function escapeRegExp (value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function matchUriTemplate (template: string, uri: string): Record<string, string> | null {
+  const compiled = compileUriTemplate(template)
+  if (!compiled) return null
+
+  const match = compiled.regex.exec(uri)
+  if (!match) return null
+
+  const params: Record<string, string> = {}
+  compiled.names.forEach((name, i) => {
+    const raw = match[i + 1]
+    try {
+      params[name] = decodeURIComponent(raw)
+    } catch {
+      params[name] = raw
+    }
+  })
+  return params
 }
 
 export function handleResourcesList (request: JSONRPCRequest, dependencies: HandlerDependencies): JSONRPCResponse {
@@ -892,6 +953,20 @@ export async function handleResourcesRead (
     }
   }
 
+  // Otherwise look for a registered template the concrete URI expands from
+  let uriParams: Record<string, string> | undefined
+  if (!resource) {
+    for (const candidate of resources.values()) {
+      if (!isTemplateUri(candidate.definition.uri)) continue
+      const params = matchUriTemplate(candidate.definition.uri, uri)
+      if (params) {
+        resource = candidate
+        uriParams = params
+        break
+      }
+    }
+  }
+
   if (!resource) {
     return createError(request.id, METHOD_NOT_FOUND, `Resource '${uri}' not found`)
   }
@@ -925,7 +1000,7 @@ export async function handleResourcesRead (
   }
 
   try {
-    const result = await resource.handler(uri, handlerContext(dependencies, sessionId))
+    const result = await resource.handler(uri, { ...handlerContext(dependencies, sessionId), uriParams })
     // A resource with no contents does not exist: answering an empty array
     // for it is not allowed, so report it the way a missing resource is.
     if (dependencies.strictErrors && Array.isArray(result?.contents) && result.contents.length === 0) {
@@ -1326,6 +1401,15 @@ async function handleTasksList (
     return createError(request.id, METHOD_NOT_FOUND, 'Method tasks/list not found')
   }
 
+  const cursor = (request.params as { cursor?: unknown } | undefined)?.cursor
+  if (cursor !== undefined) {
+    try {
+      decodeTaskCursor(cursor)
+    } catch {
+      return createError(request.id, INVALID_PARAMS, 'Invalid cursor')
+    }
+  }
+
   const subject = taskSubject(dependencies)
   if (subject === undefined) {
     // Auth is on but this token carries no `sub`, so it owns nothing we can
@@ -1334,10 +1418,18 @@ async function handleTasksList (
     return createResponse(request.id, { tasks: [], nextCursor: undefined } as ListTasksResult)
   }
 
-  const tasks = (await taskStore.list(subject)).filter(task => task.era !== 'modern')
+  let page
+  try {
+    page = await taskStore.list(subject, { cursor: cursor as string | undefined, era: 'legacy' })
+  } catch (err) {
+    if (err instanceof InvalidTaskCursorError) {
+      return createError(request.id, INVALID_PARAMS, 'Invalid cursor')
+    }
+    throw err
+  }
   const result: ListTasksResult = {
-    tasks: tasks.map(toWireTask),
-    nextCursor: undefined
+    tasks: page.tasks.map(toWireTask),
+    nextCursor: page.nextCursor
   }
   return createResponse(request.id, result)
 }

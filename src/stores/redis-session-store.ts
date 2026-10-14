@@ -8,13 +8,18 @@ import type { AuthorizationContext, TokenRefreshInfo } from '../types/auth-types
 // session's TTL and is removed with it.
 const RESOURCE_SUBSCRIPTION_PREFIX = 'resourceSubscription:'
 
+/** Idle time after which a session key expires (1 hour) */
+const DEFAULT_SESSION_TTL_MS = 60 * 60 * 1000
+
 export class RedisSessionStore implements SessionStore {
   private redis: Redis
   private maxMessages: number
+  readonly sessionTtlMs: number
 
-  constructor (options: { redis: Redis, maxMessages?: number }) {
+  constructor (options: { redis: Redis, maxMessages?: number, sessionTtlMs?: number }) {
     this.redis = options.redis
     this.maxMessages = options.maxMessages || 100
+    this.sessionTtlMs = options.sessionTtlMs ?? DEFAULT_SESSION_TTL_MS
   }
 
   async create (metadata: SessionMetadata): Promise<void> {
@@ -34,6 +39,13 @@ export class RedisSessionStore implements SessionStore {
       sessionData.clientCapabilities = JSON.stringify(metadata.clientCapabilities)
     }
 
+    if (metadata.ownerSub !== undefined) {
+      sessionData.ownerSub = metadata.ownerSub
+    }
+    if (metadata.ownerIss !== undefined) {
+      sessionData.ownerIss = metadata.ownerIss
+    }
+
     // Add authorization context if present
     if (metadata.authorization) {
       sessionData.authorization = JSON.stringify(metadata.authorization)
@@ -47,8 +59,8 @@ export class RedisSessionStore implements SessionStore {
 
     await this.redis.hset(sessionKey, sessionData)
 
-    // Set session expiration to 1 hour
-    await this.redis.expire(sessionKey, 3600)
+    // Expire the session after sessionTtlMs without activity
+    await this.redis.pexpire(sessionKey, this.sessionTtlMs)
 
     // Add token mapping if present
     if (metadata.authorization?.tokenHash) {
@@ -87,6 +99,21 @@ export class RedisSessionStore implements SessionStore {
     )
   }
 
+  async touch (sessionId: string): Promise<void> {
+    // Refresh the idle TTL atomically, and only for a session that still exists,
+    // so an expired session is never recreated without a TTL
+    await this.redis.eval(
+      `if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+       redis.call('HSET', KEYS[1], 'lastActivity', ARGV[1])
+       redis.call('PEXPIRE', KEYS[1], ARGV[2])
+       return 1`,
+      1,
+      `session:${sessionId}`,
+      new Date().toISOString(),
+      String(this.sessionTtlMs)
+    )
+  }
+
   async get (sessionId: string): Promise<SessionMetadata | null> {
     const sessionKey = `session:${sessionId}`
     const result = await this.redis.hgetall(sessionKey)
@@ -110,6 +137,13 @@ export class RedisSessionStore implements SessionStore {
       } catch (error) {
         // Ignore parsing errors for client capabilities
       }
+    }
+
+    if (result.ownerSub !== undefined) {
+      metadata.ownerSub = result.ownerSub
+    }
+    if (result.ownerIss !== undefined) {
+      metadata.ownerIss = result.ownerIss
     }
 
     // Parse authorization context if present
@@ -199,7 +233,7 @@ export class RedisSessionStore implements SessionStore {
     })
 
     // Reset session expiration
-    pipeline.expire(sessionKey, 3600)
+    pipeline.pexpire(sessionKey, this.sessionTtlMs)
 
     await pipeline.exec()
   }
@@ -232,8 +266,8 @@ export class RedisSessionStore implements SessionStore {
 
   async addTokenMapping (tokenHash: string, sessionId: string): Promise<void> {
     const tokenKey = `token:${tokenHash}`
-    // Set token mapping with same expiration as session (1 hour)
-    await this.redis.setex(tokenKey, 3600, sessionId)
+    // Set token mapping with same expiration as session
+    await this.redis.psetex(tokenKey, this.sessionTtlMs, sessionId)
   }
 
   async removeTokenMapping (tokenHash: string): Promise<void> {
@@ -268,7 +302,7 @@ export class RedisSessionStore implements SessionStore {
     await this.redis.hset(sessionKey, updateData)
 
     // Reset session expiration
-    await this.redis.expire(sessionKey, 3600)
+    await this.redis.pexpire(sessionKey, this.sessionTtlMs)
 
     // Add new token mapping if tokenHash is provided
     if (authorization.tokenHash) {

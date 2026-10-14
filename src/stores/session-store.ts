@@ -12,6 +12,17 @@ export interface SessionMetadata {
   /** Capabilities the client declared during `initialize`, if the handshake has happened */
   clientCapabilities?: ClientCapabilities
   authSession?: any // OAuth session data (legacy - for Phase 2 compatibility)
+  /**
+   * Subject (`sub`) of the verified access token that created the session.
+   * When set, only requests bearing a token for the same issuer and subject
+   * may use the session. Unset when authorization is disabled.
+   */
+  ownerSub?: string
+  /**
+   * Issuer identity of that token (see TokenValidationResult.issuer). A subject
+   * is only unique per issuer, so the owner is the (ownerIss, ownerSub) pair.
+   */
+  ownerIss?: string
 
   // Enhanced authorization context
   authorization?: AuthorizationContext
@@ -29,6 +40,12 @@ export interface SessionStore {
    */
   update(metadata: SessionMetadata): Promise<void>
   get(sessionId: string): Promise<SessionMetadata | null>
+  /**
+   * Record activity on a session so it is not expired while in use. Called on
+   * every request carrying the session id and on each SSE heartbeat. A no-op
+   * when the session is gone. Optional for custom stores that do not expire.
+   */
+  touch?(sessionId: string): Promise<void>
   delete(sessionId: string): Promise<void>
   cleanup(): Promise<void>
 

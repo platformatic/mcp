@@ -1,14 +1,31 @@
 import type { Redis } from 'ioredis'
 import type { TaskStatus } from '../schema.ts'
-import type { TaskStore, TaskRecord, TaskUpdateOptions, TaskInputUpdate, TaskOutcome } from './task-store.ts'
-import { applyInputRequestUpdates, canTransition, isTerminal } from './task-store.ts'
+import type {
+  TaskStore,
+  TaskRecord,
+  TaskUpdateOptions,
+  TaskInputUpdate,
+  TaskOutcome,
+  TaskListOptions,
+  TaskListPage,
+  TaskCursorPosition
+} from './task-store.ts'
+import {
+  applyInputRequestUpdates,
+  canTransition,
+  decodeTaskCursor,
+  encodeTaskCursor,
+  isTerminal,
+  matchesTaskEra,
+  taskPageLimit
+} from './task-store.ts'
 
 // Versioned: records here store opaque fields as JSON strings, which earlier
 // releases cannot read. A separate keyspace keeps old and new instances from
 // misreading each other's tasks during a rolling deploy or a rollback.
 const TASK_KEY_PREFIX = 'mcp:task:v2:'
-const TASK_INDEX_KEY = 'mcp:tasks:v2'
-const CLEANUP_BATCH = 500
+const OWNER_INDEX_PREFIX = 'mcp:tasks:v2:owner:'
+const ANONYMOUS_INDEX_KEY = 'mcp:tasks:v2:anonymous'
 
 /**
  * Lua's cjson cannot round-trip arbitrary JSON: it turns empty arrays into
@@ -62,6 +79,34 @@ function fromStored (stored: any): TaskRecord {
   return task
 }
 
+// Add a task to its owner's index and stretch the index's expiry so it outlives
+// every task it references. A negative expiry means the task never expires, so
+// the index must not either.
+const INDEX_ADD_SCRIPT = `
+local existed = redis.call('EXISTS', KEYS[1])
+redis.call('ZADD', KEYS[1], ARGV[1], ARGV[2])
+local secs = tonumber(ARGV[3])
+if secs < 0 then
+  redis.call('PERSIST', KEYS[1])
+elseif existed == 0 then
+  redis.call('EXPIRE', KEYS[1], secs)
+else
+  local current = redis.call('TTL', KEYS[1])
+  if current >= 0 and current < secs then
+    redis.call('EXPIRE', KEYS[1], secs)
+  end
+end
+return 1
+`
+
+/**
+ * Order task ids the way Redis orders members that share a score: by their
+ * bytes, not by UTF-16 code units as `<` on strings would.
+ */
+function compareIds (a: string, b: string): number {
+  return Buffer.compare(Buffer.from(a), Buffer.from(b))
+}
+
 /**
  * Redis-backed task store, so tasks created on one instance can be polled from
  * any other. Task retention is enforced with Redis key expiry, which means an
@@ -80,6 +125,15 @@ export class RedisTaskStore implements TaskStore {
     return `${TASK_KEY_PREFIX}${taskId}`
   }
 
+  /**
+   * Per-owner index of task ids scored by creation time, so `list` only ever
+   * touches the caller's own tasks. Subject-less tasks get a separate key that
+   * cannot collide with any subject's.
+   */
+  private indexKey (authSubject?: string): string {
+    return authSubject === undefined ? ANONYMOUS_INDEX_KEY : `${OWNER_INDEX_PREFIX}${authSubject}`
+  }
+
   private expirySeconds (task: TaskRecord): number {
     const ttl = task.ttl ?? this.defaultTtlMs
     return Math.max(1, Math.ceil(ttl / 1000))
@@ -87,25 +141,31 @@ export class RedisTaskStore implements TaskStore {
 
   async create (task: TaskRecord): Promise<void> {
     const key = this.key(task.taskId)
+    const multi = this.redis.multi()
     // A null ttl means unlimited retention (matching taskHasExpired and the
     // memory store), so write the key without an expiry rather than falling back
     // to the default and silently expiring it.
     if (task.ttl === null) {
-      await this.redis.set(key, encodeTask(task))
+      multi.set(key, encodeTask(task))
     } else {
-      await this.redis.set(key, encodeTask(task), 'EX', this.expirySeconds(task))
+      multi.set(key, encodeTask(task), 'EX', this.expirySeconds(task))
     }
-    // Index membership lets `list` enumerate without a keyspace scan; stale ids
-    // are pruned on read, since the task keys expire independently.
-    await this.redis.zadd(TASK_INDEX_KEY, new Date(task.createdAt).getTime(), task.taskId)
+    // The index lets `list` enumerate one owner's tasks without a keyspace scan.
+    // Task keys expire independently, so stale ids are pruned on read.
+    multi.eval(
+      INDEX_ADD_SCRIPT,
+      1,
+      this.indexKey(task.authSubject),
+      new Date(task.createdAt).getTime(),
+      task.taskId,
+      task.ttl === null ? -1 : this.expirySeconds(task)
+    )
+    await multi.exec()
   }
 
   async get (taskId: string): Promise<TaskRecord | null> {
     const raw = await this.redis.get(this.key(taskId))
-    if (!raw) {
-      await this.redis.zrem(TASK_INDEX_KEY, taskId)
-      return null
-    }
+    if (!raw) return null
 
     // Retention is the key's own expiry (SET … EX), timed by Redis. Judging it
     // again by this instance's clock would let one instance whose clock runs
@@ -371,38 +431,98 @@ export class RedisTaskStore implements TaskStore {
     )
   }
 
-  async list (authSubject?: string): Promise<TaskRecord[]> {
-    const ids = await this.redis.zrevrange(TASK_INDEX_KEY, 0, -1)
-    const results: TaskRecord[] = []
+  async list (authSubject?: string, options: TaskListOptions = {}): Promise<TaskListPage> {
+    const limit = taskPageLimit(options.limit)
+    const indexKey = this.indexKey(authSubject)
+    const subject = authSubject === undefined ? undefined : toWellFormed(authSubject)
 
-    for (const id of ids) {
-      const task = await this.get(id)
-      if (!task) continue
-      if (task.authSubject !== authSubject) continue
-      results.push(task)
+    // Walk the owner's index newest first. Each batch resumes from the last
+    // (score, id) pair scanned, never from an offset, so entries removed by a
+    // concurrent request between batches cannot make the walk skip live tasks.
+    // One extra live task is fetched to know whether another page follows.
+    let position: TaskCursorPosition | undefined =
+      options.cursor === undefined ? undefined : decodeTaskCursor(options.cursor)
+    // Whether the members sharing the position's score still have to be read
+    let tiesPending = position !== undefined
+    const tasks: TaskRecord[] = []
+    const stale: string[] = []
+
+    while (tasks.length <= limit) {
+      let ids: string[]
+      if (position && tiesPending) {
+        // Members with the same score sort by id, which a score range cannot
+        // express, so read the whole same-millisecond group and keep the ids
+        // after the position. Such groups are small: one owner's tasks created
+        // within a single millisecond.
+        const tied = await this.redis.zrevrangebyscore(indexKey, position.createdAt, position.createdAt)
+        const after = position.taskId
+        ids = tied.filter(id => compareIds(id, after) < 0)
+        tiesPending = false
+      } else {
+        const count = limit + 1 - tasks.length
+        const max = position ? `(${position.createdAt}` : '+inf'
+        const entries = await this.redis.zrevrangebyscore(indexKey, max, '-inf', 'WITHSCORES', 'LIMIT', 0, count)
+        if (entries.length === 0) break
+        ids = []
+        for (let i = 0; i < entries.length; i += 2) ids.push(entries[i])
+        // The batch may stop part way through a same-score group; the next
+        // iteration picks up the rest of it before moving to older scores.
+        position = { createdAt: Number(entries[entries.length - 1]), taskId: ids[ids.length - 1] }
+        tiesPending = true
+      }
+      if (ids.length === 0) continue
+
+      const raws = await this.redis.mget(ids.map(id => this.key(id)))
+      for (let i = 0; i < ids.length; i++) {
+        const raw = raws[i]
+        if (!raw) {
+          // Expiry is decided by Redis alone (see get), so only a missing key is stale
+          stale.push(ids[i])
+          continue
+        }
+        let task: TaskRecord
+        try {
+          task = decodeTask(raw)
+        } catch {
+          continue
+        }
+        // The index is per owner, but never trust it over the record itself,
+        // which stores the subject well-formed
+        if (task.authSubject !== subject) continue
+        if (!matchesTaskEra(task, options.era)) continue
+        tasks.push(task)
+      }
     }
 
-    return results
+    if (stale.length > 0) {
+      await this.redis.zrem(indexKey, ...stale)
+    }
+
+    const page: TaskListPage = { tasks: tasks.slice(0, limit) }
+    if (tasks.length > limit) {
+      page.nextCursor = encodeTaskCursor(page.tasks[page.tasks.length - 1])
+    }
+    return page
   }
 
   async delete (taskId: string): Promise<void> {
-    await this.redis.del(this.key(taskId))
-    await this.redis.zrem(TASK_INDEX_KEY, taskId)
+    const key = this.key(taskId)
+    const raw = await this.redis.get(key)
+    let authSubject: string | undefined
+    try {
+      authSubject = raw ? (JSON.parse(raw) as TaskRecord).authSubject : undefined
+    } catch {}
+
+    const multi = this.redis.multi().del(key)
+    // Without the record we cannot tell which index holds the id; `list` prunes
+    // it lazily instead.
+    if (raw) multi.zrem(this.indexKey(authSubject), taskId)
+    await multi.exec()
   }
 
   async cleanup (): Promise<void> {
-    // Task keys expire on their own; this only prunes the index of ids whose
-    // task key is already gone.
-    // Check existence in pipelined batches: one round trip per batch rather
-    // than two per indexed task.
-    const ids = await this.redis.zrange(TASK_INDEX_KEY, 0, -1)
-    for (let start = 0; start < ids.length; start += CLEANUP_BATCH) {
-      const batch = ids.slice(start, start + CLEANUP_BATCH)
-      const pipeline = this.redis.pipeline()
-      for (const id of batch) pipeline.exists(this.key(id))
-      const results = await pipeline.exec()
-      const gone = batch.filter((_, index) => results?.[index]?.[1] === 0)
-      if (gone.length > 0) await this.redis.zrem(TASK_INDEX_KEY, ...gone)
-    }
+    // Task keys and owner indexes both expire on their own, and stale index
+    // entries are pruned whenever an owner lists. Sweeping every owner's index
+    // here would mean scanning the keyspace, so there is nothing to do.
   }
 }

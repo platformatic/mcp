@@ -313,4 +313,20 @@ describe('RedisSessionStore', () => {
     const updated = await store.get('caps-session')
     assert.deepStrictEqual(updated?.clientCapabilities, { elicitation: { url: {} } })
   })
+  testWithRedis('expires sessions after sessionTtlMs and touch() refreshes the TTL', async (redis) => {
+    const store = new RedisSessionStore({ redis, maxMessages: 100, sessionTtlMs: 5000 })
+    await store.create({ id: 'ttl-session', eventId: 0, createdAt: new Date(), lastActivity: new Date() })
+
+    const ttl = await redis.pttl('session:ttl-session')
+    assert.ok(ttl > 0 && ttl <= 5000, `expected TTL within sessionTtlMs, got ${ttl}`)
+
+    await redis.pexpire('session:ttl-session', 100)
+    await store.touch('ttl-session')
+    const refreshed = await redis.pttl('session:ttl-session')
+    assert.ok(refreshed > 1000, `touch() must reset the TTL, got ${refreshed}`)
+
+    // touch() never recreates an expired session
+    await store.touch('gone-session')
+    assert.strictEqual(await redis.exists('session:gone-session'), 0)
+  })
 })

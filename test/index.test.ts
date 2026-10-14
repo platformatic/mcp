@@ -460,6 +460,7 @@ describe('MCP Fastify Plugin', () => {
       })
 
       t.assert.strictEqual(response.statusCode, 405)
+      t.assert.strictEqual(response.headers.allow, 'POST, DELETE')
     })
 
     test('should return 405 for GET request without SSE support', async (t: TestContext) => {
@@ -478,6 +479,7 @@ describe('MCP Fastify Plugin', () => {
       })
 
       t.assert.strictEqual(response.statusCode, 405)
+      t.assert.strictEqual(response.headers.allow, 'GET, POST, DELETE')
     })
 
     test('should handle regular JSON response when SSE not requested', async (t: TestContext) => {

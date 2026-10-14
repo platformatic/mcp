@@ -3,11 +3,39 @@ import { createVerifier } from 'fast-jwt'
 import type { FastifyInstance } from 'fastify'
 import type { AuthorizationConfig, TokenValidationResult, TokenIntrospectionResponse } from '../types/auth-types.ts'
 
+/**
+ * Issuers we accept, derived from the configured authorization servers.
+ *
+ * RFC 8414 says `iss` must match the issuer identifier exactly, but providers
+ * disagree on whether that identifier carries a trailing slash (Auth0 does,
+ * most others do not), and operators copy whichever form they see first. Accept
+ * both spellings of each configured server and nothing else: no prefix or
+ * path matching, so `https://auth.example.com.evil` stays rejected.
+ */
+export function buildAllowedIssuers (authorizationServers: string[]): string[] {
+  const allowed = new Set<string>()
+  for (const server of authorizationServers) {
+    const base = normalizeIssuer(server)
+    allowed.add(base)
+    allowed.add(`${base}/`)
+  }
+  return [...allowed]
+}
+
+/**
+ * Canonical form of an issuer identifier: the two spellings
+ * `buildAllowedIssuers` accepts for one server collapse to the same value.
+ */
+export function normalizeIssuer (issuer: string): string {
+  return issuer.replace(/\/+$/, '')
+}
+
 export class TokenValidator {
   private getJwks?: any
   private jwtVerifier?: any
   private config: AuthorizationConfig
   private fastify: FastifyInstance
+  private allowedIssuers: string[] = []
 
   constructor (config: AuthorizationConfig, fastify: FastifyInstance) {
     this.config = config
@@ -17,6 +45,8 @@ export class TokenValidator {
     if (!config.enabled) {
       return
     }
+
+    this.allowedIssuers = buildAllowedIssuers(config.authorizationServers)
 
     if (config.tokenValidation.jwksUri) {
       // Extract domain from JWKS URI
@@ -40,7 +70,11 @@ export class TokenValidator {
           return publicKey
         },
 
-        algorithms: ['RS256', 'ES256']
+        algorithms: ['RS256', 'ES256'],
+        // Only tokens minted by our own authorization servers, bound to a subject
+        // (sessions are keyed on it) and with a bounded lifetime.
+        allowedIss: this.allowedIssuers,
+        requiredClaims: ['iss', 'sub', 'exp']
       })
     }
   }
@@ -68,7 +102,9 @@ export class TokenValidator {
 
           return {
             valid: true,
-            payload
+            payload,
+            // fast-jwt has already checked `iss` against allowedIss
+            issuer: normalizeIssuer(payload.iss)
           }
         } catch (jwtError) {
           this.fastify.log.warn({ err: jwtError }, 'JWT validation failed, trying introspection')
@@ -156,6 +192,24 @@ export class TokenValidator {
         }
       }
 
+      // RFC 7662 makes `iss` optional, but when the server reports it, it must be
+      // one of ours.
+      if (result.iss !== undefined && !this.allowedIssuers.includes(result.iss)) {
+        return {
+          valid: false,
+          error: 'Invalid issuer claim'
+        }
+      }
+
+      // Sessions are bound to the token subject, so a token without one cannot
+      // be used against this resource server.
+      if (typeof result.sub !== 'string' || result.sub === '') {
+        return {
+          valid: false,
+          error: 'Missing subject claim'
+        }
+      }
+
       // Validate audience if required
       if (this.config.tokenValidation.validateAudience) {
         if (!result.aud || !this.validateIntrospectionAudience(result.aud)) {
@@ -166,9 +220,19 @@ export class TokenValidator {
         }
       }
 
+      // RFC 7662 lets the server omit `iss`. The response then speaks only for
+      // the introspection endpoint we were configured to trust, so that endpoint
+      // is the issuer identity. It is never confused with a real issuer: a
+      // response that does report `iss` was checked against
+      // authorizationServers above and is identified by it.
+      const issuer = result.iss !== undefined
+        ? normalizeIssuer(result.iss)
+        : `introspection:${this.config.tokenValidation.introspectionEndpoint}`
+
       return {
         valid: true,
-        payload: result
+        payload: result,
+        issuer
       }
     } catch (error) {
       this.fastify.log.error({ err: error, endpoint: this.config.tokenValidation.introspectionEndpoint }, 'Token introspection failed')

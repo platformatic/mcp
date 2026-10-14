@@ -2,6 +2,7 @@ import type { FastifyRequest, FastifyReply, preHandlerHookHandler } from 'fastif
 import type { AuthorizationConfig, ScopeImplies } from '../types/auth-types.ts'
 import { TokenValidator } from './token-validator.ts'
 import { isStdioRequest } from '../stdio-trust.ts'
+import { getResourceMetadataUrl } from './resource-metadata.ts'
 
 export function createAuthPreHandler (
   config: AuthorizationConfig,
@@ -84,6 +85,7 @@ export function createAuthPreHandler (
     // Add token payload to request context for downstream handlers
     // @ts-ignore - Adding custom property to request
     request.tokenPayload = validationResult.payload
+    request.tokenIssuer = validationResult.issuer
 
     request.log.debug({ sub: validationResult.payload?.sub }, 'Token validation successful')
   }
@@ -165,7 +167,7 @@ export function generateWWWAuthenticateHeader (config: AuthorizationConfig, chal
   if (!config.enabled) {
     throw new Error('Authorization is disabled')
   }
-  const resourceMetadataUrl = `${config.resourceUri}/.well-known/oauth-protected-resource`
+  const resourceMetadataUrl = getResourceMetadataUrl(config.resourceUri)
   const params = ['realm="MCP Server"', `resource_metadata="${resourceMetadataUrl}"`]
 
   if (challenge.error) {
@@ -188,5 +190,7 @@ export function generateWWWAuthenticateHeader (config: AuthorizationConfig, chal
 declare module 'fastify' {
   interface FastifyRequest {
     tokenPayload?: any
+    /** Canonical issuer identity of the validated token, see TokenValidationResult.issuer */
+    tokenIssuer?: string
   }
 }

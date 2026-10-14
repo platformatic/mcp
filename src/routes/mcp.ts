@@ -1,5 +1,5 @@
 import { randomUUID } from 'crypto'
-import type { FastifyError, FastifyRequest, FastifyReply, FastifyPluginAsync, FastifySchema, preHandlerHookHandler } from 'fastify'
+import type { FastifyError, FastifyInstance, FastifyRequest, FastifyReply, FastifyPluginAsync, FastifySchema, preHandlerHookHandler } from 'fastify'
 import fp from 'fastify-plugin'
 import type { JSONRPCMessage, JSONRPCNotification, JSONRPCRequest, JSONRPCResponse, JSONRPCError } from '../schema.ts'
 import {
@@ -27,6 +27,7 @@ import type {
   MCPRouteSchemaTransformer
 } from '../types.ts'
 import type { SessionStore, SessionMetadata } from '../stores/session-store.ts'
+import { DEFAULT_SESSION_TTL_MS } from '../stores/memory-session-store.ts'
 import type { TaskStore, TaskWaiters } from '../stores/task-store.ts'
 import type { MessageBroker } from '../brokers/message-broker.ts'
 import type { AuthorizationContext } from '../types/auth-types.ts'
@@ -80,6 +81,18 @@ const INVALID_BODY_CODES = new Set([
   'FST_ERR_CTP_INVALID_MEDIA_TYPE',
   'FST_ERR_CTP_INVALID_CONTENT_LENGTH'
 ])
+
+// A hook or parser can throw/reject with a non-Error value (a string, a plain
+// object). Fastify would send such a value as the response body, so give the
+// parent handler a generic Error instead and keep the original as `cause`.
+function toError (value: unknown): FastifyError {
+  if (value instanceof Error) {
+    return value as FastifyError
+  }
+  const error = new Error('Internal Server Error', { cause: value }) as FastifyError
+  error.statusCode = 500
+  return error
+}
 
 function resolveRouteUrl (prefix: string | undefined, url: string): string {
   if (!prefix || prefix === '/') {
@@ -249,16 +262,63 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     ;(request as any).mcpProtocolVersion = negotiated
   }
 
+  function getRequestSessionId (request: FastifyRequest): string | undefined {
+    return (request.headers['mcp-session-id'] as string | undefined) ||
+      (request.method === 'GET' ? (request.query as any)?.['mcp-session-id'] : undefined)
+  }
+
+  /**
+   * A session created under an access token belongs to that token's issuer and
+   * subject: two authorization servers may assign the same `sub` to different
+   * users, so the subject alone does not identify the owner. Anyone else
+   * presenting its ID gets the same 404 as for an unknown session: the
+   * Streamable HTTP transport defines 404 as "this session does not exist for
+   * you", and a 403 would confirm to an attacker that the ID is live. Runs
+   * ahead of anything else that reads the session. Modern requests have no
+   * session, and ignore a stray `Mcp-Session-Id`.
+   */
+  async function enforceSessionOwner (request: FastifyRequest, reply: FastifyReply): Promise<void> {
+    if (isModern(request)) return
+    const sessionId = getRequestSessionId(request)
+    if (!sessionId) return
+
+    const session = await sessionStore.get(sessionId)
+    if (session?.ownerSub === undefined) return
+
+    if (session.ownerSub !== request.tokenPayload?.sub || session.ownerIss !== request.tokenIssuer) {
+      request.log.warn({ sessionId }, 'Rejected MCP request for a session owned by a different user')
+      return reply.code(404).type('application/json').send({ error: 'Session not found' })
+    }
+  }
+
   // Scoped to the /mcp routes only: this plugin is not encapsulated, so an
   // app-level hook would also cover the OAuth and well-known routes.
   const mcpOnRequest = [validateOrigin, validateProtocolVersionHeader]
   // When authorization is scoped to the MCP routes, the auth check runs first,
-  // as it would if it were registered as a global preHandler hook.
+  // as it would if it were registered as a global preHandler hook, so the
+  // session owner check sees the verified token.
   const mcpPreHandler: preHandlerHookHandler[] = authPreHandler
-    ? [authPreHandler, enforceProtocolVersionHeader, reconcileProtocolVersion]
-    : [enforceProtocolVersionHeader, reconcileProtocolVersion]
+    ? [authPreHandler, enforceProtocolVersionHeader, enforceSessionOwner, reconcileProtocolVersion]
+    : [enforceProtocolVersionHeader, enforceSessionOwner, reconcileProtocolVersion]
 
-  async function createSSESession (): Promise<SessionMetadata> {
+  // Heartbeats refresh session activity, so they must come more often than the
+  // idle TTL or a live stream's session could expire between two of them
+  const heartbeatIntervalMs = Math.min(30_000, Math.max(1, Math.floor((opts.sessionTtlMs ?? DEFAULT_SESSION_TTL_MS) / 2)))
+
+  function buildAuthContext (payload: any): AuthorizationContext {
+    return {
+      userId: payload.sub,
+      clientId: payload.client_id || payload.azp,
+      scopes: typeof payload.scope === 'string' ? payload.scope.split(' ') : payload.scopes,
+      audience: Array.isArray(payload.aud) ? payload.aud : payload.aud ? [payload.aud] : undefined,
+      tokenType: 'Bearer',
+      expiresAt: payload.exp ? new Date(payload.exp * 1000) : undefined,
+      issuedAt: payload.iat ? new Date(payload.iat * 1000) : undefined,
+      authorizationServer: payload.iss
+    }
+  }
+
+  async function createSession (request: FastifyRequest): Promise<SessionMetadata> {
     const sessionId = randomUUID()
     const session: SessionMetadata = {
       id: sessionId,
@@ -268,7 +328,22 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
       lastActivity: new Date()
     }
 
+    // Bind the session to whoever created it, so its ID alone is not enough to
+    // act as that user.
+    const payload = request.tokenPayload
+    if (payload && typeof payload.sub === 'string') {
+      session.ownerSub = payload.sub
+      session.ownerIss = request.tokenIssuer
+      session.authorization = buildAuthContext(payload)
+    }
+
     await sessionStore.create(session)
+
+    // Without SSE there is no stream to deliver to, so skip the subscription
+    if (!enableSSE) {
+      return session
+    }
+
     localStreams.set(sessionId, new Set())
 
     // Subscribe to messages for this session
@@ -437,17 +512,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
     const payload = request.tokenPayload
     if (!payload) return undefined
-
-    return {
-      userId: payload.sub,
-      clientId: payload.client_id || payload.azp,
-      scopes: typeof payload.scope === 'string' ? payload.scope.split(' ') : payload.scopes,
-      audience: Array.isArray(payload.aud) ? payload.aud : payload.aud ? [payload.aud] : undefined,
-      tokenType: 'Bearer',
-      expiresAt: payload.exp ? new Date(payload.exp * 1000) : undefined,
-      issuedAt: payload.iat ? new Date(payload.iat * 1000) : undefined,
-      authorizationServer: payload.iss
-    }
+    return buildAuthContext(payload)
   }
 
   /**
@@ -756,14 +821,19 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
    * client reads a 400 without a JSON-RPC error as a server that does not
    * speak this revision. Anything else goes to the application's handler.
    */
-  function bodyParserErrorHandler (error: FastifyError, request: FastifyRequest, reply: FastifyReply): JSONRPCError {
+  function bodyParserErrorHandler (thrown: unknown, request: FastifyRequest, reply: FastifyReply) {
+    const error = toError(thrown)
     const code = PARSE_ERROR_CODES.has(error.code) || (error instanceof SyntaxError && error.statusCode === 400)
       ? PARSE_ERROR
       : INVALID_BODY_CODES.has(error.code) ? INVALID_REQUEST : undefined
-    if (code === undefined) throw error
+    if (code === undefined) {
+      // Call the encapsulating instance's handler (the user's setErrorHandler,
+      // or Fastify's default) directly: rethrowing only delegates for Errors.
+      return (app as FastifyInstance).errorHandler(error, request, reply)
+    }
     request.log.info({ err: error }, 'Rejected MCP request body')
-    reply.code(error.statusCode ?? 400).type('application/json')
-    return createError(null, code, code === PARSE_ERROR ? 'Parse error' : error.message)
+    return reply.code(error.statusCode ?? 400).type('application/json')
+      .send(createError(null, code, code === PARSE_ERROR ? 'Parse error' : 'Invalid Request'))
   }
 
   const postRouteOptions = {
@@ -809,23 +879,22 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
       }
 
       const message = request.body as JSONRPCMessage
-      let sessionId = request.headers['mcp-session-id'] as string
+      let sessionId = request.headers['mcp-session-id'] as string | undefined
+      const existingSession = sessionId ? await sessionStore.get(sessionId) : null
 
-      if (enableSSE) {
-        let session: SessionMetadata
-        if (sessionId) {
-          const existingSession = await sessionStore.get(sessionId)
-          if (existingSession) {
-            session = existingSession
-          } else {
-            session = await createSSESession()
-            reply.header('Mcp-Session-Id', session.id)
-          }
-        } else {
-          session = await createSSESession()
-          reply.header('Mcp-Session-Id', session.id)
-        }
+      // Sessions belong to Streamable HTTP, not to SSE. Without SSE we only open
+      // one on initialize: other requests keep working statelessly as before,
+      // and stateless clients do not each leave a session behind.
+      if (!existingSession && (enableSSE || isInitializeRequest(message))) {
+        const session = await createSession(request)
+        reply.header('Mcp-Session-Id', session.id)
         sessionId = session.id
+      }
+
+      // Each request on a session counts as activity, so sessions that are in
+      // use are not expired by the store's idle TTL
+      if (existingSession) {
+        await sessionStore.touch?.(existingSession.id)
       }
 
       // Build auth context from validated token payload or the custom resolver.
@@ -885,16 +954,15 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     }
   })
 
-  // Without SSE there is no standing stream to open and no session to end, so
-  // both methods answer 405 as the transport asks, naming what is allowed.
+  // Without SSE there is no standing stream to open, so GET answers 405 as the
+  // transport asks, naming what is allowed. Sessions can still be ended.
   if (!enableSSE) {
-    const notAllowed = async (request: FastifyRequest, reply: FastifyReply) => {
-      reply.header('Allow', 'POST').type('application/json').code(405).send({
+    app.get('/mcp', { onRequest: mcpOnRequest, preHandler: mcpPreHandler }, async (request: FastifyRequest, reply: FastifyReply) => {
+      if (rejectModernSessionMethod(request, reply)) return
+      reply.header('Allow', 'POST, DELETE').type('application/json').code(405).send({
         error: `Method Not Allowed: ${request.method} requires SSE, which is not enabled`
       })
-    }
-    app.get('/mcp', { onRequest: mcpOnRequest, preHandler: mcpPreHandler }, notAllowed)
-    app.delete('/mcp', { onRequest: mcpOnRequest, preHandler: mcpPreHandler }, notAllowed)
+    })
   }
 
   if (enableSSE) {
@@ -911,13 +979,12 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
       if (rejectModernSessionMethod(request, reply)) return
 
       if (!supportsSSE(request)) {
-        reply.type('application/json').code(405).send({ error: 'Method Not Allowed: SSE not supported' })
+        reply.header('Allow', 'GET, POST, DELETE').type('application/json').code(405).send({ error: 'Method Not Allowed: SSE not supported' })
         return
       }
 
       try {
-        const sessionId = (request.headers['mcp-session-id'] as string) ||
-                       (request.query as any)['mcp-session-id']
+        const sessionId = getRequestSessionId(request)
 
         // Check if there's already an active SSE session
         if (hasActiveSSESession(sessionId)) {
@@ -943,12 +1010,13 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
           const existingSession = await sessionStore.get(sessionId)
           if (existingSession) {
             session = existingSession
+            await sessionStore.touch?.(session.id)
           } else {
-            session = await createSSESession()
+            session = await createSession(request)
             raw.setHeader('Mcp-Session-Id', session.id)
           }
         } else {
-          session = await createSSESession()
+          session = await createSession(request)
           raw.setHeader('Mcp-Session-Id', session.id)
         }
 
@@ -1018,10 +1086,15 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         // Send initial heartbeat
         reply.raw.write(': heartbeat\n\n')
 
-        // Keep connection alive with periodic heartbeats
+        // Keep connection alive with periodic heartbeats. Each heartbeat also
+        // counts as session activity, so an open stream keeps its session from
+        // expiring even when no messages flow over it.
         const heartbeatInterval = setInterval(() => {
           try {
             reply.raw.write(': heartbeat\n\n')
+            sessionStore.touch?.(session.id)?.catch((err: unknown) => {
+              app.log.warn({ err, sessionId: session.id }, 'Failed to refresh session activity on heartbeat')
+            })
           } catch (error) {
             clearInterval(heartbeatInterval)
             const streams = localStreams.get(session.id)
@@ -1029,7 +1102,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
               streams.delete(reply)
             }
           }
-        }, 30000) // 30 second heartbeat
+        }, heartbeatIntervalMs)
         heartbeatInterval.unref()
 
         reply.raw.on('close', () => {
@@ -1046,7 +1119,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
   }
 
   // DELETE endpoint for explicit session termination (MCP spec)
-  if (enableSSE) {
+  {
     const deleteSchema = resolveMcpRouteSchema(undefined, {
       routeId: 'mcp.delete',
       method: 'DELETE',

@@ -76,6 +76,15 @@ export interface HandlerContext {
   log: (level: LoggingLevel, data: unknown, logger?: string) => void
 }
 
+// Context passed to resource read handlers
+export interface ResourceHandlerContext extends HandlerContext {
+  /**
+   * Values extracted from the requested URI when it was matched against a
+   * registered URI template, e.g. `{ id: '42' }` for `diary://{id}`.
+   */
+  uriParams?: Record<string, string>
+}
+
 // Resource subscription handler types
 export type ResourceSubscribeHandler = (
   params: { uri: string },
@@ -101,7 +110,7 @@ export type ToolHandler<TSchema extends TObject = TObject> = (
 
 export type ResourceHandler<TUriSchema extends TSchema = TString> = (
   uri: Static<TUriSchema>,
-  context: HandlerContext
+  context: ResourceHandlerContext
 ) => Promise<ReadResourceResult> | ReadResourceResult
 
 export type PromptHandler<TArgsSchema extends TObject = TObject> = (
@@ -229,7 +238,7 @@ declare module 'fastify' {
 
 // Unsafe handler types for backward compatibility
 export type UnsafeToolHandler = (params: any, context: HandlerContext) => Promise<CallToolResult> | CallToolResult
-export type UnsafeResourceHandler = (uri: string, context: HandlerContext) => Promise<ReadResourceResult> | ReadResourceResult
+export type UnsafeResourceHandler = (uri: string, context: ResourceHandlerContext) => Promise<ReadResourceResult> | ReadResourceResult
 export type UnsafePromptHandler = (name: string, args: any, context: HandlerContext) => Promise<GetPromptResult> | GetPromptResult
 
 // Unsafe interfaces for backward compatibility
@@ -366,6 +375,14 @@ export interface MCPPluginOptions {
    * open indefinitely, which stays valid.
    */
   sseMaxConnectionMs?: number
+  /**
+   * Expire a session after this many milliseconds without activity (default
+   * 3600000, one hour). Any request carrying the session id and every SSE
+   * heartbeat count as activity, so sessions in use are kept; sessions a client
+   * abandons without `DELETE /mcp` are removed. Applies to both the memory and
+   * the Redis session store.
+   */
+  sessionTtlMs?: number
   /**
    * Enable task-augmented execution (2025-11-25, experimental). Tools opt in
    * individually via `execution.taskSupport`.
