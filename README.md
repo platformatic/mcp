@@ -1810,6 +1810,8 @@ Authorization-aware metadata endpoints:
 - `GET /.well-known/mcp-server` - Server metadata (protected)
 - `GET /health` - Health check (public)
 
+Authorization server metadata is not served by this plugin. Clients discover it from the authorization servers listed in `authorization_servers` of the protected resource metadata (RFC 8414 / OpenID Connect Discovery on the authorization server itself).
+
 ### Security Considerations
 
 #### Token Security
