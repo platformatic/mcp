@@ -1,6 +1,5 @@
 import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify'
 import fp from 'fastify-plugin'
-import cors from '@fastify/cors'
 import type { AuthorizationConfig, ProtectedResourceMetadata } from '../types/auth-types.ts'
 import { getResourceMetadataPath, PROTECTED_RESOURCE_METADATA_PATH } from '../auth/resource-metadata.ts'
 
@@ -8,26 +7,55 @@ interface WellKnownRoutesOptions {
   authConfig?: AuthorizationConfig
 }
 
-const wellKnownRoutesPlugin = fp(async function (app: FastifyInstance, opts: WellKnownRoutesOptions) {
-  if (!opts.authConfig?.enabled) {
+const CORS_ALLOWED_METHODS = 'GET, HEAD, OPTIONS'
+const CORS_ALLOWED_HEADERS = [
+  'Content-Type',
+  'Authorization',
+  'mcp-protocol-version',
+  'x-requested-with',
+  'accept',
+  'cache-control'
+].join(', ')
+const CORS_MAX_AGE = '3600' // Cache preflight for 1 hour
+
+const wellKnownRoutesPlugin = fp(async function (fastify: FastifyInstance, opts: WellKnownRoutesOptions) {
+  const authConfig = opts.authConfig
+  if (!authConfig?.enabled) {
     return // Skip registration if authorization is not enabled
   }
 
-  const { authConfig } = opts
+  // The routes and their CORS hook live in an encapsulated child context so
+  // CORS covers only /.well-known/* and never leaks onto the application's
+  // routes (including /mcp, whose CORS policy is left to the application).
+  // @fastify/cors is not used here: it decorates the request and adds a
+  // global OPTIONS * route, both of which clash with an app-level
+  // @fastify/cors registration.
+  await fastify.register(async (app) => wellKnownRoutes(app, authConfig))
+}, {
+  name: 'well-known-routes'
+})
 
-  // Register CORS for well-known endpoints to allow cross-origin requests
-  await app.register(cors, {
-    origin: true, // Allow all origins for discovery endpoints
-    methods: ['GET', 'HEAD', 'OPTIONS'],
-    allowedHeaders: [
-      'Content-Type',
-      'Authorization',
-      'mcp-protocol-version',
-      'x-requested-with',
-      'accept',
-      'cache-control'
-    ],
-    maxAge: 3600 // Cache preflight for 1 hour
+async function wellKnownRoutes (app: FastifyInstance, authConfig: AuthorizationConfig & { enabled: true }) {
+  // Discovery endpoints are public, so allow cross-origin requests from any origin
+  app.addHook('onRequest', async (request, reply) => {
+    const origin = request.headers.origin
+    if (!origin) {
+      return
+    }
+    reply.header('Access-Control-Allow-Origin', origin)
+    reply.header('Vary', 'Origin')
+
+    if (request.method === 'OPTIONS' && request.headers['access-control-request-method']) {
+      reply.header('Access-Control-Allow-Methods', CORS_ALLOWED_METHODS)
+      reply.header('Access-Control-Allow-Headers', CORS_ALLOWED_HEADERS)
+      reply.header('Access-Control-Max-Age', CORS_MAX_AGE)
+      return reply.code(204).send()
+    }
+  })
+
+  // Lets the router accept preflight requests; they are answered in the hook above
+  app.options('/.well-known/*', async (_request, reply) => {
+    return reply.callNotFound()
   })
 
   const protectedResourceSchema = {
@@ -110,8 +138,6 @@ const wellKnownRoutesPlugin = fp(async function (app: FastifyInstance, opts: Wel
       timestamp: new Date().toISOString()
     }
   })
-}, {
-  name: 'well-known-routes'
-})
+}
 
 export default wellKnownRoutesPlugin
