@@ -245,7 +245,7 @@ describe('Resource Templates', () => {
 
       for (const uri of ['moltnet://diary/1/2', 'moltnet://diary/', 'moltnet://diary', 'xmoltnet://diary/1', 'moltnet://diary/1x/']) {
         const body = await read(app, uri)
-        t.assert.strictEqual(body.error?.code, -32601, uri)
+        t.assert.strictEqual(body.error?.code, -32002, uri)
       }
     })
 
@@ -259,7 +259,7 @@ describe('Resource Templates', () => {
         contents: [{ uri, text: 'ok' }]
       }))
 
-      t.assert.strictEqual((await read(app, 'app://v1x0/42')).error?.code, -32601)
+      t.assert.strictEqual((await read(app, 'app://v1x0/42')).error?.code, -32002)
       t.assert.ok((await read(app, 'app://v1.0/42')).result)
     })
 
@@ -291,7 +291,7 @@ describe('Resource Templates', () => {
         contents: [{ uri, text: 'ok' }]
       }))
 
-      t.assert.strictEqual((await read(app, 'files://a')).error?.code, -32601)
+      t.assert.strictEqual((await read(app, 'files://a')).error?.code, -32002)
     })
   })
 
