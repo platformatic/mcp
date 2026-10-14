@@ -3,6 +3,8 @@ import type { AuthorizationConfig, ScopeImplies } from '../types/auth-types.ts'
 import { TokenValidator } from './token-validator.ts'
 import { getResourceMetadataUrl } from './resource-metadata.ts'
 
+export const BEARER_SCHEME = /^bearer +(.*)$/i
+
 export function createAuthPreHandler (
   config: AuthorizationConfig,
   tokenValidator: TokenValidator
@@ -39,11 +41,13 @@ export function createAuthPreHandler (
       })
     }
 
-    if (!authHeader.startsWith('Bearer ')) {
+    // The auth-scheme is case-insensitive (RFC 7235 Section 2.1, RFC 6750 Section 2.1)
+    const match = BEARER_SCHEME.exec(authHeader)
+    if (!match) {
       return sendInvalidToken(reply, config, 'Authorization header must use Bearer scheme')
     }
 
-    const token = authHeader.substring(7) // Remove 'Bearer ' prefix
+    const token = match[1]
     if (!token) {
       return sendInvalidToken(reply, config, 'Bearer token is empty')
     }

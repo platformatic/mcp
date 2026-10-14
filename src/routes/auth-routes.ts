@@ -2,6 +2,7 @@ import type { FastifyInstance, FastifyPluginAsync } from 'fastify'
 import fp from 'fastify-plugin'
 import { Type } from '@sinclair/typebox'
 import type { PKCEChallenge } from '../auth/oauth-client.ts'
+import { BEARER_SCHEME } from '../auth/prehandler.ts'
 import type { SessionStore } from '../stores/session-store.ts'
 import type { DCRHooks, DCRRequest, DCRResponse } from '../types/auth-types.ts'
 
@@ -311,13 +312,14 @@ const authRoutesPlugin: FastifyPluginAsync<AuthRoutesOptions> = async (fastify: 
   }, async (request, reply) => {
     try {
       const authHeader = request.headers.authorization
-      if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      const match = authHeader && BEARER_SCHEME.exec(authHeader)
+      if (!match) {
         return reply.send({
           authenticated: false
         })
       }
 
-      const token = authHeader.substring(7)
+      const token = match[1]
       const isValid = await fastify.oauthClient.validateToken(token)
 
       return reply.send({
@@ -444,14 +446,15 @@ const authRoutesPlugin: FastifyPluginAsync<AuthRoutesOptions> = async (fastify: 
   }, async (request, reply) => {
     try {
       const authHeader = request.headers.authorization
-      if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      const match = authHeader && BEARER_SCHEME.exec(authHeader)
+      if (!match) {
         return reply.status(400).send({
           error: 'invalid_request',
           error_description: 'Missing or invalid authorization header'
         })
       }
 
-      const token = authHeader.substring(7)
+      const token = match[1]
 
       // In a full implementation, you would revoke the token at the authorization server
       // For now, we just return success
