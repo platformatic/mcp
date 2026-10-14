@@ -322,6 +322,11 @@ curl -X POST http://localhost:3000/mcp \
         "io.modelcontextprotocol/clientCapabilities":{}}}}'
 ```
 
+`supportedVersions` (and `data.supported` on `-32022`) lists every revision the server speaks,
+legacy ones included, as the specification's own example does. Only `2026-07-28` can be sent
+per request in `_meta`; the legacy revisions are reached through `initialize`, so a client that
+gets `-32022` for a legacy version should start a handshake rather than retry with `_meta`.
+
 ### What 2026-07-28 removed
 
 These are answered with `404` and `-32601` on the modern path, and continue to work
@@ -401,13 +406,26 @@ app.mcpAddTool({
 
   // On the retry, `requestState` is the value above, verified and unsealed.
   const { title } = context.requestState as { title: string }
+  // The user may decline or cancel: only an accepted answer carries content.
+  if (answer.action !== 'accept') {
+    return { content: [{ type: 'text', text: 'Cancelled' }], isError: true }
+  }
   return { content: [{ type: 'text', text: `Created "${title}" in ${answer.content?.name}` }] }
 })
 ```
 
-A handler may ask in several steps. Each retry hands it every answer given so far, not just
+Answers are checked before the handler sees them: each must be a result of the method it
+answered, and an accepted elicitation must match what was asked — content conforming to the
+form's `requestedSchema`, or no content for a URL-mode elicitation. A non-conforming answer is
+refused with `-32602`, on a retry and on `tasks/update` alike. Content sent with `decline` or
+`cancel` is not checked, so handlers should look at `action` first.
+
+A handler may ask in several steps. Each retry hands it the answers given so far, not just
 the latest round's, so the second step still sees the first answer, as it would when running
-as a task. A key asked again is replaced by its new answer.
+as a task. A key asked again is replaced by its new answer. The client echoes those answers
+back on every retry, so they are bounded by `requestStateMaxAnswerBytes` (64 KiB of JSON by
+default; `0` turns carrying off): past it the oldest answers are dropped. A handler that needs
+a large or early answer later should keep what it needs in its own `state`.
 
 `elicitForm`, `elicitUrl`, `requestSampling` and `requestRoots` build the entries. The
 dispatcher refuses to send a request the client did not declare support for, answering
@@ -425,7 +443,8 @@ await app.register(mcpPlugin, {
   // Required when more than one instance can serve a retry — the default is a
   // per-process random key, so a retry landing on another replica would be refused.
   requestStateSecret: process.env.MCP_REQUEST_STATE_SECRET,
-  requestStateTtlMs: 5 * 60 * 1000 // default
+  requestStateTtlMs: 5 * 60 * 1000, // default
+  requestStateMaxAnswerBytes: 64 * 1024 // default
 })
 ```
 
@@ -499,6 +518,11 @@ capabilities declare `listChanged: true` for tools, prompts and resources, and
 `resources.subscribe` once `app.mcpSetResourceSubscribeHandler()` is called; an explicit
 `capabilities` option is used exactly as given.
 
+A stream whose reader falls more than 1 MB behind is closed with `notifications/cancelled`
+and no final response: notifications were lost, so the client should reconnect and
+resynchronize rather than treat it as a graceful end. On stdio the same limit applies once
+stdout stops draining.
+
 Each stream holds a socket and buffers, so streams are bounded:
 `subscriptionMaxStreamsPerPrincipal` per caller (default 10, refused with HTTP `429`),
 `subscriptionMaxStreams` per instance (default 1000), and `subscriptionMaxResourceUris` per
@@ -562,11 +586,31 @@ Both are sent only when the client asked for them, on the response stream of tha
 
 Notifications are held until the outcome is known, or until the handler has run for 200ms.
 A request that never reports, or that fails before then, answers with plain JSON and its
-proper status (for example `400` for a missing client capability). Otherwise the response is
-a `text/event-stream` carrying the notifications and then the result. Once streaming has
-started the status is committed to `200`, so a later error arrives inside the stream. Nothing
-is sent after the response. Both are no-ops on the legacy path and for tasks, whose creating
-request has already been answered.
+proper status. Otherwise the response is a `text/event-stream` carrying the notifications and
+then the result. Once streaming has started the status is committed to `200`, so a later
+error arrives inside the stream. Nothing is sent after the response. Both are no-ops on the
+legacy path and for tasks, whose creating request has already been answered.
+
+A missing client capability must be answered with `400` and `-32021`, which a stream can no
+longer do. So a `tools/call`, `prompts/get` or `resources/read` only starts streaming early
+when the handler cannot need a capability the client lacks: by default, when the client
+declared every capability an input request can need (`elicitation` form and URL,
+`sampling` with `tools` and `context`, and `roots`). Otherwise its notifications wait for the
+outcome. A tool can name what it may ask for, so clients that declared that much still get
+live progress:
+
+```typescript
+app.mcpAddTool({
+  name: 'deploy',
+  inputSchema: Type.Object({}),
+  // Only ever asks with elicitForm(): clients with form elicitation get live progress.
+  inputCapabilities: { elicitation: { form: {} } }
+}, handler)
+```
+
+`inputCapabilities: {}` says the tool never asks for input, so it always streams early.
+`inputCapabilities` is never listed to clients. A tool that then asks for more than it
+declared, after progress has streamed, gets an internal error instead of `-32021`.
 
 ## Result Caching (2026-07-28)
 
@@ -658,6 +702,15 @@ extension, with `-32021`.
 While a task waits in `input_required`, `tasks/get` shows the input requests its handler made,
 which were checked against the capabilities of the request that created the task. Poll with
 the same capabilities you created it with.
+
+A task's handler may ask for input up to `taskMaxInputRounds` times (32 by default) before the
+task fails; a synchronous call has no such bound, because each retry is the client's choice.
+A handler that throws `InputRequired` with only `state` and nothing to ask is run again after
+the task's `pollIntervalMs`, as a client would retry it, rather than at once.
+
+A tool result with `isError: true` completes a 2026-07-28 task: the extension reserves
+`failed` for JSON-RPC errors, and the error result is inlined like any other. A 2025-11-25
+task with such a result is still reported `failed`, as before.
 
 On `2025-11-25`, the client opts in per call instead:
 
@@ -2089,7 +2142,7 @@ await app.register(mcpPlugin, {
 })
 ```
 
-The hook fires exactly once per tool call, after it settles: for JSON-RPC `tools/call`, for `app.mcpCallTool()`, and for a task-augmented call once execution finishes (not when the task is merely accepted). It also fires for access denial, unknown tools, invalid arguments, task-required outcomes, and a handler asking for client input (`reason: 'input-required'`; a multi round-trip retry is a new call and fires again). A task that pauses for client input is still one call: the hook fires once, with the final outcome. It does not fire for `tools/list`, initialization/ping, or malformed requests where no tool name was resolved.
+The hook fires exactly once per tool call, after it settles: for JSON-RPC `tools/call`, for `app.mcpCallTool()`, and for a task-augmented call once execution finishes (not when the task is merely accepted). It also fires for access denial, unknown tools, invalid arguments, task-required outcomes, and a handler asking for client input (`reason: 'input-required'`; a multi round-trip retry is a new call and fires again). A task that pauses for client input is still one call: the hook fires once, when the task ends, with its final outcome. When the task ended `failed` or `cancelled` although its last round returned a result or asked for input (cancelled after the handler returned, out of input rounds, or timed out waiting for input), the outcome is `{ ok: false, reason: 'task-ended', status, message }`. It does not fire for `tools/list`, initialization/ping, or malformed requests where no tool name was resolved.
 
 `event.source` is `'json-rpc'`, `'in-process'`, or `'task'`. `event.outcome` is the same `McpCallToolOutcome` returned by `mcpCallTool()`. The hook is awaited before the response is sent, so keep it fast; a throwing or rejecting hook is logged and otherwise ignored — it never changes the tool response.
 
@@ -2392,6 +2445,8 @@ await app.register(import('@fastify/bearer-auth'), {
 - `requestStateSecret`: Secret (at least 32 bytes) that seals multi round-trip
   `requestState`. Required when `redis` is configured, since any instance may serve a retry
 - `requestStateTtlMs`: How long sealed state stays valid (default 5 minutes). Must be a positive integer; anything else throws at startup
+- `requestStateMaxAnswerBytes`: How many bytes of JSON of earlier answers sealed state carries
+  into later rounds (default 65536); the oldest are dropped past it, and `0` carries none
 - `caching`: Freshness hints per cacheable operation (default `{ ttlMs: 0, cacheScope: 'private' }`)
 - `enableTasks`: Enable tasks (the 2025-11-25 core tasks and the 2026-07-28 extension)
 - `taskDefaultTtlMs` / `taskMaxTtlMs`: Task retention (defaults 60000 / 3600000)
@@ -2403,6 +2458,8 @@ await app.register(import('@fastify/bearer-auth'), {
   ttl (default 1000). A full store refuses new tasks
 - `taskLeaseMs`: Worker lease; a task whose worker stops renewing it is reported failed
   (default 15000)
+- `taskMaxInputRounds`: How many times a 2026-07-28 task's handler may throw `InputRequired`
+  before the task fails (default 32)
 - `taskShutdownTimeoutMs`: How long `close()` waits for running tasks before failing them
   (default 5000; keep it below Fastify's `pluginTimeout`)
 - `subscriptionMaxStreams` / `subscriptionMaxStreamsPerPrincipal` /
@@ -2461,6 +2518,9 @@ switch (outcome.reason) {
   case 'input-required':
     reply.code(409)
     return { error: 'Tool needs client input', inputRequests: outcome.inputRequests }
+  case 'task-ended': // only reported to onToolCallComplete, for tasks
+    reply.code(500)
+    return { error: outcome.message }
 }
 ```
 
@@ -3061,14 +3121,16 @@ the changes to the plugin's own API and defaults:
 - **`HandlerContext` gained required members**: `signal`, `sendProgress` and `log`. Code that
   builds a context by hand (for example to unit-test a handler) must provide them.
 - **`TaskStore` gained methods**: `updateInputResponses`, `acknowledgeInputResponses`,
-  `renewLease` and `expireStaleLease`. Custom stores must implement them.
+  `renewLease` and `expireStaleLease`. The plugin builds its own store (there is no option to
+  supply one); code that implements the exported `TaskStore` interface for its own use must
+  add them.
 - **Redis task records moved** to the `mcp:task:v2:` keyspace, so instances of different
   versions never misread each other's tasks. Tasks in flight during an upgrade are only
   visible to instances of the version that created them.
 - **Tasks are bound to user, OAuth client and issuer**, not the user alone, in both eras.
   `TaskRecord.authSubject` now holds that principal as a JSON string rather than a bare user
-  id, so custom `TaskStore` implementations and callers of `taskStore.list(subject)` must pass
-  it through unchanged.
+  id, so code that reads task records or calls `list(subject)` on a `MemoryTaskStore` or
+  `RedisTaskStore` directly must pass it through unchanged.
 - **Task limits apply to both eras**: 2025-11-25 tasks count against `taskMaxConcurrent` and
   `taskMaxPerPrincipal`, are aborted at their ttl and are drained on shutdown.
 - **A full in-memory task store refuses new tasks** instead of dropping finished results.
@@ -3085,8 +3147,9 @@ the changes to the plugin's own API and defaults:
   `{ ok: false, reason: 'invalid-arguments' }`.
 - **`McpCallToolOutcome` has an `input-required` variant**: a tool that throws `InputRequired`
   under `mcpCallTool()` now returns `{ ok: false, reason: 'input-required', inputRequests }`
-  instead of rejecting, and `onToolCallComplete` fires with it. Exhaustive `switch` statements
-  over `outcome.reason` need the new case.
+  instead of rejecting, and `onToolCallComplete` fires with it. A `task-ended` variant reports
+  to `onToolCallComplete` a 2026-07-28 task that ended differently from its last round.
+  Exhaustive `switch` statements over `outcome.reason` need the new cases.
 - **Tool arguments are never rewritten.** Keys or string values containing control characters
   (other than tab, newline and carriage return) are refused as invalid arguments instead of
   being stripped, and `validateJsonSchemaInputs` no longer coerces types, injects defaults or

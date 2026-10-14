@@ -40,6 +40,7 @@ import type {
 } from '../schema-2026.ts'
 import { META_SERVER_INFO, TASKS_EXTENSION } from '../schema-2026.ts'
 import type { HandlerDependencies } from '../handlers.ts'
+import type { McpCallToolOutcome } from '../types.ts'
 import {
   createError,
   createResponse,
@@ -56,7 +57,7 @@ import {
 import type { RequestContext } from './request-meta.ts'
 import { supportsTasksExtension } from './request-meta.ts'
 import { InputRequired, requiredCapabilityFor } from './input-required.ts'
-import type { RequestStateSealer } from './request-state.ts'
+import type { ElicitationExpectation, RequestStateSealer } from './request-state.ts'
 import { PrincipalRequiredError, RequestTooDeepError } from './request-state.ts'
 import { collectHeaderParams, validateToolParamHeaders } from './headers.ts'
 import type { TaskRecord } from '../stores/task-store.ts'
@@ -64,6 +65,7 @@ import { isTerminal } from '../stores/task-store.ts'
 import { principalOf } from '../principal.ts'
 import { validateElicitationRequest, validateElicitationUrl } from '../security.ts'
 import { NO_NOTIFIERS } from './request-stream.ts'
+import { createJsonSchemaValidator } from '../validation/json-schema-validator.ts'
 import { TaskStopped, quotaKeyOf, reserveTask, setLongTimeout } from '../task-registry.ts'
 
 /** Freshness hints applied to one cacheable operation. */
@@ -282,6 +284,42 @@ function missingInputCapabilities (
   return Object.keys(missing).length > 0 ? missing : undefined
 }
 
+/** Every capability an input request can need, for handlers that do not say. */
+const ANY_INPUT_CAPABILITIES: ClientCapabilities = {
+  elicitation: { form: {}, url: {} },
+  sampling: { tools: {}, context: {} },
+  roots: {}
+}
+
+/**
+ * Did the client declare every input capability in `needed` (by default,
+ * every one an input request can need)? When it did, a handler asking for
+ * input can never be refused with `-32021`, so the response may start
+ * streaming before the handler is done.
+ */
+export function coversInputCapabilities (
+  clientCapabilities: ClientCapabilities,
+  needed: ClientCapabilities = ANY_INPUT_CAPABILITIES
+): boolean {
+  if (needed.roots !== undefined && clientCapabilities.roots === undefined) return false
+  if (needed.sampling !== undefined) {
+    const declared = clientCapabilities.sampling
+    if (declared === undefined) return false
+    if (needed.sampling.tools !== undefined && declared.tools === undefined) return false
+    if (needed.sampling.context !== undefined && declared.context === undefined) return false
+  }
+  if (needed.elicitation !== undefined) {
+    const declared = clientCapabilities.elicitation
+    if (declared === undefined) return false
+    // An empty object declares form mode only, as missingInputCapabilities reads it.
+    const form = declared.form !== undefined || Object.keys(declared).length === 0
+    const wantsForm = needed.elicitation.form !== undefined || Object.keys(needed.elicitation).length === 0
+    if (wantsForm && !form) return false
+    if (needed.elicitation.url !== undefined && declared.url === undefined) return false
+  }
+  return true
+}
+
 /**
  * What is wrong with the `inputRequests` a handler produced, or `undefined`.
  *
@@ -394,26 +432,76 @@ function invalidResult (method: string, value: Record<string, unknown>): [field:
   }
 }
 
+/** Checks accepted elicitation content; never changes it. */
+let answerValidator: ReturnType<typeof createJsonSchemaValidator> | undefined
+
+/**
+ * What is wrong with an accepted elicitation's content, given what was asked:
+ * a URL-mode elicitation is answered with no content, a form with content
+ * matching its `requestedSchema`. A declined or cancelled one is not checked:
+ * its content is meaningless, and the spec only says it is typically omitted.
+ */
+function invalidElicitationAnswer (
+  value: Record<string, unknown>,
+  expected: ElicitationExpectation | undefined
+): [field: string, expected: string] | undefined {
+  if (expected === undefined || value.action !== 'accept') return undefined
+  if (expected.mode === 'url') {
+    return value.content === undefined ? undefined : ['content', 'to be omitted for a URL-mode elicitation']
+  }
+  if (value.content === undefined) return ['content', 'the submitted data when the action is accept']
+  let problem: string | null
+  try {
+    answerValidator ??= createJsonSchemaValidator()
+    problem = answerValidator.validate(expected.schema, value.content)
+  } catch {
+    // A schema that cannot be compiled is the handler's bug, and was sent to
+    // the client as is: nothing to hold the answer to.
+    return undefined
+  }
+  return problem === null ? undefined : ['content', `content matching the requested schema (${problem})`]
+}
+
 /**
  * What is wrong with the answers to the server's questions, if anything. Each
  * must be the result of the method it was asked with: an elicitation answer
  * is an `ElicitResult`, a sampling answer a `CreateMessageResult`, and so on.
- * Whether accepted content satisfies the `requestedSchema` is for the handler
- * to judge.
+ * An accepted elicitation must also match what was asked for.
  */
 function invalidAnswers (
   inputResponses: Record<string, unknown> | undefined,
   asked: Record<string, string>,
+  elicitations: Record<string, ElicitationExpectation> = {},
   onlyAsked = false
 ): string | undefined {
   for (const [key, value] of Object.entries(inputResponses ?? {})) {
     if (onlyAsked && !Object.hasOwn(asked, key)) continue
     if (!isPlainObject(value)) return `Invalid "inputResponses.${key}": expected a result object`
     const method = asked[key]
-    const problem = method === undefined ? undefined : invalidResult(method, value)
+    const problem = method === undefined
+      ? undefined
+      : invalidResult(method, value) ??
+        (method === 'elicitation/create' ? invalidElicitationAnswer(value, elicitations[key]) : undefined)
     if (problem) return `Invalid "inputResponses.${key}.${problem[0]}": expected ${problem[1]}`
   }
   return undefined
+}
+
+/** What each elicitation among `inputRequests` accepts, keyed as asked. */
+function elicitationExpectations (inputRequests: Record<string, unknown> | undefined): Record<string, ElicitationExpectation> {
+  const expectations: Record<string, ElicitationExpectation> = {}
+  for (const [key, entry] of Object.entries(inputRequests ?? {})) {
+    const request = entry as { method?: unknown, params?: Record<string, unknown> } | undefined
+    if (request?.method !== 'elicitation/create') continue
+    const params = request.params ?? {}
+    if (params.mode === 'url') {
+      expectations[key] = { mode: 'url' }
+    } else if (isPlainObject(params.requestedSchema)) {
+      // As the client received it: a TypeBox schema's symbols do not travel.
+      expectations[key] = { mode: 'form', schema: JSON.parse(JSON.stringify(params.requestedSchema)) }
+    }
+  }
+  return expectations
 }
 
 /**
@@ -489,6 +577,7 @@ function inputRequired (
       params: request.params,
       payload: thrown.state,
       inputs: inputMethods(thrown.inputRequests),
+      elicitations: elicitationExpectations(thrown.inputRequests),
       answers: answersToCarry(dependencies.mrtr?.inputResponses, thrown.inputRequests)
     })
   } catch (error) {
@@ -531,7 +620,13 @@ function inputRequired (
 function openRequestState (
   request: JSONRPCRequest,
   dependencies: ModernDependencies
-): { ok: true, payload: unknown, inputs?: Record<string, string>, answers?: Record<string, unknown> } | { ok: false, error: JSONRPCError } {
+): {
+  ok: true
+  payload: unknown
+  inputs?: Record<string, string>
+  elicitations?: Record<string, ElicitationExpectation>
+  answers?: Record<string, unknown>
+} | { ok: false, error: JSONRPCError } {
   const state = (request.params as { requestState?: unknown } | undefined)?.requestState
   if (state === undefined) return { ok: true, payload: undefined }
 
@@ -550,7 +645,13 @@ function openRequestState (
     return { ok: false, error: createError(request.id, INVALID_PARAMS, `Invalid "requestState": ${opened.reason}`) }
   }
 
-  return { ok: true, payload: opened.claims.payload, inputs: opened.claims.inputs ?? {}, answers: opened.claims.answers }
+  return {
+    ok: true,
+    payload: opened.claims.payload,
+    inputs: opened.claims.inputs ?? {},
+    elicitations: opened.claims.elicitations,
+    answers: opened.claims.answers
+  }
 }
 
 /**
@@ -606,10 +707,30 @@ const DEFAULT_POLL_INTERVAL_MS = 1000
 
 /**
  * How many times a task's handler may come back asking for more input before we
- * give up on it. Bounded so a handler that keeps asking cannot pin the task for
- * its whole ttl.
+ * give up on it, unless `taskMaxInputRounds` says otherwise. Bounded so a
+ * handler that keeps asking cannot pin the task for its whole ttl.
  */
-const MAX_TASK_INPUT_ROUNDS = 8
+const DEFAULT_TASK_MAX_INPUT_ROUNDS = 32
+
+/** How a task ended, as recorded in the store. */
+interface TaskEnd {
+  status: 'completed' | 'failed' | 'cancelled'
+  statusMessage?: string
+}
+
+/** Wait `ms`, or less if `signal` aborts first. Never rejects. */
+function sleep (ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.resolve()
+  return new Promise(resolve => {
+    const done = () => {
+      clearTimeout(timer)
+      signal.removeEventListener('abort', done)
+      resolve()
+    }
+    const timer = setTimeout(done, ms)
+    signal.addEventListener('abort', done, { once: true })
+  })
+}
 
 /** Project a stored record onto the extension's wire `Task`. */
 function toExtensionTask (record: TaskRecord): Task {
@@ -737,17 +858,25 @@ async function handleTasksUpdate (
     const stagedThisRound = Object.hasOwn(staged, key) && (stagedRounds[key] ?? round) === round
     if (record.answeredInputKeys?.includes(key) || stagedThisRound) delete awaiting[key]
   }
-  const invalidAnswer = invalidAnswers(params.inputResponses as Record<string, unknown>, awaiting, true)
+  const invalidAnswer = invalidAnswers(
+    params.inputResponses as Record<string, unknown>,
+    awaiting,
+    elicitationExpectations(record.inputRequests),
+    true
+  )
   if (invalidAnswer) return createError(request.id, INVALID_PARAMS, invalidAnswer)
 
   // Atomically move new answers into the store-backed publication outbox.
   // Previously this only marked keys answered, so a broker failure made the
   // values unrecoverable and a retry was silently ignored.
-  const update = await dependencies.taskStore!.updateInputResponses(
-    params.taskId,
-    params.inputResponses as Record<string, unknown>,
-    randomUUID()
-  )
+  // Only what was checked above goes to the store: the keys this round asked
+  // for, and retries of ones already staged. The store accepts them only if
+  // the round is still the one they were checked against, so an answer cannot
+  // slip into a round the worker opened in between without being validated.
+  const asked = inputMethods(record.inputRequests)
+  const checked = Object.fromEntries(Object.entries(params.inputResponses as Record<string, unknown>)
+    .filter(([key]) => Object.hasOwn(asked, key) || Object.hasOwn(staged, key)))
+  const update = await dependencies.taskStore!.updateInputResponses(params.taskId, checked, randomUUID(), round)
   if (!update) {
     return createError(request.id, INVALID_PARAMS, `Task '${params.taskId}' not found`)
   }
@@ -1009,7 +1138,7 @@ async function runAsTask (
   request: JSONRPCRequest,
   execute: (resume: TaskResume | undefined, signal: AbortSignal) => Promise<JSONRPCResponse | JSONRPCError>,
   dependencies: ModernDependencies,
-  settled?: () => Promise<void>
+  settled?: (end: TaskEnd) => Promise<void>
 ): Promise<JSONRPCResponse | JSONRPCError | undefined> {
   const { taskStore, taskWaiters, taskInputs, app, opts } = dependencies
 
@@ -1119,8 +1248,9 @@ async function runAsTask (
 
     // Bound the number of rounds: a handler that asks for the same thing
     // forever would otherwise pin the task until its ttl elapses.
+    const maxRounds = opts.taskMaxInputRounds ?? DEFAULT_TASK_MAX_INPUT_ROUNDS
     try {
-      for (let round = 0; round <= MAX_TASK_INPUT_ROUNDS; round++) {
+      for (let round = 0; round <= maxRounds; round++) {
         // Stopped before it ever ran (the server began shutting down while the
         // task was being created): the handler must not start.
         if (round === 0 && stopped.aborted) {
@@ -1152,16 +1282,26 @@ async function runAsTask (
             fail(stopMessage())
             break
           }
-          if (!(error instanceof InputRequired) || !taskInputs || round >= MAX_TASK_INPUT_ROUNDS) {
+          if (!(error instanceof InputRequired) || !taskInputs) {
             fail(`Tool execution failed: ${error?.message ?? error}`)
+            break
+          }
+          if (round >= maxRounds) {
+            fail(`Tool execution failed: input was still required after ${maxRounds} rounds`)
             break
           }
 
           // Nothing to ask the client: the handler only wants to resume with
-          // its state, which a task can do at once, like an immediate MRTR retry.
+          // its state, as a client would retry. Waiting the poll interval first
+          // keeps a handler that is waiting on something else from spinning.
           const requests = error.inputRequests ?? {}
           if (Object.keys(requests).length === 0) {
             state = error.state
+            await sleep(record.pollInterval ?? DEFAULT_POLL_INTERVAL_MS, stopped)
+            if (stopped.aborted) {
+              fail(stopMessage())
+              break
+            }
             continue
           }
 
@@ -1224,6 +1364,8 @@ async function runAsTask (
       fail('Internal server error')
     }
 
+    // What the task ended as: a cancellation recorded first wins over ours.
+    let recorded: TaskEnd = { status, statusMessage }
     try {
       const updated = await taskStore!.updateStatus(record.taskId, status, {
         statusMessage: statusMessage ?? null,
@@ -1234,13 +1376,19 @@ async function runAsTask (
       if (updated) taskWaiters?.notify(updated)
     } catch (error) {
       app.log.debug({ err: error, taskId: record.taskId }, 'Could not record task outcome')
+      try {
+        const current = await taskStore!.get(record.taskId)
+        if (current && isTerminal(current.status)) {
+          recorded = { status: current.status as TaskEnd['status'], statusMessage: current.statusMessage }
+        }
+      } catch {}
     } finally {
       clearInterval(leaseTimer)
       ttlTimer.clear()
       stopListening?.()
       taskInputs?.forget(record.taskId)
     }
-    await settled?.()
+    await settled?.(recorded)
   })()
 
   // Nothing awaits `execution`; the guard keeps an unexpected throw from
@@ -1363,11 +1511,13 @@ async function modernToolsCall (
   // get a task handle back without having asked for one per request.
   if (tasksAvailable && clientHasTasks && taskSupport !== 'forbidden') {
     // A task is one call however many input rounds it takes: the hook fires
-    // once, with the final outcome, timed from the task's start. A round that
-    // asks for input only reports if no later round runs (the task timed out
-    // or was cancelled while waiting).
+    // once, when the task ends, timed from its start. It reports the last
+    // round's outcome, unless the task ended differently from what that
+    // round said (cancelled or failed after the handler returned, or still
+    // asking for input when it ran out of rounds or time).
     const taskStartedAt = performance.now()
-    let unreported: (() => Promise<void>) | undefined
+    let unreported: ((outcome?: McpCallToolOutcome) => Promise<void>) | undefined
+    let lastOutcome: McpCallToolOutcome | undefined
     const task = await runAsTask(
       request,
       (resume, signal) => {
@@ -1375,11 +1525,20 @@ async function modernToolsCall (
         return run(resume, {
           source: 'task',
           startedAt: taskStartedAt,
-          deferInputRequired: (emit) => { unreported = emit }
+          defer: (outcome, emit) => {
+            lastOutcome = outcome
+            unreported = emit
+          }
         }, signal)
       },
       dependencies,
-      async () => { await unreported?.() }
+      async (end) => {
+        const ended = end.status !== 'completed' && lastOutcome !== undefined &&
+          (lastOutcome.ok || lastOutcome.reason === 'input-required')
+          ? { ok: false as const, reason: 'task-ended' as const, status: end.status, message: end.statusMessage ?? end.status }
+          : undefined
+        await unreported?.(ended)
+      }
     )
     if (task) return task
     // No task could be created right now. A tool that merely supports tasks
@@ -1426,7 +1585,8 @@ function isMrtrRetry (request: JSONRPCRequest): boolean {
 
 function handleDiscover (
   request: JSONRPCRequest,
-  dependencies: ModernDependencies
+  dependencies: ModernDependencies,
+  cache: CacheHint
 ): JSONRPCResponse {
   const result: DiscoverResult = {
     ...withCache({
@@ -1435,7 +1595,7 @@ function handleDiscover (
         enableTasks: dependencies.enableTasks
       }),
       ...(dependencies.opts.instructions ? { instructions: dependencies.opts.instructions } : {})
-    }, dependencies.caching.discover, dependencies.serverInfo)
+    }, cache, dependencies.serverInfo)
   } as DiscoverResult
 
   return createResponse(request.id, result)
@@ -1487,7 +1647,7 @@ export async function dispatchModern (
   const opened = openRequestState(request, dependencies)
   if (!opened.ok) return opened.error
   const scoped = withMrtrContext(request, dependencies, opened)
-  const invalidAnswer = invalidAnswers(scoped.mrtr?.inputResponses, opened.inputs ?? {})
+  const invalidAnswer = invalidAnswers(scoped.mrtr?.inputResponses, opened.inputs ?? {}, opened.elicitations)
   if (invalidAnswer) return createError(request.id, INVALID_PARAMS, invalidAnswer)
 
   // A result produced from `inputResponses`/`requestState` depends on inputs
@@ -1500,7 +1660,7 @@ export async function dispatchModern (
   try {
     switch (request.method) {
       case 'server/discover':
-        return handleDiscover(request, scoped)
+        return handleDiscover(request, scoped, hint('discover'))
 
       case 'tools/list':
         return adapt(

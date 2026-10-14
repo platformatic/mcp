@@ -6,7 +6,8 @@
  * status is committed to 200, yet some errors must be sent with a 4xx status.
  * So notifications are held back until the outcome is known, or until the
  * handler has been running long enough that holding them would defeat their
- * purpose. A request that never reports anything gets a plain JSON response.
+ * purpose — and only once no such error can follow. A request that never
+ * reports anything gets a plain JSON response.
  */
 
 import type { FastifyReply } from 'fastify'
@@ -30,13 +31,26 @@ export const NO_NOTIFIERS: RequestNotifiers = { sendProgress: () => {}, log: () 
 
 export class RequestStream {
   #reply: FastifyReply
+  #openEarly: boolean
   #opened = false
   #finished = false
   #held: string[] = []
+  #heldBytes = 0
   #timer?: NodeJS.Timeout
 
-  constructor (reply: FastifyReply) {
+  /**
+   * `openEarly` says whether the stream may open before the outcome is known.
+   * It must be false while the request could still end in an error that
+   * needs a 4xx status: notifications are then held until the end.
+   */
+  constructor (reply: FastifyReply, options: { openEarly?: boolean } = {}) {
     this.#reply = reply
+    this.#openEarly = options.openEarly ?? true
+  }
+
+  /** Whether the response is committed to a 200 stream. */
+  get opened (): boolean {
+    return this.#opened
   }
 
   /** Send a notification before the response. Nothing is sent after it. */
@@ -47,7 +61,13 @@ export class RequestStream {
       this.#write(frame)
       return
     }
+    // Held notifications are bounded like a slow reader's: past the limit
+    // they are dropped, which progress and log messages tolerate.
+    const bytes = Buffer.byteLength(frame)
+    if (this.#heldBytes + bytes > MAX_BUFFERED_BYTES) return
     this.#held.push(frame)
+    this.#heldBytes += bytes
+    if (!this.#openEarly) return
     this.#timer ??= setTimeout(() => {
       if (!this.#finished) this.#open()
     }, STREAM_OPEN_DELAY_MS).unref()
@@ -67,6 +87,7 @@ export class RequestStream {
       const isError = 'error' in (response as object)
       if (this.#held.length === 0 || isError) {
         this.#held = []
+        this.#heldBytes = 0
         return false
       }
       this.#open()
@@ -94,6 +115,7 @@ export class RequestStream {
     raw.writeHead(200)
     for (const frame of this.#held) this.#write(frame)
     this.#held = []
+    this.#heldBytes = 0
   }
 
   #write (frame: string): void {
@@ -102,6 +124,21 @@ export class RequestStream {
     if (raw.writableLength > MAX_BUFFERED_BYTES) return
     raw.write(frame)
   }
+}
+
+/**
+ * Does an `Accept` header list `mediaType` as acceptable? Only an explicit
+ * listing counts, as the transport requires the client to name it; one
+ * listed with `q=0` is explicitly not acceptable.
+ */
+export function acceptsMediaType (accept: string | undefined, mediaType: string): boolean {
+  if (!accept) return false
+  return accept.split(',').some(range => {
+    const [type, ...parameters] = range.split(';').map(part => part.trim().toLowerCase())
+    if (type !== mediaType) return false
+    const q = parameters.find(parameter => parameter.startsWith('q='))
+    return q === undefined || Number(q.slice(2)) > 0
+  })
 }
 
 /** Make log data serializable: errors, bigints and cycles would otherwise throw or vanish. */

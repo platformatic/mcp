@@ -378,7 +378,10 @@ export class StdioTransport {
             .filter(line => line.startsWith('data:'))
             .map(line => line.slice(5).trimStart())
             .join('\n')
-          if (data) this.sendMessage(JSON.parse(data))
+          // Wait for stdout to drain before reading on: the stream's own
+          // buffer limit then applies to a client that stops reading,
+          // instead of stdout buffering without bound.
+          if (data && !this.sendMessage(JSON.parse(data))) await this.drained(cancelled)
         }
       }
     } catch (error) {
@@ -386,21 +389,42 @@ export class StdioTransport {
     }
   }
 
+  /** Resolve once stdout can take more, it closes, or `signal` aborts. */
+  private drained (signal: AbortSignal): Promise<void> {
+    const output = this.transportOpts.output
+    if (!output || signal.aborted) return Promise.resolve()
+    return new Promise(resolve => {
+      const done = () => {
+        output.removeListener('drain', done)
+        output.removeListener('close', done)
+        output.removeListener('error', done)
+        signal.removeEventListener('abort', done)
+        resolve()
+      }
+      output.once('drain', done)
+      output.once('close', done)
+      output.once('error', done)
+      signal.addEventListener('abort', done, { once: true })
+    })
+  }
+
   /**
-   * Send a JSON-RPC message to stdout
+   * Send a JSON-RPC message to stdout. Returns false when stdout's buffer is
+   * full and the caller should wait for it to drain.
    */
-  private sendMessage (message: JSONRPCMessage | JSONRPCBatchResponse): void {
+  private sendMessage (message: JSONRPCMessage | JSONRPCBatchResponse): boolean {
     try {
       const serialized = JSON.stringify(message)
       this.log('Sending message:', message)
 
       // Write to stdout with newline delimiter
       if (this.transportOpts.output) {
-        this.transportOpts.output.write(serialized + '\n')
+        return this.transportOpts.output.write(serialized + '\n')
       }
     } catch (error) {
       this.logError('Error sending message:', error)
     }
+    return true
   }
 
   /**

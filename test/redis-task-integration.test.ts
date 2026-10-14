@@ -154,6 +154,49 @@ describe('Redis task integration (multi-instance)', () => {
     assert.strictEqual(task.result.content[0].text, 'yes')
   })
 
+  testWithRedis('tasks/update ignores a malformed unknown key and keeps the valid answer', async (redis, t) => {
+    const redisOpts = {
+      host: redis.options.host!,
+      port: redis.options.port!,
+      db: redis.options.db!
+    }
+
+    const app = fastify()
+    t.after(() => app.close())
+    await app.register(mcpPlugin, { enableTasks: true, redis: redisOpts, requestStateSecret: 'test-request-state-secret-32-bytes!!' })
+    app.mcpAddTool({
+      name: 'confirm',
+      inputSchema: Type.Object({}),
+      execution: { taskSupport: 'required' }
+    } as any, async (_args: unknown, context: any): Promise<CallToolResult> => {
+      if (!context.inputResponses?.q) {
+        throw new InputRequired({ inputRequests: { q: elicitForm('?', { type: 'object', properties: {} }) } })
+      }
+      return { content: [{ type: 'text', text: 'answered' }] }
+    })
+    await app.ready()
+
+    const taskId = (await modernCall(app, 'tools/call', { name: 'confirm', arguments: {} })).result.taskId
+    let task: any
+    for (let attempt = 0; attempt < 100 && task?.status !== 'input_required'; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 10))
+      task = (await modernCall(app, 'tasks/get', { taskId }, 2)).result
+    }
+
+    // A lone surrogate cannot be encoded for the store's script.
+    const updated = await modernCall(app, 'tasks/update', {
+      taskId,
+      inputResponses: { '\ud800': { action: 'accept' }, q: { action: 'accept', content: {} } }
+    }, 3)
+    assert.strictEqual(updated.error, undefined, JSON.stringify(updated))
+
+    for (let attempt = 0; attempt < 100 && task?.status !== 'completed'; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 10))
+      task = (await modernCall(app, 'tasks/get', { taskId }, 4)).result
+    }
+    assert.strictEqual(task.result?.content?.[0]?.text, 'answered')
+  })
+
   testWithRedis('tasks/get on a second instance sees the terminal state', async (redis, t) => {
     const redisOpts = {
       host: redis.options.host!,

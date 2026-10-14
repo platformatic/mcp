@@ -134,6 +134,21 @@ describe('RedisTaskStore', () => {
     t.assert.strictEqual(task?.inputRequests, undefined)
   })
 
+  test('no new input is accepted for a round that has moved on', async (t: TestContext) => {
+    await store.create(record({
+      status: 'input_required',
+      inputRequests: { next: { method: 'elicitation/create' } },
+      inputRequestRound: 2
+    }))
+
+    const stale = await store.updateInputResponses('task-1', { next: 'yes' }, 'delivery-1', 1)
+    t.assert.deepStrictEqual(stale?.responses, {})
+    t.assert.strictEqual((await store.get('task-1'))?.status, 'input_required')
+
+    const current = await store.updateInputResponses('task-1', { next: 'yes' }, 'delivery-2', 2)
+    t.assert.deepStrictEqual(current?.responses, { next: 'yes' })
+  })
+
   test('a null statusMessage clears the stale one', async (t: TestContext) => {
     await store.create(record({ status: 'working', statusMessage: 'Confirm?' }))
     const updated = await store.updateStatus('task-1', 'completed', { statusMessage: null })

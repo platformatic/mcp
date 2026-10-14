@@ -35,6 +35,9 @@ import type {
   McpCallToolContext,
   McpCallToolOutcome,
   MCPToolCallCompleteEvent,
+  HandlerContext,
+  ToolDefinitionExtras,
+  TaskUpdateOptions,
 } from '../dist/index.js'
 
 // ─── ToolHandler ─────────────────────────────────────────────────────
@@ -407,6 +410,8 @@ expectAssignable<McpCallToolOutcome>({ ok: false, reason: 'access-denied' })
 expectAssignable<McpCallToolOutcome>({ ok: false, reason: 'invalid-arguments', detail: 'missing input' })
 expectAssignable<McpCallToolOutcome>({ ok: false, reason: 'task-required' })
 expectNotAssignable<McpCallToolOutcome>({ ok: false, reason: 'nope' })
+expectAssignable<McpCallToolOutcome>({ ok: false, reason: 'task-ended', status: 'cancelled', message: 'Task cancelled' })
+expectNotAssignable<McpCallToolOutcome>({ ok: false, reason: 'task-ended', status: 'completed', message: 'done' })
 
 // ─── onToolCallComplete event ───────────────────────────────────────
 
@@ -474,3 +479,15 @@ const app = {} as FastifyInstance
 expectType<boolean>(app.mcpHasTool('search'))
 expectType<readonly string[]>(app.mcpListToolNames())
 expectError(app.mcpListToolNames().push('search'))
+
+// ─── Round-trip and task options ────────────────────────────────────
+
+expectAssignable<MCPPluginOptions>({ requestStateMaxAnswerBytes: 0, taskMaxInputRounds: 32 })
+expectType<AbortSignal>(({} as HandlerContext).signal)
+expectAssignable<ToolDefinitionExtras>({ inputCapabilities: { elicitation: { form: {} } } })
+expectAssignable<TaskUpdateOptions>({ statusMessage: null })
+app.mcpAddTool({
+  name: 'declared',
+  inputSchema: Type.Object({}),
+  inputCapabilities: { sampling: {} }
+}, async () => ({ content: [] }))

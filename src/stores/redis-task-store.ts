@@ -204,7 +204,8 @@ export class RedisTaskStore implements TaskStore {
   async updateInputResponses (
     taskId: string,
     responses: Record<string, unknown>,
-    responseId: string
+    responseId: string,
+    round?: number
   ): Promise<TaskInputUpdate | null> {
     const result = await this.redis.eval(
       `local raw = redis.call('GET', KEYS[1])
@@ -223,6 +224,7 @@ export class RedisTaskStore implements TaskStore {
        for _, key in ipairs(answered) do answeredSet[key] = true end
 
        local terminal = task.status == 'completed' or task.status == 'failed' or task.status == 'cancelled'
+       local sameRound = ARGV[4] == '' or tonumber(ARGV[4]) == currentRound
        local deliverable = {}
        local responseIds = {}
        local changed = false
@@ -231,7 +233,7 @@ export class RedisTaskStore implements TaskStore {
          if pending[key] ~= nil and (pendingRounds[key] == nil or pendingRounds[key] == currentRound) then
            deliverable[key] = pending[key]
            responseIds[key] = pendingIds[key] or ARGV[3]
-         elseif not terminal and outstanding[key] ~= nil and not answeredSet[key] then
+         elseif not terminal and sameRound and outstanding[key] ~= nil and not answeredSet[key] then
            deliverable[key] = value
            responseIds[key] = ARGV[3]
            pending[key] = value
@@ -268,7 +270,8 @@ export class RedisTaskStore implements TaskStore {
       this.key(taskId),
       JSON.stringify(encodeOpaqueMap(responses)),
       new Date().toISOString(),
-      responseId
+      responseId,
+      round === undefined ? '' : String(round)
     )
 
     if (typeof result !== 'string') return null

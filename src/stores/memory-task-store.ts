@@ -87,7 +87,8 @@ export class MemoryTaskStore implements TaskStore {
   async updateInputResponses (
     taskId: string,
     responses: Record<string, unknown>,
-    responseId: string
+    responseId: string,
+    round?: number
   ): Promise<TaskInputUpdate | null> {
     const task = this.tasks.get(taskId)
     if (!task || taskHasExpired(task)) {
@@ -111,7 +112,8 @@ export class MemoryTaskStore implements TaskStore {
         // Retry the durable value, not a changed replay.
         deliverable.push([key, pending[key]])
         responseIds.push([key, pendingIds[key] ?? responseId])
-      } else if (!isTerminal(task.status) && Object.hasOwn(outstanding, key) && !answered.has(key)) {
+      } else if (!isTerminal(task.status) && (round === undefined || round === currentRound) &&
+        Object.hasOwn(outstanding, key) && !answered.has(key)) {
         deliverable.push([key, value])
         responseIds.push([key, responseId])
         Object.defineProperty(pending, key, {

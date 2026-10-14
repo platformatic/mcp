@@ -665,16 +665,14 @@ describe('subscription backpressure', () => {
     registry.deliver(changed)
     t.assert.strictEqual(raw.ended, true)
     t.assert.strictEqual(registry.size, 0)
-    // The acknowledgement, then the teardown: cancellation and the graceful
-    // empty response, never the notification that overflowed the queue.
+    // The acknowledgement, then the cancellation, never the notification that
+    // overflowed the queue. A notification was lost, so there is no graceful
+    // empty response: the client must resynchronize.
     t.assert.strictEqual(raw.writes.length, 2)
     const teardown = raw.writes[1].split('\n\n').filter(Boolean).map(frame => JSON.parse(frame.slice('data: '.length)))
+    t.assert.strictEqual(teardown.length, 1)
     t.assert.strictEqual(teardown[0].method, 'notifications/cancelled')
     t.assert.strictEqual(teardown[0].params.requestId, 1)
-    t.assert.deepStrictEqual(teardown[1].result, {
-      resultType: 'complete',
-      _meta: { 'io.modelcontextprotocol/subscriptionId': 1 }
-    })
   })
 })
 

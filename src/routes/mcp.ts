@@ -32,7 +32,7 @@ import type { MessageBroker } from '../brokers/message-broker.ts'
 import type { AuthorizationContext } from '../types/auth-types.ts'
 import { processMessage, createError, handlerContext, withMcpServerSpan } from '../handlers.ts'
 import type { CachingConfig } from '../modern/handlers.ts'
-import { dispatchModern } from '../modern/handlers.ts'
+import { coversInputCapabilities, dispatchModern } from '../modern/handlers.ts'
 import {
   invalidModernMessage,
   isModernRequest,
@@ -45,9 +45,9 @@ import { repeatedMirroredHeader, validateStandardHeaders } from '../modern/heade
 import type { RequestStateSealer } from '../modern/request-state.ts'
 import { DEFAULT_MAX_RESOURCE_SUBSCRIPTIONS, SubscriptionRegistry, invalidFilter, negotiateFilter } from '../modern/subscriptions.ts'
 import { quotaKeyOf } from '../task-registry.ts'
-import type { SubscriptionFilter } from '../schema-2026.ts'
+import type { ClientCapabilities as ModernClientCapabilities, SubscriptionFilter } from '../schema-2026.ts'
 import { isStdioRequest, stdioAuthContext, stdioRequestSignal } from '../stdio-trust.ts'
-import { RequestStream, requestNotifiers } from '../modern/request-stream.ts'
+import { RequestStream, acceptsMediaType, requestNotifiers } from '../modern/request-stream.ts'
 import type { TaskInputChannel } from '../modern/task-inputs.ts'
 import type { JsonSchemaValidator } from '../validation/json-schema-validator.ts'
 
@@ -386,6 +386,22 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
    * with `-32601` to tell an unimplemented method from a legacy HTTP+SSE
    * server that does not host this endpoint at all.
    */
+  /** Can this request not end in -32021 for input the client cannot give? */
+  function cannotNeedMissingInput (message: JSONRPCRequest, clientCapabilities: ModernClientCapabilities): boolean {
+    switch (message.method) {
+      case 'tools/call': {
+        const name = (message.params as { name?: unknown } | undefined)?.name
+        const tool = typeof name === 'string' ? tools.get(name) : undefined
+        return coversInputCapabilities(clientCapabilities, tool?.definition.inputCapabilities)
+      }
+      case 'prompts/get':
+      case 'resources/read':
+        return coversInputCapabilities(clientCapabilities)
+      default:
+        return true
+    }
+  }
+
   function statusForResponse (response: JSONRPCResponse | JSONRPCError): number {
     if (!('error' in response)) return 200
 
@@ -655,9 +671,13 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
     // Progress and log notifications ride the response stream, so only open
     // one when the client asked for them and can read it.
-    const accept = String(request.headers.accept ?? '')
     const wantsNotifications = context.progressToken !== undefined || context.logLevel !== undefined
-    const stream = wantsNotifications && accept.includes('text/event-stream') ? new RequestStream(reply) : undefined
+    // A handler that asks for input the client cannot give is refused with
+    // -32021, which must go out as a 400; once the stream opens the status is
+    // 200. So it opens early only when that refusal cannot happen.
+    const stream = wantsNotifications && acceptsMediaType(request.headers.accept, 'text/event-stream')
+      ? new RequestStream(reply, { openEarly: cannotNeedMissingInput(message, context.clientCapabilities) })
+      : undefined
 
     let response: JSONRPCResponse | JSONRPCError
     try {
@@ -690,6 +710,14 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
       })
     } finally {
       handled = true
+    }
+
+    // The stream opened because the tool declared the input it may need and
+    // the client has all of it; asking for more is the tool's bug, and a 400
+    // can no longer be sent.
+    if (stream?.opened && 'error' in response && response.error.code === MISSING_REQUIRED_CLIENT_CAPABILITY) {
+      request.log.error({ method: message.method, data: response.error.data }, 'Handler asked for input beyond its declared inputCapabilities after progress had streamed')
+      response = createError(message.id, INTERNAL_ERROR, 'Internal server error')
     }
 
     // Serialize here, once: a result a handler built with a BigInt or a cycle
@@ -1073,7 +1101,18 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
   // standing stream, and modern `subscriptions/listen` streams get whichever
   // notification types they opted in to. Registering unconditionally means
   // modern subscriptions work without `enableSSE`, which is a legacy concept.
+  //
+  // The broker does not await the handler, so anything it throws must be
+  // caught here or it becomes an unhandled rejection.
   await messageBroker.subscribe('mcp/broadcast/notification', async (notification: JSONRPCMessage) => {
+    try {
+      await deliverBroadcast(notification)
+    } catch (error) {
+      app.log.error({ err: error }, 'Failed to deliver broadcast notification')
+    }
+  })
+
+  async function deliverBroadcast (notification: JSONRPCMessage): Promise<void> {
     subscriptions.deliver(notification as JSONRPCNotification)
 
     if (!enableSSE) return
@@ -1098,7 +1137,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
       sendSSEToStreams(sessionId, notification, streams)
     }
-  })
+  }
 }
 
 export default fp(mcpPubSubRoutesPlugin, {

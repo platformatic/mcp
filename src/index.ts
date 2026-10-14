@@ -215,11 +215,18 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
   if (opts.requestStateTtlMs !== undefined && (!Number.isSafeInteger(opts.requestStateTtlMs) || opts.requestStateTtlMs <= 0)) {
     throw new Error('requestStateTtlMs must be a positive integer')
   }
+  if (opts.taskMaxInputRounds !== undefined && (!Number.isSafeInteger(opts.taskMaxInputRounds) || opts.taskMaxInputRounds < 0)) {
+    throw new Error('taskMaxInputRounds must be a non-negative integer')
+  }
+  if (opts.requestStateMaxAnswerBytes !== undefined && (!Number.isSafeInteger(opts.requestStateMaxAnswerBytes) || opts.requestStateMaxAnswerBytes < 0)) {
+    throw new Error('requestStateMaxAnswerBytes must be a non-negative integer')
+  }
 
   const sealer = new RequestStateSealer({
     secret: opts.requestStateSecret,
     audience: serverInfo.name,
     ttlMs: opts.requestStateTtlMs,
+    maxAnswerBytes: opts.requestStateMaxAnswerBytes,
     // With identity resolution on, a request carrying no `userId` identifies
     // nobody, and two such callers would share the undefined principal — so state
     // sealed for one would verify for the other. Refuse rather than bind to
@@ -488,6 +495,8 @@ export type {
   MCPTool,
   MCPResource,
   MCPPrompt,
+  HandlerContext,
+  ToolDefinitionExtras,
   ToolHandler,
   ResourceHandler,
   PromptHandler,
@@ -619,7 +628,7 @@ export type {
 export type { CacheHint, CachingConfig } from './modern/handlers.ts'
 
 // Task storage, for callers that want to supply or inspect a backend
-export type { TaskStore, TaskRecord, TaskOutcome, TaskInputUpdate } from './stores/task-store.ts'
+export type { TaskStore, TaskRecord, TaskOutcome, TaskInputUpdate, TaskUpdateOptions } from './stores/task-store.ts'
 export { MemoryTaskStore } from './stores/memory-task-store.ts'
 export { RedisTaskStore } from './stores/redis-task-store.ts'
 

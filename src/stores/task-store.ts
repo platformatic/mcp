@@ -113,12 +113,15 @@ export interface TaskStore {
   updateStatus(taskId: string, status: TaskStatus, options?: TaskUpdateOptions): Promise<TaskRecord | null>
   /**
    * Atomically accept outstanding input and stage it for broker publication.
-   * A retry of a staged key returns the original stored value.
+   * A retry of a staged key returns the original stored value. When `round`
+   * is given and the task has since moved to another input round, no new
+   * input is accepted.
    */
   updateInputResponses(
     taskId: string,
     responses: Record<string, unknown>,
-    responseId: string
+    responseId: string,
+    round?: number
   ): Promise<TaskInputUpdate | null>
   /**
    * Remove delivered values from the outbox only when their stable delivery ids

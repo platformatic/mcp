@@ -34,12 +34,21 @@ export interface RequestStateClaims {
    */
   inputs?: Record<string, string>
   /**
+   * What each elicitation the server asked for accepts: a form's
+   * `requestedSchema`, or nothing for a URL-mode elicitation, so the answer
+   * can be checked on the retry.
+   */
+  elicitations?: Record<string, ElicitationExpectation>
+  /**
    * Answers the client gave in earlier rounds, keyed as the handler asked for
    * them, so a handler that asks in several steps sees every answer on the
    * retry, as it would in a task.
    */
   answers?: Record<string, unknown>
 }
+
+/** What an elicitation's answer must look like when the user accepts. */
+export type ElicitationExpectation = { mode: 'url' } | { mode: 'form', schema: Record<string, unknown> }
 
 /** Sealing was refused because the deployment identifies callers and this one is not. */
 export class PrincipalRequiredError extends Error {}
@@ -49,6 +58,9 @@ export type VerifyResult =
   | { ok: false, reason: string }
 
 const DEFAULT_TTL_MS = 5 * 60 * 1000
+
+/** How many bytes of earlier answers a sealed state carries by default. */
+export const DEFAULT_MAX_CARRIED_ANSWER_BYTES = 64 * 1024
 
 /** HMAC-SHA256 keys shorter than its output weaken it. */
 export const MIN_SECRET_BYTES = 32
@@ -104,6 +116,25 @@ function stableStringify (value: unknown, depth: number = 0): string {
 }
 
 /**
+ * The answers to carry, keeping the newest ones that fit in `maxBytes` of
+ * JSON. The client echoes the state back on every retry, so carrying every
+ * answer ever given would grow each retry until it exceeds the body limit; a
+ * handler that needs an older answer past that point keeps it in its own state.
+ */
+function withinBudget (answers: Record<string, unknown> | undefined, maxBytes: number): { answers?: Record<string, unknown> } {
+  if (answers === undefined) return {}
+  const kept: Array<[string, unknown]> = []
+  let used = 2 // the braces
+  for (const [key, value] of Object.entries(answers).reverse()) {
+    const size = Buffer.byteLength(JSON.stringify(key)) + Buffer.byteLength(JSON.stringify(value) ?? 'null') + 2
+    if (used + size > maxBytes) break
+    used += size
+    kept.unshift([key, value])
+  }
+  return kept.length > 0 ? { answers: Object.fromEntries(kept) } : {}
+}
+
+/**
  * Seals and opens `requestState` blobs.
  *
  * A caller that does not supply a secret gets a process-random one, which is
@@ -117,9 +148,17 @@ export class RequestStateSealer {
 
   #requirePrincipal: boolean
   #audience?: string
+  #maxAnswerBytes: number
 
-  constructor (options: { secret?: string | Buffer, ttlMs?: number, requirePrincipal?: boolean, audience?: string } = {}) {
+  constructor (options: {
+    secret?: string | Buffer
+    ttlMs?: number
+    requirePrincipal?: boolean
+    audience?: string
+    maxAnswerBytes?: number
+  } = {}) {
     this.#audience = options.audience
+    this.#maxAnswerBytes = options.maxAnswerBytes ?? DEFAULT_MAX_CARRIED_ANSWER_BYTES
     if (options.secret === undefined) {
       this.#secret = randomBytes(MIN_SECRET_BYTES)
     } else {
@@ -143,6 +182,7 @@ export class RequestStateSealer {
     params: unknown
     payload?: unknown
     inputs?: Record<string, string>
+    elicitations?: Record<string, ElicitationExpectation>
     answers?: Record<string, unknown>
     ttlMs?: number
   }): string {
@@ -163,7 +203,8 @@ export class RequestStateSealer {
       // `requestState` exactly as the first attempt did.
       payload: input.payload,
       ...(input.inputs ? { inputs: input.inputs } : {}),
-      ...(input.answers && Object.keys(input.answers).length > 0 ? { answers: input.answers } : {})
+      ...(input.elicitations && Object.keys(input.elicitations).length > 0 ? { elicitations: input.elicitations } : {}),
+      ...withinBudget(input.answers, this.#maxAnswerBytes)
     }
 
     const body = Buffer.from(JSON.stringify(claims), 'utf8').toString('base64url')

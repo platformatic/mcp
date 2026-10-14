@@ -369,7 +369,7 @@ export async function handleToolsList (request: JSONRPCRequest, dependencies: Ha
   const accessibleTools = registeredTools.filter((_tool, index) => accessResults[index])
   const result: ListToolsResult = {
     tools: accessibleTools.map(t => {
-      const tool = trimDefinitionToRevision(t.definition, protocolVersion)
+      const { inputCapabilities, ...tool } = trimDefinitionToRevision(t.definition, protocolVersion)
       // TypeBox schemas are already JSON Schema compatible
       const serialized: typeof tool = {
         ...tool,
@@ -594,6 +594,9 @@ function toolCallOutcomeToJsonRpc (
     // The multi round-trip machinery answers this, not a tool result.
     case 'input-required':
       throw inputRequiredErrors.get(outcome) ?? new InputRequired({ inputRequests: outcome.inputRequests })
+    // Only ever reported to onToolCallComplete, once a task has ended.
+    case 'task-ended':
+      return createError(id, INTERNAL_ERROR, outcome.message)
     default: {
       const unhandled: never = outcome
       throw new UnhandledToolCallOutcomeError(JSON.stringify(unhandled))
@@ -630,11 +633,11 @@ interface ToolCallObservationContext {
   source: MCPToolCallCompleteEvent['source']
   startedAt: number
   /**
-   * A task's handler asking for input is a round, not the end of the call:
-   * the event is handed here instead, to be emitted only if no later round
-   * produces the outcome.
+   * A task's round is not necessarily the end of the call: the event is
+   * handed here instead of being emitted, so the task can emit it once it
+   * ends, with a different outcome if the task ended differently.
    */
-  deferInputRequired?: (emit: () => Promise<void>) => void
+  defer?: (outcome: McpCallToolOutcome, emit: (override?: McpCallToolOutcome) => Promise<void>) => void
 }
 
 export async function executeToolCall (
@@ -650,9 +653,10 @@ export async function executeToolCall (
 
   const callDependencies = { ...dependencies, sessionId }
   const outcome = await executeRegisteredTool(tool, toolName, args, callDependencies)
-  const emit = () => emitToolCallComplete(observation.source, toolName, args, outcome, observation.startedAt, callDependencies)
-  if (observation.deferInputRequired && !outcome.ok && outcome.reason === 'input-required') {
-    observation.deferInputRequired(emit)
+  const emit = (override?: McpCallToolOutcome) =>
+    emitToolCallComplete(observation.source, toolName, args, override ?? outcome, observation.startedAt, callDependencies)
+  if (observation.defer) {
+    observation.defer(outcome, emit)
   } else {
     await emit()
   }
@@ -667,7 +671,7 @@ const OUTPUT_SCHEMA_REVISION = '2025-06-18'
  * it checks: the result goes to the client exactly as the tool produced it.
  */
 let outputValidator: JsonSchemaValidator | undefined
-function getOutputValidator (): JsonSchemaValidator {
+export function getOutputValidator (): JsonSchemaValidator {
   outputValidator ??= createJsonSchemaValidator({
     coerceTypes: false,
     useDefaults: false,

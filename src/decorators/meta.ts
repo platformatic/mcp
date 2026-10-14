@@ -10,7 +10,7 @@ import type {
   ResourceSubscribeHandler,
   ResourceUnsubscribeHandler
 } from '../types.ts'
-import { callRegisteredTool } from '../handlers.ts'
+import { callRegisteredTool, getOutputValidator } from '../handlers.ts'
 import { schemaToArguments, validateToolSchema, isTypeBoxSchema } from '../validation/index.ts'
 import type { JsonSchemaValidator } from '../validation/json-schema-validator.ts'
 import type { ServerCapabilities } from '../schema.ts'
@@ -89,6 +89,21 @@ const mcpDecoratorsPlugin: FastifyPluginAsync<MCPDecoratorsOptions> = async (app
     const outputDialect = (definition.outputSchema as { $schema?: unknown } | undefined)?.$schema
     if (outputDialect !== undefined && !SUPPORTED_OUTPUT_DIALECTS.has(String(outputDialect))) {
       throw new Error(`Invalid output schema for '${name}': dialect '${outputDialect}' is not supported; use JSON Schema 2020-12`)
+    }
+    // Compile now: a schema that cannot be compiled (an unknown type, an
+    // unresolvable `$ref`) would otherwise fail every call, blaming the result.
+    if (definition.outputSchema !== undefined && !isTypeBoxSchema(definition.outputSchema)) {
+      try {
+        getOutputValidator().compileAndCache(definition.outputSchema)
+      } catch (error) {
+        throw new Error(`Invalid output schema for '${name}': ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+
+    const inputCapabilities = definition.inputCapabilities
+    if (inputCapabilities !== undefined &&
+      (typeof inputCapabilities !== 'object' || inputCapabilities === null || Array.isArray(inputCapabilities))) {
+      throw new Error(`Invalid inputCapabilities for '${name}': expected client capabilities`)
     }
 
     // TypeBox schemas are already JSON Schema compatible

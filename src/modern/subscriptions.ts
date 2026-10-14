@@ -325,9 +325,10 @@ export class SubscriptionRegistry {
    * Cancellation says the server MUST send `notifications/cancelled` for the
    * listen request it tears down; Subscriptions says it SHOULD then answer that
    * request with the empty result that marks a graceful end. Both are sent,
-   * in that order, so the client can tell this from a dropped connection.
+   * in that order, so the client can tell this from a dropped connection,
+   * unless the end is not graceful because notifications were lost.
    */
-  #teardownFrames (subscription: Subscription, reason: string): string {
+  #teardownFrames (subscription: Subscription, reason: string, graceful: boolean = true): string {
     const meta = {
       [META_SUBSCRIPTION_ID]: subscription.id,
       ...(this.#serverInfo ? { [META_SERVER_INFO]: this.#serverInfo } : {})
@@ -346,7 +347,7 @@ export class SubscriptionRegistry {
       id: subscription.id,
       result: { resultType: 'complete', _meta: meta }
     } as JSONRPCMessage
-    return `data: ${JSON.stringify(cancelled)}\n\ndata: ${JSON.stringify(completion)}\n\n`
+    return `data: ${JSON.stringify(cancelled)}\n\n` + (graceful ? `data: ${JSON.stringify(completion)}\n\n` : '')
   }
 
   #matches (notification: JSONRPCNotification, subscription: Subscription): boolean {
@@ -384,7 +385,10 @@ export class SubscriptionRegistry {
         subscriptionId: subscription.id,
         maxBufferedBytes: this.#maxBufferedBytes
       }, 'Closing slow subscription after its buffer limit was exceeded')
-      this.#close(subscription, this.#teardownFrames(subscription, 'Subscription buffer limit exceeded'))
+      // Notifications were lost, so this is not a graceful end: no completion
+      // response, which would tell the client it missed nothing. Ending
+      // without one tells it to reconnect and resynchronize.
+      this.#close(subscription, this.#teardownFrames(subscription, 'Subscription buffer limit exceeded', false))
       return
     }
 

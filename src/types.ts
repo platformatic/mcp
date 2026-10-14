@@ -21,7 +21,7 @@ import type { Static, TSchema, TObject, TString } from '@sinclair/typebox'
 import type { AuthorizationConfig, AuthorizationContext } from './types/auth-types.ts'
 import type { AllowedOrigins } from './security.ts'
 import type { CacheHint } from './modern/handlers.ts'
-import type { InputRequests } from './schema-2026.ts'
+import type { ClientCapabilities as ModernClientCapabilities, InputRequests } from './schema-2026.ts'
 
 export type { CacheHint }
 
@@ -111,8 +111,25 @@ export type PromptHandler<TArgsSchema extends TObject = TObject> = (
 ) => Promise<GetPromptResult> | GetPromptResult
 
 // Generic MCP interfaces with TypeBox schema support
+/**
+ * Plugin-only fields of a tool definition. They are never listed to clients.
+ */
+export interface ToolDefinitionExtras {
+  /**
+   * The client capabilities this tool's handler may need when it throws
+   * `InputRequired` (e.g. `{ elicitation: { form: {} } }`). A 2026-07-28
+   * request can only stream progress before the result once the server knows
+   * it will not have to refuse it with `-32021` and a 400, so progress is held
+   * back unless the client declared every capability the tool may need. Left
+   * out, that is every capability an input request can need. A handler that
+   * asks for more than it declared, after progress has streamed, gets an
+   * internal error.
+   */
+  inputCapabilities?: ModernClientCapabilities
+}
+
 export interface MCPTool<TSchema extends TObject = TObject> {
-  definition: Tool & {
+  definition: Tool & ToolDefinitionExtras & {
     inputSchema: TSchema
   }
   handler?: ToolHandler<TSchema>
@@ -137,7 +154,7 @@ declare module 'fastify' {
   interface FastifyInstance {
     // Overloaded methods to support both TypeBox schemas and unsafe usage
     mcpAddTool<TSchema extends TObject>(
-      definition: Omit<Tool, 'inputSchema'> & { inputSchema: TSchema },
+      definition: Omit<Tool, 'inputSchema'> & ToolDefinitionExtras & { inputSchema: TSchema },
       handler?: ToolHandler<TSchema>
     ): void
     mcpAddTool(
@@ -297,6 +314,12 @@ export type McpCallToolOutcome =
    * cannot complete.
    */
   | { ok: false, reason: 'input-required', inputRequests: InputRequests }
+  /**
+   * A 2026-07-28 task ended `failed` or `cancelled` although its last round
+   * returned a result or asked for input: it was cancelled after the handler
+   * returned, ran out of input rounds, or timed out waiting for input.
+   */
+  | { ok: false, reason: 'task-ended', status: 'failed' | 'cancelled', message: string }
 
 interface MCPToolCallCompleteEventBase {
   toolName: string
@@ -386,6 +409,13 @@ export interface MCPPluginOptions {
    * tasks are reported failed this long after its last renewal.
    */
   taskLeaseMs?: number
+  /**
+   * How many times a 2026-07-28 task's handler may throw `InputRequired`
+   * before the task fails (default 32). A round that asks the client nothing
+   * and only carries state waits the task's poll interval before running
+   * again, so it cannot spin.
+   */
+  taskMaxInputRounds?: number
   /** Most `subscriptions/listen` streams one instance holds open (default 1000). */
   subscriptionMaxStreams?: number
   /**
@@ -434,6 +464,13 @@ export interface MCPPluginOptions {
   requestStateSecret?: string
   /** How long a sealed `requestState` stays valid. Defaults to 5 minutes. */
   requestStateTtlMs?: number
+  /**
+   * How many bytes of JSON of earlier answers a sealed `requestState` carries
+   * into later rounds. When the answers exceed it the oldest are dropped, so
+   * a handler that must keep a large or old answer stores what it needs in
+   * its own state. `0` disables carrying. Defaults to 64 KiB.
+   */
+  requestStateMaxAnswerBytes?: number
   /**
    * Resolve identities established by application-owned authentication hooks.
    * When present, this resolver is authoritative instead of the built-in OAuth
