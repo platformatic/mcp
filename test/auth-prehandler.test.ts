@@ -343,6 +343,11 @@ describe('Authorization PreHandler', () => {
 
     const body = response.json()
     t.assert.strictEqual(body.error, 'invalid_token')
+    t.assert.strictEqual(body.error_description, 'Token expired')
+    t.assert.strictEqual(
+      response.headers['www-authenticate'],
+      'Bearer realm="MCP Server", resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource", error="invalid_token", error_description="Token expired"'
+    )
 
     validator.close()
   })
