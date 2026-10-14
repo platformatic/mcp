@@ -95,7 +95,12 @@ export function validateObjectDepth (
 }
 
 /**
- * Sanitize tool parameters from untrusted sources
+ * Sanitize tool parameters from untrusted sources.
+ *
+ * The structure (depth, property counts, array lengths, cycles) is validated
+ * once up front; every string reached afterwards, including object keys and
+ * strings nested inside arrays at any depth, is length-checked and stripped of
+ * control characters.
  */
 export function sanitizeToolParams (params: Record<string, any>, limits: ToolArgumentLimits = {}): Record<string, any> {
   const maxStringLength = limits.maxStringLength ?? MAX_STRING_LENGTH
@@ -108,29 +113,24 @@ export function sanitizeToolParams (params: Record<string, any>, limits: ToolArg
     limits.maxArrayLength ?? Infinity
   )
 
-  const sanitized: Record<string, any> = {}
-
-  for (const [key, value] of Object.entries(params)) {
-    // Sanitize key
-    const sanitizedKey = sanitizeString(key, maxStringLength)
-
-    // Sanitize value based on type
+  function sanitizeValue (value: any): any {
     if (typeof value === 'string') {
-      sanitized[sanitizedKey] = sanitizeString(value, maxStringLength)
-    } else if (typeof value === 'object' && value !== null) {
-      if (Array.isArray(value)) {
-        sanitized[sanitizedKey] = value.map(item =>
-          typeof item === 'string' ? sanitizeString(item, maxStringLength) : item
-        )
-      } else {
-        sanitized[sanitizedKey] = sanitizeToolParams(value, limits)
-      }
-    } else {
-      sanitized[sanitizedKey] = value
+      return sanitizeString(value, maxStringLength)
     }
+    if (Array.isArray(value)) {
+      return value.map(sanitizeValue)
+    }
+    if (typeof value === 'object' && value !== null) {
+      const sanitized: Record<string, any> = {}
+      for (const [key, item] of Object.entries(value)) {
+        sanitized[sanitizeString(key, maxStringLength)] = sanitizeValue(item)
+      }
+      return sanitized
+    }
+    return value
   }
 
-  return sanitized
+  return sanitizeValue(params)
 }
 
 /**

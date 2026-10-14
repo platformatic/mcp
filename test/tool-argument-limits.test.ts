@@ -156,4 +156,43 @@ describe('tool argument limits', () => {
       { xs: Array.from({ length: 500 }, () => 1) }
     )
   })
+  test('refuses an over-long string inside an object inside an array by default', async (t: TestContext) => {
+    const { app, getInvocations } = await buildApp(t)
+
+    const result = await callTool(app, { xs: [{ s: 'a'.repeat(10001) }] })
+
+    t.assert.strictEqual(result.isError, true)
+    t.assert.match((result.content[0] as { text: string }).text, /maximum allowed length of 10000/)
+    t.assert.strictEqual(getInvocations(), 0)
+  })
+
+  test('sanitizeToolParams removes control characters from strings in objects inside arrays', (t: TestContext) => {
+    t.assert.deepStrictEqual(
+      sanitizeToolParams({ xs: [{ s: 'a\x00b\x07c', n: 1 }, 'd\x1Fe'] }),
+      { xs: [{ s: 'abc', n: 1 }, 'de'] }
+    )
+    t.assert.throws(
+      () => sanitizeToolParams({ xs: [{ ['k\x00'.repeat(4)]: 1 }] }, { maxStringLength: 5 }),
+      /maximum allowed length of 5/
+    )
+  })
+
+  test('sanitizeToolParams recurses into nested arrays', (t: TestContext) => {
+    t.assert.deepStrictEqual(
+      sanitizeToolParams({ xs: [[['a\x00b'], [{ s: 'c\x7Fd' }]], [1, null, true]] }),
+      { xs: [[['ab'], [{ s: 'cd' }]], [1, null, true]] }
+    )
+    t.assert.throws(
+      () => sanitizeToolParams({ xs: [[['abcdef']]] }, { maxStringLength: 5 }),
+      /maximum allowed length of 5/
+    )
+    t.assert.throws(
+      () => sanitizeToolParams({ xs: [[{ a: 1, b: 2, c: 3 }]] }, { maxObjectProperties: 2 }),
+      /too many properties \(3 > 2\)/
+    )
+    t.assert.throws(
+      () => sanitizeToolParams({ xs: [[[[1]]]] }, { maxDepth: 3 }),
+      /depth of 3/
+    )
+  })
 })
