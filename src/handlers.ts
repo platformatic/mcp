@@ -38,7 +38,7 @@ import type { RequestId } from './schema.ts'
 import type { MCPTool, MCPResource, MCPPrompt, MCPPluginOptions, ResourceHandlers, McpCallToolOutcome, ToolAccessOperation, MCPToolCallCompleteEvent, TracerLike } from './types.ts'
 import type { SessionStore } from './stores/session-store.ts'
 import type { TaskStore, TaskRecord, TaskWaiters, TaskLeases } from './stores/task-store.ts'
-import { InvalidTaskCursorError, TaskLimitError, TASK_LIMIT_REACHED, decodeTaskCursor, isTerminal, taskLeaseExpired, toWireTask } from './stores/task-store.ts'
+import { InvalidTaskCursorError, TaskLimitError, TASK_LIMIT_REACHED, decodeTaskCursor, isTerminal, toWireTask } from './stores/task-store.ts'
 import type { AuthorizationContext } from './types/auth-types.ts'
 import {
   supportsTasks,
@@ -1076,10 +1076,17 @@ async function handleTasksGet (
  * shut down), mark the task failed rather than let it read `working` until its
  * ttl. The store does this as a compare-and-set, so a renewal or completion that
  * lands first wins. Returns the task as it now stands.
+ *
+ * Whether the lease has lapsed is decided by the store alone (RedisTaskStore
+ * uses the Redis server clock): comparing against this instance's clock would
+ * let a reader running behind keep a dead task `working`. The store is only
+ * skipped for tasks that cannot have a lapsed lease at all.
  */
 async function failIfOwnerLost (task: TaskRecord, dependencies: HandlerDependencies): Promise<TaskRecord | null> {
   const { taskStore, taskWaiters } = dependencies
-  if (!taskStore?.failExpiredLease || !taskLeaseExpired(task)) return task
+  if (!taskStore?.failExpiredLease || isTerminal(task.status) || typeof task.leaseExpiresAt !== 'number') {
+    return task
+  }
 
   const current = await taskStore.failExpiredLease(task.taskId, {
     statusMessage: TASK_OWNER_LOST,

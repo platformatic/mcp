@@ -219,4 +219,62 @@ describe('Redis task integration (multi-instance)', () => {
     assert.strictEqual(result.id, 3)
     assert.match(result.error.message, /Task owner lost/)
   })
+
+  testWithRedis('a reader whose clock runs behind Redis still fails an expired lease promptly', async (redis, t) => {
+    const redisOpts = {
+      host: redis.options.host!,
+      port: redis.options.port!,
+      db: redis.options.db!
+    }
+    const taskLeaseMs = 150
+
+    let release!: () => void
+    const hang = new Promise<void>(resolve => { release = resolve })
+    t.after(() => release())
+
+    const a = fastify()
+    t.after(() => a.close())
+    await a.register(mcpPlugin, { enableTasks: true, redis: redisOpts, taskLeaseMs })
+    a.mcpAddTool({
+      name: 'hang',
+      description: 'Runs until released',
+      inputSchema: Type.Object({}),
+      execution: { taskSupport: 'optional' }
+    } as any, async (): Promise<CallToolResult> => {
+      await hang
+      return { content: [{ type: 'text', text: 'late' }] }
+    })
+    await a.ready()
+
+    const b = fastify()
+    t.after(() => b.close())
+    await b.register(mcpPlugin, { enableTasks: true, redis: redisOpts, taskLeaseMs })
+    await b.ready()
+
+    const first = (await call(a, 'tools/call', { name: 'hang', arguments: {}, task: { ttl: 60_000 } })).result.task.taskId
+    const second = (await call(a, 'tools/call', { name: 'hang', arguments: {}, task: { ttl: 60_000 } })).result.task.taskId
+
+    // A goes away; by the Redis clock both leases lapse within taskLeaseMs
+    await a.close()
+    await new Promise(resolve => setTimeout(resolve, taskLeaseMs * 3))
+
+    // From here on the reader's clock runs five minutes behind Redis
+    const realNow = Date.now.bind(Date)
+    t.mock.method(Date, 'now', () => realNow() - 5 * 60_000)
+
+    // tasks/result must not wait on the local clock to catch up
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const result = await Promise.race([
+      call(b, 'tasks/result', { taskId: first }, 2),
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error('tasks/result still blocked')), 3000)
+      })
+    ]).finally(() => clearTimeout(timer))
+    assert.strictEqual(result.id, 2)
+    assert.match(result.error.message, /Task owner lost/)
+
+    const task = (await call(b, 'tasks/get', { taskId: second })).result
+    assert.strictEqual(task.status, 'failed')
+    assert.match(task.statusMessage, /Task owner lost/)
+  })
 })

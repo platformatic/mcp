@@ -176,7 +176,8 @@ export interface TaskStore {
   /**
    * Atomically move a non-terminal task whose lease has lapsed to `failed`. A
    * task with a live (or no) lease is left untouched. Returns the task as it now
-   * stands, or null if it is gone.
+   * stands, or null if it is gone. The store's clock (the one renewLease uses)
+   * is authoritative: callers never pre-check the lease against their own clock.
    */
   failExpiredLease?(taskId: string, options: { statusMessage: string, outcome: TaskOutcome }): Promise<TaskRecord | null>
 }
@@ -239,7 +240,10 @@ export class TaskLeases {
   }
 }
 
-/** Whether a task's lease has lapsed, so its owner is presumed dead */
+/**
+ * Whether a task's lease has lapsed, so its owner is presumed dead. Only valid
+ * where `now` comes from the same clock that set the lease (MemoryTaskStore).
+ */
 export function taskLeaseExpired (task: TaskRecord, now: number = Date.now()): boolean {
   return !isTerminal(task.status) && typeof task.leaseExpiresAt === 'number' && task.leaseExpiresAt <= now
 }
