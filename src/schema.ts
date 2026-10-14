@@ -231,6 +231,9 @@ export const INVALID_PARAMS = -32602
 export const INTERNAL_ERROR = -32603
 
 // Implementation-specific JSON-RPC error codes [-32000, -32099]
+/** Returned by `resources/read` for an unknown URI (resources.md, Error Handling). */
+export const RESOURCE_NOT_FOUND = -32002
+
 /** @internal */
 export const URL_ELICITATION_REQUIRED = -32042
 

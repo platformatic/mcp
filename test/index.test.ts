@@ -19,7 +19,9 @@ import {
   JSONRPC_VERSION,
   LATEST_PROTOCOL_VERSION,
   METHOD_NOT_FOUND,
-  INTERNAL_ERROR
+  INVALID_PARAMS,
+  INTERNAL_ERROR,
+  RESOURCE_NOT_FOUND
 } from '../src/schema.ts'
 
 describe('MCP Fastify Plugin', () => {
@@ -239,7 +241,8 @@ describe('MCP Fastify Plugin', () => {
       const body = response.json() as JSONRPCError
       t.assert.strictEqual(body.jsonrpc, JSONRPC_VERSION)
       t.assert.strictEqual(body.id, 6)
-      t.assert.strictEqual(body.error.code, METHOD_NOT_FOUND)
+      // tools.md, Error Handling: unknown tools are an Invalid params protocol error
+      t.assert.strictEqual(body.error.code, INVALID_PARAMS)
       t.assert.ok(body.error.message.includes('test-tool'))
     })
 
@@ -267,8 +270,10 @@ describe('MCP Fastify Plugin', () => {
       const body = response.json() as JSONRPCError
       t.assert.strictEqual(body.jsonrpc, JSONRPC_VERSION)
       t.assert.strictEqual(body.id, 7)
-      t.assert.strictEqual(body.error.code, METHOD_NOT_FOUND)
+      // resources.md, Error Handling: "Resource not found: -32002"
+      t.assert.strictEqual(body.error.code, RESOURCE_NOT_FOUND)
       t.assert.ok(body.error.message.includes('file://test.txt'))
+      t.assert.deepStrictEqual(body.error.data, { uri: 'file://test.txt' })
     })
 
     test('should handle prompts/get request for non-existent prompt', async (t: TestContext) => {
@@ -295,7 +300,8 @@ describe('MCP Fastify Plugin', () => {
       const body = response.json() as JSONRPCError
       t.assert.strictEqual(body.jsonrpc, JSONRPC_VERSION)
       t.assert.strictEqual(body.id, 8)
-      t.assert.strictEqual(body.error.code, METHOD_NOT_FOUND)
+      // prompts.md, Error Handling: "Invalid prompt name: -32602 (Invalid params)"
+      t.assert.strictEqual(body.error.code, INVALID_PARAMS)
       t.assert.ok(body.error.message.includes('test-prompt'))
     })
 

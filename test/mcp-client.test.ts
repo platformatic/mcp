@@ -7,7 +7,8 @@ import mcpPlugin, { createMcpClient } from '../src/index.ts'
 import {
   JSONRPC_VERSION,
   LATEST_PROTOCOL_VERSION,
-  METHOD_NOT_FOUND
+  METHOD_NOT_FOUND,
+  INVALID_PARAMS
 } from '../src/schema.ts'
 
 interface CapturedRequest {
@@ -640,7 +641,7 @@ describe('MCP client', () => {
     const response = await client.callTool('does-not-exist', {})
 
     assert.ok('error' in response.body)
-    assert.equal(response.body.error.code, METHOD_NOT_FOUND)
+    assert.equal(response.body.error.code, INVALID_PARAMS)
   })
 
   test('request ids increment sequentially when not explicitly set', async (t) => {
