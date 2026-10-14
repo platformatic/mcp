@@ -2070,7 +2070,7 @@ await app.register(import('@fastify/bearer-auth'), {
 ### Plugin Options
 
 - `serverInfo`: Server identification (name, version)
-- `capabilities`: MCP capabilities configuration
+- `capabilities`: MCP capabilities configuration. `completions` is not supported (there is no `completion/complete` handler): it is dropped from the advertised capabilities and a warning is logged at registration
 - `instructions`: Optional server instructions
 - `enableSSE`: Enable Server-Sent Events support on `GET /mcp` (default: false). Sessions and `DELETE /mcp` work either way.
 - `canAccessTool`: Per-request tool authorization hook consulted by `tools/list` and `tools/call` (optional)
