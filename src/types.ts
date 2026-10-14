@@ -1,5 +1,6 @@
 import type { FastifyReply, FastifyRequest, FastifySchema, HTTPMethods } from 'fastify'
 import type { Options } from 'ajv'
+import type { RedisOptions } from 'ioredis'
 import type {
   JSONRPCMessage,
   JSONRPCNotification,
@@ -375,13 +376,11 @@ export interface MCPPluginOptions {
    * Options override the default Fastify-compatible AJV configuration.
    */
   validateJsonSchemaInputs?: Options
-  redis?: {
-    host: string
-    port: number
-    password?: string
-    db?: number
-    tls?: Record<string, unknown>
-  }
+  /**
+   * Redis connection options, passed as-is to the ioredis constructor.
+   * Providing this option switches sessions, messaging and tasks to the Redis backends.
+   */
+  redis?: RedisOptions
   authorization?: AuthorizationConfig
   /**
    * Optional OpenTelemetry instrumentation.

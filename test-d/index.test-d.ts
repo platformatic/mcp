@@ -6,7 +6,8 @@ import {
 } from 'tsd'
 import { Type } from '@sinclair/typebox'
 import type { FastifyInstance, FastifyReply, FastifyRequest, FastifySchema, HTTPMethods } from 'fastify'
-import { RedisMessageBroker, MemoryMessageBroker, RedisSessionStore, MemorySessionStore } from '../dist/index.js'
+import type { RedisOptions } from 'ioredis'
+import { RedisMessageBroker, MemoryMessageBroker, RedisSessionStore, MemorySessionStore, RateLimiter } from '../dist/index.js'
 import type {
   ToolHandler,
   ResourceHandler,
@@ -283,9 +284,31 @@ expectAssignable<AllowedOrigins>('*')
 expectAssignable<AllowedOrigins>(true)
 expectNotAssignable<AllowedOrigins>('https://example.com')
 
-// Redis config requires host and port
-expectNotAssignable<MCPPluginOptions>({ redis: { host: 'localhost' } })
-expectNotAssignable<MCPPluginOptions>({ redis: { port: 6379 } })
+// Redis config accepts any ioredis RedisOptions; host and port default to localhost:6379
+expectAssignable<MCPPluginOptions>({ redis: { host: 'localhost' } })
+expectAssignable<MCPPluginOptions>({ redis: { port: 6379 } })
+expectAssignable<MCPPluginOptions>({
+  redis: {
+    host: 'localhost',
+    port: 6379,
+    maxRetriesPerRequest: 3,
+    connectTimeout: 10_000,
+    retryStrategy: (times: number) => Math.min(times * 100, 2000),
+    keyPrefix: 'mcp:',
+    tls: { rejectUnauthorized: true },
+  },
+})
+expectAssignable<MCPPluginOptions>({
+  redis: { sentinels: [{ host: 'sentinel', port: 26379 }], name: 'mymaster' },
+})
+const ioredisOptions: RedisOptions = { host: 'localhost', enableAutoPipelining: true }
+expectAssignable<MCPPluginOptions>({ redis: ioredisOptions })
+expectNotAssignable<MCPPluginOptions>({ redis: { port: '6379' } })
+expectNotAssignable<MCPPluginOptions>({ redis: { maxRetriesPerRequest: 'three' } })
+
+// RateLimiter is exported from the main entry point
+const rateLimiter = new RateLimiter(100, 60000)
+expectType<boolean>(rateLimiter.isAllowed('session-1'))
 
 // ─── SSESession ──────────────────────────────────────────────────────
 
