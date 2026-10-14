@@ -318,6 +318,13 @@ export interface MCPPluginOptions {
    */
   taskMaxTtlMs?: number
   /**
+   * Most tasks one principal (token subject) may keep stored, finished ones
+   * included (default 100). At the cap, the caller's oldest finished task is
+   * evicted; if all of them are still running, the call fails with
+   * "Task limit reached". Without authorization every caller shares one quota.
+   */
+  taskMaxRetainedPerPrincipal?: number
+  /**
    * Origins accepted on the MCP endpoints, to prevent DNS rebinding attacks.
    * Omit to disable validation (non-browser deployments), pass `'*'` or `true`
    * to accept any origin, or list exact origins to allow.

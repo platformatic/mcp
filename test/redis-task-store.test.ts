@@ -3,6 +3,7 @@ import type { TestContext } from 'node:test'
 import type { Redis } from 'ioredis'
 import { createTestRedis, cleanupRedis } from './redis-test-utils.ts'
 import { RedisTaskStore } from '../src/stores/redis-task-store.ts'
+import { TaskLimitError } from '../src/stores/task-store.ts'
 import type { TaskRecord } from '../src/stores/task-store.ts'
 import { InvalidTaskCursorError } from '../src/stores/task-store.ts'
 
@@ -284,6 +285,56 @@ describe('RedisTaskStore', () => {
     t.assert.ok(touched.length > 0, 'monitor should have seen the list commands')
     t.assert.strictEqual(touched.some(arg => arg.includes('other-') || arg.includes('user-2')), false)
     t.assert.strictEqual(touched.some(arg => arg === 'mcp:tasks' || arg === '*'), false)
+  })
+
+  test('caps the tasks each caller retains, finished ones included', async (t: TestContext) => {
+    store = new RedisTaskStore({ redis, maxTasksPerPrincipal: 2 })
+    await store.create(record({ taskId: 'a', authSubject: 'user-1' }))
+    await store.create(record({ taskId: 'b', authSubject: 'user-1' }))
+
+    await t.assert.rejects(
+      () => store.create(record({ taskId: 'c', authSubject: 'user-1' })),
+      (err: any) => err instanceof TaskLimitError && err.limit === 2
+    )
+    t.assert.strictEqual(await store.get('c'), null)
+    t.assert.strictEqual(await redis.zcard('mcp:tasks:owner:user-1'), 2)
+
+    // Another caller, and the anonymous bucket, have their own quota
+    await store.create(record({ taskId: 'x', authSubject: 'user-2' }))
+    await store.create(record({ taskId: 'y' }))
+    t.assert.ok(await store.get('x'))
+    t.assert.strictEqual(await redis.zcard('mcp:tasks:anonymous'), 1)
+  })
+
+  test('evicts the caller\'s oldest finished task to make room', async (t: TestContext) => {
+    store = new RedisTaskStore({ redis, maxTasksPerPrincipal: 3 })
+    const base = Date.now()
+    const at = (ms: number) => new Date(base + ms).toISOString()
+    await store.create(record({ taskId: 'a', authSubject: 'user-1', createdAt: at(0) }))
+    await store.create(record({ taskId: 'b', authSubject: 'user-1', createdAt: at(1) }))
+    await store.create(record({ taskId: 'c', authSubject: 'user-1', createdAt: at(2) }))
+    await store.updateStatus('b', 'completed')
+    await store.updateStatus('c', 'cancelled')
+
+    await store.create(record({ taskId: 'd', authSubject: 'user-1', createdAt: at(3) }))
+
+    t.assert.ok(await store.get('a'))
+    t.assert.strictEqual(await store.get('b'), null)
+    t.assert.ok(await store.get('c'))
+    t.assert.ok(await store.get('d'))
+    t.assert.deepStrictEqual(await redis.zrange('mcp:tasks:owner:user-1', 0, -1), ['a', 'c', 'd'])
+    // There is no global index, only the per-owner one
+    t.assert.strictEqual(await redis.exists('mcp:tasks'), 0)
+  })
+
+  test('expired tasks no longer count against the quota', async (t: TestContext) => {
+    store = new RedisTaskStore({ redis, maxTasksPerPrincipal: 1 })
+    await store.create(record({ taskId: 'a', authSubject: 'user-1' }))
+    // Stand in for Redis expiring the task key
+    await redis.del('mcp:task:a')
+
+    await store.create(record({ taskId: 'b', authSubject: 'user-1' }))
+    t.assert.deepStrictEqual(await redis.zrange('mcp:tasks:owner:user-1', 0, -1), ['b'])
   })
 
   test('tasks created on one store instance are visible from another', async (t: TestContext) => {

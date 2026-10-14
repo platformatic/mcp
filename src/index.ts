@@ -8,7 +8,7 @@ import { MemoryMessageBroker } from './brokers/memory-message-broker.ts'
 import { RedisSessionStore } from './stores/redis-session-store.ts'
 import { RedisMessageBroker } from './brokers/redis-message-broker.ts'
 import type { TaskStore } from './stores/task-store.ts'
-import { TaskWaiters } from './stores/task-store.ts'
+import { TaskWaiters, validateTaskLimit } from './stores/task-store.ts'
 import { MemoryTaskStore } from './stores/memory-task-store.ts'
 import { RedisTaskStore } from './stores/redis-task-store.ts'
 import type { MCPPluginOptions, MCPTool, MCPResource, MCPPrompt, ResourceHandlers } from './types.ts'
@@ -84,6 +84,10 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
   if (opts.sessionTtlMs !== undefined && !(Number.isFinite(opts.sessionTtlMs) && opts.sessionTtlMs > 0)) {
     throw new Error('sessionTtlMs must be a positive number of milliseconds')
   }
+  if (opts.taskMaxRetainedPerPrincipal !== undefined) {
+    // Checked before any Redis connection is opened, so a bad value cannot leak one
+    validateTaskLimit('taskMaxRetainedPerPrincipal', opts.taskMaxRetainedPerPrincipal)
+  }
   const tools = new Map<string, MCPTool>()
   const resources = new Map<string, MCPResource>()
   const prompts = new Map<string, MCPPrompt>()
@@ -113,14 +117,18 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
       }
     })
     if (enableTasks) {
-      taskStore = new RedisTaskStore({ redis, defaultTtlMs: opts.taskDefaultTtlMs })
+      taskStore = new RedisTaskStore({
+        redis,
+        defaultTtlMs: opts.taskDefaultTtlMs,
+        maxTasksPerPrincipal: opts.taskMaxRetainedPerPrincipal
+      })
     }
   } else {
     // Memory implementations for single-instance deployment
     sessionStore = new MemorySessionStore(100, { sessionTtlMs: opts.sessionTtlMs })
     messageBroker = new MemoryMessageBroker()
     if (enableTasks) {
-      taskStore = new MemoryTaskStore()
+      taskStore = new MemoryTaskStore({ maxTasksPerPrincipal: opts.taskMaxRetainedPerPrincipal })
     }
   }
 
@@ -420,7 +428,7 @@ export {
 
 // Task storage, for callers that want to supply or inspect a backend
 export type { TaskStore, TaskRecord, TaskOutcome, TaskListOptions, TaskListPage } from './stores/task-store.ts'
-export { InvalidTaskCursorError, DEFAULT_TASK_PAGE_SIZE } from './stores/task-store.ts'
+export { InvalidTaskCursorError, DEFAULT_TASK_PAGE_SIZE, TaskLimitError, TASK_LIMIT_REACHED, DEFAULT_TASK_MAX_PER_PRINCIPAL } from './stores/task-store.ts'
 export { MemoryTaskStore } from './stores/memory-task-store.ts'
 export { RedisTaskStore } from './stores/redis-task-store.ts'
 

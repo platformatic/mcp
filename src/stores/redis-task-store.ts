@@ -2,32 +2,81 @@ import type { Redis } from 'ioredis'
 import type { TaskStatus } from '../schema.ts'
 import type { TaskStore, TaskRecord, TaskOutcome, TaskListOptions, TaskListPage, TaskCursorPosition } from './task-store.ts'
 import {
+  DEFAULT_TASK_MAX_PER_PRINCIPAL,
+  TaskLimitError,
   canTransition,
   decodeTaskCursor,
   encodeTaskCursor,
   isTerminal,
-  taskPageLimit
+  taskPageLimit,
+  validateTaskLimit
 } from './task-store.ts'
 
 const TASK_KEY_PREFIX = 'mcp:task:'
 const OWNER_INDEX_PREFIX = 'mcp:tasks:owner:'
 const ANONYMOUS_INDEX_KEY = 'mcp:tasks:anonymous'
 
-// Add a task to its owner's index and stretch the index's expiry so it outlives
-// every task it references. A negative expiry means the task never expires, so
-// the index must not either.
-const INDEX_ADD_SCRIPT = `
-local existed = redis.call('EXISTS', KEYS[1])
-redis.call('ZADD', KEYS[1], ARGV[1], ARGV[2])
-local secs = tonumber(ARGV[3])
+// Store a task while enforcing its owner's retention cap, atomically so that
+// concurrent creates on different instances cannot overshoot it.
+//
+// KEYS: task key, owner index
+// ARGV: task JSON, expiry seconds (-1 = none), score, task id, cap, task key prefix
+//
+// The owner index is a sorted set of task ids scored by creation time (the same
+// one `list` pages through). Ids whose task key has expired are pruned first;
+// then, at the cap, the oldest finished tasks are evicted. Returns 0 (storing
+// nothing) when the owner is at the cap with nothing finished to evict. Task
+// keys are derived from index members, so this needs a standalone Redis (or
+// every key in one slot).
+const CREATE_SCRIPT = `
+local prefix = ARGV[6]
+local cap = tonumber(ARGV[5])
+local live = {}
+for _, id in ipairs(redis.call('ZRANGE', KEYS[2], 0, -1)) do
+  if redis.call('EXISTS', prefix .. id) == 1 then
+    table.insert(live, id)
+  else
+    redis.call('ZREM', KEYS[2], id)
+  end
+end
+
+local need = #live - cap + 1
+if need > 0 then
+  local victims = {}
+  for _, id in ipairs(live) do
+    if #victims >= need then break end
+    local ok, cur = pcall(cjson.decode, redis.call('GET', prefix .. id))
+    local s = ok and type(cur) == 'table' and cur.status
+    if s == 'completed' or s == 'failed' or s == 'cancelled' then
+      table.insert(victims, id)
+    end
+  end
+  if #victims < need then return 0 end
+  for _, id in ipairs(victims) do
+    redis.call('DEL', prefix .. id)
+    redis.call('ZREM', KEYS[2], id)
+  end
+end
+
+local secs = tonumber(ARGV[2])
 if secs < 0 then
-  redis.call('PERSIST', KEYS[1])
-elseif existed == 0 then
-  redis.call('EXPIRE', KEYS[1], secs)
+  redis.call('SET', KEYS[1], ARGV[1])
 else
-  local current = redis.call('TTL', KEYS[1])
+  redis.call('SET', KEYS[1], ARGV[1], 'EX', secs)
+end
+
+-- Stretch the owner index's expiry so it outlives every task it references,
+-- and never expire it while it holds a task that never expires.
+local existed = redis.call('EXISTS', KEYS[2])
+redis.call('ZADD', KEYS[2], ARGV[3], ARGV[4])
+if secs < 0 then
+  redis.call('PERSIST', KEYS[2])
+elseif existed == 0 then
+  redis.call('EXPIRE', KEYS[2], secs)
+else
+  local current = redis.call('TTL', KEYS[2])
   if current >= 0 and current < secs then
-    redis.call('EXPIRE', KEYS[1], secs)
+    redis.call('EXPIRE', KEYS[2], secs)
   end
 end
 return 1
@@ -49,10 +98,13 @@ function compareIds (a: string, b: string): number {
 export class RedisTaskStore implements TaskStore {
   private redis: Redis
   private readonly defaultTtlMs: number
+  private readonly maxTasksPerPrincipal: number
 
-  constructor (options: { redis: Redis, defaultTtlMs?: number }) {
+  constructor (options: { redis: Redis, defaultTtlMs?: number, maxTasksPerPrincipal?: number }) {
     this.redis = options.redis
     this.defaultTtlMs = options.defaultTtlMs ?? 3600_000
+    this.maxTasksPerPrincipal = options.maxTasksPerPrincipal ?? DEFAULT_TASK_MAX_PER_PRINCIPAL
+    validateTaskLimit('maxTasksPerPrincipal', this.maxTasksPerPrincipal)
   }
 
   private key (taskId: string): string {
@@ -61,8 +113,8 @@ export class RedisTaskStore implements TaskStore {
 
   /**
    * Per-owner index of task ids scored by creation time, so `list` only ever
-   * touches the caller's own tasks. Subject-less tasks get a separate key that
-   * cannot collide with any subject's.
+   * touches the caller's own tasks and `create` can enforce the retention cap.
+   * Subject-less tasks get a separate key that cannot collide with any subject's.
    */
   private indexKey (authSubject?: string): string {
     return authSubject === undefined ? ANONYMOUS_INDEX_KEY : `${OWNER_INDEX_PREFIX}${authSubject}`
@@ -74,27 +126,26 @@ export class RedisTaskStore implements TaskStore {
   }
 
   async create (task: TaskRecord): Promise<void> {
-    const key = this.key(task.taskId)
-    const multi = this.redis.multi()
     // A null ttl means unlimited retention (matching taskHasExpired and the
     // memory store), so write the key without an expiry rather than falling back
     // to the default and silently expiring it.
-    if (task.ttl === null) {
-      multi.set(key, JSON.stringify(task))
-    } else {
-      multi.set(key, JSON.stringify(task), 'EX', this.expirySeconds(task))
-    }
-    // The index lets `list` enumerate one owner's tasks without a keyspace scan.
-    // Task keys expire independently, so stale ids are pruned on read.
-    multi.eval(
-      INDEX_ADD_SCRIPT,
-      1,
+    // The owner index lets `list` enumerate one owner's tasks without a keyspace
+    // scan. Task keys expire independently, so stale ids are pruned here and on read.
+    const stored = await this.redis.eval(
+      CREATE_SCRIPT,
+      2,
+      this.key(task.taskId),
       this.indexKey(task.authSubject),
+      JSON.stringify(task),
+      task.ttl === null ? -1 : this.expirySeconds(task),
       new Date(task.createdAt).getTime(),
       task.taskId,
-      task.ttl === null ? -1 : this.expirySeconds(task)
+      this.maxTasksPerPrincipal,
+      TASK_KEY_PREFIX
     )
-    await multi.exec()
+    if (stored !== 1) {
+      throw new TaskLimitError(this.maxTasksPerPrincipal)
+    }
   }
 
   async get (taskId: string): Promise<TaskRecord | null> {

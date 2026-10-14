@@ -389,6 +389,25 @@ a per-subject index, so a listing only reads the caller's own tasks.
 Custom `TaskStore` implementations must implement `list(authSubject, { cursor, limit })` and
 return `{ tasks, nextCursor? }`, throwing `InvalidTaskCursorError` for a cursor they did not issue.
 
+Each caller (token subject) may keep at most `taskMaxRetainedPerPrincipal` tasks stored
+(default 100). Finished tasks count until their `ttl` expires, so one caller cannot fill the
+store with results it never collects. When a caller is at its quota, its oldest finished task
+is evicted to make room; if all of them are still running, the `tools/call` fails with
+`-32029` "Task limit reached". Without authorization every caller shares a single quota, so
+raise it if you expect many concurrent anonymous tasks. The in-memory store also holds at most
+1000 tasks in total; when full, it evicts the caller's oldest finished task, then the oldest
+finished task of any caller, before refusing. The Redis store enforces the quota atomically
+with a per-caller sorted set (`mcp:tasks:owner:<subject>`, or `mcp:tasks:anonymous`), so it
+holds across instances. Custom `TaskStore` implementations should throw `TaskLimitError` from
+`create()` to produce the same response.
+
+```typescript
+await app.register(mcpPlugin, {
+  enableTasks: true,
+  taskMaxRetainedPerPrincipal: 20 // tasks each caller may keep, finished ones included
+})
+```
+
 **Security**: when authorization is enabled, tasks are bound to the token subject and a
 requestor can only reach its own. Without authorization no requestor can be identified, so
 tasks are reachable by anyone holding the (random UUID) task id, and `tasks/list` is both

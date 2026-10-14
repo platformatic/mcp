@@ -38,7 +38,7 @@ import type { RequestId } from './schema.ts'
 import type { MCPTool, MCPResource, MCPPrompt, MCPPluginOptions, ResourceHandlers, McpCallToolOutcome, ToolAccessOperation, MCPToolCallCompleteEvent, TracerLike } from './types.ts'
 import type { SessionStore } from './stores/session-store.ts'
 import type { TaskStore, TaskRecord, TaskWaiters } from './stores/task-store.ts'
-import { InvalidTaskCursorError, decodeTaskCursor, isTerminal, toWireTask } from './stores/task-store.ts'
+import { InvalidTaskCursorError, TaskLimitError, TASK_LIMIT_REACHED, decodeTaskCursor, isTerminal, toWireTask } from './stores/task-store.ts'
 import type { AuthorizationContext } from './types/auth-types.ts'
 import {
   supportsTasks,
@@ -1334,7 +1334,14 @@ async function runToolCallAsTask (
   }
 
   const task = newTaskRecord('tools/call', ttl, taskSubject(dependencies), taskTtlBounds(dependencies))
-  await taskStore.create(task)
+  try {
+    await taskStore.create(task)
+  } catch (error) {
+    if (error instanceof TaskLimitError) {
+      return createError(request.id, TASK_LIMIT_REACHED, 'Task limit reached')
+    }
+    throw error
+  }
 
   // Deliberately not awaited: the point of a task is to return control now.
   const execution = (async () => {
