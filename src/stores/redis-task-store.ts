@@ -1,6 +1,6 @@
 import type { Redis } from 'ioredis'
 import type { TaskStatus } from '../schema.ts'
-import type { TaskStore, TaskRecord, TaskOutcome, TaskListOptions, TaskListPage, TaskCursorPosition } from './task-store.ts'
+import type { TaskStore, TaskRecord, TaskOutcome, TaskListOptions, TaskListPage, TaskCursorPosition, TaskOwner } from './task-store.ts'
 import {
   DEFAULT_TASK_MAX_PER_PRINCIPAL,
   TaskLimitError,
@@ -8,6 +8,7 @@ import {
   canTransition,
   decodeTaskCursor,
   encodeTaskCursor,
+  isTaskOwner,
   isTerminal,
   ownerLostOutcome,
   taskPageLimit,
@@ -103,6 +104,10 @@ function compareIds (a: string, b: string): number {
   return Buffer.compare(Buffer.from(a), Buffer.from(b))
 }
 
+function taskOwner (task: TaskRecord): TaskOwner {
+  return { subject: task.authSubject, issuer: task.authIssuer }
+}
+
 /**
  * Redis-backed task store, so tasks created on one instance can be polled from
  * any other. Task retention is enforced with Redis key expiry, which means an
@@ -127,10 +132,13 @@ export class RedisTaskStore implements TaskStore {
   /**
    * Per-owner index of task ids scored by creation time, so `list` only ever
    * touches the caller's own tasks and `create` can enforce the retention cap.
-   * Subject-less tasks get a separate key that cannot collide with any subject's.
+   * Ownerless tasks get a separate key that cannot collide with any owner's.
+   * Issuer and subject may both contain ':', so each is percent-encoded to keep
+   * the pair unambiguous.
    */
-  private indexKey (authSubject?: string): string {
-    return authSubject === undefined ? ANONYMOUS_INDEX_KEY : `${OWNER_INDEX_PREFIX}${authSubject}`
+  private indexKey (owner: TaskOwner): string {
+    if (owner.subject === undefined && owner.issuer === undefined) return ANONYMOUS_INDEX_KEY
+    return `${OWNER_INDEX_PREFIX}${encodeURIComponent(owner.issuer ?? '')}:${encodeURIComponent(owner.subject ?? '')}`
   }
 
   private expirySeconds (task: TaskRecord): number {
@@ -148,7 +156,7 @@ export class RedisTaskStore implements TaskStore {
       CREATE_SCRIPT,
       2,
       this.key(task.taskId),
-      this.indexKey(task.authSubject),
+      this.indexKey(taskOwner(task)),
       JSON.stringify(task),
       task.ttl === null ? -1 : this.expirySeconds(task),
       new Date(task.createdAt).getTime(),
@@ -294,9 +302,9 @@ export class RedisTaskStore implements TaskStore {
     }
   }
 
-  async list (authSubject?: string, options: TaskListOptions = {}): Promise<TaskListPage> {
+  async list (owner: TaskOwner = {}, options: TaskListOptions = {}): Promise<TaskListPage> {
     const limit = taskPageLimit(options.limit)
-    const indexKey = this.indexKey(authSubject)
+    const indexKey = this.indexKey(owner)
 
     // Walk the owner's index newest first. Each batch resumes from the last
     // (score, id) pair scanned, never from an offset, so entries removed by a
@@ -349,7 +357,7 @@ export class RedisTaskStore implements TaskStore {
           continue
         }
         // The index is per owner, but never trust it over the record itself
-        if (task.authSubject !== authSubject) continue
+        if (!isTaskOwner(task, owner)) continue
         tasks.push(task)
       }
     }
@@ -368,15 +376,15 @@ export class RedisTaskStore implements TaskStore {
   async delete (taskId: string): Promise<void> {
     const key = this.key(taskId)
     const raw = await this.redis.get(key)
-    let authSubject: string | undefined
+    let owner: TaskOwner = {}
     try {
-      authSubject = raw ? (JSON.parse(raw) as TaskRecord).authSubject : undefined
+      if (raw) owner = taskOwner(JSON.parse(raw) as TaskRecord)
     } catch {}
 
     const multi = this.redis.multi().del(key)
     // Without the record we cannot tell which index holds the id; `list` prunes
     // it lazily instead.
-    if (raw) multi.zrem(this.indexKey(authSubject), taskId)
+    if (raw) multi.zrem(this.indexKey(owner), taskId)
     await multi.exec()
   }
 

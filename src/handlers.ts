@@ -37,8 +37,8 @@ import type { RequestId } from './schema.ts'
 
 import type { MCPTool, MCPResource, MCPPrompt, MCPPluginOptions, ResourceHandlers, McpCallToolOutcome, ToolAccessOperation, MCPToolCallCompleteEvent, TracerLike } from './types.ts'
 import type { SessionStore } from './stores/session-store.ts'
-import type { TaskStore, TaskRecord, TaskWaiters, TaskLeases } from './stores/task-store.ts'
-import { InvalidTaskCursorError, TaskLimitError, TASK_LIMIT_REACHED, TASK_OWNER_LOST, decodeTaskCursor, isTerminal, ownerLostOutcome, toWireTask } from './stores/task-store.ts'
+import type { TaskStore, TaskRecord, TaskOwner, TaskWaiters, TaskLeases } from './stores/task-store.ts'
+import { InvalidTaskCursorError, TaskLimitError, TASK_LIMIT_REACHED, TASK_OWNER_LOST, decodeTaskCursor, isTaskOwner, isTerminal, ownerLostOutcome, toWireTask } from './stores/task-store.ts'
 import type { AuthorizationContext } from './types/auth-types.ts'
 import {
   supportsTasks,
@@ -954,14 +954,18 @@ function taskTtlBounds (dependencies: HandlerDependencies): { defaultTtl: number
 }
 
 /**
- * The authorization subject a task belongs to.
+ * The owner a task created by this request belongs to: the token's subject and
+ * its normalized issuer, since a subject is only unique within its issuer.
  *
- * When the deployment cannot identify requestors this is undefined, and tasks
+ * When the deployment cannot identify requestors both are undefined, and tasks
  * are reachable by anyone holding the (cryptographically random) task id. That
  * limitation is why `tasks/list` is only advertised when auth is in play.
  */
-function taskSubject (dependencies: HandlerDependencies): string | undefined {
-  return dependencies.authContext?.userId
+function taskOwner (dependencies: HandlerDependencies): TaskOwner {
+  return {
+    subject: dependencies.authContext?.userId,
+    issuer: dependencies.authContext ? dependencies.request.tokenIssuer : undefined
+  }
 }
 
 /**
@@ -984,13 +988,14 @@ function canIdentifyRequestors (dependencies: HandlerDependencies): boolean {
 function assertTaskAccess (task: TaskRecord | null, dependencies: HandlerDependencies): TaskRecord | null {
   if (!task) return null
 
-  const subject = taskSubject(dependencies)
-
   if (canIdentifyRequestors(dependencies)) {
-    // Auth on: a task is reachable only by the exact subject that owns it. A
-    // token without a `sub` claim identifies no one, so an undefined subject
-    // must never match another subject-less task via `undefined === undefined`.
-    if (subject === undefined || task.authSubject !== subject) return null
+    // Auth on: a task is reachable only by the exact (issuer, subject) pair that
+    // owns it. A token without a `sub` or issuer identifies no one, so an
+    // undefined value must never match an ownerless task via
+    // `undefined === undefined`. Tasks created before issuers were recorded
+    // have no authIssuer and so stay unreachable until their ttl expires.
+    const owner = taskOwner(dependencies)
+    if (owner.subject === undefined || owner.issuer === undefined || !isTaskOwner(task, owner)) return null
     return task
   }
 
@@ -1027,7 +1032,7 @@ export function resolveTaskAugmentation (
 function newTaskRecord (
   method: string,
   ttl: number | undefined,
-  subject: string | undefined,
+  owner: TaskOwner,
   bounds: { defaultTtl: number, maxTtl: number }
 ): TaskRecord {
   const now = new Date().toISOString()
@@ -1041,7 +1046,8 @@ function newTaskRecord (
     ttl: Math.min(Math.max(requested, MIN_TASK_TTL), bounds.maxTtl),
     pollInterval: DEFAULT_POLL_INTERVAL,
     method,
-    authSubject: subject
+    authSubject: owner.subject,
+    authIssuer: owner.issuer
   }
 }
 
@@ -1274,17 +1280,17 @@ async function handleTasksList (
     }
   }
 
-  const subject = taskSubject(dependencies)
-  if (subject === undefined) {
-    // Auth is on but this token carries no `sub`, so it owns nothing we can
-    // identify. Listing the undefined-subject tasks would expose every other
-    // subject-less caller's tasks, so return an empty set instead.
+  const owner = taskOwner(dependencies)
+  if (owner.subject === undefined || owner.issuer === undefined) {
+    // Auth is on but this token carries no `sub` (or issuer), so it owns nothing
+    // we can identify. Listing the ownerless tasks would expose every other such
+    // caller's tasks, so return an empty set instead.
     return createResponse(request.id, { tasks: [], nextCursor: undefined } as ListTasksResult)
   }
 
   let page
   try {
-    page = await taskStore.list(subject, { cursor: cursor as string | undefined })
+    page = await taskStore.list(owner, { cursor: cursor as string | undefined })
   } catch (err) {
     if (err instanceof InvalidTaskCursorError) {
       return createError(request.id, INVALID_PARAMS, 'Invalid cursor')
@@ -1379,7 +1385,7 @@ async function runToolCallAsTask (
     return createError(request.id, METHOD_NOT_FOUND, 'Tasks are not enabled on this server')
   }
 
-  const task = newTaskRecord('tools/call', ttl, taskSubject(dependencies), taskTtlBounds(dependencies))
+  const task = newTaskRecord('tools/call', ttl, taskOwner(dependencies), taskTtlBounds(dependencies))
   try {
     await taskStore.create(task)
   } catch (error) {

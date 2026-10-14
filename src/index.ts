@@ -448,7 +448,7 @@ export {
 } from './schema.ts'
 
 // Task storage, for callers that want to supply or inspect a backend
-export type { TaskStore, TaskRecord, TaskOutcome, TaskListOptions, TaskListPage } from './stores/task-store.ts'
+export type { TaskStore, TaskRecord, TaskOutcome, TaskListOptions, TaskListPage, TaskOwner } from './stores/task-store.ts'
 export { InvalidTaskCursorError, DEFAULT_TASK_PAGE_SIZE, TaskLimitError, TASK_LIMIT_REACHED, DEFAULT_TASK_MAX_PER_PRINCIPAL } from './stores/task-store.ts'
 export { MemoryTaskStore } from './stores/memory-task-store.ts'
 export { RedisTaskStore } from './stores/redis-task-store.ts'

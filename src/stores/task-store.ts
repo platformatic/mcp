@@ -15,6 +15,11 @@ export interface TaskRecord extends Task {
    * belonging to a different context.
    */
   authSubject?: string
+  /**
+   * Normalized issuer of the token that created the task. A subject is only
+   * unique within its issuer, so the owner is the (authIssuer, authSubject) pair.
+   */
+  authIssuer?: string
   /** The method of the request the task wraps, e.g. `tools/call` */
   method: string
   /** Terminal outcome, present once the task reaches completed/failed/cancelled */
@@ -43,6 +48,20 @@ export function isTerminal (status: TaskStatus): boolean {
 
 export function canTransition (from: TaskStatus, to: TaskStatus): boolean {
   return ALLOWED_TRANSITIONS[from]?.includes(to) ?? false
+}
+
+/**
+ * Who a task belongs to. Both fields are undefined for tasks created without
+ * authorization.
+ */
+export interface TaskOwner {
+  subject?: string
+  issuer?: string
+}
+
+/** Whether a task belongs to exactly this owner */
+export function isTaskOwner (task: TaskRecord, owner: TaskOwner): boolean {
+  return task.authSubject === owner.subject && task.authIssuer === owner.issuer
 }
 
 export interface TaskListOptions {
@@ -160,11 +179,11 @@ export interface TaskStore {
    */
   updateStatus(taskId: string, status: TaskStatus, options?: { statusMessage?: string, outcome?: TaskOutcome }): Promise<TaskRecord | null>
   /**
-   * One page of the tasks visible to the given authorization subject, newest
-   * first. Pass the previous page's `nextCursor` to continue.
+   * One page of the tasks belonging to the given owner, newest first. Pass the
+   * previous page's `nextCursor` to continue.
    * @throws InvalidTaskCursorError if `cursor` was not issued by this store
    */
-  list(authSubject?: string, options?: TaskListOptions): Promise<TaskListPage>
+  list(owner?: TaskOwner, options?: TaskListOptions): Promise<TaskListPage>
   delete(taskId: string): Promise<void>
   /** Drop tasks whose ttl has elapsed */
   cleanup(): Promise<void>
@@ -314,6 +333,6 @@ export function taskHasExpired (task: TaskRecord, now: number = Date.now()): boo
  * Strip storage-only fields so a record can go on the wire as a spec `Task`.
  */
 export function toWireTask (task: TaskRecord): Task {
-  const { authSubject, method, outcome, leaseExpiresAt, ...wire } = task
+  const { authSubject, authIssuer, method, outcome, leaseExpiresAt, ...wire } = task
   return wire
 }

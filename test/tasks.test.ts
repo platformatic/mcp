@@ -9,6 +9,8 @@ import { MemoryTaskStore } from '../src/stores/memory-task-store.ts'
 import { canTransition, isTerminal, taskHasExpired, toWireTask, InvalidTaskCursorError, DEFAULT_TASK_PAGE_SIZE, TaskLimitError, TASK_LIMIT_REACHED, TaskLeases, TASK_OWNER_LOST } from '../src/stores/task-store.ts'
 import type { TaskRecord } from '../src/stores/task-store.ts'
 import { resolveTaskAugmentation, RELATED_TASK_META_KEY } from '../src/handlers.ts'
+
+const ISS = 'https://auth.example.com'
 import { createTestAuthConfig, createTestJWT, setupMockAgent, generateMockJWKSResponse } from './auth-test-utils.ts'
 
 function record (overrides: Partial<TaskRecord> = {}): TaskRecord {
@@ -118,8 +120,9 @@ describe('task store', () => {
   })
 
   test('toWireTask drops storage-only fields', (t: TestContext) => {
-    const wire = toWireTask(record({ authSubject: 'user-1', outcome: { jsonrpc: '2.0', id: 1, result: {} } }))
+    const wire = toWireTask(record({ authSubject: 'user-1', authIssuer: ISS, outcome: { jsonrpc: '2.0', id: 1, result: {} } }))
     t.assert.strictEqual('authSubject' in wire, false)
+    t.assert.strictEqual('authIssuer' in wire, false)
     t.assert.strictEqual('method' in wire, false)
     t.assert.strictEqual('outcome' in wire, false)
     t.assert.strictEqual(wire.taskId, 'task-1')
@@ -199,13 +202,24 @@ describe('task store', () => {
 
   test('MemoryTaskStore isolates tasks by authorization subject', async (t: TestContext) => {
     const store = new MemoryTaskStore()
-    await store.create(record({ taskId: 'a', authSubject: 'user-1' }))
-    await store.create(record({ taskId: 'b', authSubject: 'user-2' }))
+    await store.create(record({ taskId: 'a', authSubject: 'user-1', authIssuer: ISS }))
+    await store.create(record({ taskId: 'b', authSubject: 'user-2', authIssuer: ISS }))
     await store.create(record({ taskId: 'c' }))
 
-    t.assert.deepStrictEqual((await store.list('user-1')).tasks.map(x => x.taskId), ['a'])
-    t.assert.deepStrictEqual((await store.list('user-2')).tasks.map(x => x.taskId), ['b'])
+    t.assert.deepStrictEqual((await store.list({ subject: 'user-1', issuer: ISS })).tasks.map(x => x.taskId), ['a'])
+    t.assert.deepStrictEqual((await store.list({ subject: 'user-2', issuer: ISS })).tasks.map(x => x.taskId), ['b'])
     t.assert.deepStrictEqual((await store.list()).tasks.map(x => x.taskId), ['c'])
+  })
+
+  test('MemoryTaskStore isolates tasks by issuer as well as subject', async (t: TestContext) => {
+    const store = new MemoryTaskStore()
+    await store.create(record({ taskId: 'a', authSubject: '12345', authIssuer: 'https://idp-a.example.com' }))
+    await store.create(record({ taskId: 'b', authSubject: '12345', authIssuer: 'https://idp-b.example.com' }))
+    // Created before issuers were recorded
+    await store.create(record({ taskId: 'legacy', authSubject: '12345' }))
+
+    t.assert.deepStrictEqual((await store.list({ subject: '12345', issuer: 'https://idp-a.example.com' })).tasks.map(x => x.taskId), ['a'])
+    t.assert.deepStrictEqual((await store.list({ subject: '12345', issuer: 'https://idp-b.example.com' })).tasks.map(x => x.taskId), ['b'])
   })
 
   test('MemoryTaskStore paginates list newest first with an opaque cursor', async (t: TestContext) => {
@@ -214,15 +228,15 @@ describe('task store', () => {
     // Two tasks share a creation time to exercise the id tie-break
     const times = [0, 1, 2, 2, 3]
     for (let i = 0; i < times.length; i++) {
-      await store.create(record({ taskId: `t${i}`, authSubject: 'user-1', createdAt: new Date(base + times[i]).toISOString() }))
+      await store.create(record({ taskId: `t${i}`, authSubject: 'user-1', authIssuer: ISS, createdAt: new Date(base + times[i]).toISOString() }))
     }
-    await store.create(record({ taskId: 'other', authSubject: 'user-2', createdAt: new Date(base + 10).toISOString() }))
+    await store.create(record({ taskId: 'other', authSubject: 'user-2', authIssuer: ISS, createdAt: new Date(base + 10).toISOString() }))
 
     const seen: string[] = []
     let cursor: string | undefined
     let pages = 0
     do {
-      const page = await store.list('user-1', { cursor, limit: 2 })
+      const page = await store.list({ subject: 'user-1', issuer: ISS }, { cursor, limit: 2 })
       t.assert.ok(page.tasks.length <= 2)
       seen.push(...page.tasks.map(x => x.taskId))
       cursor = page.nextCursor
@@ -235,18 +249,18 @@ describe('task store', () => {
 
   test('MemoryTaskStore omits nextCursor on the last page', async (t: TestContext) => {
     const store = new MemoryTaskStore()
-    await store.create(record({ taskId: 'a', authSubject: 'user-1' }))
-    await store.create(record({ taskId: 'b', authSubject: 'user-1' }))
+    await store.create(record({ taskId: 'a', authSubject: 'user-1', authIssuer: ISS }))
+    await store.create(record({ taskId: 'b', authSubject: 'user-1', authIssuer: ISS }))
 
-    const page = await store.list('user-1', { limit: 2 })
+    const page = await store.list({ subject: 'user-1', issuer: ISS }, { limit: 2 })
     t.assert.strictEqual(page.tasks.length, 2)
     t.assert.strictEqual(page.nextCursor, undefined)
   })
 
   test('MemoryTaskStore rejects an invalid cursor', async (t: TestContext) => {
     const store = new MemoryTaskStore()
-    await t.assert.rejects(store.list('user-1', { cursor: 'not-a-cursor' }), InvalidTaskCursorError)
-    await t.assert.rejects(store.list('user-1', { cursor: Buffer.from('{"t":"x"}').toString('base64url') }), InvalidTaskCursorError)
+    await t.assert.rejects(store.list({ subject: 'user-1', issuer: ISS }, { cursor: 'not-a-cursor' }), InvalidTaskCursorError)
+    await t.assert.rejects(store.list({ subject: 'user-1', issuer: ISS }, { cursor: Buffer.from('{"t":"x"}').toString('base64url') }), InvalidTaskCursorError)
   })
 
   test('concurrent cancel and completion cannot overwrite each other', async (t: TestContext) => {
