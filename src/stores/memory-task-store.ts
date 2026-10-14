@@ -1,13 +1,16 @@
 import type { TaskStatus } from '../schema.ts'
 import type { TaskStore, TaskRecord, TaskOutcome, TaskListOptions, TaskListPage } from './task-store.ts'
 import {
+  DEFAULT_TASK_MAX_PER_PRINCIPAL,
+  TaskLimitError,
   canTransition,
   decodeTaskCursor,
   encodeTaskCursor,
   isAfterTaskCursor,
   isTerminal,
   taskHasExpired,
-  taskPageLimit
+  taskPageLimit,
+  validateTaskLimit
 } from './task-store.ts'
 
 /**
@@ -17,21 +20,74 @@ import {
  * outlives its ttl even if `cleanup()` has not run recently.
  */
 export class MemoryTaskStore implements TaskStore {
+  // Insertion order is creation order, so iteration visits the oldest first
   private tasks = new Map<string, TaskRecord>()
   private readonly maxTasks: number
+  private readonly maxTasksPerPrincipal: number
 
-  constructor (maxTasks: number = 1000) {
-    this.maxTasks = maxTasks
+  constructor (options: number | { maxTasks?: number, maxTasksPerPrincipal?: number } = {}) {
+    const opts = typeof options === 'number' ? { maxTasks: options } : options
+    this.maxTasks = opts.maxTasks ?? 1000
+    this.maxTasksPerPrincipal = opts.maxTasksPerPrincipal ?? DEFAULT_TASK_MAX_PER_PRINCIPAL
+    validateTaskLimit('maxTasks', this.maxTasks)
+    validateTaskLimit('maxTasksPerPrincipal', this.maxTasksPerPrincipal)
   }
 
   async create (task: TaskRecord): Promise<void> {
-    if (this.tasks.size >= this.maxTasks) {
-      await this.cleanup()
+    // No await until the task is stored, so concurrent creates cannot both
+    // pass the capacity checks and overshoot them.
+    const owner = task.authSubject
+    const ownedBy = (t: TaskRecord) => t.authSubject === owner
+
+    // Finished tasks count too: otherwise one caller could hold every slot
+    // with results it never collects until their ttl runs out.
+    if (this.count(ownedBy) >= this.maxTasksPerPrincipal) {
+      this.sweepExpired()
+      if (this.count(ownedBy) >= this.maxTasksPerPrincipal && !this.evictOldestFinished(ownedBy)) {
+        throw new TaskLimitError(this.maxTasksPerPrincipal)
+      }
     }
+
     if (this.tasks.size >= this.maxTasks) {
-      throw new Error(`Task limit reached (${this.maxTasks})`)
+      this.sweepExpired()
+      // Prefer the caller's own finished work; failing that, the oldest
+      // finished task of anyone, as stale results matter less than new work.
+      if (
+        this.tasks.size >= this.maxTasks &&
+        !this.evictOldestFinished(ownedBy) &&
+        !this.evictOldestFinished(() => true)
+      ) {
+        throw new TaskLimitError(this.maxTasks)
+      }
     }
+
     this.tasks.set(task.taskId, { ...task })
+  }
+
+  private count (predicate: (task: TaskRecord) => boolean): number {
+    let n = 0
+    for (const task of this.tasks.values()) {
+      if (predicate(task)) n++
+    }
+    return n
+  }
+
+  private evictOldestFinished (predicate: (task: TaskRecord) => boolean): boolean {
+    for (const [taskId, task] of this.tasks) {
+      if (isTerminal(task.status) && predicate(task)) {
+        this.tasks.delete(taskId)
+        return true
+      }
+    }
+    return false
+  }
+
+  private sweepExpired (): void {
+    for (const [taskId, task] of this.tasks.entries()) {
+      if (taskHasExpired(task)) {
+        this.tasks.delete(taskId)
+      }
+    }
   }
 
   async get (taskId: string): Promise<TaskRecord | null> {
@@ -112,10 +168,6 @@ export class MemoryTaskStore implements TaskStore {
   }
 
   async cleanup (): Promise<void> {
-    for (const [taskId, task] of this.tasks.entries()) {
-      if (taskHasExpired(task)) {
-        this.tasks.delete(taskId)
-      }
-    }
+    this.sweepExpired()
   }
 }

@@ -6,7 +6,7 @@ import mcpPlugin from '../src/index.ts'
 import { JSONRPC_VERSION, LATEST_PROTOCOL_VERSION, METHOD_NOT_FOUND, INVALID_PARAMS } from '../src/schema.ts'
 import type { Task, CreateTaskResult, ListTasksResult, CallToolResult } from '../src/schema.ts'
 import { MemoryTaskStore } from '../src/stores/memory-task-store.ts'
-import { canTransition, isTerminal, taskHasExpired, toWireTask, InvalidTaskCursorError, DEFAULT_TASK_PAGE_SIZE } from '../src/stores/task-store.ts'
+import { canTransition, isTerminal, taskHasExpired, toWireTask, InvalidTaskCursorError, DEFAULT_TASK_PAGE_SIZE, TaskLimitError, TASK_LIMIT_REACHED } from '../src/stores/task-store.ts'
 import type { TaskRecord } from '../src/stores/task-store.ts'
 import { resolveTaskAugmentation, RELATED_TASK_META_KEY } from '../src/handlers.ts'
 import { createTestAuthConfig, createTestJWT, setupMockAgent, generateMockJWKSResponse } from './auth-test-utils.ts'
@@ -228,6 +228,64 @@ describe('task store', () => {
 
     await t.assert.rejects(() => store.updateStatus('task-1', 'completed'), /terminal status/)
     t.assert.strictEqual((await store.get('task-1'))!.status, 'cancelled')
+  })
+
+  test('MemoryTaskStore counts finished tasks against the per-principal cap', async (t: TestContext) => {
+    const store = new MemoryTaskStore({ maxTasksPerPrincipal: 2 })
+    await store.create(record({ taskId: 'a', authSubject: 'user-1' }))
+    await store.create(record({ taskId: 'b', authSubject: 'user-1' }))
+
+    // Both still running: nothing can be evicted, so the third is refused
+    await t.assert.rejects(
+      () => store.create(record({ taskId: 'c', authSubject: 'user-1' })),
+      (err: any) => err instanceof TaskLimitError && err.limit === 2
+    )
+
+    // Another caller is unaffected
+    await store.create(record({ taskId: 'x', authSubject: 'user-2' }))
+    t.assert.ok(await store.get('x'))
+  })
+
+  test('MemoryTaskStore evicts the caller\'s oldest finished task to make room', async (t: TestContext) => {
+    const store = new MemoryTaskStore({ maxTasksPerPrincipal: 3 })
+    await store.create(record({ taskId: 'a', authSubject: 'user-1' }))
+    await store.create(record({ taskId: 'b', authSubject: 'user-1' }))
+    await store.create(record({ taskId: 'c', authSubject: 'user-1' }))
+    await store.updateStatus('b', 'completed')
+    await store.updateStatus('c', 'failed')
+
+    await store.create(record({ taskId: 'd', authSubject: 'user-1' }))
+
+    // 'a' is older but still running, so the oldest finished task 'b' goes
+    t.assert.ok(await store.get('a'))
+    t.assert.strictEqual(await store.get('b'), null)
+    t.assert.ok(await store.get('c'))
+    t.assert.ok(await store.get('d'))
+  })
+
+  test('MemoryTaskStore frees store capacity held by another caller\'s finished tasks', async (t: TestContext) => {
+    // The scenario from #249: one caller's finished tasks fill the whole store
+    const store = new MemoryTaskStore({ maxTasks: 3, maxTasksPerPrincipal: 3 })
+    for (const id of ['a', 'b', 'c']) {
+      await store.create(record({ taskId: id, authSubject: 'user-1', ttl: 3600_000 }))
+      await store.updateStatus(id, 'completed')
+    }
+
+    await store.create(record({ taskId: 'd', authSubject: 'user-2' }))
+    t.assert.ok(await store.get('d'))
+    t.assert.strictEqual(await store.get('a'), null)
+    t.assert.ok(await store.get('b'))
+  })
+
+  test('MemoryTaskStore refuses when the store is full of running tasks', async (t: TestContext) => {
+    const store = new MemoryTaskStore(2)
+    await store.create(record({ taskId: 'a', authSubject: 'user-1' }))
+    await store.create(record({ taskId: 'b', authSubject: 'user-2' }))
+
+    await t.assert.rejects(
+      () => store.create(record({ taskId: 'c', authSubject: 'user-3' })),
+      /Task limit reached/
+    )
   })
 })
 
@@ -571,6 +629,35 @@ describe('tasks over the wire', () => {
       payload: { jsonrpc: JSONRPC_VERSION, id: 1, method: 'tools/call', params: { name: 'noop', arguments: {}, task: {} } }
     })
     t.assert.strictEqual(res.statusCode, 401)
+  })
+
+  test('a caller over its task quota gets "Task limit reached", not an internal error', async (t: TestContext) => {
+    const app = await buildApp(t, { taskMaxRetainedPerPrincipal: 1 })
+    app.mcpAddTool({
+      name: 'hang',
+      description: 'Never finishes',
+      inputSchema: Type.Object({}),
+      execution: { taskSupport: 'optional' }
+    } as any, () => new Promise<CallToolResult>(() => {}))
+
+    const first = await call(app, 'tools/call', { name: 'hang', arguments: {}, task: {} })
+    t.assert.ok(first.result.task.taskId)
+
+    const second = await call(app, 'tools/call', { name: 'hang', arguments: {}, task: {} })
+    t.assert.strictEqual(second.error.code, TASK_LIMIT_REACHED)
+    t.assert.strictEqual(second.error.message, 'Task limit reached')
+  })
+
+  test('a finished task is evicted so the same caller can start another', async (t: TestContext) => {
+    const app = await buildApp(t, { taskMaxRetainedPerPrincipal: 1 })
+
+    const first = await call(app, 'tools/call', { name: 'slow-add', arguments: { a: 1, b: 2 }, task: { ttl: 3600_000 } })
+    await waitForTerminal(app, first.result.task.taskId)
+
+    const second = await call(app, 'tools/call', { name: 'slow-add', arguments: { a: 1, b: 2 }, task: { ttl: 3600_000 } })
+    t.assert.ok(second.result.task.taskId)
+    const gone = await call(app, 'tasks/get', { taskId: first.result.task.taskId })
+    t.assert.strictEqual(gone.error.code, INVALID_PARAMS)
   })
 
   test('task methods are unavailable when tasks are disabled', async (t: TestContext) => {

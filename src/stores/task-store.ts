@@ -108,7 +108,43 @@ export function taskPageLimit (limit: number | undefined): number {
   return limit
 }
 
+/** Tasks one principal may keep stored, finished ones included, by default */
+export const DEFAULT_TASK_MAX_PER_PRINCIPAL = 100
+
+/**
+ * JSON-RPC error code returned when a task cannot be created because the
+ * caller (or the store) is at capacity and holds no finished task to evict.
+ * Implementation-defined, in the -32000..-32099 server error range.
+ */
+export const TASK_LIMIT_REACHED = -32029
+
+/**
+ * Thrown by `TaskStore.create` when the store is at capacity and no finished
+ * task can be evicted to make room.
+ */
+export class TaskLimitError extends Error {
+  readonly limit: number
+
+  constructor (limit: number) {
+    super(`Task limit reached (${limit})`)
+    this.name = 'TaskLimitError'
+    this.limit = limit
+  }
+}
+
+export function validateTaskLimit (name: string, value: unknown): void {
+  if (!Number.isInteger(value) || (value as number) < 1) {
+    throw new TypeError(`${name} must be a positive integer`)
+  }
+}
+
 export interface TaskStore {
+  /**
+   * Store a new task. Every principal (and the anonymous caller) has a cap on
+   * the tasks it keeps stored, finished ones included; at the cap, its oldest
+   * finished task is evicted to make room.
+   * @throws TaskLimitError if at capacity with no finished task to evict
+   */
   create(task: TaskRecord): Promise<void>
   get(taskId: string): Promise<TaskRecord | null>
   /**
