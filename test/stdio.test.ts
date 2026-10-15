@@ -8,6 +8,7 @@ import { LATEST_PROTOCOL_VERSION } from '../src/schema.ts'
 import { META_PROTOCOL_VERSION, META_CLIENT_INFO, META_CLIENT_CAPABILITIES } from '../src/schema-2026.ts'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { createStdioTransport, runStdioServer } from '../src/stdio.ts'
+import { MemoryMessageBroker } from '../src/brokers/memory-message-broker.ts'
 
 // Note: These tests are placeholders.
 // The actual stdio functionality is tested in stdio-simple.test.ts using subprocess integration.
@@ -104,13 +105,16 @@ async function setupStdio () {
   transport.start()
 
   const lines = createInterface({ input: output })[Symbol.asyncIterator]()
-  async function send (message: unknown): Promise<any> {
-    input.write(JSON.stringify(message) + '\n')
+  async function sendRaw (line: string): Promise<any> {
+    input.write(line + '\n')
     const { value } = await lines.next()
     return JSON.parse(value as string)
   }
+  function send (message: unknown): Promise<any> {
+    return sendRaw(JSON.stringify(message))
+  }
 
-  return { send, stop: () => transport.stop() }
+  return { send, sendRaw, stop: () => transport.stop() }
 }
 
 function initialize (id: number, protocolVersion: string) {
@@ -175,6 +179,23 @@ test('stdio transport - a 2026-07-28 message after a legacy initialize keeps its
   assert.strictEqual(list.result.tools[0].name, 'iconic')
 })
 
+test('stdio transport - rejects a numeric id that is not a safe integer', async (t) => {
+  const { sendRaw, stop } = await setupStdio()
+  t.after(stop)
+
+  // JSON.parse turns 9007199254740993 into 9007199254740992, so answering it
+  // would echo a different id than the client sent
+  const response = await sendRaw('{"jsonrpc":"2.0","id":9007199254740993,"method":"tools/list"}')
+  assert.strictEqual(response.id, null)
+  assert.strictEqual(response.error.code, -32600)
+  assert.strictEqual(response.result, undefined)
+
+  // 1e400 parses to Infinity, which would be re-serialized as null
+  const infinite = await sendRaw('{"jsonrpc":"2.0","id":1e400,"method":"tools/list"}')
+  assert.strictEqual(infinite.id, null)
+  assert.strictEqual(infinite.error.code, -32600)
+})
+
 test('runStdioServer - resolves only after app.close() completes on input EOF', async () => {
   const app = fastify({ logger: false })
 
@@ -193,6 +214,9 @@ test('runStdioServer - resolves only after app.close() completes on input EOF', 
 
   await app.ready()
 
+  const sigintBaseline = process.listenerCount('SIGINT')
+  const sigtermBaseline = process.listenerCount('SIGTERM')
+
   const input = new PassThrough()
   const running = runStdioServer(app, {
     input,
@@ -203,6 +227,8 @@ test('runStdioServer - resolves only after app.close() completes on input EOF', 
 
   await running
   assert.strictEqual(onCloseDone, true, 'onClose hook should complete before runStdioServer resolves')
+  assert.strictEqual(process.listenerCount('SIGINT'), sigintBaseline, 'SIGINT listeners should be removed')
+  assert.strictEqual(process.listenerCount('SIGTERM'), sigtermBaseline, 'SIGTERM listeners should be removed')
 })
 
 test('stdio transport - concurrent stop() calls share the same close promise', async () => {
@@ -236,4 +262,133 @@ test('stdio transport - concurrent stop() calls share the same close promise', a
 
   await second
   assert.strictEqual(onCloseDone, true, 'second stop() should wait for app.close()')
+})
+
+test('stdio transport - does not create SSE sessions when enableSSE is on', async (t) => {
+  const subscriptions: string[] = []
+  const original = MemoryMessageBroker.prototype.subscribe
+  t.mock.method(MemoryMessageBroker.prototype, 'subscribe', function (this: MemoryMessageBroker, topic: string, handler: any) {
+    subscriptions.push(topic)
+    return original.call(this, topic, handler)
+  })
+
+  const app = fastify({ logger: false })
+  await app.register(mcpPlugin, {
+    serverInfo: { name: 'test-server', version: '1.0.0' },
+    capabilities: { tools: {} },
+    enableSSE: true
+  })
+  await app.ready()
+
+  const input = new PassThrough()
+  const output = new PassThrough()
+  const transport = createStdioTransport(app, { input, output, error: new PassThrough() })
+  transport.start()
+  t.after(() => transport.stop())
+
+  const lines = createInterface({ input: output })[Symbol.asyncIterator]()
+  async function send (message: unknown): Promise<any> {
+    input.write(JSON.stringify(message) + '\n')
+    const { value } = await lines.next()
+    return JSON.parse(value as string)
+  }
+
+  const init = await send(initialize(1, '2025-06-18'))
+  assert.ok(init.result)
+  for (let i = 0; i < 50; i++) {
+    const pong = await send({ jsonrpc: '2.0', id: i + 2, method: 'ping' })
+    assert.deepStrictEqual(pong.result, {})
+  }
+
+  const sessionTopics = subscriptions.filter(topic => topic.startsWith('mcp/session/'))
+  assert.deepStrictEqual(sessionTopics, [])
+})
+
+test('stdio transport - the stdio marker header alone does not skip SSE sessions', async (t) => {
+  const app = fastify({ logger: false })
+  await app.register(mcpPlugin, {
+    serverInfo: { name: 'test-server', version: '1.0.0' },
+    capabilities: { tools: {} },
+    enableSSE: true
+  })
+  t.after(() => app.close())
+
+  // Any HTTP client can send this header, so it must not be trusted on its own
+  const response = await app.inject({
+    method: 'POST',
+    url: '/mcp',
+    headers: {
+      'content-type': 'application/json',
+      'x-platformatic-mcp-transport': 'stdio'
+    },
+    payload: { jsonrpc: '2.0', id: 1, method: 'ping' }
+  })
+  assert.strictEqual(response.statusCode, 200)
+  assert.ok(response.headers['mcp-session-id'])
+})
+
+test('stdio transport - stop() removes the SIGINT/SIGTERM listeners', async () => {
+  const sigintBaseline = process.listenerCount('SIGINT')
+  const sigtermBaseline = process.listenerCount('SIGTERM')
+
+  const transports = []
+  for (let i = 0; i < 3; i++) {
+    const app = fastify({ logger: false })
+    await app.register(mcpPlugin, {
+      serverInfo: {
+        name: 'test-server',
+        version: '1.0.0'
+      }
+    })
+    await app.ready()
+
+    const transport = createStdioTransport(app, {
+      input: new PassThrough(),
+      output: new PassThrough(),
+      error: new PassThrough()
+    })
+    transport.start()
+    transports.push(transport)
+  }
+
+  assert.strictEqual(process.listenerCount('SIGINT'), sigintBaseline + 3)
+  assert.strictEqual(process.listenerCount('SIGTERM'), sigtermBaseline + 3)
+
+  for (const transport of transports) {
+    await transport.stop()
+  }
+
+  assert.strictEqual(process.listenerCount('SIGINT'), sigintBaseline)
+  assert.strictEqual(process.listenerCount('SIGTERM'), sigtermBaseline)
+})
+
+test('stdio transport - a signal removes both signal listeners', async () => {
+  const sigintBaseline = process.listenerCount('SIGINT')
+  const sigtermBaseline = process.listenerCount('SIGTERM')
+
+  const app = fastify({ logger: false })
+  await app.register(mcpPlugin, {
+    serverInfo: {
+      name: 'test-server',
+      version: '1.0.0'
+    }
+  })
+  await app.ready()
+
+  const transport = createStdioTransport(app, {
+    input: new PassThrough(),
+    output: new PassThrough(),
+    error: new PassThrough()
+  })
+  transport.start()
+
+  // Invoke the transport's own SIGINT handler directly rather than sending a
+  // real signal to the test runner
+  const handler = process.listeners('SIGINT').at(-1) as () => void
+  handler()
+
+  assert.strictEqual(process.listenerCount('SIGINT'), sigintBaseline)
+  assert.strictEqual(process.listenerCount('SIGTERM'), sigtermBaseline)
+
+  await transport.stop()
 })

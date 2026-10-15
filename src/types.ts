@@ -1,5 +1,6 @@
 import type { FastifyReply, FastifyRequest, FastifySchema, HTTPMethods } from 'fastify'
 import type { Options } from 'ajv'
+import type { RedisOptions } from 'ioredis'
 import type {
   JSONRPCMessage,
   JSONRPCNotification,
@@ -19,7 +20,7 @@ import type {
 } from './schema.ts'
 import type { Static, TSchema, TObject, TString } from '@sinclair/typebox'
 import type { AuthorizationConfig, AuthorizationContext } from './types/auth-types.ts'
-import type { AllowedOrigins } from './security.ts'
+import type { AllowedOrigins, ToolArgumentLimits } from './security.ts'
 import type { CacheHint } from './modern/handlers.ts'
 import type { ClientCapabilities as ModernClientCapabilities, InputRequests } from './schema-2026.ts'
 
@@ -372,7 +373,9 @@ export interface MCPPluginOptions {
   /**
    * Close an SSE stream after this many milliseconds so the client falls back to
    * polling and reconnects with `Last-Event-ID` (SEP-1699). Omit to keep streams
-   * open indefinitely, which stays valid.
+   * open indefinitely, which stays valid. With authorization enabled, a stream is
+   * also closed when the token that opened it expires (its `exp` claim), whichever
+   * comes first, so the client reconnects with a fresh token.
    */
   sseMaxConnectionMs?: number
   /**
@@ -416,14 +419,24 @@ export interface MCPPluginOptions {
   taskMaxPerPrincipal?: number
   /**
    * Most tasks the in-memory task store holds, finished ones included until
-   * their ttl (default 1000). A full store refuses new tasks rather than
-   * dropping results their owners have not read yet.
+   * their ttl (default 1000). At the cap the oldest finished task is evicted;
+   * if every stored task is still running, new tasks are refused.
    */
   taskStoreMaxTasks?: number
   /**
-   * How long a running 2026-07-28 task's worker lease lasts, in milliseconds
-   * (default 15000; renewed every third of it). When an instance dies, its
-   * tasks are reported failed this long after its last renewal.
+   * Most tasks one caller (a user at an issuer, whichever OAuth client they
+   * come through) may keep stored, finished ones included (default 100). At
+   * the cap, the caller's oldest finished task is evicted; if all of them are
+   * still running, the call fails with "Task limit reached". Unlike
+   * `taskMaxPerPrincipal`, which bounds the tasks running on one instance,
+   * this bounds what the store retains across instances.
+   */
+  taskMaxRetainedPerPrincipal?: number
+  /**
+   * How long a running task's worker lease lasts, for both protocol eras, in
+   * milliseconds (default 15000; renewed every third of it). When an instance
+   * dies, its tasks are reported failed this long after its last renewal
+   * instead of staying `working` until their ttl runs out.
    */
   taskLeaseMs?: number
   /**
@@ -504,6 +517,14 @@ export interface MCPPluginOptions {
    */
   allowedOrigins?: AllowedOrigins
   /**
+   * Limits applied to every tool's arguments before the handler runs. Defaults:
+   * `maxStringLength` 10000, `maxObjectProperties` 100, `maxDepth` 10,
+   * `maxArrayLength` unlimited. Arrays are not counted as object properties.
+   * Pass `Infinity` to disable a limit; Fastify's `bodyLimit` still caps the
+   * total request size.
+   */
+  toolArgumentLimits?: ToolArgumentLimits
+  /**
    * Per-request tool authorization, keyed by tool name. Consulted by both
    * `tools/list` (a denied tool is omitted) and `tools/call` (a denied tool
    * answers with the same "not found" error as an unknown tool, so callers
@@ -556,15 +577,11 @@ export interface MCPPluginOptions {
    * Options override the default Fastify-compatible AJV configuration.
    */
   validateJsonSchemaInputs?: Options
-  sessionStore?: 'memory' | 'redis'
-  messageBroker?: 'memory' | 'redis'
-  redis?: {
-    host: string
-    port: number
-    password?: string
-    db?: number
-    tls?: Record<string, unknown>
-  }
+  /**
+   * Redis connection options, passed as-is to the ioredis constructor.
+   * Providing this option switches sessions, messaging and tasks to the Redis backends.
+   */
+  redis?: RedisOptions
   authorization?: AuthorizationConfig
   /**
    * Optional OpenTelemetry instrumentation.

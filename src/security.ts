@@ -18,17 +18,32 @@ const MAX_OBJECT_DEPTH = 10
 const MAX_OBJECT_PROPERTIES = 100
 
 /**
+ * Limits applied to tool arguments by `sanitizeToolParams`.
+ * Use `Infinity` to disable a limit.
+ */
+export interface ToolArgumentLimits {
+  /** Maximum length of any string, including object keys (default 10000) */
+  maxStringLength?: number
+  /** Maximum number of keys in a single object; arrays are not counted (default 100) */
+  maxObjectProperties?: number
+  /** Maximum number of items in a single array (default unlimited) */
+  maxArrayLength?: number
+  /** Maximum nesting depth (default 10) */
+  maxDepth?: number
+}
+
+/**
  * Sanitize a string by removing potentially dangerous characters
  * and limiting length to prevent DoS attacks
  */
-export function sanitizeString (input: string): string {
+export function sanitizeString (input: string, maxLength: number = MAX_STRING_LENGTH): string {
   if (typeof input !== 'string') {
     throw new Error('Input must be a string')
   }
 
   // Limit string length
-  if (input.length > MAX_STRING_LENGTH) {
-    throw new Error(`String length exceeds maximum allowed length of ${MAX_STRING_LENGTH}`)
+  if (input.length > maxLength) {
+    throw new Error(`String length exceeds maximum allowed length of ${maxLength}`)
   }
 
   // Remove null bytes and other control characters (except newlines and tabs)
@@ -39,7 +54,12 @@ export function sanitizeString (input: string): string {
 /**
  * Validate object depth to prevent stack overflow attacks
  */
-export function validateObjectDepth (obj: any, maxDepth: number = MAX_OBJECT_DEPTH): void {
+export function validateObjectDepth (
+  obj: any,
+  maxDepth: number = MAX_OBJECT_DEPTH,
+  maxProperties: number = MAX_OBJECT_PROPERTIES,
+  maxArrayLength: number = Infinity
+): void {
   function checkDepth (current: any, depth: number): void {
     if (depth > maxDepth) {
       throw new Error(`Object nesting depth exceeds maximum allowed depth of ${maxDepth}`)
@@ -52,10 +72,14 @@ export function validateObjectDepth (obj: any, maxDepth: number = MAX_OBJECT_DEP
       }
       seen.add(current)
 
-      // Check number of properties
+      // Arrays are bounded by their own limit, not counted as properties
       const keys = Object.keys(current)
-      if (keys.length > MAX_OBJECT_PROPERTIES) {
-        throw new Error(`Object has too many properties (${keys.length} > ${MAX_OBJECT_PROPERTIES})`)
+      if (Array.isArray(current)) {
+        if (current.length > maxArrayLength) {
+          throw new Error(`Array has too many items (${current.length} > ${maxArrayLength})`)
+        }
+      } else if (keys.length > maxProperties) {
+        throw new Error(`Object has too many properties (${keys.length} > ${maxProperties})`)
       }
 
       for (const key of keys) {
@@ -73,30 +97,41 @@ export function validateObjectDepth (obj: any, maxDepth: number = MAX_OBJECT_DEP
 /**
  * Check tool parameters from untrusted sources and return them unchanged.
  *
- * Arguments are refused rather than rewritten: stripping characters would let
- * two keys collapse into one, and would hand the handler a value different
- * from the one a gateway saw mirrored in the `Mcp-Param-*` headers.
+ * The structure (depth, property counts, array lengths, cycles) is validated
+ * once up front; every string reached afterwards, including object keys and
+ * strings nested inside arrays at any depth, is length-checked. Arguments are
+ * refused rather than rewritten: stripping characters would let two keys
+ * collapse into one, and would hand the handler a value different from the
+ * one a gateway saw mirrored in the `Mcp-Param-*` headers.
  */
-export function sanitizeToolParams (params: Record<string, any>): Record<string, any> {
-  // Validate object structure first
-  validateObjectDepth(params)
-  checkStrings(params)
-  return params
-}
+export function sanitizeToolParams (params: Record<string, any>, limits: ToolArgumentLimits = {}): Record<string, any> {
+  const maxStringLength = limits.maxStringLength ?? MAX_STRING_LENGTH
 
-function checkStrings (value: unknown): void {
-  if (typeof value === 'string') {
-    if (sanitizeString(value) !== value) {
-      throw new Error('Tool arguments must not contain control characters')
-    }
-  } else if (Array.isArray(value)) {
-    for (const item of value) checkStrings(item)
-  } else if (typeof value === 'object' && value !== null) {
-    for (const [key, item] of Object.entries(value)) {
-      checkStrings(key)
-      checkStrings(item)
+  // Validate object structure first
+  validateObjectDepth(
+    params,
+    limits.maxDepth ?? MAX_OBJECT_DEPTH,
+    limits.maxObjectProperties ?? MAX_OBJECT_PROPERTIES,
+    limits.maxArrayLength ?? Infinity
+  )
+
+  function checkStrings (value: unknown): void {
+    if (typeof value === 'string') {
+      if (sanitizeString(value, maxStringLength) !== value) {
+        throw new Error('Tool arguments must not contain control characters')
+      }
+    } else if (Array.isArray(value)) {
+      for (const item of value) checkStrings(item)
+    } else if (typeof value === 'object' && value !== null) {
+      for (const [key, item] of Object.entries(value)) {
+        checkStrings(key)
+        checkStrings(item)
+      }
     }
   }
+
+  checkStrings(params)
+  return params
 }
 
 /**
@@ -218,6 +253,8 @@ export function isOriginAllowed (origin: string | undefined, allowed: AllowedOri
   if (allowed === undefined) return true
   if (origin === undefined) return true
   if (allowed === true || allowed === '*') return true
+  // Never fall through to String.prototype.includes, a substring match
+  if (!Array.isArray(allowed)) return false
   return allowed.includes(origin)
 }
 

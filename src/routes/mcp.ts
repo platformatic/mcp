@@ -28,10 +28,10 @@ import type {
 } from '../types.ts'
 import type { SessionStore, SessionMetadata } from '../stores/session-store.ts'
 import { DEFAULT_SESSION_TTL_MS } from '../stores/memory-session-store.ts'
-import type { TaskStore, TaskWaiters } from '../stores/task-store.ts'
+import type { TaskStore, TaskWaiters, TaskLeases } from '../stores/task-store.ts'
 import type { MessageBroker } from '../brokers/message-broker.ts'
 import type { AuthorizationContext } from '../types/auth-types.ts'
-import { processMessage, createError, handlerContext, withMcpServerSpan } from '../handlers.ts'
+import { processMessage, checkRequestId, createError, handlerContext, withMcpServerSpan } from '../handlers.ts'
 import type { CachingConfig } from '../modern/handlers.ts'
 import { coversInputCapabilities, dispatchModern } from '../modern/handlers.ts'
 import {
@@ -52,6 +52,8 @@ import { RequestStream, acceptsMediaType, requestNotifiers } from '../modern/req
 import type { TaskInputChannel } from '../modern/task-inputs.ts'
 import type { JsonSchemaValidator } from '../validation/json-schema-validator.ts'
 
+const MAX_TIMER_DELAY_MS = 2 ** 31 - 1
+
 interface MCPPubSubRoutesOptions {
   enableSSE: boolean
   opts: MCPPluginOptions
@@ -66,6 +68,8 @@ interface MCPPubSubRoutesOptions {
   localStreams: Map<string, Set<any>>
   taskStore?: TaskStore
   taskWaiters?: TaskWaiters
+  shutdownSignal?: AbortSignal
+  taskLeases?: TaskLeases
   jsonSchemaValidator?: JsonSchemaValidator
   taskInputs: TaskInputChannel
   sealer: RequestStateSealer
@@ -135,7 +139,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
   const {
     enableSSE, opts, capabilities, serverInfo, tools, resources, prompts, resourceHandlers,
     sessionStore, messageBroker, localStreams, taskStore, taskWaiters, jsonSchemaValidator,
-    taskInputs, sealer, caching, subscriptions, enableTasks, authPreHandler
+    taskInputs, sealer, caching, subscriptions, enableTasks, authPreHandler, shutdownSignal, taskLeases
   } = options
   const mcpUrl = resolveRouteUrl(app.prefix, '/mcp')
 
@@ -305,7 +309,13 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
   // idle TTL or a live stream's session could expire between two of them
   const heartbeatIntervalMs = Math.min(30_000, Math.max(1, Math.floor((opts.sessionTtlMs ?? DEFAULT_SESSION_TTL_MS) / 2)))
 
-  function buildAuthContext (payload: any): AuthorizationContext {
+  /**
+   * The identity a validated token carries. The issuer is the normalized one
+   * the validator vouched for (a trailing slash dropped, or the introspection
+   * endpoint for an introspected token without `iss`), so the same user is the
+   * same principal for sessions, tasks, quotas and sealed request state.
+   */
+  function buildAuthContext (request: FastifyRequest, payload: any): AuthorizationContext {
     return {
       userId: payload.sub,
       clientId: payload.client_id || payload.azp,
@@ -314,8 +324,19 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
       tokenType: 'Bearer',
       expiresAt: payload.exp ? new Date(payload.exp * 1000) : undefined,
       issuedAt: payload.iat ? new Date(payload.iat * 1000) : undefined,
-      authorizationServer: payload.iss
+      authorizationServer: request.tokenIssuer ?? payload.iss
     }
+  }
+
+  /**
+   * Whether a POST body can be handed to `processMessage`: a request, a
+   * notification, a response to a server-initiated request, or a batch (which
+   * `processMessage` refuses itself).
+   */
+  function isJSONRPCMessageShape (body: unknown): boolean {
+    if (Array.isArray(body)) return true
+    if (typeof body !== 'object' || body === null) return false
+    return 'method' in body || 'result' in body || 'error' in body
   }
 
   async function createSession (request: FastifyRequest): Promise<SessionMetadata> {
@@ -334,7 +355,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     if (payload && typeof payload.sub === 'string') {
       session.ownerSub = payload.sub
       session.ownerIss = request.tokenIssuer
-      session.authorization = buildAuthContext(payload)
+      session.authorization = buildAuthContext(request, payload)
     }
 
     await sessionStore.create(session)
@@ -348,20 +369,26 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
     // Subscribe to messages for this session
     await messageBroker.subscribe(`mcp/session/${sessionId}/message`, async (message: JSONRPCMessage) => {
-      const streams = localStreams.get(sessionId)
-      if (streams && streams.size > 0) {
-        app.log.debug({ sessionId, message }, 'Received message for session via broker, sending to streams')
-        sendSSEToStreams(sessionId, message, streams)
-      } else {
-        app.log.debug({ sessionId }, 'Received message for session via broker, storing in history without active streams')
-        // Store message in history even without active streams for session persistence
-        const session = await sessionStore.get(sessionId)
-        if (session) {
-          const eventId = (++session.eventId).toString()
-          session.lastEventId = eventId
-          session.lastActivity = new Date()
-          await sessionStore.addMessage(sessionId, eventId, message)
+      // Brokers do not await this handler, so any rejection must be caught
+      // here or it becomes an unhandled rejection that crashes the process
+      try {
+        const streams = localStreams.get(sessionId)
+        if (streams && streams.size > 0) {
+          app.log.debug({ sessionId, message }, 'Received message for session via broker, sending to streams')
+          await sendSSEToStreams(sessionId, message, streams)
+        } else {
+          app.log.debug({ sessionId }, 'Received message for session via broker, storing in history without active streams')
+          // Store message in history even without active streams for session persistence
+          const session = await sessionStore.get(sessionId)
+          if (session) {
+            const eventId = (++session.eventId).toString()
+            session.lastEventId = eventId
+            session.lastActivity = new Date()
+            await sessionStore.addMessage(sessionId, eventId, message)
+          }
         }
+      } catch (error) {
+        app.log.error({ err: error, sessionId }, 'Failed to deliver message to session')
       }
     })
 
@@ -512,7 +539,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
     const payload = request.tokenPayload
     if (!payload) return undefined
-    return buildAuthContext(payload)
+    return buildAuthContext(request, payload)
   }
 
   /**
@@ -878,14 +905,29 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         }, async () => await handleModernPost(request, reply, resolvedAuthContext))
       }
 
+      // null, numbers, strings, a text/plain body, ... are not JSON-RPC
+      // messages; answer before a session is created for them.
+      if (!isJSONRPCMessageShape(request.body)) {
+        reply.code(400).type('application/json')
+        return createError(null, INVALID_REQUEST, 'Invalid Request: body is not a JSON-RPC message')
+      }
+
       const message = request.body as JSONRPCMessage
+      const idError = checkRequestId(message)
+      if (idError) {
+        reply.code(400).type('application/json')
+        return idError
+      }
+
       let sessionId = request.headers['mcp-session-id'] as string | undefined
       const existingSession = sessionId ? await sessionStore.get(sessionId) : null
 
       // Sessions belong to Streamable HTTP, not to SSE. Without SSE we only open
       // one on initialize: other requests keep working statelessly as before,
-      // and stateless clients do not each leave a session behind.
-      if (!existingSession && (enableSSE || isInitializeRequest(message))) {
+      // and stateless clients do not each leave a session behind. Stdio
+      // requests never carry a session id or open a GET stream, so a session
+      // created for them would never be freed.
+      if (!existingSession && !isStdioRequest(request) && (enableSSE || isInitializeRequest(message))) {
         const session = await createSession(request)
         reply.header('Mcp-Session-Id', session.id)
         sessionId = session.id
@@ -921,6 +963,8 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         sessionStore,
         taskStore,
         taskWaiters,
+        shutdownSignal,
+        taskLeases,
         taskInputs,
         jsonSchemaValidator,
         sessionId,
@@ -1057,7 +1101,9 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
                 sessionId: session.id
               }, 'Last SSE stream closed, cleaning up session')
               localStreams.delete(session.id)
-              messageBroker.unsubscribe(`mcp/session/${session.id}/message`)
+              messageBroker.unsubscribe(`mcp/session/${session.id}/message`).catch((error) => {
+                app.log.error({ err: error, sessionId: session.id }, 'Failed to unsubscribe session from message broker')
+              })
             }
           }
         })
@@ -1065,20 +1111,45 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         // SEP-1699: servers may end an SSE stream whenever they like, turning the
         // stream into a polling channel. The client reconnects with Last-Event-ID
         // on GET and we replay whatever it missed, so closing here loses nothing.
-        let maxDurationTimer: NodeJS.Timeout | undefined
-        if (opts.sseMaxConnectionMs) {
-          maxDurationTimer = setTimeout(() => {
+        // Access is only checked when the stream opens, so never let it outlive the
+        // token that opened it: close at exp and the client reconnects with a fresh one.
+        const tokenExp = request.tokenPayload?.exp
+        const msUntilTokenExp = typeof tokenExp === 'number' ? Math.max(0, tokenExp * 1000 - Date.now()) : undefined
+        let closeAfterMs = opts.sseMaxConnectionMs || undefined
+        let closeReason = 'Closing SSE stream to let the client poll; it may resume with Last-Event-ID'
+        if (msUntilTokenExp !== undefined && (closeAfterMs === undefined || msUntilTokenExp < closeAfterMs)) {
+          closeAfterMs = msUntilTokenExp
+          closeReason = 'Closing SSE stream because the token that opened it expired; it may reconnect with a fresh token'
+        }
+
+        if (closeAfterMs !== undefined) {
+          const deadline = Date.now() + closeAfterMs
+          let maxDurationTimer: NodeJS.Timeout | undefined
+          const closeStream = () => {
             app.log.info({
               sessionId: session.id,
-              afterMs: opts.sseMaxConnectionMs
-            }, 'Closing SSE stream to let the client poll; it may resume with Last-Event-ID')
+              afterMs: closeAfterMs
+            }, closeReason)
             try {
               reply.raw.end()
             } catch {
             // already gone
             }
-          }, opts.sseMaxConnectionMs)
-          maxDurationTimer.unref()
+          }
+          // setTimeout fires immediately on delays past 2^31-1 ms (~24.8 days), so
+          // wait in capped steps until the deadline is reached
+          const scheduleClose = () => {
+            const remaining = Math.max(0, deadline - Date.now())
+            maxDurationTimer = setTimeout(() => {
+              if (Date.now() >= deadline) {
+                closeStream()
+              } else {
+                scheduleClose()
+              }
+            }, Math.min(remaining, MAX_TIMER_DELAY_MS))
+            maxDurationTimer.unref()
+          }
+          scheduleClose()
 
           reply.raw.on('close', () => clearTimeout(maxDurationTimer))
         }
@@ -1208,7 +1279,9 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         }
       }
 
-      sendSSEToStreams(sessionId, notification, streams)
+      sendSSEToStreams(sessionId, notification, streams).catch((error) => {
+        app.log.error({ err: error, sessionId }, 'Failed to deliver broadcast notification to session')
+      })
     }
   }
 }

@@ -13,6 +13,8 @@ import type {
   ListToolsResult,
   ListResourcesResult,
   ListResourceTemplatesResult,
+  Resource,
+  ResourceTemplate,
   ListPromptsResult,
   CallToolResult,
   ReadResourceResult,
@@ -29,7 +31,8 @@ import {
   METHOD_NOT_FOUND,
   INTERNAL_ERROR,
   INVALID_PARAMS,
-  INVALID_REQUEST
+  INVALID_REQUEST,
+  RESOURCE_NOT_FOUND
 } from './schema.ts'
 import type { ClientCapabilities, RequestId } from './schema.ts'
 
@@ -46,8 +49,8 @@ import type {
   TracerLike
 } from './types.ts'
 import type { SessionStore } from './stores/session-store.ts'
-import type { TaskStore, TaskRecord, TaskWaiters } from './stores/task-store.ts'
-import { InvalidTaskCursorError, decodeTaskCursor, isTerminal, toWireTask } from './stores/task-store.ts'
+import type { TaskStore, TaskRecord, TaskWaiters, TaskLeases } from './stores/task-store.ts'
+import { InvalidTaskCursorError, TaskLimitError, TASK_LIMIT_REACHED, TASK_OWNER_LOST, decodeTaskCursor, isTerminal, ownerLostOutcome, toWireTask } from './stores/task-store.ts'
 import type { AuthorizationContext } from './types/auth-types.ts'
 import { principalOf } from './principal.ts'
 import { TaskStopped, quotaKeyOf, reserveTask, setLongTimeout } from './task-registry.ts'
@@ -91,6 +94,9 @@ export type HandlerDependencies = {
   sessionStore?: SessionStore
   taskStore?: TaskStore
   taskWaiters?: TaskWaiters
+  /** Aborted when the plugin starts closing, to release blocked calls */
+  shutdownSignal?: AbortSignal
+  taskLeases?: TaskLeases
   jsonSchemaValidator?: JsonSchemaValidator
   sessionId?: string
   /** The revision this client negotiated; responses are shaped to match it */
@@ -153,6 +159,21 @@ export function createError (id: string | number | null, code: number, message: 
     id: id as RequestId,
     error: { code, message, data }
   }
+}
+
+/**
+ * Requests MUST carry a string or integer id, and responses MUST echo it. A
+ * numeric id outside the safe integer range has already lost precision in
+ * JSON.parse, so answering it would echo a different id; refuse it instead.
+ * Returns the error to send, or null if the id is acceptable.
+ */
+export function checkRequestId (message: unknown): JSONRPCError | null {
+  if (message === null || typeof message !== 'object' || Array.isArray(message)) return null
+  const id = (message as { id?: unknown }).id
+  if (typeof id === 'number' && !Number.isSafeInteger(id)) {
+    return createError(null, INVALID_REQUEST, 'Invalid Request: numeric id must be a safe integer')
+  }
+  return null
 }
 
 /**
@@ -454,12 +475,33 @@ function matchUriTemplate (template: string, uri: string): Record<string, string
   return params
 }
 
+// Fields shared by the spec Resource and ResourceTemplate shapes. Anything else
+// on a registered definition (uriPattern, uriSchema, ...) is a registration
+// input and must not be listed: uriSchema would leak validation patterns.
+const RESOURCE_METADATA_FIELDS = ['name', 'title', 'description', 'mimeType', 'icons', 'annotations', '_meta'] as const
+
+function pickResourceMetadata (definition: Record<string, any>, fields: readonly string[]): Record<string, unknown> {
+  const picked: Record<string, unknown> = {}
+  for (const field of fields) {
+    if (definition[field] !== undefined) {
+      picked[field] = definition[field]
+    }
+  }
+  return picked
+}
+
 export function handleResourcesList (request: JSONRPCRequest, dependencies: HandlerDependencies): JSONRPCResponse {
   const { resources, protocolVersion } = dependencies
   const result: ListResourcesResult = {
     resources: Array.from(resources.values())
       .filter(r => !isTemplateUri(r.definition.uri))
-      .map(r => trimDefinitionToRevision(r.definition, protocolVersion)),
+      .map(r => {
+        const definition = trimDefinitionToRevision(r.definition, protocolVersion)
+        return {
+          uri: definition.uri,
+          ...pickResourceMetadata(definition, [...RESOURCE_METADATA_FIELDS, 'size'])
+        } as Resource
+      }),
     nextCursor: undefined
   }
   return createResponse(request.id, result)
@@ -471,8 +513,11 @@ export function handleResourceTemplatesList (request: JSONRPCRequest, dependenci
     resourceTemplates: Array.from(resources.values())
       .filter(r => isTemplateUri(r.definition.uri))
       .map(r => {
-        const { uri, ...rest } = trimDefinitionToRevision(r.definition, protocolVersion)
-        return { ...rest, uriTemplate: uri }
+        const definition = trimDefinitionToRevision(r.definition, protocolVersion)
+        return {
+          uriTemplate: definition.uri,
+          ...pickResourceMetadata(definition, RESOURCE_METADATA_FIELDS)
+        } as ResourceTemplate
       }),
     nextCursor: undefined
   }
@@ -646,7 +691,8 @@ function toolCallOutcomeToJsonRpc (
     }
     case 'not-found':
     case 'access-denied':
-      return createError(id, METHOD_NOT_FOUND, `Tool '${toolName}' not found`)
+      // tools.md, Error Handling: unknown tools are an Invalid params protocol error
+      return createError(id, INVALID_PARAMS, `Tool '${toolName}' not found`)
     // Unreachable from the JSON-RPC path today (handleToolsCall resolves task
     // augmentation itself), but kept in the mapping so the two paths stay
     // consistent if they ever converge. Mirrors resolveTaskAugmentation's error.
@@ -837,7 +883,7 @@ async function runRegisteredTool (
 
   try {
     // Sanitize arguments to prevent injection attacks
-    toolArguments = sanitizeToolParams(toolArguments)
+    toolArguments = sanitizeToolParams(toolArguments, dependencies.opts.toolArgumentLimits)
   } catch (sanitizeError) {
     dependencies.app.log.warn({
       tool: toolName,
@@ -968,7 +1014,8 @@ export async function handleResourcesRead (
   }
 
   if (!resource) {
-    return createError(request.id, METHOD_NOT_FOUND, `Resource '${uri}' not found`)
+    // resources.md, Error Handling: "Resource not found: -32002"
+    return createError(request.id, RESOURCE_NOT_FOUND, `Resource '${uri}' not found`, { uri })
   }
 
   if (!resource.handler) {
@@ -1037,7 +1084,8 @@ export async function handlePromptsGet (
 
   const prompt = prompts.get(promptName)
   if (!prompt) {
-    return createError(request.id, METHOD_NOT_FOUND, `Prompt '${promptName}' not found`)
+    // prompts.md, Error Handling: "Invalid prompt name: -32602 (Invalid params)"
+    return createError(request.id, INVALID_PARAMS, `Prompt '${promptName}' not found`)
   }
 
   // Failures are JSON-RPC errors: -32602 for the client's arguments, -32603
@@ -1137,7 +1185,7 @@ function taskTtlBounds (dependencies: HandlerDependencies): { defaultTtl: number
  * The principal a task belongs to: user, OAuth client and issuer, so another
  * app acting for the same user cannot read or cancel the task.
  *
- * When the deployment cannot identify requestors this is undefined, and tasks
+ * When the deployment cannot identify requestors it is undefined, and tasks
  * are reachable by anyone holding the (cryptographically random) task id. That
  * limitation is why `tasks/list` is only advertised when auth is in play.
  */
@@ -1169,12 +1217,11 @@ function assertTaskAccess (task: TaskRecord | null, dependencies: HandlerDepende
   // answered through `tasks/update`), which a 2025-11-25 client cannot use.
   if (task.era === 'modern') return null
 
-  const subject = taskSubject(dependencies)
-
   if (canIdentifyRequestors(dependencies)) {
     // Identity resolution on: a task is reachable only by its exact owner. A
     // context without a `userId` identifies no one, so an undefined subject
     // must never match another subject-less task via `undefined === undefined`.
+    const subject = taskSubject(dependencies)
     if (subject === undefined || task.authSubject !== subject) return null
     return task
   }
@@ -1213,7 +1260,8 @@ function newTaskRecord (
   method: string,
   ttl: number | undefined,
   subject: string | undefined,
-  bounds: { defaultTtl: number, maxTtl: number }
+  bounds: { defaultTtl: number, maxTtl: number },
+  leaseMs?: number
 ): TaskRecord {
   const now = new Date().toISOString()
   const requested = ttl ?? bounds.defaultTtl
@@ -1227,7 +1275,10 @@ function newTaskRecord (
     pollInterval: DEFAULT_POLL_INTERVAL,
     method,
     authSubject: subject,
-    era: 'legacy'
+    era: 'legacy',
+    // Leased from the start, so a worker that dies before its first renewal is
+    // still reaped. The store stamps it with its own clock.
+    ...(leaseMs !== undefined ? { leaseExpiresAt: Date.now() + leaseMs } : {})
   }
 }
 
@@ -1245,12 +1296,37 @@ async function handleTasksGet (
     return createError(request.id, INVALID_PARAMS, 'Missing required parameter: taskId')
   }
 
-  const task = assertTaskAccess(await taskStore.get(taskId), dependencies)
+  const found = assertTaskAccess(await taskStore.get(taskId), dependencies)
+  const task = found && await failIfOwnerLost(found, dependencies)
   if (!task) {
     return createError(request.id, INVALID_PARAMS, 'Failed to retrieve task: Task not found')
   }
 
   return createResponse(request.id, toWireTask(task))
+}
+
+/**
+ * If the instance running `task` has stopped renewing its lease (it died or
+ * shut down), mark the task failed rather than let it read `working` until its
+ * ttl. The store does this as a compare-and-set, so a renewal or completion that
+ * lands first wins. Returns the task as it now stands.
+ *
+ * Whether the lease has lapsed is decided by the store alone (RedisTaskStore
+ * uses the Redis server clock): comparing against this instance's clock would
+ * let a reader running behind keep a dead task `working`. The store is only
+ * skipped for tasks that cannot have a lapsed lease at all.
+ */
+async function failIfOwnerLost (task: TaskRecord, dependencies: HandlerDependencies): Promise<TaskRecord | null> {
+  const { taskStore, taskWaiters } = dependencies
+  if (!taskStore || isTerminal(task.status) || typeof task.leaseExpiresAt !== 'number') {
+    return task
+  }
+
+  const failed = await taskStore.expireStaleLease(task.taskId, TASK_OWNER_LOST, ownerLostOutcome())
+  if (!failed) return task
+  dependencies.app.log.warn({ taskId: task.taskId }, 'Task failed: the instance running it stopped renewing its lease')
+  taskWaiters?.notify(failed)
+  return failed
 }
 
 /**
@@ -1319,6 +1395,7 @@ async function awaitTaskTerminal (
     // The poll timer elapsed (or the accelerator aborted); the shared store is
     // the source of truth, so re-read it before deciding whether to loop again.
     task = await taskStore.get(taskId)
+    if (task) task = await failIfOwnerLost(task, dependencies)
   }
 
   return task
@@ -1338,7 +1415,8 @@ async function handleTasksResult (
     return createError(request.id, INVALID_PARAMS, 'Missing required parameter: taskId')
   }
 
-  let task = assertTaskAccess(await taskStore.get(taskId), dependencies)
+  const found = assertTaskAccess(await taskStore.get(taskId), dependencies)
+  let task = found && await failIfOwnerLost(found, dependencies)
   if (!task) {
     return createError(request.id, INVALID_PARAMS, 'Failed to retrieve task: Task not found')
   }
@@ -1346,16 +1424,36 @@ async function handleTasksResult (
   // `tasks/result` blocks until the task is terminal. Works across instances:
   // see awaitTaskTerminal.
   if (!isTerminal(task.status)) {
+    // Watch the response, not the request: the IncomingMessage emits 'close'
+    // as soon as its body is consumed, long before this handler runs.
+    const res = dependencies.reply.raw
     const controller = new AbortController()
-    dependencies.request.raw.on('close', () => controller.abort())
+    const onClose = () => controller.abort()
+    res.on('close', onClose)
+    if (res.destroyed || res.socket?.destroyed) controller.abort()
+    const { shutdownSignal } = dependencies
+    const signal = shutdownSignal
+      ? AbortSignal.any([controller.signal, shutdownSignal])
+      : controller.signal
     try {
-      const settled = await awaitTaskTerminal(taskId, task, dependencies, controller.signal)
+      const settled = await awaitTaskTerminal(taskId, task, dependencies, signal)
       if (!settled) {
         return createError(request.id, INVALID_PARAMS, 'Failed to retrieve task: Task not found')
       }
       task = settled
     } catch {
+      if (shutdownSignal?.aborted) {
+        // The server is past closing idle sockets; don't leave a keep-alive
+        // connection behind for close() to wait on.
+        dependencies.reply.header('connection', 'close')
+        return createError(request.id, INTERNAL_ERROR, 'Server shutting down')
+      }
       return createError(request.id, INTERNAL_ERROR, 'Client disconnected while awaiting task result')
+    } finally {
+      res.removeListener('close', onClose)
+      // Release the TaskWaiters entry: it is only removed by a local notify()
+      // or an abort, and polling may have answered this call instead.
+      controller.abort()
     }
   }
 
@@ -1412,9 +1510,9 @@ async function handleTasksList (
 
   const subject = taskSubject(dependencies)
   if (subject === undefined) {
-    // Auth is on but this token carries no `sub`, so it owns nothing we can
-    // identify. Listing the undefined-subject tasks would expose every other
-    // subject-less caller's tasks, so return an empty set instead.
+    // Identity resolution is on but this caller carries no user, so it owns
+    // nothing we can identify. Listing the ownerless tasks would expose every
+    // other such caller's tasks, so return an empty set instead.
     return createResponse(request.id, { tasks: [], nextCursor: undefined } as ListTasksResult)
   }
 
@@ -1519,7 +1617,7 @@ async function runToolCallAsTask (
   execute: (signal: AbortSignal) => Promise<JSONRPCResponse | JSONRPCError>,
   dependencies: HandlerDependencies
 ): Promise<JSONRPCResponse | JSONRPCError> {
-  const { taskStore, taskWaiters, app } = dependencies
+  const { taskStore, taskWaiters, taskLeases, app } = dependencies
   if (!taskStore) {
     return createError(request.id, METHOD_NOT_FOUND, 'Tasks are not enabled on this server')
   }
@@ -1532,7 +1630,7 @@ async function runToolCallAsTask (
     return createError(request.id, INVALID_REQUEST, 'Cannot create a task: the caller is not identified')
   }
 
-  const task = newTaskRecord('tools/call', ttl, subject, taskTtlBounds(dependencies))
+  const task = newTaskRecord('tools/call', ttl, subject, taskTtlBounds(dependencies), taskLeases?.leaseMs)
 
   // Legacy tasks share the limits, ttl abort and shutdown drain of the
   // 2026-07-28 ones, so neither era can starve the other.
@@ -1551,7 +1649,21 @@ async function runToolCallAsTask (
     await taskStore.create(task)
   } catch (error) {
     reservation.release()
+    if (error instanceof TaskLimitError) {
+      return createError(request.id, TASK_LIMIT_REACHED, 'Task limit reached')
+    }
     throw error
+  }
+  // The lease lets any instance tell a crashed worker from a slow one. A
+  // renewal that finds the task ended (a cancellation whose broker message was
+  // lost) stops the handler too.
+  try {
+    await taskLeases?.start(task.taskId, (status) => {
+      reservation.live.stop(new TaskStopped(status === 'cancelled' ? 'Task cancelled' : 'Task ended'))
+    })
+  } catch (error) {
+    // Without a lease the task simply cannot be reaped early; it still runs
+    app.log.warn({ err: error, taskId: task.taskId }, 'Failed to take task lease')
   }
 
   // `tasks/cancel` may arrive on any instance; it reaches the worker here.
@@ -1607,6 +1719,8 @@ async function runToolCallAsTask (
     } catch (error) {
       // The task was cancelled or expired while the tool was still running
       app.log.debug({ err: error, taskId: task.taskId }, 'Could not record task outcome')
+    } finally {
+      taskLeases?.stop(task.taskId)
     }
   })()
 

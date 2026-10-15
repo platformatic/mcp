@@ -8,7 +8,7 @@ import { MemoryMessageBroker } from './brokers/memory-message-broker.ts'
 import { RedisSessionStore } from './stores/redis-session-store.ts'
 import { RedisMessageBroker } from './brokers/redis-message-broker.ts'
 import type { TaskStore } from './stores/task-store.ts'
-import { TaskWaiters } from './stores/task-store.ts'
+import { TaskWaiters, TaskLeases, validateTaskLimit } from './stores/task-store.ts'
 import { MemoryTaskStore } from './stores/memory-task-store.ts'
 import { RedisTaskStore } from './stores/redis-task-store.ts'
 import type { MCPPluginOptions, MCPTool, MCPResource, MCPPrompt, ResourceHandlers } from './types.ts'
@@ -70,6 +70,7 @@ import type {
 
 const REDIS_QUIT_TIMEOUT_MS = 2000
 const TASK_CLEANUP_INTERVAL_MS = 10 * 60 * 1000
+const DEFAULT_TASK_LEASE_MS = 15_000
 
 declare module 'fastify' {
   interface FastifyInstance {
@@ -78,6 +79,13 @@ declare module 'fastify' {
 }
 
 const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOptions) {
+  // A single string would make the allow-list check a substring match, so fail loudly
+  const allowedOrigins: unknown = opts.allowedOrigins
+  if (allowedOrigins !== undefined && allowedOrigins !== true && allowedOrigins !== '*' &&
+    !(Array.isArray(allowedOrigins) && allowedOrigins.every((origin) => typeof origin === 'string'))) {
+    throw new TypeError(`allowedOrigins must be true, '*' or an array of origin strings, got ${JSON.stringify(allowedOrigins)}`)
+  }
+
   const serverInfo: Implementation = opts.serverInfo ?? {
     name: '@platformatic/mcp',
     version: '1.0.0'
@@ -86,12 +94,18 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
   // The plugin can always broadcast list changes (mcpBroadcastNotification),
   // so by default it says so; without it, 2026-07-28 subscriptions/listen
   // could acknowledge nothing. `resources.subscribe` is declared once a
-  // subscribe handler is registered. Explicit capabilities are used as given.
-  const capabilities: ServerCapabilities = opts.capabilities ?? {
+  // subscribe handler is registered. Explicit capabilities are used as given,
+  // except that completion/complete is not implemented, so `completions` is
+  // never advertised: clients that negotiate on it would only get -32601 back.
+  const { completions, ...configuredCapabilities } = opts.capabilities ?? {
     tools: { listChanged: true },
     resources: { listChanged: true },
     prompts: { listChanged: true }
   }
+  if (completions !== undefined) {
+    app.log.warn('The "completions" capability is not supported (completion/complete is not implemented) and will not be advertised')
+  }
+  const capabilities: ServerCapabilities = configuredCapabilities
 
   // Several instances serve each other's MRTR retries, so they must share the
   // key that seals request state; without one each would refuse the others'.
@@ -114,6 +128,10 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
 
   if (opts.sessionTtlMs !== undefined && !(Number.isFinite(opts.sessionTtlMs) && opts.sessionTtlMs > 0)) {
     throw new Error('sessionTtlMs must be a positive number of milliseconds')
+  }
+  if (opts.taskMaxRetainedPerPrincipal !== undefined) {
+    // Checked before any Redis connection is opened, so a bad value cannot leak one
+    validateTaskLimit('taskMaxRetainedPerPrincipal', opts.taskMaxRetainedPerPrincipal)
   }
   const tools = new Map<string, MCPTool>()
   const resources = new Map<string, MCPResource>()
@@ -144,14 +162,21 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
       }
     })
     if (enableTasks) {
-      taskStore = new RedisTaskStore({ redis, defaultTtlMs: opts.taskDefaultTtlMs })
+      taskStore = new RedisTaskStore({
+        redis,
+        defaultTtlMs: opts.taskDefaultTtlMs,
+        maxTasksPerPrincipal: opts.taskMaxRetainedPerPrincipal
+      })
     }
   } else {
     // Memory implementations for single-instance deployment
     sessionStore = new MemorySessionStore(100, { sessionTtlMs: opts.sessionTtlMs })
     messageBroker = new MemoryMessageBroker()
     if (enableTasks) {
-      taskStore = new MemoryTaskStore(opts.taskStoreMaxTasks)
+      taskStore = new MemoryTaskStore({
+        maxTasks: opts.taskStoreMaxTasks,
+        maxTasksPerPrincipal: opts.taskMaxRetainedPerPrincipal
+      })
     }
   }
 
@@ -159,6 +184,21 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
   // tasks/result request needs to be woken when that task finishes.
   const taskWaiters = new TaskWaiters()
   const taskInputs = new TaskInputChannel(opts.taskMaxTtlMs ?? 3_600_000)
+
+  // Aborted in preClose so calls blocked on work this instance does not own
+  // (e.g. tasks/result for a task running elsewhere) give up instead of
+  // holding the server open until that work finishes.
+  const shutdownController = new AbortController()
+  app.addHook('preClose', async () => {
+    shutdownController.abort()
+  })
+
+  // Leases let any instance notice that the one running a task has died.
+  const taskLeases = taskStore
+    ? new TaskLeases(taskStore, opts.taskLeaseMs ?? DEFAULT_TASK_LEASE_MS, (err, taskId) => {
+      app.log.warn({ err, taskId }, 'Failed to renew task lease')
+    })
+    : undefined
 
   if (enableTasks) {
     // Advertise which task operations we support. `tasks/list` is only offered
@@ -392,6 +432,8 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     localStreams,
     taskStore,
     taskWaiters,
+    shutdownSignal: shutdownController.signal,
+    taskLeases,
     jsonSchemaValidator,
     taskInputs,
     sealer,
@@ -427,10 +469,10 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     }
   })
 
-  // Expired task keys vanish on their own in Redis, but their ids linger in
-  // the index until something prunes it, so prune it on a schedule.
-  // Each instance runs it at a jittered interval, so instances deployed
-  // together do not all sweep the shared index at the same moment.
+  // The memory store only drops expired tasks lazily, so sweep it on a
+  // schedule (the Redis store expires keys itself and prunes its indexes on
+  // create and list). Each instance runs it at a jittered interval, so
+  // instances deployed together do not all sweep at the same moment.
   const taskCleanup = taskStore
     ? setInterval(() => {
       taskStore.cleanup().catch((error) => app.log.debug({ err: error }, 'Task store cleanup failed'))
@@ -441,6 +483,10 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
   app.addHook('onClose', async () => {
     if (taskCleanup) clearInterval(taskCleanup)
     clearInterval(sessionCleanupTimer)
+
+    // Tasks still running here are abandoned: stop vouching for them so their
+    // leases lapse and other instances report them failed.
+    taskLeases?.close()
 
     // Clean up all SSE streams and sessions
     const unsubscribePromises: Promise<void>[] = []
@@ -512,6 +558,8 @@ export type {
   MessageBroker
 } from './brokers/message-broker.ts'
 
+export type { ToolArgumentLimits } from './security.ts'
+
 // Export plugin types
 export type {
   MCPPluginOptions,
@@ -547,6 +595,8 @@ export type {
   TracerLike
 } from './types.ts'
 
+export type { AllowedOrigins } from './security.ts'
+
 // Export telemetry utilities for advanced consumers
 export { MCP_ATTR, buildSpanAttributes } from './telemetry-constants.ts'
 export { withSpan } from './telemetry.ts'
@@ -567,6 +617,9 @@ export type {
 } from './types/auth-types.ts'
 
 export { colonScopeHierarchy } from './auth/prehandler.ts'
+
+// Rate limiting helper
+export { RateLimiter } from './security.ts'
 
 export type {
   JSONRPCMessage,
@@ -663,7 +716,7 @@ export type { CacheHint, CachingConfig } from './modern/handlers.ts'
 
 // Task storage, for callers that want to supply or inspect a backend
 export type { TaskStore, TaskRecord, TaskOutcome, TaskInputUpdate, TaskUpdateOptions, TaskListOptions, TaskListPage } from './stores/task-store.ts'
-export { InvalidTaskCursorError, DEFAULT_TASK_PAGE_SIZE } from './stores/task-store.ts'
+export { InvalidTaskCursorError, DEFAULT_TASK_PAGE_SIZE, TaskLimitError, TASK_LIMIT_REACHED, DEFAULT_TASK_MAX_PER_PRINCIPAL } from './stores/task-store.ts'
 export { MemoryTaskStore } from './stores/memory-task-store.ts'
 export { RedisTaskStore } from './stores/redis-task-store.ts'
 

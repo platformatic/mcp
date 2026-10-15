@@ -1,4 +1,5 @@
-import type { Task, TaskStatus, JSONRPCResultResponse, JSONRPCErrorResponse } from '../schema.ts'
+import type { Task, TaskStatus, JSONRPCResultResponse, JSONRPCErrorResponse, RequestId } from '../schema.ts'
+import { INTERNAL_ERROR, JSONRPC_VERSION } from '../schema.ts'
 
 /**
  * The final outcome of a task-augmented request, stored verbatim so that
@@ -9,7 +10,8 @@ export type TaskOutcome = JSONRPCResultResponse | JSONRPCErrorResponse
 
 export interface TaskRecord extends Task {
   /**
-   * Authorization subject this task belongs to, when the deployment can identify
+   * Principal this task belongs to (see `principalOf`: the user, the OAuth
+   * client and the normalized issuer), when the deployment can identify
    * requestors. `tasks/get`, `tasks/result` and `tasks/cancel` must refuse tasks
    * belonging to a different context.
    */
@@ -178,7 +180,43 @@ export function taskPageLimit (limit: number | undefined): number {
   return limit
 }
 
+/** Tasks one principal may keep stored, finished ones included, by default */
+export const DEFAULT_TASK_MAX_PER_PRINCIPAL = 100
+
+/**
+ * JSON-RPC error code returned when a task cannot be created because the
+ * caller (or the store) is at capacity and holds no finished task to evict.
+ * Implementation-defined, in the -32000..-32099 server error range.
+ */
+export const TASK_LIMIT_REACHED = -32029
+
+/**
+ * Thrown by `TaskStore.create` when the store is at capacity and no finished
+ * task can be evicted to make room.
+ */
+export class TaskLimitError extends Error {
+  readonly limit: number
+
+  constructor (limit: number) {
+    super(`Task limit reached (${limit})`)
+    this.name = 'TaskLimitError'
+    this.limit = limit
+  }
+}
+
+export function validateTaskLimit (name: string, value: unknown): void {
+  if (!Number.isInteger(value) || (value as number) < 1) {
+    throw new TypeError(`${name} must be a positive integer`)
+  }
+}
+
 export interface TaskStore {
+  /**
+   * Store a new task. Every principal (and the anonymous caller) has a cap on
+   * the tasks it keeps stored, finished ones included; at the cap, its oldest
+   * finished task is evicted to make room.
+   * @throws TaskLimitError if at capacity with no finished task to evict
+   */
   create(task: TaskRecord): Promise<void>
   get(taskId: string): Promise<TaskRecord | null>
   /**
@@ -217,8 +255,8 @@ export interface TaskStore {
    */
   expireStaleLease(taskId: string, statusMessage: string, outcome: TaskOutcome): Promise<TaskRecord | null>
   /**
-   * One page of the tasks visible to the given authorization subject, newest
-   * first. Pass the previous page's `nextCursor` to continue.
+   * One page of the tasks visible to the given principal, newest first. Pass
+   * the previous page's `nextCursor` to continue.
    * @throws InvalidTaskCursorError if `cursor` was not issued by this store
    */
   list(authSubject?: string, options?: TaskListOptions): Promise<TaskListPage>
@@ -226,6 +264,80 @@ export interface TaskStore {
   /** Drop tasks whose ttl has elapsed */
   cleanup(): Promise<void>
   close?(): Promise<void>
+}
+
+/**
+ * Keeps the leases of the tasks this instance is running alive. If the instance
+ * dies (or closes) the renewals stop, the lease lapses, and whichever instance
+ * next reads the task marks it failed instead of reporting `working` until the
+ * task's ttl runs out.
+ */
+export class TaskLeases {
+  private timers = new Map<string, ReturnType<typeof setInterval>>()
+  private closed = false
+  private readonly store: TaskStore
+  readonly leaseMs: number
+  private readonly onError?: (error: unknown, taskId: string) => void
+
+  constructor (store: TaskStore, leaseMs: number, onError?: (error: unknown, taskId: string) => void) {
+    this.store = store
+    this.leaseMs = leaseMs
+    this.onError = onError
+  }
+
+  /**
+   * Take the lease on a freshly created task and keep renewing it until
+   * `stop()`, or until the store reports the task gone or terminal. `onEnded`
+   * hears about the latter, so a worker whose cancellation was lost in transit
+   * still learns that its task ended.
+   */
+  async start (taskId: string, onEnded?: (status: TaskStatus | null) => void): Promise<void> {
+    if (this.closed) return
+    const renew = async (): Promise<boolean> => {
+      try {
+        const status = await this.store.renewLease(taskId, this.leaseMs)
+        if (status === null || isTerminal(status)) {
+          this.stop(taskId)
+          onEnded?.(status)
+          return false
+        }
+      } catch (error) {
+        this.onError?.(error, taskId)
+      }
+      return true
+    }
+
+    if (!await renew() || this.closed) return
+    const timer = setInterval(() => { renew() }, Math.max(1, Math.floor(this.leaseMs / 3)))
+    timer.unref()
+    this.timers.set(taskId, timer)
+  }
+
+  stop (taskId: string): void {
+    const timer = this.timers.get(taskId)
+    if (timer) {
+      clearInterval(timer)
+      this.timers.delete(taskId)
+    }
+  }
+
+  /** Stop renewing everything, e.g. when the server shuts down */
+  close (): void {
+    this.closed = true
+    for (const timer of this.timers.values()) {
+      clearInterval(timer)
+    }
+    this.timers.clear()
+  }
+}
+
+/** Why a task whose running instance stopped renewing its lease was failed */
+export const TASK_OWNER_LOST = 'Task owner lost: the server instance running this task stopped responding'
+
+/** The outcome recorded on a task failed because its lease lapsed */
+export function ownerLostOutcome (): JSONRPCErrorResponse {
+  // The originating request id is long gone; JSON-RPC uses null for that
+  return { jsonrpc: JSONRPC_VERSION, id: null as unknown as RequestId, error: { code: INTERNAL_ERROR, message: TASK_OWNER_LOST } }
 }
 
 /**

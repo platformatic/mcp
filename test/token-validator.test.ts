@@ -98,7 +98,43 @@ describe('TokenValidator', () => {
       const result = await validator.validateToken(token)
 
       t.assert.strictEqual(result.valid, false)
-      t.assert.ok(result.error)
+      t.assert.strictEqual(result.error, 'Token expired')
+
+      validator.close()
+    })
+
+    test('should reject JWT with a bad signature', async (t: TestContext) => {
+      const config = createTestAuthConfig()
+      restoreMock = setupMockAgent({
+        'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse()
+      })
+
+      const validator = new TokenValidator(config, app)
+      // Swap in the signature of a different token
+      const [header, payload] = createTestJWT().split('.')
+      const otherSignature = createTestJWT({ sub: 'someone-else' }).split('.')[2]
+      const token = `${header}.${payload}.${otherSignature}`
+
+      const result = await validator.validateToken(token)
+
+      t.assert.strictEqual(result.valid, false)
+      t.assert.strictEqual(result.error, 'Invalid token signature')
+
+      validator.close()
+    })
+
+    test('should reject a malformed JWT without echoing its content', async (t: TestContext) => {
+      const config = createTestAuthConfig()
+      restoreMock = setupMockAgent({
+        'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse()
+      })
+
+      const validator = new TokenValidator(config, app)
+
+      const result = await validator.validateToken('not-a-jwt-secret-value')
+
+      t.assert.strictEqual(result.valid, false)
+      t.assert.strictEqual(result.error, 'Invalid token')
 
       validator.close()
     })

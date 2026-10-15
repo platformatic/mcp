@@ -4,7 +4,7 @@ import Fastify from 'fastify'
 import mcpPlugin from '../src/index.ts'
 import type { MCPPluginOptions } from '../src/types.ts'
 import type { JSONRPCRequest, JSONRPCResultResponse, JSONRPCErrorResponse, ListToolsResult } from '../src/schema.ts'
-import { INVALID_PARAMS, JSONRPC_VERSION, LATEST_PROTOCOL_VERSION, METHOD_NOT_FOUND } from '../src/schema.ts'
+import { INVALID_PARAMS, JSONRPC_VERSION, LATEST_PROTOCOL_VERSION } from '../src/schema.ts'
 import { createTestJWT, setupMockAgent, generateMockJWKSResponse, createTestAuthConfig } from './auth-test-utils.ts'
 
 async function buildApp (t: TestContext, opts: MCPPluginOptions = {}) {
@@ -100,7 +100,7 @@ describe('Tool Authorization (canAccessTool)', () => {
     const unknownBody = unknownResponse.json() as JSONRPCErrorResponse
 
     t.assert.strictEqual(handlerInvoked, false, 'denied handler must not run')
-    t.assert.strictEqual(deniedBody.error.code, METHOD_NOT_FOUND)
+    t.assert.strictEqual(deniedBody.error.code, INVALID_PARAMS)
     t.assert.strictEqual(deniedBody.error.message, "Tool 'restricted-tool' not found")
     // Same code and message shape as a genuinely unknown tool: no existence leak
     t.assert.strictEqual(unknownBody.error.code, deniedBody.error.code)
@@ -261,7 +261,7 @@ describe('Tool Authorization (canAccessTool)', () => {
 
     const callResponse = await app.inject({ method: 'POST', url: '/mcp', payload: callRequest('restricted-tool') })
     const callBody = callResponse.json() as JSONRPCErrorResponse
-    t.assert.strictEqual(callBody.error.code, METHOD_NOT_FOUND)
+    t.assert.strictEqual(callBody.error.code, INVALID_PARAMS)
   })
 
   test('a throwing hook fails closed', async (t: TestContext) => {
@@ -277,7 +277,7 @@ describe('Tool Authorization (canAccessTool)', () => {
 
     const callResponse = await app.inject({ method: 'POST', url: '/mcp', payload: callRequest('public-tool') })
     const callBody = callResponse.json() as JSONRPCErrorResponse
-    t.assert.strictEqual(callBody.error.code, METHOD_NOT_FOUND)
+    t.assert.strictEqual(callBody.error.code, INVALID_PARAMS)
   })
 
   test('non-boolean truthy returns deny access', async (t: TestContext) => {
@@ -322,7 +322,7 @@ describe('Tool Authorization (canAccessTool)', () => {
       }
     })
     const taskCallBody = taskCallResponse.json() as JSONRPCErrorResponse
-    t.assert.strictEqual(taskCallBody.error.code, METHOD_NOT_FOUND)
+    t.assert.strictEqual(taskCallBody.error.code, INVALID_PARAMS)
     t.assert.strictEqual(taskCallBody.error.message, "Tool 'restricted-task-tool' not found")
     t.assert.deepStrictEqual(operations, ['call'])
   })
@@ -367,7 +367,7 @@ describe('Tool Authorization (canAccessTool)', () => {
       payload: callRequest('restricted-tool')
     })
     const readerCallBody = readerCall.json() as JSONRPCErrorResponse
-    t.assert.strictEqual(readerCallBody.error.code, METHOD_NOT_FOUND)
+    t.assert.strictEqual(readerCallBody.error.code, INVALID_PARAMS)
 
     const adminCall = await app.inject({
       method: 'POST',

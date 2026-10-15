@@ -220,6 +220,40 @@ describe('Authorization PreHandler', () => {
     validator.close()
   })
 
+  for (const scheme of ['Bearer', 'bearer', 'BEARER']) {
+    test(`should accept the ${scheme} auth-scheme case-insensitively`, async (t: TestContext) => {
+      const config = createTestAuthConfig()
+      restoreMock = setupMockAgent({
+        'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse()
+      })
+
+      const validator = new TokenValidator(config, app)
+      const preHandler = createAuthPreHandler(config, validator)
+
+      app.addHook('preHandler', preHandler)
+      app.get('/test', async (request: any) => ({
+        success: true,
+        user: (request as any).tokenPayload?.sub
+      }))
+
+      await app.ready()
+
+      const token = createTestJWT()
+      const response = await app.inject({
+        method: 'GET',
+        url: '/test',
+        headers: {
+          authorization: `${scheme} ${token}`
+        }
+      })
+
+      t.assert.strictEqual(response.statusCode, 200)
+      t.assert.strictEqual(response.json().user, 'test-user')
+
+      validator.close()
+    })
+  }
+
   test('should return 401 with invalid token', async (t: TestContext) => {
     const config = createTestAuthConfig()
     restoreMock = setupMockAgent({
@@ -309,6 +343,11 @@ describe('Authorization PreHandler', () => {
 
     const body = response.json()
     t.assert.strictEqual(body.error, 'invalid_token')
+    t.assert.strictEqual(body.error_description, 'Token expired')
+    t.assert.strictEqual(
+      response.headers['www-authenticate'],
+      'Bearer realm="MCP Server", resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource", error="invalid_token", error_description="Token expired"'
+    )
 
     validator.close()
   })

@@ -11,6 +11,7 @@ import type {
   JSONRPCRequest,
   JSONRPCNotification
 } from './schema.ts'
+import { checkRequestId } from './handlers.ts'
 
 // Local batch types for JSON-RPC 2.0 compatibility
 type JSONRPCBatchRequest = (JSONRPCRequest | JSONRPCNotification)[]
@@ -79,6 +80,8 @@ export class StdioTransport {
   // what a legacy `initialize` agreed on and echo it like an HTTP client would.
   private protocolVersion: string | undefined
   private closePromise: Promise<void> | null = null
+  private onSigint: (() => void) | null = null
+  private onSigterm: (() => void) | null = null
 
   constructor (
     app: FastifyInstance,
@@ -132,20 +135,22 @@ export class StdioTransport {
       })
     })
 
-    // Handle process signals for graceful shutdown
-    process.on('SIGINT', () => {
+    // Handle process signals for graceful shutdown. Keep references so stop()
+    // can remove them; otherwise every transport leaks two listeners.
+    this.onSigint = () => {
       this.log('Received SIGINT, shutting down...')
       this.stop().catch(error => {
         this.logError('Error during shutdown:', error)
       })
-    })
-
-    process.on('SIGTERM', () => {
+    }
+    this.onSigterm = () => {
       this.log('Received SIGTERM, shutting down...')
       this.stop().catch(error => {
         this.logError('Error during shutdown:', error)
       })
-    })
+    }
+    process.on('SIGINT', this.onSigint)
+    process.on('SIGTERM', this.onSigterm)
 
     this.log('MCP stdio transport started successfully')
   }
@@ -154,6 +159,8 @@ export class StdioTransport {
    * Stop the stdio transport
    */
   stop (): Promise<void> {
+    this.removeSignalListeners()
+
     // Return the same promise to every caller so that concurrent stop() calls
     // (readline close, stdin end, signals) all wait for app.close() to finish
     if (!this.closePromise) {
@@ -162,12 +169,27 @@ export class StdioTransport {
     return this.closePromise
   }
 
+  private removeSignalListeners (): void {
+    if (this.onSigint) {
+      process.removeListener('SIGINT', this.onSigint)
+      this.onSigint = null
+    }
+    if (this.onSigterm) {
+      process.removeListener('SIGTERM', this.onSigterm)
+      this.onSigterm = null
+    }
+  }
+
   private async doStop (): Promise<void> {
     this.log('Stopping stdio transport...')
 
     if (this.readline) {
       this.readline.close()
     }
+
+    // Nobody is left to read a response: cancel what is still running, so
+    // handlers stop rather than outlive the resources app.close() tears down.
+    for (const cancel of this.inFlight.values()) cancel.abort(new Error('stdio transport closed'))
 
     // Close the Fastify app gracefully
     try {
@@ -268,6 +290,12 @@ export class StdioTransport {
    * on its own.
    */
   private async processMessage (message: JSONRPCMessage): Promise<JSONRPCResponse | JSONRPCError | null> {
+    // Check before inject re-serializes the message: an id such as 1e400
+    // parses to Infinity, which JSON.stringify would turn into null, and an
+    // unsafe integer would come back as a different id.
+    const idError = checkRequestId(message)
+    if (idError) return idError
+
     const id = 'id' in message ? (message as { id: string | number }).id : undefined
     const key = id === undefined ? undefined : requestKey(id)
     const cancel = new AbortController()
@@ -483,6 +511,8 @@ export async function runStdioServer (
   // Return a promise that resolves when the process should shut down
   return new Promise((resolve) => {
     const shutdown = async () => {
+      process.removeListener('SIGINT', shutdown)
+      process.removeListener('SIGTERM', shutdown)
       await transport.stop()
       resolve()
     }

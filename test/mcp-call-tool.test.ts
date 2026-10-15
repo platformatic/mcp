@@ -5,7 +5,7 @@ import type { FastifyRequest } from 'fastify'
 import { Type } from '@sinclair/typebox'
 import mcpPlugin from '../src/index.ts'
 import type { JSONRPCErrorResponse, JSONRPCRequest, JSONRPCResultResponse, CallToolResult } from '../src/index.ts'
-import { JSONRPC_VERSION, LATEST_LEGACY_PROTOCOL_VERSION, METHOD_NOT_FOUND } from '../src/schema.ts'
+import { JSONRPC_VERSION, LATEST_LEGACY_PROTOCOL_VERSION, INVALID_PARAMS } from '../src/schema.ts'
 
 type DirectBody = {
   name: string
@@ -368,7 +368,7 @@ describe('mcpCallTool', () => {
     })
     t.assert.deepStrictEqual(directUnknown.json(), { ok: false, reason: 'not-found' })
     const unknownError = (rpcUnknown.json() as JSONRPCErrorResponse).error
-    t.assert.strictEqual(unknownError.code, METHOD_NOT_FOUND)
+    t.assert.strictEqual(unknownError.code, INVALID_PARAMS)
     t.assert.strictEqual(unknownError.message, "Tool 'missing' not found")
 
     const directDenied = await app.inject({
@@ -386,7 +386,7 @@ describe('mcpCallTool', () => {
     // tools apart from unknown ones.
     t.assert.deepStrictEqual(directDenied.json(), { ok: false, reason: 'access-denied' })
     const deniedError = (rpcDenied.json() as JSONRPCErrorResponse).error
-    t.assert.strictEqual(deniedError.code, METHOD_NOT_FOUND)
+    t.assert.strictEqual(deniedError.code, INVALID_PARAMS)
     t.assert.strictEqual(deniedError.message, "Tool 'restricted' not found")
 
     const directInvalid = await app.inject({

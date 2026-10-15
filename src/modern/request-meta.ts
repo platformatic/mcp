@@ -23,7 +23,9 @@ import {
  * when it is a well-formed request or notification.
  *
  * The transport carries exactly one message per POST, and a request id must be
- * a string or an integer: never null.
+ * a string or an integer: never null. A number outside the safe integer range
+ * has already lost precision in JSON.parse, so answering it would echo a
+ * different id.
  */
 export function invalidModernMessage (body: unknown): string | undefined {
   if (Array.isArray(body)) return 'Batch requests are not supported'
@@ -32,8 +34,8 @@ export function invalidModernMessage (body: unknown): string | undefined {
   const message = body as { jsonrpc?: unknown, method?: unknown, id?: unknown }
   if (message.jsonrpc !== JSONRPC_VERSION) return 'Invalid request: "jsonrpc" must be "2.0"'
   if (typeof message.method !== 'string') return 'Invalid request: "method" must be a string'
-  if ('id' in message && typeof message.id !== 'string' && !Number.isInteger(message.id)) {
-    return 'Invalid request: "id" must be a string or an integer'
+  if ('id' in message && typeof message.id !== 'string' && !Number.isSafeInteger(message.id)) {
+    return 'Invalid request: "id" must be a string or a safe integer'
   }
   return undefined
 }
@@ -46,7 +48,7 @@ export function requestIdOf (body: unknown): RequestId | null {
   const id = (body && typeof body === 'object' && !Array.isArray(body))
     ? (body as { id?: unknown }).id
     : undefined
-  return typeof id === 'string' || Number.isInteger(id) ? id as RequestId : null
+  return typeof id === 'string' || Number.isSafeInteger(id) ? id as RequestId : null
 }
 
 /** The protocol version a request names in `_meta`, if it names one. */

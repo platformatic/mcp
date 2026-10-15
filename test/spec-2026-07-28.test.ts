@@ -508,7 +508,10 @@ describe('2026-07-28: server features', () => {
     const app = await buildServer(t)
 
     const response = await call(app, 'resources/read', { params: { uri: 'file:///missing' } })
+    // Never -32002, which the handshake revisions use and this one forbids;
+    // the URI travels in `data`, as resources.md shows
     t.assert.strictEqual(response.json().error.code, INVALID_PARAMS)
+    t.assert.deepStrictEqual(response.json().error.data, { uri: 'file:///missing' })
   })
 })
 
@@ -1402,15 +1405,17 @@ describe('2026-07-28: per-caller and global limits', () => {
     t.assert.strictEqual(response.json().error.code, INVALID_PARAMS)
   })
 
-  test('a full memory store keeps unread results and refuses new tasks', async (t: TestContext) => {
+  test('a full memory store evicts finished tasks first and refuses only when all are running', async (t: TestContext) => {
     const store = new MemoryTaskStore(2)
     const now = new Date().toISOString()
     const base = { createdAt: now, lastUpdatedAt: now, ttl: 60_000, method: 'tools/call' }
     await store.create({ ...base, taskId: 'done', status: 'completed' })
     await store.create({ ...base, taskId: 'running', status: 'working' })
-    await t.assert.rejects(store.create({ ...base, taskId: 'new', status: 'working' }), /Task limit reached/)
-    // Nobody else's task creation can delete a finished result before its ttl.
-    t.assert.strictEqual((await store.get('done'))?.status, 'completed')
+    // The finished task makes room; the running one is never dropped.
+    await store.create({ ...base, taskId: 'new', status: 'working' })
+    t.assert.strictEqual(await store.get('done'), null)
+    t.assert.strictEqual((await store.get('running'))?.status, 'working')
+    await t.assert.rejects(store.create({ ...base, taskId: 'newer', status: 'working' }), /Task limit reached/)
 
     // Expired tasks still make room.
     const old = new Date(Date.now() - 120_000).toISOString()

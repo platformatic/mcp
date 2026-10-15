@@ -19,7 +19,9 @@ import {
   JSONRPC_VERSION,
   LATEST_LEGACY_PROTOCOL_VERSION,
   METHOD_NOT_FOUND,
-  INTERNAL_ERROR
+  INVALID_PARAMS,
+  RESOURCE_NOT_FOUND,
+  INVALID_REQUEST
 } from '../src/schema.ts'
 
 describe('MCP Fastify Plugin', () => {
@@ -69,6 +71,65 @@ describe('MCP Fastify Plugin', () => {
       const body = response.json() as { error: { code: number }, id: unknown }
       t.assert.strictEqual(body.error.code, -32600)
       t.assert.strictEqual(body.id, null)
+    })
+
+    test('rejects a numeric id above 2^53 instead of answering with a different id', async (t: TestContext) => {
+      const app = Fastify()
+      t.after(() => app.close())
+      await app.register(mcpPlugin)
+      await app.ready()
+
+      // JSON.parse turns 9007199254740993 into 9007199254740992; the response
+      // must not carry an id the client never sent
+      const response = await app.inject({
+        method: 'POST',
+        url: '/mcp',
+        headers: { 'content-type': 'application/json' },
+        payload: '{"jsonrpc":"2.0","id":9007199254740993,"method":"tools/list"}'
+      })
+
+      t.assert.strictEqual(response.statusCode, 400)
+      const body = response.json() as JSONRPCError
+      t.assert.strictEqual(body.jsonrpc, JSONRPC_VERSION)
+      t.assert.strictEqual(body.id, null)
+      t.assert.strictEqual(body.error.code, -32600)
+    })
+
+    test('rejects a fractional numeric id with -32600', async (t: TestContext) => {
+      const app = Fastify()
+      t.after(() => app.close())
+      await app.register(mcpPlugin)
+      await app.ready()
+
+      // basic.md: requests MUST include a string or integer ID
+      const response = await app.inject({
+        method: 'POST',
+        url: '/mcp',
+        payload: { jsonrpc: JSONRPC_VERSION, id: 1.5, method: 'ping' }
+      })
+
+      t.assert.strictEqual(response.statusCode, 400)
+      const body = response.json() as JSONRPCError
+      t.assert.strictEqual(body.id, null)
+      t.assert.strictEqual(body.error.code, -32600)
+    })
+
+    test('accepts the largest safe integer id and large string ids', async (t: TestContext) => {
+      const app = Fastify()
+      t.after(() => app.close())
+      await app.register(mcpPlugin)
+      await app.ready()
+
+      for (const id of [Number.MAX_SAFE_INTEGER, -Number.MAX_SAFE_INTEGER, '9007199254740993']) {
+        const response = await app.inject({
+          method: 'POST',
+          url: '/mcp',
+          payload: { jsonrpc: JSONRPC_VERSION, id, method: 'ping' }
+        })
+
+        t.assert.strictEqual(response.statusCode, 200)
+        t.assert.strictEqual(response.json().id, id)
+      }
     })
 
     test('should handle initialize request', async (t: TestContext) => {
@@ -239,7 +300,8 @@ describe('MCP Fastify Plugin', () => {
       const body = response.json() as JSONRPCError
       t.assert.strictEqual(body.jsonrpc, JSONRPC_VERSION)
       t.assert.strictEqual(body.id, 6)
-      t.assert.strictEqual(body.error.code, METHOD_NOT_FOUND)
+      // tools.md, Error Handling: unknown tools are an Invalid params protocol error
+      t.assert.strictEqual(body.error.code, INVALID_PARAMS)
       t.assert.ok(body.error.message.includes('test-tool'))
     })
 
@@ -267,8 +329,10 @@ describe('MCP Fastify Plugin', () => {
       const body = response.json() as JSONRPCError
       t.assert.strictEqual(body.jsonrpc, JSONRPC_VERSION)
       t.assert.strictEqual(body.id, 7)
-      t.assert.strictEqual(body.error.code, METHOD_NOT_FOUND)
+      // resources.md, Error Handling: "Resource not found: -32002"
+      t.assert.strictEqual(body.error.code, RESOURCE_NOT_FOUND)
       t.assert.ok(body.error.message.includes('file://test.txt'))
+      t.assert.deepStrictEqual(body.error.data, { uri: 'file://test.txt' })
     })
 
     test('should handle prompts/get request for non-existent prompt', async (t: TestContext) => {
@@ -295,7 +359,8 @@ describe('MCP Fastify Plugin', () => {
       const body = response.json() as JSONRPCError
       t.assert.strictEqual(body.jsonrpc, JSONRPC_VERSION)
       t.assert.strictEqual(body.id, 8)
-      t.assert.strictEqual(body.error.code, METHOD_NOT_FOUND)
+      // prompts.md, Error Handling: "Invalid prompt name: -32602 (Invalid params)"
+      t.assert.strictEqual(body.error.code, INVALID_PARAMS)
       t.assert.ok(body.error.message.includes('test-prompt'))
     })
 
@@ -384,10 +449,10 @@ describe('MCP Fastify Plugin', () => {
         payload: invalidMessage
       })
 
-      t.assert.strictEqual(response.statusCode, 500)
+      t.assert.strictEqual(response.statusCode, 400)
       const body = response.json() as JSONRPCError
       t.assert.strictEqual(body.jsonrpc, JSONRPC_VERSION)
-      t.assert.strictEqual(body.error.code, INTERNAL_ERROR)
+      t.assert.strictEqual(body.error.code, INVALID_REQUEST)
     })
   })
 

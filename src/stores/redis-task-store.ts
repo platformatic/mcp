@@ -11,13 +11,18 @@ import type {
   TaskCursorPosition
 } from './task-store.ts'
 import {
+  DEFAULT_TASK_MAX_PER_PRINCIPAL,
+  TaskLimitError,
+  TASK_OWNER_LOST,
   applyInputRequestUpdates,
   canTransition,
   decodeTaskCursor,
   encodeTaskCursor,
   isTerminal,
   matchesTaskEra,
-  taskPageLimit
+  ownerLostOutcome,
+  taskPageLimit,
+  validateTaskLimit
 } from './task-store.ts'
 
 // Versioned: records here store opaque fields as JSON strings, which earlier
@@ -79,21 +84,94 @@ function fromStored (stored: any): TaskRecord {
   return task
 }
 
-// Add a task to its owner's index and stretch the index's expiry so it outlives
-// every task it references. A negative expiry means the task never expires, so
-// the index must not either.
-const INDEX_ADD_SCRIPT = `
-local existed = redis.call('EXISTS', KEYS[1])
-redis.call('ZADD', KEYS[1], ARGV[1], ARGV[2])
-local secs = tonumber(ARGV[3])
+// Store a task while enforcing its owner's retention cap, atomically so that
+// concurrent creates on different instances cannot overshoot it.
+//
+// KEYS: task key, owner index
+// ARGV: task JSON, expiry seconds (-1 = none), score, task id, cap, task key
+//       prefix, then the status message, encoded outcome and timestamp for
+//       orphaned tasks, then the lease in ms ('' for none)
+//
+// The owner index is a sorted set of task ids scored by creation time (the same
+// one `list` pages through). Ids whose task key has expired are pruned first,
+// so an index nobody lists cannot grow without bound; then, at the cap, tasks
+// whose lease has lapsed (their instance died) are failed, as expireStaleLease
+// would, and the oldest finished tasks are evicted. Returns 0 (storing nothing)
+// when the owner is at the cap with nothing finished to evict. Task keys are
+// derived from index members, so this needs a standalone Redis (or every key
+// in one slot).
+//
+// Leases are timed by Redis's own clock, so the new task's first lease is
+// stamped here: one taken from the creating instance's clock could look lapsed
+// to the check above on a concurrent create.
+const CREATE_SCRIPT = `
+local prefix = ARGV[6]
+local cap = tonumber(ARGV[5])
+local t = redis.call('TIME')
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+local live = {}
+for _, id in ipairs(redis.call('ZRANGE', KEYS[2], 0, -1)) do
+  if redis.call('EXISTS', prefix .. id) == 1 then
+    table.insert(live, id)
+  else
+    redis.call('ZREM', KEYS[2], id)
+  end
+end
+
+local need = #live - cap + 1
+if need > 0 then
+  local victims = {}
+  for _, id in ipairs(live) do
+    local ok, cur = pcall(cjson.decode, redis.call('GET', prefix .. id))
+    local s = ok and type(cur) == 'table' and cur.status
+    if s == 'completed' or s == 'failed' or s == 'cancelled' then
+      if #victims < need then table.insert(victims, id) end
+    elseif s and type(cur.leaseExpiresAt) == 'number' and cur.leaseExpiresAt <= now then
+      cur.status = 'failed'
+      cur.statusMessage = ARGV[7]
+      cur.outcome = ARGV[8]
+      cur.lastUpdatedAt = ARGV[9]
+      cur.inputRequests = nil
+      cur.pendingInputResponses = nil
+      cur.pendingInputResponseIds = nil
+      cur.pendingInputResponseRounds = nil
+      redis.call('SET', prefix .. id, cjson.encode(cur), 'KEEPTTL')
+      if #victims < need then table.insert(victims, id) end
+    end
+  end
+  if #victims < need then return 0 end
+  for _, id in ipairs(victims) do
+    redis.call('DEL', prefix .. id)
+    redis.call('ZREM', KEYS[2], id)
+  end
+end
+
+local record = ARGV[1]
+if ARGV[10] ~= '' then
+  local task = cjson.decode(record)
+  task.leaseExpiresAt = now + tonumber(ARGV[10])
+  record = cjson.encode(task)
+end
+
+local secs = tonumber(ARGV[2])
 if secs < 0 then
-  redis.call('PERSIST', KEYS[1])
-elseif existed == 0 then
-  redis.call('EXPIRE', KEYS[1], secs)
+  redis.call('SET', KEYS[1], record)
 else
-  local current = redis.call('TTL', KEYS[1])
+  redis.call('SET', KEYS[1], record, 'EX', secs)
+end
+
+-- Stretch the owner index's expiry so it outlives every task it references,
+-- and never expire it while it holds a task that never expires.
+local existed = redis.call('EXISTS', KEYS[2])
+redis.call('ZADD', KEYS[2], ARGV[3], ARGV[4])
+if secs < 0 then
+  redis.call('PERSIST', KEYS[2])
+elseif existed == 0 then
+  redis.call('EXPIRE', KEYS[2], secs)
+else
+  local current = redis.call('TTL', KEYS[2])
   if current >= 0 and current < secs then
-    redis.call('EXPIRE', KEYS[1], secs)
+    redis.call('EXPIRE', KEYS[2], secs)
   end
 end
 return 1
@@ -115,10 +193,13 @@ function compareIds (a: string, b: string): number {
 export class RedisTaskStore implements TaskStore {
   private redis: Redis
   private readonly defaultTtlMs: number
+  private readonly maxTasksPerPrincipal: number
 
-  constructor (options: { redis: Redis, defaultTtlMs?: number }) {
+  constructor (options: { redis: Redis, defaultTtlMs?: number, maxTasksPerPrincipal?: number }) {
     this.redis = options.redis
     this.defaultTtlMs = options.defaultTtlMs ?? 3600_000
+    this.maxTasksPerPrincipal = options.maxTasksPerPrincipal ?? DEFAULT_TASK_MAX_PER_PRINCIPAL
+    validateTaskLimit('maxTasksPerPrincipal', this.maxTasksPerPrincipal)
   }
 
   private key (taskId: string): string {
@@ -140,27 +221,34 @@ export class RedisTaskStore implements TaskStore {
   }
 
   async create (task: TaskRecord): Promise<void> {
-    const key = this.key(task.taskId)
-    const multi = this.redis.multi()
     // A null ttl means unlimited retention (matching taskHasExpired and the
     // memory store), so write the key without an expiry rather than falling back
-    // to the default and silently expiring it.
-    if (task.ttl === null) {
-      multi.set(key, encodeTask(task))
-    } else {
-      multi.set(key, encodeTask(task), 'EX', this.expirySeconds(task))
-    }
-    // The index lets `list` enumerate one owner's tasks without a keyspace scan.
-    // Task keys expire independently, so stale ids are pruned on read.
-    multi.eval(
-      INDEX_ADD_SCRIPT,
-      1,
+    // to the default and silently expiring it. The owner index lets `list`
+    // enumerate one owner's tasks without a keyspace scan; task keys expire
+    // independently, so stale ids are pruned here and on read.
+    const { leaseExpiresAt, ...rest } = task
+    // Restamped by the script against the Redis clock, keeping its length (a
+    // lease already in the past stays lapsed).
+    const leaseMs = leaseExpiresAt === undefined ? '' : String(leaseExpiresAt - Date.now())
+    const stored = await this.redis.eval(
+      CREATE_SCRIPT,
+      2,
+      this.key(task.taskId),
       this.indexKey(task.authSubject),
+      encodeTask(rest),
+      task.ttl === null ? -1 : this.expirySeconds(task),
       new Date(task.createdAt).getTime(),
       task.taskId,
-      task.ttl === null ? -1 : this.expirySeconds(task)
+      this.maxTasksPerPrincipal,
+      TASK_KEY_PREFIX,
+      toWellFormed(TASK_OWNER_LOST),
+      JSON.stringify(ownerLostOutcome()),
+      new Date().toISOString(),
+      leaseMs
     )
-    await multi.exec()
+    if (stored !== 1) {
+      throw new TaskLimitError(this.maxTasksPerPrincipal)
+    }
   }
 
   async get (taskId: string): Promise<TaskRecord | null> {
@@ -522,7 +610,7 @@ export class RedisTaskStore implements TaskStore {
 
   async cleanup (): Promise<void> {
     // Task keys and owner indexes both expire on their own, and stale index
-    // entries are pruned whenever an owner lists. Sweeping every owner's index
-    // here would mean scanning the keyspace, so there is nothing to do.
+    // entries are pruned whenever the owner creates or lists tasks. Sweeping
+    // every owner's index here would mean scanning the keyspace.
   }
 }

@@ -1,6 +1,5 @@
 import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify'
 import fp from 'fastify-plugin'
-import cors from '@fastify/cors'
 import type { AuthorizationConfig, ProtectedResourceMetadata } from '../types/auth-types.ts'
 import { getResourceMetadataPath, PROTECTED_RESOURCE_METADATA_PATH } from '../auth/resource-metadata.ts'
 
@@ -8,26 +7,55 @@ interface WellKnownRoutesOptions {
   authConfig?: AuthorizationConfig
 }
 
-const wellKnownRoutesPlugin = fp(async function (app: FastifyInstance, opts: WellKnownRoutesOptions) {
-  if (!opts.authConfig?.enabled) {
+const CORS_ALLOWED_METHODS = 'GET, HEAD, OPTIONS'
+const CORS_ALLOWED_HEADERS = [
+  'Content-Type',
+  'Authorization',
+  'mcp-protocol-version',
+  'x-requested-with',
+  'accept',
+  'cache-control'
+].join(', ')
+const CORS_MAX_AGE = '3600' // Cache preflight for 1 hour
+
+const wellKnownRoutesPlugin = fp(async function (fastify: FastifyInstance, opts: WellKnownRoutesOptions) {
+  const authConfig = opts.authConfig
+  if (!authConfig?.enabled) {
     return // Skip registration if authorization is not enabled
   }
 
-  const { authConfig } = opts
+  // The routes and their CORS hook live in an encapsulated child context so
+  // CORS covers only /.well-known/* and never leaks onto the application's
+  // routes (including /mcp, whose CORS policy is left to the application).
+  // @fastify/cors is not used here: it decorates the request and adds a
+  // global OPTIONS * route, both of which clash with an app-level
+  // @fastify/cors registration.
+  await fastify.register(async (app) => wellKnownRoutes(app, authConfig))
+}, {
+  name: 'well-known-routes'
+})
 
-  // Register CORS for well-known endpoints to allow cross-origin requests
-  await app.register(cors, {
-    origin: true, // Allow all origins for discovery endpoints
-    methods: ['GET', 'HEAD', 'OPTIONS'],
-    allowedHeaders: [
-      'Content-Type',
-      'Authorization',
-      'mcp-protocol-version',
-      'x-requested-with',
-      'accept',
-      'cache-control'
-    ],
-    maxAge: 3600 // Cache preflight for 1 hour
+async function wellKnownRoutes (app: FastifyInstance, authConfig: AuthorizationConfig & { enabled: true }) {
+  // Discovery endpoints are public, so allow cross-origin requests from any origin
+  app.addHook('onRequest', async (request, reply) => {
+    const origin = request.headers.origin
+    if (!origin) {
+      return
+    }
+    reply.header('Access-Control-Allow-Origin', origin)
+    reply.header('Vary', 'Origin')
+
+    if (request.method === 'OPTIONS' && request.headers['access-control-request-method']) {
+      reply.header('Access-Control-Allow-Methods', CORS_ALLOWED_METHODS)
+      reply.header('Access-Control-Allow-Headers', CORS_ALLOWED_HEADERS)
+      reply.header('Access-Control-Max-Age', CORS_MAX_AGE)
+      return reply.code(204).send()
+    }
+  })
+
+  // Lets the router accept preflight requests; they are answered in the hook above
+  app.options('/.well-known/*', async (_request, reply) => {
+    return reply.callNotFound()
   })
 
   const protectedResourceSchema = {
@@ -86,94 +114,6 @@ const wellKnownRoutesPlugin = fp(async function (app: FastifyInstance, opts: Wel
     serveProtectedResourceMetadata(legacyMcpPath, `${authConfig.resourceUri.replace(/\/+$/, '')}/mcp`)
   }
 
-  // OpenID Connect Discovery for MCP (based on OpenID Connect Discovery 1.0)
-  app.get('/.well-known/openid-configuration/mcp', {
-    schema: {
-      response: {
-        200: {
-          type: 'object',
-          properties: {
-            issuer: { type: 'string' },
-            authorization_endpoint: { type: 'string' },
-            token_endpoint: { type: 'string' },
-            token_endpoint_auth_methods_supported: {
-              type: 'array',
-              items: { type: 'string' }
-            },
-            code_challenge_methods_supported: {
-              type: 'array',
-              items: { type: 'string' }
-            },
-            response_types_supported: {
-              type: 'array',
-              items: { type: 'string' }
-            },
-            grant_types_supported: {
-              type: 'array',
-              items: { type: 'string' }
-            },
-            scopes_supported: {
-              type: 'array',
-              items: { type: 'string' }
-            },
-            token_introspection_endpoint: { type: 'string' },
-            jwks_uri: { type: 'string', nullable: true },
-            mcp_resource_uri: { type: 'string' },
-            mcp_authorization_servers: {
-              type: 'array',
-              items: { type: 'string' }
-            }
-          },
-          required: [
-            'issuer',
-            'authorization_endpoint',
-            'token_endpoint',
-            'token_endpoint_auth_methods_supported',
-            'code_challenge_methods_supported',
-            'response_types_supported',
-            'grant_types_supported',
-            'scopes_supported',
-            'token_introspection_endpoint',
-            'mcp_resource_uri',
-            'mcp_authorization_servers'
-          ]
-        }
-      }
-    }
-  }, async (_request: FastifyRequest, reply: FastifyReply) => {
-    const primaryAuthServer = authConfig.authorizationServers[0]
-
-    reply.header('Content-Type', 'application/json')
-
-    return {
-      issuer: primaryAuthServer,
-      authorization_endpoint: `${primaryAuthServer}/oauth/authorize`,
-      token_endpoint: `${primaryAuthServer}/oauth/token`,
-      token_endpoint_auth_methods_supported: [
-        'client_secret_post',
-        'client_secret_basic',
-        'none'
-      ],
-      code_challenge_methods_supported: ['S256'],
-      response_types_supported: ['code'],
-      grant_types_supported: [
-        'authorization_code',
-        'refresh_token'
-      ],
-      scopes_supported: [
-        'read',
-        'write',
-        'mcp:resources',
-        'mcp:prompts',
-        'mcp:tools'
-      ],
-      token_introspection_endpoint: authConfig.tokenValidation.introspectionEndpoint ?? `${primaryAuthServer}/oauth/introspect`,
-      jwks_uri: authConfig.tokenValidation.jwksUri || null,
-      mcp_resource_uri: authConfig.resourceUri,
-      mcp_authorization_servers: authConfig.authorizationServers
-    }
-  })
-
   // Health check endpoint that can be used to verify the resource server is operational
   app.get('/.well-known/mcp-resource-health', {
     schema: {
@@ -198,8 +138,6 @@ const wellKnownRoutesPlugin = fp(async function (app: FastifyInstance, opts: Wel
       timestamp: new Date().toISOString()
     }
   })
-}, {
-  name: 'well-known-routes'
-})
+}
 
 export default wellKnownRoutesPlugin

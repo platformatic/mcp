@@ -403,16 +403,21 @@ await app.register(mcpPlugin, {
 
 ## Request Body Errors
 
-Body-parser failures on `POST /mcp` are answered with a JSON-RPC error (with `id: null`)
-while keeping the HTTP status code:
+Body-parser failures and bodies that are not JSON-RPC messages on `POST /mcp` are answered
+with a JSON-RPC error (with `id: null`) while keeping the HTTP status code:
 
 | Cause | Status | JSON-RPC error |
 | --- | --- | --- |
 | Malformed or empty JSON | `400` | `-32700` Parse error |
 | Body larger than Fastify's `bodyLimit` | `413` | `-32600` Invalid Request |
 | Unsupported `Content-Type` | `415` | `-32600` Invalid Request |
+| Not a JSON-RPC request, notification or response (`null`, a number, a string, a `text/plain` body, or an object with none of `method`, `result` or `error`) | `400` | `-32600` Invalid Request |
 
-The handler is scoped to the `POST /mcp` route. Any other error on that route, and every
+A body that is not a JSON-RPC message is rejected before any SSE session is created for it.
+A JSON-RPC response posted by the client is answered with `202` and handed to
+`onClientResponse`.
+
+The body-parser error handler is scoped to the `POST /mcp` route. Any other error on that route, and every
 error on your other routes, still goes to your own (or Fastify's default) error handler.
 
 ## Multi Round-Trip Requests (2026-07-28)
@@ -689,6 +694,39 @@ await app.register(mcpPlugin, {
 Requests without an `Origin` header are always accepted — the header is set by browsers, so
 its absence means the request did not come from one.
 
+`allowedOrigins` must be `true`, `'*'` or an array of strings; any other value (including a
+single origin string) makes registration throw. Wrap a single origin in an array.
+
+## CORS
+
+The plugin does not set CORS headers on `/mcp`; browser clients need the application to
+configure CORS for it, for example with [`@fastify/cors`](https://github.com/fastify/fastify-cors):
+
+```typescript
+import cors from '@fastify/cors'
+
+await app.register(cors, {
+  origin: ['https://app.example.com'],
+  methods: ['GET', 'POST', 'DELETE'],
+  allowedHeaders: [
+    'Content-Type',
+    'Authorization',
+    'Last-Event-ID',
+    'Mcp-Session-Id',
+    'Mcp-Protocol-Version',
+    'Mcp-Method',
+    'Mcp-Name'
+  ],
+  exposedHeaders: ['Mcp-Session-Id']
+})
+await app.register(mcpPlugin, { /* ... */ })
+```
+
+`allowedHeaders` does not accept wildcards, so list any `Mcp-Param-*` headers your clients send.
+When authorization is enabled, the `/.well-known/*` discovery endpoints answer cross-origin
+requests from any origin on their own; that CORS handling is scoped to those routes and does not
+affect the rest of the application.
+
 ## Tasks
 
 Tasks let a tool call return immediately with a task handle while the work continues in the
@@ -766,6 +804,9 @@ On `2025-11-25`, the client opts in per call instead:
 
 and may then use `tasks/get`, `tasks/result` (blocks until the task is terminal),
 `tasks/list` and `tasks/cancel`, plus optional `notifications/tasks/status` pushes over SSE.
+A blocked `tasks/result` stops waiting when its client disconnects, and when the server
+closes it answers with a JSON-RPC `-32603` "Server shutting down" error, so `app.close()`
+never waits on a task running on another instance.
 
 Retention defaults to 60 seconds when the client does not request a `ttl`. Tasks are meant
 for long-running work, so if your tools can outlive that, raise the bounds — otherwise a task
@@ -790,7 +831,39 @@ instance can serve a poll for a task created on another.
 `tasks/list` returns the caller's tasks newest first, 50 per page. When more remain, the
 result carries an opaque `nextCursor`; pass it back as `params.cursor` to fetch the next
 page. An unrecognised cursor is rejected with `-32602` (Invalid params). The Redis store keeps
-a per-subject index, so a listing only reads the caller's own tasks.
+a per-owner index, so a listing only reads the caller's own tasks.
+
+Each caller (a user at an issuer, through an OAuth client) may keep at most
+`taskMaxRetainedPerPrincipal` tasks stored (default 100), for both protocol eras. Finished tasks
+count until their `ttl` expires, so one caller cannot fill the store with results it never
+collects. When a caller is at its quota, its oldest finished task is evicted to make room; if all
+of them are still running, a 2025-11-25 `tools/call` fails with `-32029` "Task limit reached", a
+2026-07-28 tool that requires task mode gets the same error, and one that only optionally
+supports tasks runs synchronously instead. Callers the deployment cannot identify share a single
+quota, so raise it if you expect many concurrent anonymous tasks. The in-memory store also holds
+at most `taskStoreMaxTasks` tasks in total (default 1000); when full, it evicts the caller's
+oldest finished task, then the oldest finished task of any caller, before refusing. Eviction
+can drop a finished result its client has not read yet. The Redis store enforces the quota
+atomically with a per-caller sorted set, so it holds across instances, and prunes expired
+entries from it whenever that caller creates or lists tasks.
+
+The instance running a task (of either era) holds a lease on it and renews it every third of
+`taskLeaseMs` (default 15 seconds). If that instance dies or shuts down before the task
+finishes, renewals stop. Once the lease lapses, the next `tasks/get` or `tasks/result`
+(including one already waiting) marks the task `failed`, so it no longer reads `working` until
+its ttl runs out. A caller at `taskMaxRetainedPerPrincipal` gets the same treatment for their
+orphaned tasks when they create a new one. The check is a compare-and-set, so a renewal or
+completion that lands first always wins. With Redis, the lease is set and checked against the
+Redis server clock, so clock skew between instances can never fail a task that is still
+running:
+
+```typescript
+await app.register(mcpPlugin, {
+  enableTasks: true,
+  taskMaxRetainedPerPrincipal: 20, // tasks each caller may keep, finished ones included
+  taskLeaseMs: 15_000 // a dead instance's tasks are failed this long after its last renewal
+})
+```
 
 **Security**: when built-in authorization or `resolveAuthorizationContext` is configured,
 tasks are bound to the resolved principal (user, OAuth client and issuer) and a requestor can
@@ -816,7 +889,9 @@ const elicitationId = await app.mcpElicitUrl(
 )
 
 // Later, once the out-of-band interaction finishes
-await app.mcpNotifyElicitationComplete(sessionId, elicitationId)
+if (elicitationId) {
+  await app.mcpNotifyElicitationComplete(sessionId, elicitationId)
+}
 ```
 
 Servers **MUST NOT** request passwords, API keys or payment details through form mode — use
@@ -923,8 +998,11 @@ const success = await app.mcpElicit(
       bio: { type: 'string', maxLength: 500, description: 'Short bio' },
       skills: {
         type: 'array',
-        items: { type: 'string' },
-        maxItems: 10,
+        items: {
+          type: 'string',
+          enum: ['typescript', 'rust', 'go', 'python']
+        },
+        maxItems: 4,
         description: 'Your skills'
       }
     }
@@ -1194,6 +1272,8 @@ await app.register(mcpPlugin, {
 })
 ```
 
+When authorization is enabled, the access token is only checked when a `GET /mcp` stream opens. So that a stream never outlives that token, the server closes it at the token's `exp` (or after `sseMaxConnectionMs`, whichever comes first). The client then reconnects with a fresh token and resumes with `Last-Event-ID`. Tokens without an `exp` claim are bounded only by `sseMaxConnectionMs`, so set it if your authorization server issues them or if you want revocation and scope changes to take effect within a bounded time.
+
 ## Redis Configuration for Horizontal Scaling
 
 The plugin supports Redis-backed session management and message broadcasting for horizontal scaling across multiple server instances.
@@ -1233,9 +1313,9 @@ await app.register(mcpPlugin, {
     port: parseInt(process.env.REDIS_PORT || '6379'),
     db: parseInt(process.env.REDIS_DB || '0'),
     password: process.env.REDIS_PASSWORD,
-    // Additional ioredis options
-    retryDelayOnFailover: 100,
-    maxRetriesPerRequest: 3
+    // Any other ioredis RedisOptions are accepted and passed through
+    maxRetriesPerRequest: 3,
+    retryStrategy: (times) => Math.min(times * 100, 2000)
   },
   serverInfo: {
     name: 'scalable-mcp-server',
@@ -1795,8 +1875,7 @@ The plugin includes comprehensive OAuth 2.1 authorization support for secure MCP
 
 - **Complete OAuth 2.1 Support**: Authorization Code Flow with PKCE
 - **Session-Based Authorization**: Token-to-session mapping with secure context
-- **Authorization-Aware SSE**: User-specific session isolation and message routing
-- **Automatic Token Refresh**: Background token refresh with retry logic
+- **Authorization-Aware SSE**: Authorization context bound to each SSE session
 - **JWT Token Validation**: Support for JWT tokens with JWKS endpoints
 - **Token Introspection**: RFC 7662 compliant token introspection
 - **Dynamic Client Registration**: RFC 7591 compliant client registration
@@ -1893,9 +1972,6 @@ eventSource.onmessage = (event) => {
   const message = JSON.parse(event.data)
   console.log('Received:', message)
 }
-
-// Server can send user-specific messages
-// app.mcpSendToUser(userId, notification)
 ```
 
 ### Authorization Configuration
@@ -2055,60 +2131,14 @@ interface SessionMetadata {
 }
 ```
 
-### User-Specific Message Routing
+### Token Refresh
 
-Send messages to specific users across all their sessions:
-
-```typescript
-// In your tool handler
-app.mcpAddTool({
-  name: 'notify-user',
-  description: 'Send notification to user',
-  inputSchema: Type.Object({
-    userId: Type.String(),
-    message: Type.String()
-  })
-}, async (params, { sessionId, authContext }) => {
-  // Send to all sessions for this user
-  await app.mcpSendToUser(params.userId, {
-    jsonrpc: '2.0',
-    method: 'notifications/message',
-    params: {
-      level: 'info',
-      message: params.message
-    }
-  })
-  
-  return { content: [{ type: 'text', text: 'Notification sent' }] }
-})
-```
-
-### Automatic Token Refresh
-
-The plugin includes a background service for automatic token refresh:
-
-```typescript
-// Token refresh configuration
-authorization: {
-  enabled: true,
-  tokenRefresh: {
-    // Check for expiring tokens every 5 minutes
-    checkIntervalMs: 5 * 60 * 1000,
-    
-    // Refresh tokens 5 minutes before expiry
-    refreshBufferMinutes: 5,
-    
-    // Maximum refresh attempts
-    maxRetries: 3
-  }
-}
-
-// Manual token refresh
-const success = await app.tokenRefreshService.refreshSessionToken(sessionId)
-
-// Token refresh notifications sent via SSE
-// Client receives: { method: 'notifications/token_refreshed', params: { access_token: '...' } }
-```
+Automatic background token refresh is not available yet: there is no
+`authorization.tokenRefresh` option and no `app.tokenRefreshService`
+decorator. Clients are expected to refresh their own access tokens (for
+example through `POST /oauth/refresh` when `oauth2Client` is configured).
+End-to-end token refresh is tracked in
+[#146](https://github.com/platformatic/mcp/issues/146).
 
 ### Authorization-Aware Tools
 
@@ -2167,7 +2197,7 @@ await app.register(mcpPlugin, {
 The hook receives the tool name and a per-request context (`authContext`, `request`, `sessionId`, `operation`), and may be sync or async. It is consulted at both dispatch points, so list and call can never disagree:
 
 - `tools/list` omits every tool the hook denies for that request, calling the hook with `operation: 'list'`. Per-tool checks run concurrently with a fixed cap (8 at a time), so an async hook backed by a database or HTTP service is not flooded with one lookup per registered tool; the listing keeps registration order.
-- `tools/call` on a denied tool returns the same `-32601` "Tool 'name' not found" protocol error as an unknown tool, calling the hook with `operation: 'call'`. The hook runs even for unknown names, so callers cannot probe for tools they are not allowed to see by response shape. Response timing is not guaranteed to be indistinguishable — it depends on what the hook itself does per name. Task-augmented calls (`task` field) and `app.mcpCallTool()` also use `operation: 'call'`.
+- `tools/call` on a denied tool returns the same `-32602` (Invalid params) "Tool 'name' not found" protocol error as an unknown tool, calling the hook with `operation: 'call'`. The hook runs even for unknown names, so callers cannot probe for tools they are not allowed to see by response shape. Response timing is not guaranteed to be indistinguishable — it depends on what the hook itself does per name. Task-augmented calls (`task` field) and `app.mcpCallTool()` also use `operation: 'call'`.
 
 Visibility and execution policies may intentionally differ — a tool hidden from `tools/list` can still be callable by a client that already knows its name.
 
@@ -2260,12 +2290,20 @@ When `oauth2Client` is configured, the plugin registers these legacy server-side
 
 ### Well-Known Endpoints
 
-Authorization-aware metadata endpoints:
+These routes are registered only when `authorization.enabled` is true. They are
+all unauthenticated: the bearer-token check skips every path under
+`/.well-known/`. They allow cross-origin `GET` requests (CORS) so browser-based
+clients can discover them.
 
-- `GET /.well-known/oauth-protected-resource` - OAuth 2.0 Protected Resource Metadata (RFC 9728, public)
+- `GET /.well-known/oauth-protected-resource` - OAuth 2.0 Protected Resource Metadata (RFC 9728). Its `resource` field is `resourceUri`.
 - `GET /.well-known/oauth-protected-resource{path}` - Same metadata, served when `resourceUri` has a path (e.g. `resourceUri: 'https://mcp.example.com/mcp'` is served at `/.well-known/oauth-protected-resource/mcp`). This is the URL advertised in the `resource_metadata` parameter of `WWW-Authenticate` challenges, as required by RFC 9728 §3.1, and its `resource` field equals `resourceUri` exactly.
-- `GET /.well-known/mcp-server` - Server metadata (protected)
-- `GET /health` - Health check (public)
+- `GET /.well-known/oauth-protected-resource/mcp` - Legacy MCP-specific metadata route, kept for backwards compatibility. Its `resource` field is `resourceUri` with `/mcp` appended. When `resourceUri` already ends in `/mcp`, this path is the RFC 9728 route above instead.
+- `GET /.well-known/openid-configuration/mcp` - OpenID Connect style discovery document built from the first entry of `authorizationServers`, plus `mcp_resource_uri` and `mcp_authorization_servers`
+- `GET /.well-known/mcp-resource-health` - Health check for the resource server: `{ status: 'healthy', resource, timestamp }`
+
+Authorization server metadata is not served by this plugin. Clients discover it from the authorization servers listed in `authorization_servers` of the protected resource metadata (RFC 8414 / OpenID Connect Discovery on the authorization server itself).
+
+These endpoints send CORS headers for any origin. This applies only to `/.well-known/*`; see [CORS](#cors) for `/mcp`.
 
 ### Security Considerations
 
@@ -2369,9 +2407,9 @@ All inputs undergo automatic security processing:
 
 ```typescript
 // Automatic security measures applied:
-// ✅ String length limits (max 10,000 chars)
-// ✅ Object depth limits (max 10 levels)
-// ✅ Property count limits (max 100 per object)
+// ✅ String length limits (default max 10,000 chars)
+// ✅ Object depth limits (default max 10 levels)
+// ✅ Property count limits (default max 100 per object, arrays not counted)
 // ✅ Control character removal
 // ✅ Circular reference detection
 // ✅ Schema complexity validation
@@ -2382,7 +2420,7 @@ All inputs undergo automatic security processing:
 Implement rate limiting for production deployments:
 
 ```typescript
-import { RateLimiter } from '@platformatic/mcp/security'
+import { RateLimiter } from '@platformatic/mcp'
 
 const rateLimiter = new RateLimiter(100, 60000) // 100 requests per minute
 
@@ -2464,12 +2502,13 @@ await app.register(import('@fastify/bearer-auth'), {
 ### Plugin Options
 
 - `serverInfo`: Server identification (name, version)
-- `capabilities`: MCP capabilities configuration
+- `capabilities`: MCP capabilities configuration. `completions` is not supported (there is no `completion/complete` handler): it is dropped from the advertised capabilities and a warning is logged at registration
 - `instructions`: Optional server instructions
 - `enableSSE`: Enable Server-Sent Events support on `GET /mcp` (default: false). Sessions and `DELETE /mcp` work either way.
 - `resolveAuthorizationContext`: Maps identities established by upstream Fastify authentication hooks into MCP authorization context (optional)
 - `canAccessTool`: Per-request tool authorization hook consulted by `tools/list` and `tools/call` (optional)
 - `onToolCallComplete`: Transport-neutral hook fired once after every tool call settles, across JSON-RPC, `mcpCallTool()`, and tasks (optional)
+- `toolArgumentLimits`: Limits applied to tool arguments before the handler runs (optional): `maxStringLength` (default 10000), `maxObjectProperties` (default 100, arrays not counted), `maxArrayLength` (default unlimited), `maxDepth` (default 10). `Infinity` disables a limit
 - `onClientResponse`: Receives the JSON-RPC responses clients POST back for server-initiated requests, such as elicitation results (optional)
 - `authorization`: OAuth 2.1 authorization configuration (optional)
   - `enabled`: Enable OAuth 2.1 authorization (default: false)
@@ -2488,10 +2527,6 @@ await app.register(import('@fastify/bearer-auth'), {
     - `resourceUri`: Resource URI.
     - `scopes`: Requested OAuth scopes
     - `dynamicRegistration`: Enable dynamic client registration (default: false)
-  - `tokenRefresh`: Automatic token refresh configuration
-    - `checkIntervalMs`: Token refresh check interval
-    - `refreshBufferMinutes`: Minutes before expiry to refresh tokens
-    - `maxRetries`: Maximum refresh attempts
 - `requestStateSecret`: Secret (at least 32 bytes) that seals multi round-trip
   `requestState`. Required when `redis` is configured, since any instance may serve a retry
 - `requestStateTtlMs`: How long sealed state stays valid (default 5 minutes). Must be a positive integer; anything else throws at startup
@@ -2505,7 +2540,10 @@ await app.register(import('@fastify/bearer-auth'), {
 - `taskMaxPerPrincipal`: Most tasks one caller (a user at an issuer) runs on an instance
   (default 100). Not applied to callers the deployment cannot identify
 - `taskStoreMaxTasks`: Capacity of the in-memory task store, finished tasks included until their
-  ttl (default 1000). A full store refuses new tasks
+  ttl (default 1000). A full store evicts the oldest finished task, and refuses new tasks only when
+  every stored task is still running
+- `taskMaxRetainedPerPrincipal`: Most tasks one caller keeps stored, finished ones included
+  (default 100). At the cap the caller's oldest finished task is evicted
 - `taskLeaseMs`: Worker lease; a task whose worker stops renewing it is reported failed
   (default 15000)
 - `taskMaxInputRounds`: How many times a 2026-07-28 task's handler may throw `InputRequired`
@@ -2519,7 +2557,7 @@ await app.register(import('@fastify/bearer-auth'), {
   - `port`: Redis server port
   - `db`: Redis database number
   - `password`: Redis authentication password
-  - Additional ioredis connection options supported
+  - Any other ioredis [`RedisOptions`](https://github.com/redis/ioredis/blob/main/lib/redis/RedisOptions.ts) (`tls`, `retryStrategy`, `sentinels`, ...); the object is passed to the ioredis constructor as-is
 
 ### Decorators
 
@@ -2784,13 +2822,6 @@ app.mcpAddPrompt({
 
 - `app.mcpBroadcastNotification(notification)`: Broadcast a notification to all connected SSE clients (works across Redis instances). `notifications/resources/updated` only reaches sessions subscribed to its `params.uri`
 - `app.mcpSendToSession(sessionId, message)`: Send a message/request to a specific SSE session (works across Redis instances)
-- `app.mcpSendToUser(userId, message)`: Send a message to all sessions for a specific user (authorization-aware)
-
-#### Authorization Functions
-
-- `app.tokenRefreshService`: Token refresh service instance for manual token refresh
-  - `refreshSessionToken(sessionId)`: Manually refresh token for a session
-  - `notifyTokenRefresh(sessionId, token, response)`: Send token refresh notification
 
 ## Handler API Reference
 
@@ -2855,8 +2886,15 @@ These legacy server-side OAuth client endpoints do not proxy MCP client authoriz
 
 ### Well-Known Endpoints
 
-- `GET /.well-known/mcp-server`: Server metadata and capabilities (protected when authorization is enabled)
-- `GET /health`: Health check endpoint (always public)
+Registered only when authorization is enabled, and always unauthenticated:
+
+- `GET /.well-known/oauth-protected-resource`: OAuth 2.0 Protected Resource Metadata (RFC 9728)
+- `GET /.well-known/oauth-protected-resource{path}`: Same metadata at the RFC 9728 §3.1 location when `resourceUri` has a path
+- `GET /.well-known/oauth-protected-resource/mcp`: Legacy MCP-specific protected resource metadata
+- `GET /.well-known/openid-configuration/mcp`: OpenID Connect style discovery document
+- `GET /.well-known/mcp-resource-health`: Resource server health check
+
+The plugin does not register a `/health` route; add your own if you need one.
 
 ## Supported MCP Methods
 
@@ -2916,9 +2954,25 @@ The plugin automatically checks tool parameters to prevent common attacks:
 
 - **String length limits:** Maximum 10,000 characters per string
 - **Object depth limits:** Maximum 10 levels of nesting
-- **Property count limits:** Maximum 100 properties per object
+- **Property count limits:** Maximum 100 properties per object (array items are not counted)
+- **Array length limits:** Unlimited by default
 - **Control character rejection:** Arguments whose keys or string values contain null bytes or other control characters (tabs and newlines excepted) are refused, never rewritten, so the handler sees exactly what the client sent
 - **Circular reference detection:** Prevents infinite loops
+
+The limits are configurable with the `toolArgumentLimits` option. Pass `Infinity` to disable one;
+Fastify's `bodyLimit` still caps the total request size. Arguments over a limit are refused with an
+`isError: true` result and the tool handler is not called.
+
+```typescript
+await app.register(mcpPlugin, {
+  toolArgumentLimits: {
+    maxStringLength: 1_000_000, // default 10000
+    maxObjectProperties: 500,   // default 100
+    maxArrayLength: 10_000,     // default Infinity
+    maxDepth: 10                // default 10
+  }
+})
+```
 
 #### Schema Validation
 
@@ -2981,7 +3035,7 @@ app.mcpAddTool({
 Implement rate limiting to prevent abuse:
 
 ```typescript
-import { RateLimiter } from '@platformatic/mcp/security'
+import { RateLimiter } from '@platformatic/mcp'
 
 const rateLimiter = new RateLimiter(100, 60000) // 100 requests per minute
 

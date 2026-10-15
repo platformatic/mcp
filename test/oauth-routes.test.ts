@@ -508,6 +508,34 @@ describe('OAuth Routes', () => {
     assert.strictEqual(body.logout_status, 'success')
   })
 
+  test('should accept a lower-case bearer auth-scheme on logout', async (t) => {
+    const fastify = Fastify()
+    t.after(async () => {
+      await fastify.close()
+    })
+
+    const config = {
+      clientId: 'test-client',
+      authorizationServer: 'https://auth.example.com'
+    }
+
+    await fastify.register(oauthClientPlugin, config)
+    const sessionStore = new MemorySessionStore(100)
+    await fastify.register(authRoutesPlugin, { sessionStore })
+
+    const response = await fastify.inject({
+      method: 'POST',
+      url: '/oauth/logout',
+      headers: {
+        authorization: 'bearer test-token'
+      }
+    })
+
+    assert.strictEqual(response.statusCode, 200)
+    const body = JSON.parse(response.body)
+    assert.strictEqual(body.logout_status, 'success')
+  })
+
   test('should reject logout without authorization header', async (t) => {
     const fastify = Fastify()
     t.after(async () => {

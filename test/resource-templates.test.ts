@@ -1,6 +1,7 @@
 import { test, describe } from 'node:test'
 import type { TestContext } from 'node:test'
 import Fastify from 'fastify'
+import { Type } from '@sinclair/typebox'
 import mcpPlugin from '../src/index.ts'
 import type {
   JSONRPCRequest,
@@ -9,7 +10,7 @@ import type {
   ListResourceTemplatesResult,
   ReadResourceResult
 } from '../src/schema.ts'
-import { JSONRPC_VERSION } from '../src/schema.ts'
+import { JSONRPC_VERSION, LATEST_LEGACY_PROTOCOL_VERSION } from '../src/schema.ts'
 
 describe('Resource Templates', () => {
   test('resources/list excludes template URIs', async (t: TestContext) => {
@@ -244,7 +245,7 @@ describe('Resource Templates', () => {
 
       for (const uri of ['moltnet://diary/1/2', 'moltnet://diary/', 'moltnet://diary', 'xmoltnet://diary/1', 'moltnet://diary/1x/']) {
         const body = await read(app, uri)
-        t.assert.strictEqual(body.error?.code, -32601, uri)
+        t.assert.strictEqual(body.error?.code, -32002, uri)
       }
     })
 
@@ -258,7 +259,7 @@ describe('Resource Templates', () => {
         contents: [{ uri, text: 'ok' }]
       }))
 
-      t.assert.strictEqual((await read(app, 'app://v1x0/42')).error?.code, -32601)
+      t.assert.strictEqual((await read(app, 'app://v1x0/42')).error?.code, -32002)
       t.assert.ok((await read(app, 'app://v1.0/42')).result)
     })
 
@@ -290,7 +291,64 @@ describe('Resource Templates', () => {
         contents: [{ uri, text: 'ok' }]
       }))
 
-      t.assert.strictEqual((await read(app, 'files://a')).error?.code, -32601)
+      t.assert.strictEqual((await read(app, 'files://a')).error?.code, -32002)
     })
+  })
+
+  test('listings expose only spec Resource and ResourceTemplate fields', async (t: TestContext) => {
+    const app = Fastify()
+    t.after(() => app.close())
+
+    await app.register(mcpPlugin)
+    await app.ready()
+
+    const shared = {
+      title: 'Title',
+      description: 'Description',
+      mimeType: 'text/plain',
+      icons: [{ src: 'https://example.com/icon.png' }],
+      annotations: { audience: ['user' as const], priority: 0.5 },
+      _meta: { custom: true }
+    }
+    app.mcpAddResource({
+      ...shared,
+      name: 'status',
+      uriPattern: 'file:///status',
+      uriSchema: Type.String({ pattern: '^file:///status' }),
+      size: 42
+    })
+    app.mcpAddResource({
+      ...shared,
+      name: 'doc',
+      uriPattern: 'file:///docs/{id}',
+      uriSchema: Type.String({ pattern: '^file:///docs/' })
+    })
+
+    const list = async (method: string) => {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/mcp',
+        headers: { 'mcp-protocol-version': LATEST_LEGACY_PROTOCOL_VERSION },
+        payload: { jsonrpc: JSONRPC_VERSION, id: 1, method } satisfies JSONRPCRequest
+      })
+      return (response.json() as JSONRPCResultResponse).result
+    }
+
+    // uriPattern and uriSchema are registration inputs, not part of the spec
+    // shapes, and would leak the server's validation patterns
+    const resources = (await list('resources/list')) as ListResourcesResult
+    t.assert.deepStrictEqual(resources.resources, [{
+      ...shared,
+      uri: 'file:///status',
+      name: 'status',
+      size: 42
+    }])
+
+    const templates = (await list('resources/templates/list')) as ListResourceTemplatesResult
+    t.assert.deepStrictEqual(templates.resourceTemplates, [{
+      ...shared,
+      uriTemplate: 'file:///docs/{id}',
+      name: 'doc'
+    }])
   })
 })

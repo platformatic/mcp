@@ -21,6 +21,7 @@ import {
   INVALID_REQUEST,
   INTERNAL_ERROR,
   METHOD_NOT_FOUND,
+  RESOURCE_NOT_FOUND,
   HEADER_MISMATCH,
   MISSING_REQUIRED_CLIENT_CAPABILITY,
   UNSUPPORTED_PROTOCOL_VERSION,
@@ -157,13 +158,6 @@ function withCache<T extends Record<string, unknown>> (
   } as CacheableResult
 }
 
-/**
- * Rewrap a legacy handler's response in the modern envelope.
- *
- * The legacy path answers "not found" for tools, resources and prompts with
- * `-32601`; this revision requires `-32602` for all three, so remap rather than
- * duplicate the lookups.
- */
 function filterInvalidHeaderTools (
   response: JSONRPCResponse | JSONRPCError,
   dependencies: ModernDependencies
@@ -189,13 +183,22 @@ function filterInvalidHeaderTools (
   return createResponse(response.id, { ...result, tools })
 }
 
+/**
+ * Rewrap a legacy handler's response in the modern envelope.
+ *
+ * The shared handlers answer "not found" the way the handshake revisions do:
+ * `-32601` for some lookups and `-32002` for an unknown resource. This
+ * revision requires `-32602` for unknown tools, resources and prompts, and
+ * must never emit `-32002`, so remap rather than duplicate the lookups. The
+ * error's `data` (such as the resource `uri`) is kept.
+ */
 function adapt (
   response: JSONRPCResponse | JSONRPCError,
   serverInfo: Implementation | undefined,
   hint?: CacheHint
 ): JSONRPCResponse | JSONRPCError {
   if ('error' in response) {
-    if (response.error.code === METHOD_NOT_FOUND) {
+    if (response.error.code === METHOD_NOT_FOUND || response.error.code === RESOURCE_NOT_FOUND) {
       return createError(response.id ?? null, INVALID_PARAMS, response.error.message, response.error.data)
     }
     return response

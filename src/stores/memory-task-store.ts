@@ -1,6 +1,9 @@
 import type { TaskStatus } from '../schema.ts'
 import type { TaskStore, TaskRecord, TaskUpdateOptions, TaskInputUpdate, TaskOutcome, TaskListOptions, TaskListPage } from './task-store.ts'
 import {
+  DEFAULT_TASK_MAX_PER_PRINCIPAL,
+  TaskLimitError,
+  TASK_OWNER_LOST,
   applyInputRequestUpdates,
   canTransition,
   decodeTaskCursor,
@@ -8,8 +11,10 @@ import {
   isAfterTaskCursor,
   isTerminal,
   matchesTaskEra,
+  ownerLostOutcome,
   taskHasExpired,
-  taskPageLimit
+  taskPageLimit,
+  validateTaskLimit
 } from './task-store.ts'
 
 /**
@@ -19,24 +24,97 @@ import {
  * outlives its ttl even if `cleanup()` has not run recently.
  */
 export class MemoryTaskStore implements TaskStore {
+  // Insertion order is creation order, so iteration visits the oldest first
   private tasks = new Map<string, TaskRecord>()
   private readonly maxTasks: number
+  private readonly maxTasksPerPrincipal: number
 
-  constructor (maxTasks: number = 1000) {
-    this.maxTasks = maxTasks
+  constructor (options: number | { maxTasks?: number, maxTasksPerPrincipal?: number } = {}) {
+    const opts = typeof options === 'number' ? { maxTasks: options } : options
+    this.maxTasks = opts.maxTasks ?? 1000
+    this.maxTasksPerPrincipal = opts.maxTasksPerPrincipal ?? DEFAULT_TASK_MAX_PER_PRINCIPAL
+    validateTaskLimit('maxTasks', this.maxTasks)
+    validateTaskLimit('maxTasksPerPrincipal', this.maxTasksPerPrincipal)
   }
 
   async create (task: TaskRecord): Promise<void> {
-    if (this.tasks.size >= this.maxTasks) {
-      await this.cleanup()
+    // No await until the task is stored, so concurrent creates cannot both
+    // pass the capacity checks and overshoot them.
+    const ownedBy = (t: TaskRecord) => t.authSubject === task.authSubject
+
+    // Finished tasks count too: otherwise one caller could hold every slot
+    // with results it never collects until their ttl runs out.
+    if (this.count(ownedBy) >= this.maxTasksPerPrincipal) {
+      this.sweepExpired()
+      this.failLapsedLeases(ownedBy)
+      if (this.count(ownedBy) >= this.maxTasksPerPrincipal && !this.evictOldestFinished(ownedBy)) {
+        throw new TaskLimitError(this.maxTasksPerPrincipal)
+      }
     }
-    // Only expired tasks are dropped to make room: a finished task is kept
-    // until its ttl so its owner can still read the outcome, whoever else is
-    // creating tasks. A full store refuses new tasks instead.
+
     if (this.tasks.size >= this.maxTasks) {
-      throw new Error(`Task limit reached (${this.maxTasks})`)
+      this.sweepExpired()
+      this.failLapsedLeases(() => true)
+      // Prefer the caller's own finished work; failing that, the oldest
+      // finished task of anyone, as stale results matter less than new work.
+      if (
+        this.tasks.size >= this.maxTasks &&
+        !this.evictOldestFinished(ownedBy) &&
+        !this.evictOldestFinished(() => true)
+      ) {
+        throw new TaskLimitError(this.maxTasks)
+      }
     }
+
     this.tasks.set(task.taskId, { ...task })
+  }
+
+  private count (predicate: (task: TaskRecord) => boolean): number {
+    let n = 0
+    for (const task of this.tasks.values()) {
+      if (predicate(task)) n++
+    }
+    return n
+  }
+
+  private evictOldestFinished (predicate: (task: TaskRecord) => boolean): boolean {
+    for (const [taskId, task] of this.tasks) {
+      if (isTerminal(task.status) && predicate(task)) {
+        this.tasks.delete(taskId)
+        return true
+      }
+    }
+    return false
+  }
+
+  /**
+   * Fail the tasks whose running instance stopped renewing their lease, so they
+   * can be evicted like any finished task. Otherwise an orphan nobody polls
+   * would hold a slot until its ttl runs out.
+   */
+  private failLapsedLeases (predicate: (task: TaskRecord) => boolean): void {
+    const now = Date.now()
+    for (const [taskId, task] of this.tasks) {
+      if (!predicate(task) || isTerminal(task.status)) continue
+      if (task.leaseExpiresAt === undefined || now <= task.leaseExpiresAt) continue
+      const failed: TaskRecord = {
+        ...task,
+        status: 'failed',
+        statusMessage: TASK_OWNER_LOST,
+        outcome: ownerLostOutcome(),
+        lastUpdatedAt: new Date(now).toISOString()
+      }
+      applyInputRequestUpdates(failed, { inputRequests: null, clearPendingInputResponses: true })
+      this.tasks.set(taskId, failed)
+    }
+  }
+
+  private sweepExpired (): void {
+    for (const [taskId, task] of this.tasks.entries()) {
+      if (taskHasExpired(task)) {
+        this.tasks.delete(taskId)
+      }
+    }
   }
 
   async get (taskId: string): Promise<TaskRecord | null> {
