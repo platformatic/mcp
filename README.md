@@ -2051,6 +2051,17 @@ await app.register(import('@fastify/bearer-auth'), {
 - `capabilities`: MCP capabilities configuration. `completions` is not supported (there is no `completion/complete` handler): it is dropped from the advertised capabilities and a warning is logged at registration
 - `instructions`: Optional server instructions
 - `enableSSE`: Enable Server-Sent Events support on `GET /mcp` (default: false). Sessions and `DELETE /mcp` work either way.
+- `sessionTtlMs`: Idle session expiry in milliseconds (default: `3600000`, one hour); applies to the memory and Redis stores. See [Sessions](#sessions)
+- `sseMaxConnectionMs`: Close each SSE stream after this many milliseconds so the client reconnects with `Last-Event-ID` (default: unset, streams stay open). See [SSE Configuration](#sse-configuration)
+- `allowedOrigins`: Origins accepted on the MCP endpoints, against DNS rebinding: an array of exact origins, or `'*'` / `true` for any (default: unset, no validation). See [Origin Validation](#origin-validation)
+- `enableTasks`: Enable task-augmented execution (default: false, experimental). See [Tasks](#tasks-mcp-2025-11-25-experimental)
+- `taskDefaultTtlMs`: Retention for a task whose creator requested no `ttl`, in milliseconds (default: `60000`)
+- `taskMaxTtlMs`: Ceiling on task retention, in milliseconds; a larger requested `ttl` is capped (default: `3600000`)
+- `taskMaxRetainedPerPrincipal`: Most tasks one principal may keep stored, finished ones included (default: `100`)
+- `taskLeaseMs`: Lease on a running task, in milliseconds; a task whose instance stops renewing it is reported `failed` (default: `30000`)
+- `transformRouteSchema`: Callback to customize Fastify/OpenAPI schema metadata on the MCP transport routes, called once per route at startup (optional). See [Customizing MCP Route Schemas](#customizing-mcp-route-schemas)
+- `validateJsonSchemaInputs`: AJV options enabling validation of plain-JSON-Schema tool inputs (default: unset, no validation; `{}` enables it). See [Validating plain JSON Schema inputs with AJV](#validating-plain-json-schema-inputs-with-ajv)
+- `telemetry`: OpenTelemetry instrumentation, `{ tracer }` with any `Tracer` from `@opentelemetry/api`, which must be installed (optional; default: no spans)
 - `canAccessTool`: Per-request tool authorization hook consulted by `tools/list` and `tools/call` (optional)
 - `onToolCallComplete`: Transport-neutral hook fired once after every tool call settles, across JSON-RPC, `mcpCallTool()`, and tasks (optional)
 - `toolArgumentLimits`: Limits applied to tool arguments before the handler runs (optional): `maxStringLength` (default 10000), `maxObjectProperties` (default 100, arrays not counted), `maxArrayLength` (default unlimited), `maxDepth` (default 10). `Infinity` disables a limit
