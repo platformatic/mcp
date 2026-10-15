@@ -64,6 +64,13 @@ declare module 'fastify' {
 }
 
 const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOptions) {
+  // A single string would make the allow-list check a substring match, so fail loudly
+  const allowedOrigins: unknown = opts.allowedOrigins
+  if (allowedOrigins !== undefined && allowedOrigins !== true && allowedOrigins !== '*' &&
+    !(Array.isArray(allowedOrigins) && allowedOrigins.every((origin) => typeof origin === 'string'))) {
+    throw new TypeError(`allowedOrigins must be true, '*' or an array of origin strings, got ${JSON.stringify(allowedOrigins)}`)
+  }
+
   const serverInfo: Implementation = opts.serverInfo ?? {
     name: '@platformatic/mcp',
     version: '1.0.0'

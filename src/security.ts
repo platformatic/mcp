@@ -252,6 +252,8 @@ export function isOriginAllowed (origin: string | undefined, allowed: AllowedOri
   if (allowed === undefined) return true
   if (origin === undefined) return true
   if (allowed === true || allowed === '*') return true
+  // Never fall through to String.prototype.includes, a substring match
+  if (!Array.isArray(allowed)) return false
   return allowed.includes(origin)
 }
 
