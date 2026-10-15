@@ -101,6 +101,13 @@ export function validateObjectDepth (
  * once up front; every string reached afterwards, including object keys and
  * strings nested inside arrays at any depth, is length-checked and stripped of
  * control characters.
+ *
+ * Objects are copied by defining plain own data properties instead of direct
+ * assignment, so special key names such as `__proto__`, `constructor` and
+ * `prototype` cannot invoke inherited accessors and change the prototype of
+ * the sanitized result. When stripping control characters maps two different
+ * input keys onto the same output key, a `Duplicate key` error is thrown rather
+ * than silently dropping one of the values.
  */
 export function sanitizeToolParams (params: Record<string, any>, limits: ToolArgumentLimits = {}): Record<string, any> {
   const maxStringLength = limits.maxStringLength ?? MAX_STRING_LENGTH
@@ -123,7 +130,22 @@ export function sanitizeToolParams (params: Record<string, any>, limits: ToolArg
     if (typeof value === 'object' && value !== null) {
       const sanitized: Record<string, any> = {}
       for (const [key, item] of Object.entries(value)) {
-        sanitized[sanitizeString(key, maxStringLength)] = sanitizeValue(item)
+        const sanitizedKey = sanitizeString(key, maxStringLength)
+        // Copy with defineProperty rather than assignment: assignment on an
+        // ordinary object invokes inherited accessors for special names
+        // (notably `__proto__`), which lets untrusted input change the
+        // prototype of the sanitized result. defineProperty always creates a
+        // plain own data property and never triggers a setter, so `__proto__`,
+        // `constructor` and `prototype` are handled safely as ordinary keys.
+        if (Object.prototype.hasOwnProperty.call(sanitized, sanitizedKey)) {
+          throw new Error(`Duplicate key ${JSON.stringify(sanitizedKey)} after key sanitization`)
+        }
+        Object.defineProperty(sanitized, sanitizedKey, {
+          value: sanitizeValue(item),
+          enumerable: true,
+          writable: true,
+          configurable: true
+        })
       }
       return sanitized
     }
