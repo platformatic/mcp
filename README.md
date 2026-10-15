@@ -936,6 +936,14 @@ PORT=3001 REDIS_HOST=redis.example.com node server.js
 PORT=3002 REDIS_HOST=redis.example.com node server.js
 ```
 
+### Tools, Resources and Prompts Across Instances
+
+Redis shares sessions and notifications, not registrations: the tools, resources and prompts registered with `mcpAddTool`, `mcpAddResource` and `mcpAddPrompt` live in each process's memory. A `tools/list` (or `resources/list`, `prompts/list`) request is answered by whichever instance the load balancer picks, so:
+
+- Register tools, resources and prompts identically on every instance, at startup.
+- `mcpBroadcastNotification` reaches clients connected to every instance. Registering something at runtime and broadcasting `notifications/tools/list_changed` (or the resources/prompts equivalent) is only safe on a single instance, or when every instance performs the same registration. Otherwise clients on other instances re-list and do not find it.
+- During a rolling redeploy that changes the registered set, old and new instances briefly serve different lists, and clients may re-list against either version.
+
 ### Graceful Shutdown
 
 `RedisMessageBroker.close()` is bounded: it waits up to `closeTimeoutMs` (default 2000ms) for
@@ -1237,7 +1245,8 @@ app.mcpSendToSession('session-id', {
   }
 })
 
-// Example: Broadcast tool list changes
+// Example: Broadcast tool list changes. With Redis, every instance must have
+// made the same change first (see "Tools, Resources and Prompts Across Instances")
 app.mcpBroadcastNotification({
   jsonrpc: '2.0',
   method: 'notifications/tools/list_changed'
