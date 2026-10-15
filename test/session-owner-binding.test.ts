@@ -63,11 +63,13 @@ async function buildApp (t: TestContext, redis?: Redis, options: BuildOptions = 
   return app
 }
 
-async function initialize (app: Awaited<ReturnType<typeof buildApp>>, token: string): Promise<string> {
+async function initialize (app: Awaited<ReturnType<typeof buildApp>>, token: string, staleSessionId?: string): Promise<string> {
   const response = await app.inject({
     method: 'POST',
     url: '/mcp',
-    headers: { authorization: `Bearer ${token}` },
+    headers: staleSessionId
+      ? { authorization: `Bearer ${token}`, 'mcp-session-id': staleSessionId }
+      : { authorization: `Bearer ${token}` },
     payload: {
       jsonrpc: JSONRPC_VERSION,
       id: 1,
@@ -121,8 +123,21 @@ async function assertHijackRejected (
   // let him in on any of the three methods.
   const post = await callWhoami(app, bob, sessionId)
   t.assert.strictEqual(post.statusCode, 404)
-  t.assert.deepStrictEqual(post.json(), { error: 'Session not found' })
+  // Same answer as for a session that does not exist at all
+  t.assert.deepStrictEqual(post.json(), {
+    jsonrpc: JSONRPC_VERSION,
+    id: null,
+    error: { code: -32001, message: 'Session not found' }
+  })
   t.assert.strictEqual(post.headers['mcp-session-id'], undefined)
+
+  // initialize with an unknown ID starts a fresh session, so it must do the
+  // same here: Bob gets his own session, not Alice's and not a tell-tale 404
+  const bobSessionId = await initialize(app, bob, sessionId)
+  t.assert.notStrictEqual(bobSessionId, sessionId)
+  const bobOwn = await callWhoami(app, bob, bobSessionId)
+  t.assert.strictEqual(bobOwn.statusCode, 200)
+  t.assert.strictEqual(bobOwn.json().result.content[0].text, bobClaims.sub)
 
   const get = await app.inject({
     method: 'GET',
