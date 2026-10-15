@@ -61,9 +61,12 @@ describe('task options validation (#302)', () => {
     await assertRegistrationAccepts(t, { taskMaxRetainedPerPrincipal: 20 })
   })
 
-  test('registration accepts a taskDefaultTtlMs above taskMaxTtlMs, which is capped', async (t: TestContext) => {
-    await assertRegistrationAccepts(t, { taskDefaultTtlMs: 120_000, taskMaxTtlMs: 60_000 })
-    await assertRegistrationAccepts(t, { taskDefaultTtlMs: 2 * 3600_000 })
+  test('registration throws when taskDefaultTtlMs exceeds taskMaxTtlMs', async (t: TestContext) => {
+    await assertRegistrationRejects(t, { taskDefaultTtlMs: 120_000, taskMaxTtlMs: 60_000 }, /taskDefaultTtlMs \(120000\) must not exceed taskMaxTtlMs \(60000\)/)
+  })
+
+  test('registration throws when taskDefaultTtlMs exceeds the default taskMaxTtlMs', async (t: TestContext) => {
+    await assertRegistrationRejects(t, { taskDefaultTtlMs: 2 * 3600_000 }, /taskDefaultTtlMs \(7200000\) must not exceed taskMaxTtlMs \(3600000\)/)
   })
 
   test('registration accepts taskDefaultTtlMs equal to taskMaxTtlMs', async (t: TestContext) => {
