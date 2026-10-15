@@ -1,6 +1,7 @@
 import type { Redis } from 'ioredis'
 import type { JSONRPCMessage } from '../schema.ts'
 import type { SessionStore, SessionMetadata } from './session-store.ts'
+import { SessionLimitError, SubscriptionLimitError, DEFAULT_MAX_SESSIONS_PER_PRINCIPAL, DEFAULT_MAX_RESOURCE_SUBSCRIPTIONS_PER_SESSION, validateStoreLimit } from './session-store.ts'
 import type { AuthorizationContext, TokenRefreshInfo } from '../types/auth-types.ts'
 
 // Each subscribed URI is its own hash field, so concurrent subscribe and
@@ -11,19 +12,101 @@ const RESOURCE_SUBSCRIPTION_PREFIX = 'resourceSubscription:'
 /** Idle time after which a session key expires (1 hour) */
 const DEFAULT_SESSION_TTL_MS = 60 * 60 * 1000
 
+// Per-owner set of session ids, so `create` can enforce the active-session cap
+// atomically. Session keys expire independently, so stale ids (whose key is
+// gone) are pruned on every create for that owner, just like the task store.
+const SESSION_OWNER_INDEX_PREFIX = 'sessionOwner:'
+const SESSION_OWNER_INDEX_ANONYMOUS = 'sessionOwner:__anonymous__'
+
+// Create a session while enforcing its owner's active-session cap, atomically.
+//
+// KEYS[1] = session key, KEYS[2] = owner index (set of session ids)
+// ARGV[1] = session id, ARGV[2] = sessionTtlMs, ARGV[3] = cap (-1 = unlimited),
+//          ARGV[4] = session key prefix, ARGV[5...] = hash field/value pairs
+//
+// Ids whose session key has expired are pruned first; then, at the cap, the
+// create is refused. Returns 0 (storing nothing) when at the cap, else 1.
+const CREATE_WITH_LIMIT_SCRIPT = `
+local prefix = ARGV[4]
+local cap = tonumber(ARGV[3])
+local live = {}
+for _, id in ipairs(redis.call('SMEMBERS', KEYS[2])) do
+  if redis.call('EXISTS', prefix .. id) == 1 then
+    table.insert(live, id)
+  else
+    redis.call('SREM', KEYS[2], id)
+  end
+end
+
+if cap >= 0 and #live >= cap then
+  return 0
+end
+
+redis.call('DEL', KEYS[1])
+redis.call('HSET', KEYS[1], unpack(ARGV, 5))
+redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[2]))
+redis.call('SADD', KEYS[2], ARGV[1])
+return 1
+`
+
+// Add a resource subscription while enforcing the per-session cap, atomically,
+// so concurrent subscribes cannot overshoot it.
+//
+// KEYS[1] = session key
+// ARGV[1] = subscription field, ARGV[2] = subscription prefix, ARGV[3] = cap
+//
+// Returns: 0 = session gone (no-op), 1 = added, 2 = already subscribed
+// (idempotent), -1 = at the subscription cap.
+const ADD_SUBSCRIPTION_SCRIPT = `
+if redis.call('EXISTS', KEYS[1]) == 0 then
+  return 0
+end
+if redis.call('HEXISTS', KEYS[1], ARGV[1]) == 1 then
+  return 2
+end
+local prefix = ARGV[2]
+local cap = tonumber(ARGV[3])
+if cap >= 0 then
+  local count = 0
+  for _, field in ipairs(redis.call('HKEYS', KEYS[1])) do
+    if string.sub(field, 1, #prefix) == prefix then
+      count = count + 1
+    end
+  end
+  if count >= cap then
+    return -1
+  end
+end
+redis.call('HSET', KEYS[1], ARGV[1], '1')
+return 1
+`
+
 export class RedisSessionStore implements SessionStore {
   private redis: Redis
   private maxMessages: number
   readonly sessionTtlMs: number
+  private readonly maxSessionsPerPrincipal: number
+  private readonly maxResourceSubscriptionsPerSession: number
 
-  constructor (options: { redis: Redis, maxMessages?: number, sessionTtlMs?: number }) {
+  constructor (options: { redis: Redis, maxMessages?: number, sessionTtlMs?: number, maxSessionsPerPrincipal?: number, maxResourceSubscriptionsPerSession?: number }) {
     this.redis = options.redis
     this.maxMessages = options.maxMessages || 100
     this.sessionTtlMs = options.sessionTtlMs ?? DEFAULT_SESSION_TTL_MS
+    this.maxSessionsPerPrincipal = options.maxSessionsPerPrincipal ?? DEFAULT_MAX_SESSIONS_PER_PRINCIPAL
+    this.maxResourceSubscriptionsPerSession = options.maxResourceSubscriptionsPerSession ?? DEFAULT_MAX_RESOURCE_SUBSCRIPTIONS_PER_SESSION
+    validateStoreLimit('maxSessionsPerPrincipal', this.maxSessionsPerPrincipal)
+    validateStoreLimit('maxResourceSubscriptionsPerSession', this.maxResourceSubscriptionsPerSession)
   }
 
-  async create (metadata: SessionMetadata): Promise<void> {
-    const sessionKey = `session:${metadata.id}`
+  /** The set key holding the session ids of one owner bucket. */
+  private ownerIndexKey (metadata: SessionMetadata): string {
+    if (metadata.ownerSub === undefined && metadata.ownerIss === undefined) {
+      return SESSION_OWNER_INDEX_ANONYMOUS
+    }
+    return `${SESSION_OWNER_INDEX_PREFIX}${encodeURIComponent(metadata.ownerIss ?? '')}:${encodeURIComponent(metadata.ownerSub ?? '')}`
+  }
+
+  private sessionData (metadata: SessionMetadata): Record<string, string> {
     const sessionData: Record<string, string> = {
       id: metadata.id,
       eventId: metadata.eventId.toString(),
@@ -57,10 +140,38 @@ export class RedisSessionStore implements SessionStore {
       sessionData.authSession = JSON.stringify(metadata.authSession)
     }
 
-    await this.redis.hset(sessionKey, sessionData)
+    return sessionData
+  }
 
-    // Expire the session after sessionTtlMs without activity
-    await this.redis.pexpire(sessionKey, this.sessionTtlMs)
+  async create (metadata: SessionMetadata): Promise<void> {
+    const sessionKey = `session:${metadata.id}`
+    const sessionData = this.sessionData(metadata)
+    const args = Object.entries(sessionData).flat()
+
+    if (this.maxSessionsPerPrincipal === Infinity) {
+      await this.redis.hset(sessionKey, sessionData)
+
+      // Expire the session after sessionTtlMs without activity
+      await this.redis.pexpire(sessionKey, this.sessionTtlMs)
+    } else {
+      // Enforce the owner's active-session cap atomically: the check and the
+      // write happen in one script, so concurrent creates on different
+      // instances cannot overshoot the cap.
+      const stored = await this.redis.eval(
+        CREATE_WITH_LIMIT_SCRIPT,
+        2,
+        sessionKey,
+        this.ownerIndexKey(metadata),
+        metadata.id,
+        String(this.sessionTtlMs),
+        String(this.maxSessionsPerPrincipal),
+        'session:',
+        ...args
+      )
+      if (stored !== 1) {
+        throw new SessionLimitError(this.maxSessionsPerPrincipal)
+      }
+    }
 
     // Add token mapping if present
     if (metadata.authorization?.tokenHash) {
@@ -185,10 +296,15 @@ export class RedisSessionStore implements SessionStore {
     const sessionKey = `session:${sessionId}`
     const historyKey = `session:${sessionId}:history`
 
-    // Get session to clean up token mappings
+    // Get session to clean up token mappings and pull its id out of the owner
+    // index (a no-op when the session is already gone; the index prunes ids
+    // whose key has expired the next time that owner creates a session).
     const session = await this.get(sessionId)
     if (session?.authorization?.tokenHash) {
       await this.removeTokenMapping(session.authorization.tokenHash)
+    }
+    if (session) {
+      await this.redis.srem(this.ownerIndexKey(session), sessionId)
     }
 
     await this.redis.del(sessionKey, historyKey)
@@ -312,15 +428,20 @@ export class RedisSessionStore implements SessionStore {
 
   async addResourceSubscription (sessionId: string, uri: string): Promise<void> {
     // Skip the write when the session is gone so we never recreate an expired
-    // session key without a TTL.
-    await this.redis.eval(
-      `if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
-       redis.call('HSET', KEYS[1], ARGV[1], '1')
-       return 1`,
+    // session key without a TTL. Duplicate subscriptions stay idempotent, and
+    // the per-session cap (when configured) is enforced atomically so
+    // concurrent subscribes cannot overshoot it.
+    const result = await this.redis.eval(
+      ADD_SUBSCRIPTION_SCRIPT,
       1,
       `session:${sessionId}`,
-      RESOURCE_SUBSCRIPTION_PREFIX + uri
+      RESOURCE_SUBSCRIPTION_PREFIX + uri,
+      RESOURCE_SUBSCRIPTION_PREFIX,
+      String(this.maxResourceSubscriptionsPerSession === Infinity ? -1 : this.maxResourceSubscriptionsPerSession)
     )
+    if (result === -1) {
+      throw new SubscriptionLimitError(this.maxResourceSubscriptionsPerSession)
+    }
   }
 
   async removeResourceSubscription (sessionId: string, uri: string): Promise<void> {
