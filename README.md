@@ -382,10 +382,10 @@ A client-requested `ttl` must be a non-negative integer number of milliseconds; 
 `CreateTaskResult`.
 
 `taskDefaultTtlMs`, `taskMaxTtlMs` and `taskLeaseMs` must be positive integer numbers of
-milliseconds and `taskMaxRetainedPerPrincipal` a positive integer. Registration throws a
-`TypeError` naming the option otherwise, so a typo or a value read from an environment variable
-as a string fails at startup rather than failing every task. A `taskDefaultTtlMs` above
-`taskMaxTtlMs` is capped to it.
+milliseconds, `taskMaxRetainedPerPrincipal` a positive integer, and `taskDefaultTtlMs` must not
+exceed `taskMaxTtlMs` (default 1 hour). Registration throws a `TypeError` naming the option
+otherwise, so a typo or a value read from an environment variable as a string fails at startup
+rather than failing every task.
 
 Tasks are stored in memory by default and in Redis when a `redis` option is given, so any
 instance can serve a poll for a task created on another.
