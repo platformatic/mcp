@@ -21,6 +21,8 @@ import {
   META_CLIENT_INFO
 } from '../src/schema-2026.ts'
 import { JSONRPC_VERSION } from '../src/schema.ts'
+import { AnswerValidator, normalizeAnswerSchema } from '../src/modern/answer-validator.ts'
+import { RequestStream } from '../src/modern/request-stream.ts'
 
 describe('header value encoding', () => {
   test('plain ASCII values ride literally', (t: TestContext) => {
@@ -42,6 +44,14 @@ describe('header value encoding', () => {
     const encoded = encodeHeaderValue(literal)
     t.assert.notStrictEqual(encoded, literal)
     t.assert.strictEqual(decodeHeaderValue(encoded), literal)
+  })
+
+  test('a leading byte-order mark survives decoding', (t: TestContext) => {
+    // Dropping it would make a header naming "\uFEFFdelete_all" match a body
+    // naming "delete_all", while a gateway routes on the former.
+    const withBom = Buffer.from('\uFEFFdelete_all', 'utf8').toString('base64')
+    t.assert.strictEqual(decodeHeaderValue(`=?base64?${withBom}?=`), '\uFEFFdelete_all')
+    t.assert.strictEqual(decodeHeaderValue(encodeHeaderValue('\uFEFFx')), '\uFEFFx')
   })
 
   test('invalid Base64 inside the sentinel is rejected rather than guessed at', (t: TestContext) => {
@@ -740,5 +750,76 @@ describe('revision era', () => {
     t.assert.strictEqual(isModernRevision('2027-01-01'), true)
     t.assert.strictEqual(isModernRevision('2025-11-25'), false)
     t.assert.strictEqual(isModernRevision(undefined), false)
+  })
+})
+
+describe('answer validator', () => {
+  test('ignores annotations, $schema and $id, but keeps property names and enum values', (t: TestContext) => {
+    const normalized = normalizeAnswerSchema({
+      $schema: 'http://json-schema.org/draft-07/schema#',
+      $id: 'urn:x',
+      title: 'T',
+      type: 'object',
+      properties: { title: { type: 'string', description: 'd', default: 'x' }, pick: { enum: [{ title: 'kept' }] } }
+    })
+    t.assert.deepStrictEqual(normalized, {
+      type: 'object',
+      properties: { title: { type: 'string' }, pick: { enum: [{ title: 'kept' }] } }
+    })
+  })
+
+  test('keeps a bounded number of compiled schemas', (t: TestContext) => {
+    const validator = new AnswerValidator()
+    for (let i = 0; i < 400; i++) {
+      t.assert.strictEqual(validator.validate({ type: 'object', properties: { [`p${i}`]: { type: 'string' } } }, {}), null)
+    }
+    t.assert.strictEqual(validator.size, 256)
+    // An evicted schema still validates: it is compiled again.
+    t.assert.match(validator.validate({ type: 'object', properties: { p0: { type: 'string' } } }, { p0: 1 }) ?? '', /must be string/)
+  })
+
+  test('schemas that differ only in wording share one compiled validator', (t: TestContext) => {
+    const validator = new AnswerValidator()
+    for (let i = 0; i < 50; i++) {
+      validator.validate(normalizeAnswerSchema({ type: 'object', properties: { a: { type: 'string', description: `Rename to ${i}?` } } }) as object, {})
+    }
+    t.assert.strictEqual(validator.size, 1)
+  })
+})
+
+describe('request stream back-pressure', () => {
+  function fakeReply () {
+    const raw = new EventEmitter() as any
+    raw.destroyed = false
+    raw.writableEnded = false
+    raw.writableLength = 0
+    raw.written = [] as string[]
+    raw.accepting = true
+    raw.write = (frame: string) => { raw.written.push(frame); return raw.accepting }
+    raw.end = () => { raw.writableEnded = true }
+    raw.setHeader = () => {}
+    raw.writeHead = () => {}
+    return { raw, getHeaders: () => ({}), hijack: () => {} } as any
+  }
+
+  test('drops notifications while the reader is not draining, even when writableLength stays 0', async (t: TestContext) => {
+    const reply = fakeReply()
+    const stream = new RequestStream(reply)
+    const notification = (n: number) => ({ jsonrpc: JSONRPC_VERSION, method: 'notifications/progress', params: { progressToken: 'p', progress: n } }) as any
+    stream.notify(notification(1))
+    await delay(250) // the stream opens and writes the held frame
+    t.assert.strictEqual(reply.raw.written.length, 1)
+
+    reply.raw.accepting = false
+    stream.notify(notification(2)) // written, and reports back-pressure
+    stream.notify(notification(3)) // dropped
+    stream.notify(notification(4)) // dropped
+    t.assert.strictEqual(reply.raw.written.length, 2)
+
+    reply.raw.accepting = true
+    reply.raw.emit('drain')
+    stream.notify(notification(5))
+    t.assert.strictEqual(reply.raw.written.length, 3)
+    t.assert.match(reply.raw.written[2], /"progress":5/)
   })
 })

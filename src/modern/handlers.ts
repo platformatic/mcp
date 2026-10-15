@@ -59,14 +59,14 @@ import type { RequestContext } from './request-meta.ts'
 import { supportsTasksExtension } from './request-meta.ts'
 import { InputRequired, requiredCapabilityFor } from './input-required.ts'
 import type { ElicitationExpectation, RequestStateSealer } from './request-state.ts'
-import { PrincipalRequiredError, RequestTooDeepError } from './request-state.ts'
+import { AnswersTooLargeError, PrincipalRequiredError, RequestTooDeepError } from './request-state.ts'
+import { AnswerValidator, normalizeAnswerSchema } from './answer-validator.ts'
 import { collectHeaderParams, validateToolParamHeaders } from './headers.ts'
 import type { TaskRecord } from '../stores/task-store.ts'
-import { isTerminal } from '../stores/task-store.ts'
+import { TASK_OWNER_LOST, TaskLimitError, isTerminal } from '../stores/task-store.ts'
 import { principalOf } from '../principal.ts'
 import { validateElicitationRequest, validateElicitationUrl } from '../security.ts'
 import { NO_NOTIFIERS } from './request-stream.ts'
-import { createJsonSchemaValidator } from '../validation/json-schema-validator.ts'
 import { TaskStopped, quotaKeyOf, reserveTask, setLongTimeout } from '../task-registry.ts'
 
 /** Freshness hints applied to one cacheable operation. */
@@ -332,6 +332,9 @@ export function coversInputCapabilities (
  */
 function invalidInputRequests (inputRequests: Record<string, unknown>): string | undefined {
   for (const [key, entry] of Object.entries(inputRequests)) {
+    // Assigning this key changes an object's prototype instead of adding it,
+    // so the request would silently vanish from what the client receives.
+    if (key === '__proto__') return 'uses the reserved key \'__proto__\''
     const method = (entry as { method?: unknown })?.method
     if (!requiredCapabilityFor(entry as { method?: string })) {
       return `input request '${key}' has unsupported method '${method}'`
@@ -376,6 +379,13 @@ function invalidElicitation (params: unknown): string | undefined {
     if (typeof type === 'string' && FLAT_SCHEMA_TYPES.has(type)) continue
     if (type === 'array' && isMultiSelectItems((property as { items?: unknown }).items)) continue
     return `has requestedSchema property '${name}' that is neither a primitive nor a multi-select enum`
+  }
+  // Compiled now, so a schema the answer could never be checked against is
+  // the handler's error rather than a check that silently switches off.
+  try {
+    answerValidator.compile(normalizeAnswerSchema(requestedSchema) as object)
+  } catch (error) {
+    return `has a requestedSchema that cannot be compiled: ${error instanceof Error ? error.message : String(error)}`
   }
   return undefined
 }
@@ -436,7 +446,7 @@ function invalidResult (method: string, value: Record<string, unknown>): [field:
 }
 
 /** Checks accepted elicitation content; never changes it. */
-let answerValidator: ReturnType<typeof createJsonSchemaValidator> | undefined
+const answerValidator = new AnswerValidator()
 
 /**
  * What is wrong with an accepted elicitation's content, given what was asked:
@@ -455,12 +465,11 @@ function invalidElicitationAnswer (
   if (value.content === undefined) return ['content', 'the submitted data when the action is accept']
   let problem: string | null
   try {
-    answerValidator ??= createJsonSchemaValidator()
     problem = answerValidator.validate(expected.schema, value.content)
   } catch {
-    // A schema that cannot be compiled is the handler's bug, and was sent to
-    // the client as is: nothing to hold the answer to.
-    return undefined
+    // Checked when the question was asked, so only state sealed by an older
+    // release can get here. An answer that cannot be checked is not accepted.
+    return ['content', 'content matching the requested schema, which cannot be compiled']
   }
   return problem === null ? undefined : ['content', `content matching the requested schema (${problem})`]
 }
@@ -500,8 +509,9 @@ function elicitationExpectations (inputRequests: Record<string, unknown> | undef
     if (params.mode === 'url') {
       expectations[key] = { mode: 'url' }
     } else if (isPlainObject(params.requestedSchema)) {
-      // As the client received it: a TypeBox schema's symbols do not travel.
-      expectations[key] = { mode: 'form', schema: JSON.parse(JSON.stringify(params.requestedSchema)) }
+      // As the client received it (a TypeBox schema's symbols do not travel),
+      // keeping only the keywords that constrain an answer.
+      expectations[key] = { mode: 'form', schema: normalizeAnswerSchema(JSON.parse(JSON.stringify(params.requestedSchema))) as Record<string, unknown> }
     }
   }
   return expectations
@@ -587,6 +597,12 @@ function inputRequired (
     if (error instanceof RequestTooDeepError) {
       dependencies.app.log.warn({ err: error, method: request.method }, 'Could not seal request state')
       return createError(request.id, INVALID_PARAMS, `Invalid request: ${error.message}`)
+    }
+    if (error instanceof AnswersTooLargeError) {
+      // The handler asked again after gathering more than a retry may carry;
+      // dropping answers would leave it asking for them again.
+      dependencies.app.log.error({ err: error, method: request.method }, 'Could not seal request state: carried answers exceed requestStateMaxAnswerBytes')
+      return createError(request.id, INTERNAL_ERROR, 'Internal server error')
     }
     if (error instanceof PrincipalRequiredError) {
       // Sealing refuses an unidentified caller when the deployment identifies
@@ -813,7 +829,8 @@ async function loadTask (taskId: string, dependencies: ModernDependencies): Prom
   return record
 }
 
-const WORKER_LOST = 'The server running this task stopped before it finished'
+// The same message as the handshake revisions and the stores' own reaping.
+const WORKER_LOST = TASK_OWNER_LOST
 
 async function handleTasksGet (
   request: JSONRPCRequest,
@@ -1192,7 +1209,11 @@ async function runAsTask (
     await taskStore!.create(record)
   } catch (error) {
     reservation.release()
-    app.log.warn({ err: error }, 'Could not create task')
+    // At the caller's retention cap (or a full store) with nothing finished to
+    // evict. -32029, which the handshake revisions answer, lies in the range
+    // 2026-07-28 reserves for the specification, so the caller decides how to
+    // answer instead: synchronously, or with an error when a task is required.
+    app.log.warn({ err: error }, error instanceof TaskLimitError ? 'Not creating a task: task limit reached' : 'Could not create task')
     return undefined
   }
   const expiresAt = createdAt + ttl
@@ -1249,11 +1270,15 @@ async function runAsTask (
       outcome = error ?? createError(request.id, INTERNAL_ERROR, message)
     }
 
-    // Bound the number of rounds: a handler that asks for the same thing
-    // forever would otherwise pin the task until its ttl elapses.
+    // Bound the rounds that ask the client: a handler that asks for the same
+    // thing forever would otherwise pin the task until its ttl elapses. Rounds
+    // that only carry state are paced by the poll interval and bounded by the
+    // ttl instead, so a handler can poll something else for as long as its
+    // task lives.
     const maxRounds = opts.taskMaxInputRounds ?? DEFAULT_TASK_MAX_INPUT_ROUNDS
+    let asked = 0
     try {
-      for (let round = 0; round <= maxRounds; round++) {
+      for (let round = 0; ; round++) {
         // Stopped before it ever ran (the server began shutting down while the
         // task was being created): the handler must not start.
         if (round === 0 && stopped.aborted) {
@@ -1289,11 +1314,6 @@ async function runAsTask (
             fail(`Tool execution failed: ${error?.message ?? error}`)
             break
           }
-          if (round >= maxRounds) {
-            fail(`Tool execution failed: input was still required after ${maxRounds} rounds`)
-            break
-          }
-
           // Nothing to ask the client: the handler only wants to resume with
           // its state, as a client would retry. Waiting the poll interval first
           // keeps a handler that is waiting on something else from spinning.
@@ -1307,6 +1327,12 @@ async function runAsTask (
             }
             continue
           }
+
+          if (asked >= maxRounds) {
+            fail(`Tool execution failed: input was still required after ${maxRounds} rounds`)
+            break
+          }
+          asked++
 
           const invalid = invalidInputRequests(requests)
           if (invalid) {

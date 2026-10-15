@@ -45,6 +45,7 @@ import type { RequestContext } from '../modern/request-meta.ts'
 import { repeatedMirroredHeader, validateStandardHeaders } from '../modern/headers.ts'
 import type { RequestStateSealer } from '../modern/request-state.ts'
 import { DEFAULT_MAX_RESOURCE_SUBSCRIPTIONS, SubscriptionRegistry, invalidFilter, negotiateFilter } from '../modern/subscriptions.ts'
+import type { SubscriptionDeadline } from '../modern/subscriptions.ts'
 import { quotaKeyOf } from '../task-registry.ts'
 import type { ClientCapabilities as ModernClientCapabilities, SubscriptionFilter } from '../schema-2026.ts'
 import { isStdioRequest, stdioAuthContext, stdioRequestSignal } from '../stdio-trust.ts'
@@ -601,6 +602,21 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
   }
 
   /**
+   * When a listen stream must end: when the token that opened it expires, or
+   * after `sseMaxConnectionMs`, whichever comes first. Access is only checked
+   * when the stream opens, as for the legacy GET stream.
+   */
+  function listenDeadline (authContext: AuthorizationContext | undefined): SubscriptionDeadline | undefined {
+    const expiresAt = authContext?.expiresAt?.getTime()
+    const maxAt = opts.sseMaxConnectionMs ? Date.now() + opts.sseMaxConnectionMs : undefined
+    if (expiresAt !== undefined && Number.isFinite(expiresAt) && (maxAt === undefined || expiresAt <= maxAt)) {
+      return { at: expiresAt, reason: 'The access token that opened this subscription expired' }
+    }
+    if (maxAt !== undefined) return { at: maxAt, reason: 'Subscription reached its maximum duration' }
+    return undefined
+  }
+
+  /**
    * Serve a request that speaks 2026-07-28.
    *
    * Nothing here consults or creates a session: the request's `_meta` carries
@@ -728,7 +744,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
           types: Object.keys(filter).filter(key => key !== 'resourceSubscriptions'),
           resourceSubscriptions: filter.resourceSubscriptions?.length ?? 0
         }, 'Opening subscription stream')
-        opened = subscriptions.open(reply, message.id, filter, quotaKey, listenCancel, onEnd)
+        opened = subscriptions.open(reply, message.id, filter, quotaKey, listenCancel, onEnd, listenDeadline(authContext))
       } finally {
         reserved()
       }

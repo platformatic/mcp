@@ -83,10 +83,14 @@ export function trimDefinitionToRevision<T extends Record<string, any>> (definit
  * something the client's revision cannot express.
  */
 export function capabilitiesForRevision<T extends Record<string, any>> (capabilities: T, version: string | undefined): T {
-  if (supportsTasks(version) || capabilities.tasks === undefined) {
-    return capabilities
+  // `extensions` belongs to 2026-07-28 and is advertised by server/discover;
+  // the handshake revisions have no such capability.
+  const { extensions, ...withoutExtensions } = capabilities
+  const legacy = (extensions === undefined ? capabilities : withoutExtensions) as T
+  if (supportsTasks(version) || legacy.tasks === undefined) {
+    return legacy
   }
 
-  const { tasks, ...rest } = capabilities
+  const { tasks, ...rest } = legacy
   return rest as T
 }

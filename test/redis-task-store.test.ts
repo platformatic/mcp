@@ -460,6 +460,28 @@ describe('RedisTaskStore', () => {
     t.assert.strictEqual(rest.nextCursor, undefined)
   })
 
+  test('create prunes expired ids from an index nobody lists', async (t: TestContext) => {
+    // Modern and anonymous tasks are indexed but never listed, so only create
+    // keeps their index from growing with every expired task.
+    for (let i = 0; i < 5; i++) await store.create(record({ taskId: `old-${i}` }))
+    await redis.del(...Array.from({ length: 5 }, (_, i) => `mcp:task:v2:old-${i}`))
+    t.assert.strictEqual(await redis.zcard('mcp:tasks:v2:anonymous'), 5)
+
+    await store.create(record({ taskId: 'new' }))
+    t.assert.deepStrictEqual(await redis.zrange('mcp:tasks:v2:anonymous', 0, -1), ['new'])
+  })
+
+  test('a new task\'s lease is stamped by the Redis clock', async (t: TestContext) => {
+    const realNow = Date.now.bind(Date)
+    // This instance's clock runs an hour behind Redis's.
+    t.mock.method(Date, 'now', () => realNow() - 3600_000)
+    await store.create(record({ leaseExpiresAt: Date.now() + 60_000 }))
+    t.mock.restoreAll()
+
+    const lease = (await store.get('task-1'))!.leaseExpiresAt!
+    t.assert.ok(Math.abs(lease - (realNow() + 60_000)) < 5_000, `lease ${lease - realNow()}ms from now`)
+  })
+
   test('list rejects an invalid cursor', async (t: TestContext) => {
     await t.assert.rejects(store.list(owner('user-1', ISS), { cursor: 'not-a-cursor' }), InvalidTaskCursorError)
   })

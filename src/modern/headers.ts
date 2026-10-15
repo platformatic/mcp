@@ -19,8 +19,13 @@ const TCHAR = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/
 /** Visible ASCII, space and horizontal tab — what a header value may contain. */
 const SAFE_HEADER_VALUE = /^[\x20-\x7E\t]*$/
 
-/** Reject malformed byte sequences rather than replacing them with U+FFFD. */
-const UTF8_DECODER = new TextDecoder('utf-8', { fatal: true })
+/**
+ * Reject malformed byte sequences rather than replacing them with U+FFFD, and
+ * keep a leading byte-order mark: dropping it would let `\uFEFFdelete_all` in
+ * a header match `delete_all` in the body, while a gateway decoding the header
+ * with a plain UTF-8 decoder routes on the former.
+ */
+const UTF8_DECODER = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true })
 
 export type HeaderCheck = { ok: true } | { ok: false, message: string }
 

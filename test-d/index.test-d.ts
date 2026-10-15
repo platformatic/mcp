@@ -267,6 +267,13 @@ const authorizationContextResolver: AuthorizationContextResolver = async (reques
   return { userId: 'user-1', scopes: ['tools:read'] }
 }
 expectAssignable<MCPPluginOptions>({ resolveAuthorizationContext: authorizationContextResolver })
+
+// A server can advertise its own extensions; server/discover carries them
+expectAssignable<MCPPluginOptions>({ capabilities: { tools: {}, extensions: { 'io.example/ui': {} } } })
+// and a handler can read the client's
+declare const handlerContext: HandlerContext
+expectAssignable<object | undefined>(handlerContext.clientCapabilities?.extensions?.['io.example/ui'])
+expectAssignable<MCPPluginOptions>({ taskMaxRetainedPerPrincipal: 20, toolArgumentLimits: { maxArrayLength: 100 } })
 expectType<Promise<AuthorizationContext | undefined> | AuthorizationContext | undefined>(
   authorizationContextResolver({} as FastifyRequest)
 )

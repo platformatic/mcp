@@ -35,6 +35,7 @@ import {
   RESOURCE_NOT_FOUND
 } from './schema.ts'
 import type { ClientCapabilities, RequestId } from './schema.ts'
+import type { ClientCapabilities as ModernClientCapabilities } from './schema-2026.ts'
 
 import type {
   MCPTool,
@@ -124,7 +125,7 @@ export type HandlerDependencies = {
   /** Request-scoped notifications; see `HandlerContext.sendProgress` and `log`. */
   notifiers?: RequestNotifiers
   /** What the client declared on this request; see `HandlerContext.clientCapabilities`. */
-  clientCapabilities?: ClientCapabilities
+  clientCapabilities?: ModernClientCapabilities
 }
 
 export type ToolCallDependencies = Pick<HandlerDependencies,

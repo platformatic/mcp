@@ -3,7 +3,7 @@ import type { TestContext } from 'node:test'
 import Fastify from 'fastify'
 import { Type } from '@sinclair/typebox'
 import mcpPlugin from '../src/index.ts'
-import { JSONRPC_VERSION, LATEST_LEGACY_PROTOCOL_VERSION, METHOD_NOT_FOUND, INVALID_PARAMS } from '../src/schema.ts'
+import { JSONRPC_VERSION, LATEST_LEGACY_PROTOCOL_VERSION, METHOD_NOT_FOUND, INVALID_PARAMS, INVALID_REQUEST } from '../src/schema.ts'
 import type { Task, CreateTaskResult, ListTasksResult, CallToolResult } from '../src/schema.ts'
 import { MemoryTaskStore } from '../src/stores/memory-task-store.ts'
 import { canTransition, isTerminal, taskHasExpired, toWireTask, InvalidTaskCursorError, DEFAULT_TASK_PAGE_SIZE, TaskLimitError, TASK_LIMIT_REACHED, TaskLeases, TASK_OWNER_LOST } from '../src/stores/task-store.ts'
@@ -174,6 +174,20 @@ describe('task store', () => {
     t.assert.strictEqual(await store.expireStaleLease('missing', 'x', outcome), null)
     t.assert.strictEqual((await store.get('live'))?.status, 'working')
     t.assert.strictEqual((await store.get('none'))?.status, 'working')
+  })
+
+  test('TaskLeases tells the worker when its task ended elsewhere', async (t: TestContext) => {
+    const store = new MemoryTaskStore()
+    await store.create(record({ taskId: 'a' }))
+    const leases = new TaskLeases(store, 30)
+    t.after(() => leases.close())
+    const ended: unknown[] = []
+    await leases.start('a', status => ended.push(status))
+
+    // A cancellation whose broker message was lost: the next renewal finds it.
+    await store.updateStatus('a', 'cancelled')
+    await new Promise(resolve => setTimeout(resolve, 60))
+    t.assert.deepStrictEqual(ended, ['cancelled'])
   })
 
   test('TaskLeases renews until stopped and stops everything on close', async (t: TestContext) => {
@@ -850,6 +864,32 @@ describe('tasks over the wire', () => {
       const bad = await authedCall(tokenA, 'tasks/list', { cursor })
       t.assert.strictEqual(bad.error.code, INVALID_PARAMS)
     }
+  })
+
+  test('a caller the resolver cannot identify cannot create a task', async (t: TestContext) => {
+    const app = Fastify({ logger: false })
+    t.after(() => app.close())
+    await app.register(mcpPlugin, {
+      enableTasks: true,
+      // Authenticated upstream, but with no user to bind a task to
+      resolveAuthorizationContext: async () => ({ scopes: ['read'] })
+    })
+    app.mcpAddTool({
+      name: 'noop',
+      inputSchema: Type.Object({}),
+      execution: { taskSupport: 'optional' }
+    } as any, async (): Promise<CallToolResult> => ({ content: [{ type: 'text', text: 'ok' }] }))
+    await app.ready()
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/mcp',
+      headers: { 'mcp-protocol-version': LATEST_LEGACY_PROTOCOL_VERSION },
+      payload: { jsonrpc: JSONRPC_VERSION, id: 1, method: 'tools/call', params: { name: 'noop', arguments: {}, task: {} } }
+    })
+    // A task nobody could reach again, and that no per-caller limit covers,
+    // is refused rather than created.
+    t.assert.strictEqual(response.json().error?.code, INVALID_REQUEST)
   })
 
   test('a token without sub is rejected before it can create subject-less tasks', async (t: TestContext) => {

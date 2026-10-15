@@ -9,7 +9,6 @@ import type {
   ReadResourceResult,
   GetPromptResult,
   ServerCapabilities,
-  ClientCapabilities,
   Implementation,
   Tool,
   Resource,
@@ -22,7 +21,7 @@ import type { Static, TSchema, TObject, TString } from '@sinclair/typebox'
 import type { AuthorizationConfig, AuthorizationContext } from './types/auth-types.ts'
 import type { AllowedOrigins, ToolArgumentLimits } from './security.ts'
 import type { CacheHint } from './modern/handlers.ts'
-import type { ClientCapabilities as ModernClientCapabilities, InputRequests } from './schema-2026.ts'
+import type { ClientCapabilities as ModernClientCapabilities, ServerCapabilities as ModernServerCapabilities, InputRequests } from './schema-2026.ts'
 
 export type { CacheHint }
 
@@ -39,7 +38,7 @@ export interface HandlerContext {
    * handler can choose, say, URL-mode over form elicitation, or skip asking
    * at all. Absent on the legacy path.
    */
-  clientCapabilities?: ClientCapabilities
+  clientCapabilities?: ModernClientCapabilities
   request: FastifyRequest
   reply: FastifyReply
   authContext?: AuthorizationContext
@@ -367,7 +366,11 @@ export interface MCPClientResponseContext {
 
 export interface MCPPluginOptions {
   serverInfo?: Implementation
-  capabilities?: ServerCapabilities
+  /**
+   * What the server supports. `extensions` is advertised by 2026-07-28's
+   * `server/discover` only; the handshake revisions never see it.
+   */
+  capabilities?: ServerCapabilities & Pick<ModernServerCapabilities, 'extensions'>
   instructions?: string
   enableSSE?: boolean
   /**

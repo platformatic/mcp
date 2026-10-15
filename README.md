@@ -327,6 +327,12 @@ legacy ones included, as the specification's own example does. Only `2026-07-28`
 per request in `_meta`; the legacy revisions are reached through `initialize`, so a client that
 gets `-32022` for a legacy version should start a handshake rather than retry with `_meta`.
 
+A modern notification (a message without an `id`) is acknowledged with `202` once it is a
+well-formed JSON-RPC message; its `_meta` and mirrored headers are not checked, since nothing
+is answered to it. A tool with no handler answers `tools/call` with an `isError` result, as on
+the legacy path, while a resource or prompt with no handler answers `-32603`. The list
+operations return everything in one page and ignore a `cursor`.
+
 ### What 2026-07-28 removed
 
 These are answered with `404` and `-32601` on the modern path, and continue to work
@@ -472,8 +478,17 @@ A handler may ask in several steps. Each retry hands it the answers given so far
 the latest round's, so the second step still sees the first answer, as it would when running
 as a task. A key asked again is replaced by its new answer. The client echoes those answers
 back on every retry, so they are bounded by `requestStateMaxAnswerBytes` (64 KiB of JSON by
-default; `0` turns carrying off): past it the oldest answers are dropped. A handler that needs
-a large or early answer later should keep what it needs in its own `state`.
+default; `0` turns carrying off). Answers are never dropped silently: when a handler asks again
+after gathering more than that, the request fails with `-32603` (and the server logs why),
+since a handler that lost an earlier answer would only ask for it again. A handler that gathers
+large answers should keep what it needs in its own `state` and raise the limit, or set it to
+`0` and carry nothing.
+
+An accepted form answer is validated against the `requestedSchema` exactly as written, every
+keyword included (`pattern` too, so keep patterns simple). Annotations (`title`,
+`description`, `default`, `examples`) and `$schema` / `$id` are ignored, so a draft-07 schema
+works. A schema that cannot be compiled fails the request with `-32603` when the handler asks,
+rather than leaving its answers unchecked.
 
 `elicitForm`, `elicitUrl`, `requestSampling` and `requestRoots` build the entries. The
 dispatcher refuses to send a request the client did not declare support for, answering
@@ -610,6 +625,13 @@ list it on one that does not have it. Designing this for rolling redeploys is tr
 Request-scoped notifications (`notifications/progress`, `notifications/message`) are never
 delivered here; they belong on the response stream of the request they relate to.
 
+A stream ends when the access token that opened it expires, or after `sseMaxConnectionMs` when
+that comes first, with `notifications/cancelled` and the graceful completion response, so the
+client listens again with fresh credentials and misses nothing. Callers the deployment cannot
+identify all share `subscriptionMaxStreams` (1000 by default) and have no per-caller limit, so
+one anonymous client can hold every slot; deployments that accept anonymous listeners should
+bound them upstream (per IP, say) or lower the limit.
+
 ## Progress and Logging (2026-07-28)
 
 Handlers report progress and log messages through their context:
@@ -656,7 +678,10 @@ app.mcpAddTool({
 }, handler)
 ```
 
-`inputCapabilities: {}` says the tool never asks for input, so it always streams early.
+In practice few clients declare all of these, so **a tool without `inputCapabilities` usually
+delivers its progress together with its result**. Declare `inputCapabilities` on every tool
+whose progress should arrive live. `inputCapabilities: {}` says the tool never asks for input,
+so it always streams early.
 `inputCapabilities` is never listed to clients. A tool that then asks for more than it
 declared, after progress has streamed, gets an internal error instead of `-32021`.
 
@@ -784,10 +809,12 @@ While a task waits in `input_required`, `tasks/get` shows the input requests its
 which were checked against the capabilities of the request that created the task. Poll with
 the same capabilities you created it with.
 
-A task's handler may ask for input up to `taskMaxInputRounds` times (32 by default) before the
-task fails; a synchronous call has no such bound, because each retry is the client's choice.
-A handler that throws `InputRequired` with only `state` and nothing to ask is run again after
-the task's `pollIntervalMs`, as a client would retry it, rather than at once.
+A task's handler may ask the client for input up to `taskMaxInputRounds` times (32 by default)
+before the task fails; a synchronous call has no such bound, because each retry is the client's
+choice. A handler that throws `InputRequired` with only `state` and nothing to ask is run again
+after the task's `pollIntervalMs`, as a client would retry it, rather than at once. Such rounds
+do not count toward `taskMaxInputRounds`: a handler may poll something else this way for as
+long as the task's ttl allows.
 
 A tool result with `isError: true` completes a 2026-07-28 task: the extension reserves
 `failed` for JSON-RPC errors, and the error result is inlined like any other. A 2025-11-25
@@ -2234,6 +2261,10 @@ Duration semantics also differ by source: `'json-rpc'` and `'in-process'` durati
 
 Use `transformRouteSchema` to customize Fastify/OpenAPI schema metadata on MCP transport routes without replacing handlers or route definitions.
 
+Avoid adding a `body` schema to the `POST /mcp` route: Fastify answers a validation failure with
+its own plain `400`, not a JSON-RPC error, and a 2026-07-28 client reads a `400` without a
+recognized JSON-RPC error as a server that does not speak its revision.
+
 ```typescript
 import Fastify from 'fastify'
 import mcpPlugin from '@platformatic/mcp'
@@ -2531,7 +2562,7 @@ await app.register(import('@fastify/bearer-auth'), {
   `requestState`. Required when `redis` is configured, since any instance may serve a retry
 - `requestStateTtlMs`: How long sealed state stays valid (default 5 minutes). Must be a positive integer; anything else throws at startup
 - `requestStateMaxAnswerBytes`: How many bytes of JSON of earlier answers sealed state carries
-  into later rounds (default 65536); the oldest are dropped past it, and `0` carries none
+  into later rounds (default 65536); asking again past it fails with `-32603`, and `0` carries none
 - `caching`: Freshness hints per cacheable operation (default `{ ttlMs: 0, cacheScope: 'private' }`)
 - `enableTasks`: Enable tasks (the 2025-11-25 core tasks and the 2026-07-28 extension)
 - `taskDefaultTtlMs` / `taskMaxTtlMs`: Task retention (defaults 60000 / 3600000)
@@ -2546,8 +2577,8 @@ await app.register(import('@fastify/bearer-auth'), {
   (default 100). At the cap the caller's oldest finished task is evicted
 - `taskLeaseMs`: Worker lease; a task whose worker stops renewing it is reported failed
   (default 15000)
-- `taskMaxInputRounds`: How many times a 2026-07-28 task's handler may throw `InputRequired`
-  before the task fails (default 32)
+- `taskMaxInputRounds`: How many times a 2026-07-28 task's handler may ask the client for input
+  before the task fails (default 32). Rounds that only carry state do not count
 - `taskShutdownTimeoutMs`: How long `close()` waits for running tasks before failing them
   (default 5000; keep it below Fastify's `pluginTimeout`)
 - `subscriptionMaxStreams` / `subscriptionMaxStreamsPerPrincipal` /
@@ -3229,19 +3260,30 @@ the changes to the plugin's own API and defaults:
 - **`HandlerContext` gained required members**: `signal`, `sendProgress` and `log`. Code that
   builds a context by hand (for example to unit-test a handler) must provide them.
 - **`TaskStore` gained methods**: `updateInputResponses`, `acknowledgeInputResponses`,
-  `renewLease` and `expireStaleLease`. The plugin builds its own store (there is no option to
-  supply one); code that implements the exported `TaskStore` interface for its own use must
-  add them.
+  `renewLease` and `expireStaleLease`, and `list` takes `{ cursor, limit, era }` and returns
+  `{ tasks, nextCursor? }`, throwing `InvalidTaskCursorError` for a cursor it did not issue.
+  `create` throws `TaskLimitError` at a caller's retention cap. The plugin builds its own store
+  (there is no option to supply one); code that implements the exported `TaskStore` interface
+  for its own use must follow these.
 - **Redis task records moved** to the `mcp:task:v2:` keyspace, so instances of different
-  versions never misread each other's tasks. Tasks in flight during an upgrade are only
-  visible to instances of the version that created them.
+  versions never misread each other's tasks. During a rolling deploy, tasks created by an
+  instance of the previous version are invisible to upgraded instances (and the reverse): a
+  client polling such a task through an upgraded instance gets "Task not found". Drain tasks
+  before upgrading, or accept that tasks in flight may have to be restarted.
 - **Tasks are bound to user, OAuth client and issuer**, not the user alone, in both eras.
   `TaskRecord.authSubject` now holds that principal as a JSON string rather than a bare user
   id, so code that reads task records or calls `list(subject)` on a `MemoryTaskStore` or
   `RedisTaskStore` directly must pass it through unchanged.
 - **Task limits apply to both eras**: 2025-11-25 tasks count against `taskMaxConcurrent` and
   `taskMaxPerPrincipal`, are aborted at their ttl and are drained on shutdown.
-- **A full in-memory task store refuses new tasks** instead of dropping finished results.
+- **Task retention is capped per caller** (`taskMaxRetainedPerPrincipal`, default 100) in both
+  stores and both eras; at the cap, and when the in-memory store is full, the oldest finished
+  task is evicted, so a finished result its client has not read yet can be lost.
+- **`requestStateMaxAnswerBytes` fails rather than truncates**: a retry whose carried answers
+  exceed it is answered `-32603`.
+- **`HandlerContext.authContext.authorizationServer` is the normalized issuer** the token
+  validator vouched for (no trailing slash; `introspection:<endpoint>` for an introspected
+  token without `iss`), as sessions already used.
 - **`requestStateSecret` is required with `redis`**, and must be at least 32 bytes.
 - **Default capabilities declare `listChanged: true`** for tools, prompts and resources, and
   registering one after ready broadcasts `list_changed`. Legacy clients only see `listChanged`

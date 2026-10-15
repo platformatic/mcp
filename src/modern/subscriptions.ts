@@ -45,7 +45,19 @@ interface Subscription {
   onCancel?: () => void
   /** Runs once when the stream ends, however it ends. */
   onEnd?: () => void
+  /** Ends the stream at its deadline (token expiry, maximum lifetime). */
+  deadlineTimer?: NodeJS.Timeout
 }
+
+/** When a stream must end, and why: the client reconnects afterwards. */
+export interface SubscriptionDeadline {
+  /** Epoch milliseconds. */
+  at: number
+  reason: string
+}
+
+/** setTimeout fires at once past 2^31-1 ms, so longer waits go in steps. */
+const MAX_TIMER_DELAY_MS = 2 ** 31 - 1
 
 const BOOLEAN_FILTER_FIELDS = ['toolsListChanged', 'promptsListChanged', 'resourcesListChanged'] as const
 
@@ -208,7 +220,8 @@ export class SubscriptionRegistry {
     filter: SubscriptionFilter,
     quotaKey?: string,
     cancelSignal?: AbortSignal,
-    onEnd?: () => void
+    onEnd?: () => void,
+    deadline?: SubscriptionDeadline
   ): boolean {
     const raw = reply.raw
     // A cancellation that arrived while the caller was still preparing the
@@ -266,6 +279,26 @@ export class SubscriptionRegistry {
     }, KEEPALIVE_MS)
     subscription.keepAlive.unref()
     this.#subscriptions.add(subscription)
+
+    // Access is checked when the stream opens, so it must not outlive what
+    // granted it. Ending gracefully tells the client it missed nothing and may
+    // listen again, with fresh credentials.
+    if (deadline) {
+      const schedule = () => {
+        const remaining = Math.max(0, deadline.at - Date.now())
+        subscription.deadlineTimer = setTimeout(() => {
+          if (!this.#subscriptions.has(subscription)) return
+          if (Date.now() < deadline.at) {
+            schedule()
+            return
+          }
+          this.#log.info({ subscriptionId: id, reason: deadline.reason }, 'Ending subscription stream at its deadline')
+          this.#close(subscription, this.#teardownFrames(subscription, deadline.reason))
+        }, Math.min(remaining, MAX_TIMER_DELAY_MS))
+        subscription.deadlineTimer.unref()
+      }
+      schedule()
+    }
 
     // The acknowledgement must be the first thing on the stream, so the client
     // learns which of its requested notification types were actually accepted.
@@ -428,6 +461,7 @@ export class SubscriptionRegistry {
 
   #remove (subscription: Subscription): void {
     if (subscription.keepAlive) clearInterval(subscription.keepAlive)
+    if (subscription.deadlineTimer) clearTimeout(subscription.deadlineTimer)
     if (subscription.onDrain) subscription.reply.raw.off('drain', subscription.onDrain)
     if (subscription.onClose) subscription.reply.raw.off('close', subscription.onClose)
     if (subscription.onCancel) subscription.cancelSignal?.removeEventListener('abort', subscription.onCancel)

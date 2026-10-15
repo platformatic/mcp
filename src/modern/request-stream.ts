@@ -37,6 +37,8 @@ export class RequestStream {
   #held: string[] = []
   #heldBytes = 0
   #timer?: NodeJS.Timeout
+  /** The stream reported back-pressure and has not drained since. */
+  #blocked = false
 
   /**
    * `openEarly` says whether the stream may open before the outcome is known.
@@ -118,11 +120,20 @@ export class RequestStream {
     this.#heldBytes = 0
   }
 
+  /**
+   * Write a notification, dropping it while the reader is not keeping up:
+   * progress and log messages tolerate gaps, unbounded buffering does not.
+   * Back-pressure is read from `write()` itself, since `writableLength` stays
+   * at zero on an injected (stdio) response that is buffering all the same.
+   */
   #write (frame: string): void {
     const raw = this.#reply.raw
     if (raw.destroyed || raw.writableEnded) return
-    if (raw.writableLength > MAX_BUFFERED_BYTES) return
-    raw.write(frame)
+    if (this.#blocked || raw.writableLength > MAX_BUFFERED_BYTES) return
+    if (!raw.write(frame)) {
+      this.#blocked = true
+      raw.once('drain', () => { this.#blocked = false })
+    }
   }
 }
 

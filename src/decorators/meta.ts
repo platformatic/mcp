@@ -1,3 +1,4 @@
+import { invalidCapabilityMember } from '../modern/request-meta.ts'
 import type { FastifyPluginAsync } from 'fastify'
 import fp from 'fastify-plugin'
 import type {
@@ -101,9 +102,16 @@ const mcpDecoratorsPlugin: FastifyPluginAsync<MCPDecoratorsOptions> = async (app
     }
 
     const inputCapabilities = definition.inputCapabilities
-    if (inputCapabilities !== undefined &&
-      (typeof inputCapabilities !== 'object' || inputCapabilities === null || Array.isArray(inputCapabilities))) {
-      throw new Error(`Invalid inputCapabilities for '${name}': expected client capabilities`)
+    if (inputCapabilities !== undefined) {
+      if (typeof inputCapabilities !== 'object' || inputCapabilities === null || Array.isArray(inputCapabilities)) {
+        throw new Error(`Invalid inputCapabilities for '${name}': expected client capabilities`)
+      }
+      // Held to the same shape as a client's declaration, which it is
+      // compared against on every call.
+      const member = invalidCapabilityMember(inputCapabilities as Record<string, unknown>)
+      if (member !== undefined) {
+        throw new Error(`Invalid inputCapabilities for '${name}': '${member}' must be an object`)
+      }
     }
 
     // TypeBox schemas are already JSON Schema compatible

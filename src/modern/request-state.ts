@@ -115,23 +115,24 @@ function stableStringify (value: unknown, depth: number = 0): string {
   return `{${entries.join(',')}}`
 }
 
+/** Thrown when the answers a retry must carry exceed `requestStateMaxAnswerBytes`. */
+export class AnswersTooLargeError extends Error {
+  constructor (bytes: number, maxBytes: number) {
+    super(`the answers to carry take ${bytes} bytes of JSON, more than requestStateMaxAnswerBytes (${maxBytes})`)
+  }
+}
+
 /**
- * The answers to carry, keeping the newest ones that fit in `maxBytes` of
- * JSON. The client echoes the state back on every retry, so carrying every
- * answer ever given would grow each retry until it exceeds the body limit; a
- * handler that needs an older answer past that point keeps it in its own state.
+ * The answers to carry. The client echoes the state back on every retry, so
+ * they are bounded by `maxBytes` of JSON. Past it sealing fails rather than
+ * dropping some: a handler that silently lost an earlier answer would ask for
+ * it again, possibly forever. `0` carries none at all.
  */
 function withinBudget (answers: Record<string, unknown> | undefined, maxBytes: number): { answers?: Record<string, unknown> } {
-  if (answers === undefined) return {}
-  const kept: Array<[string, unknown]> = []
-  let used = 2 // the braces
-  for (const [key, value] of Object.entries(answers).reverse()) {
-    const size = Buffer.byteLength(JSON.stringify(key)) + Buffer.byteLength(JSON.stringify(value) ?? 'null') + 2
-    if (used + size > maxBytes) break
-    used += size
-    kept.unshift([key, value])
-  }
-  return kept.length > 0 ? { answers: Object.fromEntries(kept) } : {}
+  if (answers === undefined || maxBytes === 0 || Object.keys(answers).length === 0) return {}
+  const bytes = Buffer.byteLength(JSON.stringify(answers))
+  if (bytes > maxBytes) throw new AnswersTooLargeError(bytes, maxBytes)
+  return { answers }
 }
 
 /**

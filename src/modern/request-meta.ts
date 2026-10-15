@@ -166,7 +166,7 @@ function isObject (value: unknown): boolean {
  * object (`{ "elicitation": null }`, say), so it is refused up front rather
  * than failing wherever it is first used.
  */
-function invalidCapabilityMember (capabilities: Record<string, unknown>): string | undefined {
+export function invalidCapabilityMember (capabilities: Record<string, unknown>): string | undefined {
   for (const [name, members] of Object.entries(OBJECT_CAPABILITIES)) {
     const declared = capabilities[name]
     if (declared === undefined) continue
