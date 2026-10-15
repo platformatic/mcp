@@ -1398,8 +1398,7 @@ The plugin includes comprehensive OAuth 2.1 authorization support for secure MCP
 
 - **Complete OAuth 2.1 Support**: Authorization Code Flow with PKCE
 - **Session-Based Authorization**: Token-to-session mapping with secure context
-- **Authorization-Aware SSE**: User-specific session isolation and message routing
-- **Automatic Token Refresh**: Background token refresh with retry logic
+- **Authorization-Aware SSE**: Authorization context bound to each SSE session
 - **JWT Token Validation**: Support for JWT tokens with JWKS endpoints
 - **Token Introspection**: RFC 7662 compliant token introspection
 - **Dynamic Client Registration**: RFC 7591 compliant client registration
@@ -1495,9 +1494,6 @@ eventSource.onmessage = (event) => {
   const message = JSON.parse(event.data)
   console.log('Received:', message)
 }
-
-// Server can send user-specific messages
-// app.mcpSendToUser(userId, notification)
 ```
 
 ### Authorization Configuration
@@ -1657,60 +1653,14 @@ interface SessionMetadata {
 }
 ```
 
-### User-Specific Message Routing
+### Token Refresh
 
-Send messages to specific users across all their sessions:
-
-```typescript
-// In your tool handler
-app.mcpAddTool({
-  name: 'notify-user',
-  description: 'Send notification to user',
-  inputSchema: Type.Object({
-    userId: Type.String(),
-    message: Type.String()
-  })
-}, async (params, { sessionId, authContext }) => {
-  // Send to all sessions for this user
-  await app.mcpSendToUser(params.userId, {
-    jsonrpc: '2.0',
-    method: 'notifications/message',
-    params: {
-      level: 'info',
-      message: params.message
-    }
-  })
-  
-  return { content: [{ type: 'text', text: 'Notification sent' }] }
-})
-```
-
-### Automatic Token Refresh
-
-The plugin includes a background service for automatic token refresh:
-
-```typescript
-// Token refresh configuration
-authorization: {
-  enabled: true,
-  tokenRefresh: {
-    // Check for expiring tokens every 5 minutes
-    checkIntervalMs: 5 * 60 * 1000,
-    
-    // Refresh tokens 5 minutes before expiry
-    refreshBufferMinutes: 5,
-    
-    // Maximum refresh attempts
-    maxRetries: 3
-  }
-}
-
-// Manual token refresh
-const success = await app.tokenRefreshService.refreshSessionToken(sessionId)
-
-// Token refresh notifications sent via SSE
-// Client receives: { method: 'notifications/token_refreshed', params: { access_token: '...' } }
-```
+Automatic background token refresh is not available yet: there is no
+`authorization.tokenRefresh` option and no `app.tokenRefreshService`
+decorator. Clients are expected to refresh their own access tokens (for
+example through `POST /oauth/refresh` when `oauth2Client` is configured).
+End-to-end token refresh is tracked in
+[#146](https://github.com/platformatic/mcp/issues/146).
 
 ### Authorization-Aware Tools
 
@@ -2093,10 +2043,6 @@ await app.register(import('@fastify/bearer-auth'), {
     - `resourceUri`: Resource URI.
     - `scopes`: Requested OAuth scopes
     - `dynamicRegistration`: Enable dynamic client registration (default: false)
-  - `tokenRefresh`: Automatic token refresh configuration
-    - `checkIntervalMs`: Token refresh check interval
-    - `refreshBufferMinutes`: Minutes before expiry to refresh tokens
-    - `maxRetries`: Maximum refresh attempts
 - `redis`: Redis configuration for horizontal scaling (optional)
   - `host`: Redis server hostname
   - `port`: Redis server port
@@ -2352,13 +2298,6 @@ app.mcpAddPrompt({
 
 - `app.mcpBroadcastNotification(notification)`: Broadcast a notification to all connected SSE clients (works across Redis instances). `notifications/resources/updated` only reaches sessions subscribed to its `params.uri`
 - `app.mcpSendToSession(sessionId, message)`: Send a message/request to a specific SSE session (works across Redis instances)
-- `app.mcpSendToUser(userId, message)`: Send a message to all sessions for a specific user (authorization-aware)
-
-#### Authorization Functions
-
-- `app.tokenRefreshService`: Token refresh service instance for manual token refresh
-  - `refreshSessionToken(sessionId)`: Manually refresh token for a session
-  - `notifyTokenRefresh(sessionId, token, response)`: Send token refresh notification
 
 ## Handler API Reference
 
