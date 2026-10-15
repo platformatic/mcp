@@ -18,7 +18,7 @@ import type {
 } from './schema.ts'
 import type { Static, TSchema, TObject, TString } from '@sinclair/typebox'
 import type { AuthorizationConfig, AuthorizationContext } from './types/auth-types.ts'
-import type { AllowedOrigins } from './security.ts'
+import type { AllowedOrigins, ToolArgumentLimits } from './security.ts'
 
 // Context interface for all handler types
 export interface HandlerContext {
@@ -330,6 +330,14 @@ export interface MCPPluginOptions {
    * to accept any origin, or list exact origins to allow.
    */
   allowedOrigins?: AllowedOrigins
+  /**
+   * Limits applied to every tool's arguments before the handler runs. Defaults:
+   * `maxStringLength` 10000, `maxObjectProperties` 100, `maxDepth` 10,
+   * `maxArrayLength` unlimited. Arrays are not counted as object properties.
+   * Pass `Infinity` to disable a limit; Fastify's `bodyLimit` still caps the
+   * total request size.
+   */
+  toolArgumentLimits?: ToolArgumentLimits
   /**
    * Per-request tool authorization, keyed by tool name. Consulted by both
    * `tools/list` (a denied tool is omitted) and `tools/call` (a denied tool
