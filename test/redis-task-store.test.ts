@@ -165,14 +165,14 @@ describe('RedisTaskStore', () => {
     await store.create(record({ taskId: 'x', authSubject: 'c', authIssuer: 'a:b' }))
     await store.create(record({ taskId: 'y', authSubject: 'b:c', authIssuer: 'a' }))
 
-    t.assert.deepStrictEqual(await redis.zrange('mcp:tasks:owner:a%3Ab:c', 0, -1), ['x'])
-    t.assert.deepStrictEqual(await redis.zrange('mcp:tasks:owner:a:b%3Ac', 0, -1), ['y'])
+    t.assert.deepStrictEqual(await redis.zrange('mcp:tasks:owner:a%3Ab:c', 0, '-1'), ['x'])
+    t.assert.deepStrictEqual(await redis.zrange('mcp:tasks:owner:a:b%3Ac', 0, '-1'), ['y'])
     t.assert.deepStrictEqual((await store.list({ subject: 'c', issuer: 'a:b' })).tasks.map(x => x.taskId), ['x'])
     t.assert.deepStrictEqual((await store.list({ subject: 'b:c', issuer: 'a' })).tasks.map(x => x.taskId), ['y'])
 
     await store.delete('x')
     t.assert.strictEqual(await redis.exists('mcp:tasks:owner:a%3Ab:c'), 0)
-    t.assert.deepStrictEqual(await redis.zrange('mcp:tasks:owner:a:b%3Ac', 0, -1), ['y'])
+    t.assert.deepStrictEqual(await redis.zrange('mcp:tasks:owner:a:b%3Ac', 0, '-1'), ['y'])
   })
 
   test('delete removes the task and its owner index entry', async (t: TestContext) => {
@@ -191,7 +191,7 @@ describe('RedisTaskStore', () => {
     await redis.del('mcp:task:a')
 
     t.assert.deepStrictEqual((await store.list({ subject: 'user-1', issuer: ISS })).tasks.map(x => x.taskId), ['b'])
-    t.assert.deepStrictEqual(await redis.zrange(USER_1_INDEX, 0, -1), ['b'])
+    t.assert.deepStrictEqual(await redis.zrange(USER_1_INDEX, 0, '-1'), ['b'])
   })
 
   test('owner index expires no earlier than its longest-lived task', async (t: TestContext) => {
@@ -349,7 +349,7 @@ describe('RedisTaskStore', () => {
     t.assert.strictEqual(await store.get('b'), null)
     t.assert.ok(await store.get('c'))
     t.assert.ok(await store.get('d'))
-    t.assert.deepStrictEqual(await redis.zrange(USER_1_INDEX, 0, -1), ['a', 'c', 'd'])
+    t.assert.deepStrictEqual(await redis.zrange(USER_1_INDEX, 0, '-1'), ['a', 'c', 'd'])
     // There is no global index, only the per-owner one
     t.assert.strictEqual(await redis.exists('mcp:tasks'), 0)
   })
@@ -361,7 +361,7 @@ describe('RedisTaskStore', () => {
     await redis.del('mcp:task:a')
 
     await store.create(record({ taskId: 'b', authSubject: 'user-1', authIssuer: ISS }))
-    t.assert.deepStrictEqual(await redis.zrange(USER_1_INDEX, 0, -1), ['b'])
+    t.assert.deepStrictEqual(await redis.zrange(USER_1_INDEX, 0, '-1'), ['b'])
   })
 
   test('fails orphaned tasks so they stop holding the caller\'s quota', async (t: TestContext) => {
