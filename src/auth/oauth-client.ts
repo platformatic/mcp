@@ -1,4 +1,6 @@
 import type { FastifyPluginAsync, FastifyBaseLogger } from 'fastify'
+import type { MCPRouteSchemaTransformer } from '../types.ts'
+import { routeSchemaOptions } from '../routes/route-schema.ts'
 import fp from 'fastify-plugin'
 import { createHash, randomBytes } from 'node:crypto'
 import { validateTokenResponse, validateIntrospectionResponse, validateClientRegistrationResponse } from './oauth-schemas.ts'
@@ -19,6 +21,7 @@ export interface OAuthClientConfig {
    * Pass `true` for the default path, or an object to override it.
    */
   clientIdMetadataDocument?: boolean | { path?: string }
+  transformRouteSchema?: MCPRouteSchemaTransformer
 }
 
 /** Where the client metadata document is served unless overridden */
@@ -201,7 +204,7 @@ const oauthClientPlugin: FastifyPluginAsync<OAuthClientConfig> = async (fastify,
         'clientIdMetadataDocument path is outside /.well-known; add it to authorization.excludedPaths or the authorization server will get 401 when fetching it')
     }
 
-    fastify.get(path, async (_request, reply) => {
+    fastify.get(path, routeSchemaOptions(fastify, 'oauth.clientIdMetadataDocument', 'GET', path, undefined, opts.transformRouteSchema), async (_request, reply) => {
       return reply.type('application/json').send(document)
     })
 
