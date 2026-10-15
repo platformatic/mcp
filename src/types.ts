@@ -290,7 +290,9 @@ export interface MCPPluginOptions {
   /**
    * Close an SSE stream after this many milliseconds so the client falls back to
    * polling and reconnects with `Last-Event-ID` (SEP-1699). Omit to keep streams
-   * open indefinitely, which stays valid.
+   * open indefinitely, which stays valid. With authorization enabled, a stream is
+   * also closed when the token that opened it expires (its `exp` claim), whichever
+   * comes first, so the client reconnects with a fresh token.
    */
   sseMaxConnectionMs?: number
   /**

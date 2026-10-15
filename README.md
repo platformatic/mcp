@@ -815,6 +815,8 @@ await app.register(mcpPlugin, {
 })
 ```
 
+When authorization is enabled, the access token is only checked when a `GET /mcp` stream opens. So that a stream never outlives that token, the server closes it at the token's `exp` (or after `sseMaxConnectionMs`, whichever comes first). The client then reconnects with a fresh token and resumes with `Last-Event-ID`. Tokens without an `exp` claim are bounded only by `sseMaxConnectionMs`, so set it if your authorization server issues them or if you want revocation and scope changes to take effect within a bounded time.
+
 ## Redis Configuration for Horizontal Scaling
 
 The plugin supports Redis-backed session management and message broadcasting for horizontal scaling across multiple server instances.
