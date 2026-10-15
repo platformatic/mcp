@@ -8,7 +8,7 @@ import { MemoryMessageBroker } from './brokers/memory-message-broker.ts'
 import { RedisSessionStore } from './stores/redis-session-store.ts'
 import { RedisMessageBroker } from './brokers/redis-message-broker.ts'
 import type { TaskStore } from './stores/task-store.ts'
-import { TaskWaiters, validateTaskLimit } from './stores/task-store.ts'
+import { TaskWaiters, TaskLeases, validateTaskLimit } from './stores/task-store.ts'
 import { MemoryTaskStore } from './stores/memory-task-store.ts'
 import { RedisTaskStore } from './stores/redis-task-store.ts'
 import type { MCPPluginOptions, MCPTool, MCPResource, MCPPrompt, ResourceHandlers } from './types.ts'
@@ -55,6 +55,7 @@ import type {
 } from './schema.ts'
 
 const REDIS_QUIT_TIMEOUT_MS = 2000
+const DEFAULT_TASK_LEASE_MS = 30_000
 
 declare module 'fastify' {
   interface FastifyInstance {
@@ -149,6 +150,13 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
   app.addHook('preClose', async () => {
     shutdownController.abort()
   })
+
+  // Leases let any instance notice that the one running a task has died.
+  const taskLeases = taskStore
+    ? new TaskLeases(taskStore, opts.taskLeaseMs ?? DEFAULT_TASK_LEASE_MS, (err, taskId) => {
+      app.log.warn({ err, taskId }, 'Failed to renew task lease')
+    })
+    : undefined
 
   if (enableTasks) {
     // Advertise which task operations we support. `tasks/list` is only offered
@@ -265,6 +273,7 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     taskStore,
     taskWaiters,
     shutdownSignal: shutdownController.signal,
+    taskLeases,
     jsonSchemaValidator,
     authPreHandler: mcpAuthPreHandler
   })
@@ -272,6 +281,10 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
   // Add close hook to clean up Redis connections and authorization components
   app.addHook('onClose', async () => {
     clearInterval(sessionCleanupTimer)
+
+    // Tasks still running here are abandoned: stop vouching for them so their
+    // leases lapse and other instances report them failed.
+    taskLeases?.close()
 
     // Clean up all SSE streams and sessions
     const unsubscribePromises: Promise<void>[] = []

@@ -3,7 +3,7 @@ import type { TestContext } from 'node:test'
 import type { Redis } from 'ioredis'
 import { createTestRedis, cleanupRedis } from './redis-test-utils.ts'
 import { RedisTaskStore } from '../src/stores/redis-task-store.ts'
-import { TaskLimitError } from '../src/stores/task-store.ts'
+import { TaskLimitError, TASK_OWNER_LOST } from '../src/stores/task-store.ts'
 import type { TaskRecord } from '../src/stores/task-store.ts'
 import { InvalidTaskCursorError } from '../src/stores/task-store.ts'
 
@@ -337,6 +337,28 @@ describe('RedisTaskStore', () => {
     t.assert.deepStrictEqual(await redis.zrange('mcp:tasks:owner:user-1', 0, -1), ['b'])
   })
 
+  test('fails orphaned tasks so they stop holding the caller\'s quota', async (t: TestContext) => {
+    store = new RedisTaskStore({ redis, maxTasksPerPrincipal: 3 })
+    const base = Date.now()
+    const at = (ms: number) => new Date(base + ms).toISOString()
+    // 'b' was running on an instance that died: its lease lapsed, nobody polled it
+    await store.create(record({ taskId: 'a', authSubject: 'user-1', createdAt: at(0), leaseExpiresAt: base + 60_000 }))
+    await store.create(record({ taskId: 'b', authSubject: 'user-1', createdAt: at(1), leaseExpiresAt: base - 1 }))
+    await store.create(record({ taskId: 'c', authSubject: 'user-1', createdAt: at(2), leaseExpiresAt: base - 1 }))
+
+    await store.create(record({ taskId: 'd', authSubject: 'user-1', createdAt: at(3) }))
+
+    // 'b' was failed and, as the oldest finished task, evicted; 'c' stays, failed
+    t.assert.strictEqual((await store.get('a'))?.status, 'working')
+    t.assert.strictEqual(await store.get('b'), null)
+    const orphan = await store.get('c')
+    t.assert.strictEqual(orphan?.status, 'failed')
+    t.assert.strictEqual(orphan?.statusMessage, TASK_OWNER_LOST)
+    t.assert.strictEqual((orphan?.outcome as any)?.error?.message, TASK_OWNER_LOST)
+    t.assert.ok(await redis.ttl('mcp:task:c') > 0)
+    t.assert.ok(await store.get('d'))
+  })
+
   test('tasks created on one store instance are visible from another', async (t: TestContext) => {
     await store.create(record({ authSubject: 'user-1' }))
 
@@ -346,5 +368,48 @@ describe('RedisTaskStore', () => {
 
     t.assert.strictEqual(task?.taskId, 'task-1')
     t.assert.deepStrictEqual((await other.list('user-1')).tasks.map(x => x.taskId), ['task-1'])
+  })
+
+  test('fails a task whose lease has lapsed, keeping its retention', async (t: TestContext) => {
+    await store.create(record({ leaseExpiresAt: Date.now() - 1 }))
+    const ttlBefore = await redis.pttl('mcp:task:task-1')
+    const outcome = { jsonrpc: '2.0' as const, id: 1, error: { code: -32603, message: 'lost' } }
+
+    const failed = await store.failExpiredLease('task-1', { statusMessage: 'Task owner lost', outcome })
+    t.assert.strictEqual(failed?.status, 'failed')
+    t.assert.strictEqual(failed?.statusMessage, 'Task owner lost')
+    t.assert.deepStrictEqual(failed?.outcome, outcome)
+    t.assert.deepStrictEqual(await store.get('task-1'), failed)
+    const ttlAfter = await redis.pttl('mcp:task:task-1')
+    t.assert.ok(ttlAfter > 0 && ttlAfter <= ttlBefore)
+    // Once terminal the lease can no longer be renewed
+    t.assert.strictEqual(await store.renewLease('task-1', 1000), false)
+  })
+
+  test('a renewed lease is not reaped', async (t: TestContext) => {
+    await store.create(record({ leaseExpiresAt: Date.now() - 1 }))
+    const outcome = { jsonrpc: '2.0' as const, id: 1, error: { code: -32603, message: 'lost' } }
+
+    t.assert.strictEqual(await store.renewLease('task-1', 60_000), true)
+    const task = await store.get('task-1')
+    t.assert.ok(task!.leaseExpiresAt! > Date.now())
+    t.assert.strictEqual(task!.ttl, 60_000)
+
+    const after = await store.failExpiredLease('task-1', { statusMessage: 'x', outcome })
+    t.assert.strictEqual(after?.status, 'working')
+  })
+
+  test('tasks without a lease, terminal or missing tasks are not reaped', async (t: TestContext) => {
+    const outcome = { jsonrpc: '2.0' as const, id: 1, error: { code: -32603, message: 'lost' } }
+    await store.create(record({ taskId: 'none', ttl: null }))
+    await store.create(record({ taskId: 'done', leaseExpiresAt: Date.now() - 1 }))
+    await store.updateStatus('done', 'completed')
+
+    const none = await store.failExpiredLease('none', { statusMessage: 'x', outcome })
+    t.assert.strictEqual(none?.status, 'working')
+    t.assert.strictEqual(none?.ttl, null)
+    t.assert.strictEqual((await store.failExpiredLease('done', { statusMessage: 'x', outcome }))?.status, 'completed')
+    t.assert.strictEqual(await store.failExpiredLease('missing', { statusMessage: 'x', outcome }), null)
+    t.assert.strictEqual(await store.renewLease('missing', 1000), false)
   })
 })

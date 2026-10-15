@@ -6,7 +6,7 @@ import mcpPlugin from '../src/index.ts'
 import { JSONRPC_VERSION, LATEST_PROTOCOL_VERSION, METHOD_NOT_FOUND, INVALID_PARAMS } from '../src/schema.ts'
 import type { Task, CreateTaskResult, ListTasksResult, CallToolResult } from '../src/schema.ts'
 import { MemoryTaskStore } from '../src/stores/memory-task-store.ts'
-import { canTransition, isTerminal, taskHasExpired, toWireTask, InvalidTaskCursorError, DEFAULT_TASK_PAGE_SIZE, TaskLimitError, TASK_LIMIT_REACHED } from '../src/stores/task-store.ts'
+import { canTransition, isTerminal, taskHasExpired, toWireTask, InvalidTaskCursorError, DEFAULT_TASK_PAGE_SIZE, TaskLimitError, TASK_LIMIT_REACHED, TaskLeases, TASK_OWNER_LOST } from '../src/stores/task-store.ts'
 import type { TaskRecord } from '../src/stores/task-store.ts'
 import { resolveTaskAugmentation, RELATED_TASK_META_KEY } from '../src/handlers.ts'
 import { createTestAuthConfig, createTestJWT, setupMockAgent, generateMockJWKSResponse } from './auth-test-utils.ts'
@@ -123,6 +123,58 @@ describe('task store', () => {
     t.assert.strictEqual('method' in wire, false)
     t.assert.strictEqual('outcome' in wire, false)
     t.assert.strictEqual(wire.taskId, 'task-1')
+  })
+
+  test('toWireTask drops the lease', (t: TestContext) => {
+    const wire = toWireTask(record({ leaseExpiresAt: Date.now() }))
+    t.assert.strictEqual('leaseExpiresAt' in wire, false)
+  })
+
+  test('MemoryTaskStore fails a task whose lease has lapsed', async (t: TestContext) => {
+    const store = new MemoryTaskStore()
+    await store.create(record({ leaseExpiresAt: Date.now() - 1 }))
+    const outcome = { jsonrpc: '2.0' as const, id: 1, error: { code: -32603, message: 'lost' } }
+
+    const failed = await store.failExpiredLease('task-1', { statusMessage: 'Task owner lost', outcome })
+    t.assert.strictEqual(failed?.status, 'failed')
+    t.assert.strictEqual(failed?.statusMessage, 'Task owner lost')
+    t.assert.deepStrictEqual((await store.get('task-1'))?.outcome, outcome)
+    // Once terminal the lease can no longer be renewed
+    t.assert.strictEqual(await store.renewLease('task-1', 1000), false)
+  })
+
+  test('MemoryTaskStore leaves tasks with a live or no lease alone', async (t: TestContext) => {
+    const store = new MemoryTaskStore()
+    const outcome = { jsonrpc: '2.0' as const, id: 1, error: { code: -32603, message: 'lost' } }
+    await store.create(record({ taskId: 'live', leaseExpiresAt: Date.now() - 1 }))
+    await store.create(record({ taskId: 'none' }))
+
+    // A renewal that lands before the reaper wins
+    t.assert.strictEqual(await store.renewLease('live', 60_000), true)
+    t.assert.strictEqual((await store.failExpiredLease('live', { statusMessage: 'x', outcome }))?.status, 'working')
+    t.assert.strictEqual((await store.failExpiredLease('none', { statusMessage: 'x', outcome }))?.status, 'working')
+    t.assert.strictEqual(await store.failExpiredLease('missing', { statusMessage: 'x', outcome }), null)
+  })
+
+  test('TaskLeases renews until stopped and stops everything on close', async (t: TestContext) => {
+    const store = new MemoryTaskStore()
+    await store.create(record({ taskId: 'a' }))
+    await store.create(record({ taskId: 'b' }))
+    const leases = new TaskLeases(store, 30)
+    t.after(() => leases.close())
+
+    await leases.start('a')
+    await leases.start('b')
+    await new Promise(resolve => setTimeout(resolve, 100))
+    // Renewals kept both leases in the future, well past the initial 30ms
+    t.assert.ok((await store.get('a'))!.leaseExpiresAt! > Date.now())
+    t.assert.ok((await store.get('b'))!.leaseExpiresAt! > Date.now())
+
+    leases.stop('a')
+    leases.close()
+    await new Promise(resolve => setTimeout(resolve, 100))
+    t.assert.ok((await store.get('a'))!.leaseExpiresAt! <= Date.now())
+    t.assert.ok((await store.get('b'))!.leaseExpiresAt! <= Date.now())
   })
 
   test('MemoryTaskStore enforces the status machine', async (t: TestContext) => {
@@ -263,6 +315,42 @@ describe('task store', () => {
     t.assert.ok(await store.get('d'))
   })
 
+  test('MemoryTaskStore fails orphaned tasks so they stop holding the caller\'s quota', async (t: TestContext) => {
+    // 'a' was running on an instance that died: its lease lapsed, nobody polled it
+    const store = new MemoryTaskStore({ maxTasksPerPrincipal: 2 })
+    await store.create(record({ taskId: 'a', authSubject: 'user-1', leaseExpiresAt: Date.now() - 1 }))
+    await store.create(record({ taskId: 'b', authSubject: 'user-1', leaseExpiresAt: Date.now() + 60_000 }))
+
+    await store.create(record({ taskId: 'c', authSubject: 'user-1' }))
+
+    t.assert.strictEqual(await store.get('a'), null)
+    t.assert.strictEqual((await store.get('b'))?.status, 'working')
+    t.assert.ok(await store.get('c'))
+
+    // Live leases still count: 'b' and 'c' fill the quota
+    await t.assert.rejects(
+      () => store.create(record({ taskId: 'd', authSubject: 'user-1' })),
+      (err: any) => err instanceof TaskLimitError
+    )
+  })
+
+  test('MemoryTaskStore records orphaned tasks as failed when reclaiming quota', async (t: TestContext) => {
+    const store = new MemoryTaskStore({ maxTasksPerPrincipal: 3 })
+    await store.create(record({ taskId: 'a', authSubject: 'user-1' }))
+    await store.updateStatus('a', 'completed')
+    await store.create(record({ taskId: 'b', authSubject: 'user-1', leaseExpiresAt: Date.now() - 1 }))
+    await store.create(record({ taskId: 'c', authSubject: 'user-1' }))
+
+    await store.create(record({ taskId: 'd', authSubject: 'user-1' }))
+
+    // The oldest finished task makes room; the orphan stays, now failed
+    t.assert.strictEqual(await store.get('a'), null)
+    const orphan = await store.get('b')
+    t.assert.strictEqual(orphan?.status, 'failed')
+    t.assert.strictEqual(orphan?.statusMessage, TASK_OWNER_LOST)
+    t.assert.strictEqual((orphan?.outcome as any)?.error?.message, TASK_OWNER_LOST)
+  })
+
   test('MemoryTaskStore frees store capacity held by another caller\'s finished tasks', async (t: TestContext) => {
     // The scenario from #249: one caller's finished tasks fill the whole store
     const store = new MemoryTaskStore({ maxTasks: 3, maxTasksPerPrincipal: 3 })
@@ -369,6 +457,28 @@ describe('tasks over the wire', () => {
     // Asked for immediately, while the tool is still sleeping
     const body = await call(app, 'tasks/result', { taskId })
     t.assert.strictEqual(body.result.content[0].text, '2')
+  })
+
+  test('a task running longer than its lease keeps renewing it and completes', async (t: TestContext) => {
+    const app = await buildApp(t, { taskLeaseMs: 30 })
+    app.mcpAddTool({
+      name: 'slower-than-lease',
+      description: 'Outlives several lease periods',
+      inputSchema: Type.Object({}),
+      execution: { taskSupport: 'optional' }
+    } as any, async (): Promise<CallToolResult> => {
+      await new Promise(resolve => setTimeout(resolve, 200))
+      return { content: [{ type: 'text', text: 'still alive' }] }
+    })
+
+    const created = await call(app, 'tools/call', { name: 'slower-than-lease', arguments: {}, task: {} })
+    const taskId = (created.result as CreateTaskResult).task.taskId
+
+    await new Promise(resolve => setTimeout(resolve, 100))
+    t.assert.strictEqual((await call(app, 'tasks/get', { taskId })).result.status, 'working')
+
+    const body = await call(app, 'tasks/result', { taskId })
+    t.assert.strictEqual(body.result.content[0].text, 'still alive')
   })
 
   test('a tool returning isError makes the task fail', async (t: TestContext) => {

@@ -4,10 +4,12 @@ import type { TaskStore, TaskRecord, TaskOutcome, TaskListOptions, TaskListPage,
 import {
   DEFAULT_TASK_MAX_PER_PRINCIPAL,
   TaskLimitError,
+  TASK_OWNER_LOST,
   canTransition,
   decodeTaskCursor,
   encodeTaskCursor,
   isTerminal,
+  ownerLostOutcome,
   taskPageLimit,
   validateTaskLimit
 } from './task-store.ts'
@@ -20,12 +22,15 @@ const ANONYMOUS_INDEX_KEY = 'mcp:tasks:anonymous'
 // concurrent creates on different instances cannot overshoot it.
 //
 // KEYS: task key, owner index
-// ARGV: task JSON, expiry seconds (-1 = none), score, task id, cap, task key prefix
+// ARGV: task JSON, expiry seconds (-1 = none), score, task id, cap, task key prefix,
+//       then the status message, outcome JSON and timestamp for orphaned tasks
 //
 // The owner index is a sorted set of task ids scored by creation time (the same
 // one `list` pages through). Ids whose task key has expired are pruned first;
-// then, at the cap, the oldest finished tasks are evicted. Returns 0 (storing
-// nothing) when the owner is at the cap with nothing finished to evict. Task
+// then, at the cap, tasks whose lease has lapsed (their instance died) are
+// failed, as failExpiredLease would, and the oldest finished tasks are evicted.
+// Returns 0 (storing nothing) when the owner is at the cap with nothing
+// finished to evict. Task
 // keys are derived from index members, so this needs a standalone Redis (or
 // every key in one slot).
 const CREATE_SCRIPT = `
@@ -42,13 +47,21 @@ end
 
 local need = #live - cap + 1
 if need > 0 then
+  local t = redis.call('TIME')
+  local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
   local victims = {}
   for _, id in ipairs(live) do
-    if #victims >= need then break end
     local ok, cur = pcall(cjson.decode, redis.call('GET', prefix .. id))
     local s = ok and type(cur) == 'table' and cur.status
     if s == 'completed' or s == 'failed' or s == 'cancelled' then
-      table.insert(victims, id)
+      if #victims < need then table.insert(victims, id) end
+    elseif s and type(cur.leaseExpiresAt) == 'number' and cur.leaseExpiresAt <= now then
+      cur.status = 'failed'
+      cur.statusMessage = ARGV[7]
+      cur.outcome = cjson.decode(ARGV[8])
+      cur.lastUpdatedAt = ARGV[9]
+      redis.call('SET', prefix .. id, cjson.encode(cur), 'KEEPTTL')
+      if #victims < need then table.insert(victims, id) end
     end
   end
   if #victims < need then return 0 end
@@ -141,7 +154,10 @@ export class RedisTaskStore implements TaskStore {
       new Date(task.createdAt).getTime(),
       task.taskId,
       this.maxTasksPerPrincipal,
-      TASK_KEY_PREFIX
+      TASK_KEY_PREFIX,
+      TASK_OWNER_LOST,
+      JSON.stringify(ownerLostOutcome()),
+      new Date().toISOString()
     )
     if (stored !== 1) {
       throw new TaskLimitError(this.maxTasksPerPrincipal)
@@ -216,6 +232,66 @@ export class RedisTaskStore implements TaskStore {
       throw new Error(`Task ${taskId} is already in terminal status '${result}'`)
     }
     return updated
+  }
+
+  async renewLease (taskId: string, leaseMs: number): Promise<boolean> {
+    // The expiry is computed from the Redis server clock, as is the check in
+    // failExpiredLease, so clock skew between instances cannot fail a live task.
+    const result = await this.redis.eval(
+      `local raw = redis.call('GET', KEYS[1])
+       if not raw then return 0 end
+       local ok, cur = pcall(cjson.decode, raw)
+       if not ok then return 0 end
+       local s = cur.status
+       if s == 'completed' or s == 'failed' or s == 'cancelled' then return 0 end
+       local t = redis.call('TIME')
+       cur.leaseExpiresAt = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000) + tonumber(ARGV[1])
+       redis.call('SET', KEYS[1], cjson.encode(cur), 'KEEPTTL')
+       return 1`,
+      1,
+      this.key(taskId),
+      String(leaseMs)
+    )
+    return result === 1
+  }
+
+  async failExpiredLease (
+    taskId: string,
+    options: { statusMessage: string, outcome: TaskOutcome }
+  ): Promise<TaskRecord | null> {
+    // Compare-and-set in one script: only a non-terminal task whose lease has
+    // lapsed is failed, so a renewal (or completion) that lands first wins.
+    const raw = await this.redis.eval(
+      `local raw = redis.call('GET', KEYS[1])
+       if not raw then return false end
+       local ok, cur = pcall(cjson.decode, raw)
+       if not ok then return false end
+       local s = cur.status
+       if s == 'completed' or s == 'failed' or s == 'cancelled' then return raw end
+       if type(cur.leaseExpiresAt) ~= 'number' then return raw end
+       local t = redis.call('TIME')
+       local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+       if cur.leaseExpiresAt > now then return raw end
+       cur.status = 'failed'
+       cur.statusMessage = ARGV[1]
+       cur.outcome = cjson.decode(ARGV[2])
+       cur.lastUpdatedAt = ARGV[3]
+       local updated = cjson.encode(cur)
+       redis.call('SET', KEYS[1], updated, 'KEEPTTL')
+       return updated`,
+      1,
+      this.key(taskId),
+      options.statusMessage,
+      JSON.stringify(options.outcome),
+      new Date().toISOString()
+    ) as string | null
+
+    if (!raw) return null
+    try {
+      return JSON.parse(raw)
+    } catch {
+      return null
+    }
   }
 
   async list (authSubject?: string, options: TaskListOptions = {}): Promise<TaskListPage> {

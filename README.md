@@ -401,10 +401,22 @@ with a per-caller sorted set (`mcp:tasks:owner:<subject>`, or `mcp:tasks:anonymo
 holds across instances. Custom `TaskStore` implementations should throw `TaskLimitError` from
 `create()` to produce the same response.
 
+The instance running a task holds a lease on it and renews it every third of `taskLeaseMs`
+(default 30 seconds). If that instance dies or shuts down before the task finishes, renewals
+stop. Once the lease lapses, the next `tasks/get` or `tasks/result` (including one already
+waiting) marks the task `failed` with the status message "Task owner lost", so the task no
+longer reads `working` until its ttl runs out. A caller at `taskMaxRetainedPerPrincipal` gets
+the same treatment for their orphaned tasks when they create a new one, so tasks nobody polls
+cannot keep them locked out of their quota. The check is a compare-and-set, so a renewal or
+completion that lands first always wins. With Redis, the lease is set and checked against the
+Redis server clock, so clock skew between instances can never fail a task that is still running,
+nor delay failing one whose owner is gone:
+
 ```typescript
 await app.register(mcpPlugin, {
   enableTasks: true,
-  taskMaxRetainedPerPrincipal: 20 // tasks each caller may keep, finished ones included
+  taskMaxRetainedPerPrincipal: 20, // tasks each caller may keep, finished ones included
+  taskLeaseMs: 30_000 // a dead instance's tasks are failed this long after its last renewal
 })
 ```
 

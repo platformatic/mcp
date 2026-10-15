@@ -37,8 +37,8 @@ import type { RequestId } from './schema.ts'
 
 import type { MCPTool, MCPResource, MCPPrompt, MCPPluginOptions, ResourceHandlers, McpCallToolOutcome, ToolAccessOperation, MCPToolCallCompleteEvent, TracerLike } from './types.ts'
 import type { SessionStore } from './stores/session-store.ts'
-import type { TaskStore, TaskRecord, TaskWaiters } from './stores/task-store.ts'
-import { InvalidTaskCursorError, TaskLimitError, TASK_LIMIT_REACHED, decodeTaskCursor, isTerminal, toWireTask } from './stores/task-store.ts'
+import type { TaskStore, TaskRecord, TaskWaiters, TaskLeases } from './stores/task-store.ts'
+import { InvalidTaskCursorError, TaskLimitError, TASK_LIMIT_REACHED, TASK_OWNER_LOST, decodeTaskCursor, isTerminal, ownerLostOutcome, toWireTask } from './stores/task-store.ts'
 import type { AuthorizationContext } from './types/auth-types.ts'
 import {
   supportsTasks,
@@ -77,6 +77,7 @@ export type HandlerDependencies = {
   taskWaiters?: TaskWaiters
   /** Aborted when the plugin starts closing, to release blocked calls */
   shutdownSignal?: AbortSignal
+  taskLeases?: TaskLeases
   jsonSchemaValidator?: JsonSchemaValidator
   sessionId?: string
   /** The revision this client negotiated; responses are shaped to match it */
@@ -1058,12 +1059,40 @@ async function handleTasksGet (
     return createError(request.id, INVALID_PARAMS, 'Missing required parameter: taskId')
   }
 
-  const task = assertTaskAccess(await taskStore.get(taskId), dependencies)
+  const found = assertTaskAccess(await taskStore.get(taskId), dependencies)
+  const task = found && await failIfOwnerLost(found, dependencies)
   if (!task) {
     return createError(request.id, INVALID_PARAMS, 'Failed to retrieve task: Task not found')
   }
 
   return createResponse(request.id, toWireTask(task))
+}
+
+/**
+ * If the instance running `task` has stopped renewing its lease (it died or
+ * shut down), mark the task failed rather than let it read `working` until its
+ * ttl. The store does this as a compare-and-set, so a renewal or completion that
+ * lands first wins. Returns the task as it now stands.
+ *
+ * Whether the lease has lapsed is decided by the store alone (RedisTaskStore
+ * uses the Redis server clock): comparing against this instance's clock would
+ * let a reader running behind keep a dead task `working`. The store is only
+ * skipped for tasks that cannot have a lapsed lease at all.
+ */
+async function failIfOwnerLost (task: TaskRecord, dependencies: HandlerDependencies): Promise<TaskRecord | null> {
+  const { taskStore, taskWaiters } = dependencies
+  if (!taskStore?.failExpiredLease || isTerminal(task.status) || typeof task.leaseExpiresAt !== 'number') {
+    return task
+  }
+
+  const current = await taskStore.failExpiredLease(task.taskId, {
+    statusMessage: TASK_OWNER_LOST,
+    outcome: ownerLostOutcome()
+  })
+  if (current && isTerminal(current.status)) {
+    taskWaiters?.notify(current)
+  }
+  return current
 }
 
 /**
@@ -1132,6 +1161,7 @@ async function awaitTaskTerminal (
     // The poll timer elapsed (or the accelerator aborted); the shared store is
     // the source of truth, so re-read it before deciding whether to loop again.
     task = await taskStore.get(taskId)
+    if (task) task = await failIfOwnerLost(task, dependencies)
   }
 
   return task
@@ -1151,7 +1181,8 @@ async function handleTasksResult (
     return createError(request.id, INVALID_PARAMS, 'Missing required parameter: taskId')
   }
 
-  let task = assertTaskAccess(await taskStore.get(taskId), dependencies)
+  const found = assertTaskAccess(await taskStore.get(taskId), dependencies)
+  let task = found && await failIfOwnerLost(found, dependencies)
   if (!task) {
     return createError(request.id, INVALID_PARAMS, 'Failed to retrieve task: Task not found')
   }
@@ -1343,7 +1374,7 @@ async function runToolCallAsTask (
   execute: () => Promise<JSONRPCResponse | JSONRPCError>,
   dependencies: HandlerDependencies
 ): Promise<JSONRPCResponse | JSONRPCError> {
-  const { taskStore, taskWaiters, app } = dependencies
+  const { taskStore, taskWaiters, taskLeases, app } = dependencies
   if (!taskStore) {
     return createError(request.id, METHOD_NOT_FOUND, 'Tasks are not enabled on this server')
   }
@@ -1356,6 +1387,12 @@ async function runToolCallAsTask (
       return createError(request.id, TASK_LIMIT_REACHED, 'Task limit reached')
     }
     throw error
+  }
+  try {
+    await taskLeases?.start(task.taskId)
+  } catch (error) {
+    // Without a lease the task simply cannot be reaped early; it still runs
+    app.log.warn({ err: error, taskId: task.taskId }, 'Failed to take task lease')
   }
 
   // Deliberately not awaited: the point of a task is to return control now.
@@ -1390,6 +1427,8 @@ async function runToolCallAsTask (
     } catch (error) {
       // The task was cancelled or expired while the tool was still running
       app.log.debug({ err: error, taskId: task.taskId }, 'Could not record task outcome')
+    } finally {
+      taskLeases?.stop(task.taskId)
     }
   })()
 

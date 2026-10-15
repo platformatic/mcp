@@ -3,12 +3,15 @@ import type { TaskStore, TaskRecord, TaskOutcome, TaskListOptions, TaskListPage 
 import {
   DEFAULT_TASK_MAX_PER_PRINCIPAL,
   TaskLimitError,
+  TASK_OWNER_LOST,
   canTransition,
   decodeTaskCursor,
   encodeTaskCursor,
   isAfterTaskCursor,
   isTerminal,
+  ownerLostOutcome,
   taskHasExpired,
+  taskLeaseExpired,
   taskPageLimit,
   validateTaskLimit
 } from './task-store.ts'
@@ -43,6 +46,7 @@ export class MemoryTaskStore implements TaskStore {
     // with results it never collects until their ttl runs out.
     if (this.count(ownedBy) >= this.maxTasksPerPrincipal) {
       this.sweepExpired()
+      this.failLapsedLeases(ownedBy)
       if (this.count(ownedBy) >= this.maxTasksPerPrincipal && !this.evictOldestFinished(ownedBy)) {
         throw new TaskLimitError(this.maxTasksPerPrincipal)
       }
@@ -50,6 +54,7 @@ export class MemoryTaskStore implements TaskStore {
 
     if (this.tasks.size >= this.maxTasks) {
       this.sweepExpired()
+      this.failLapsedLeases(() => true)
       // Prefer the caller's own finished work; failing that, the oldest
       // finished task of anyone, as stale results matter less than new work.
       if (
@@ -80,6 +85,26 @@ export class MemoryTaskStore implements TaskStore {
       }
     }
     return false
+  }
+
+  /**
+   * Fail the tasks whose running instance stopped renewing their lease, so they
+   * can be evicted like any finished task. Otherwise an orphan nobody polls
+   * would hold a slot until its ttl runs out.
+   */
+  private failLapsedLeases (predicate: (task: TaskRecord) => boolean): void {
+    const now = Date.now()
+    for (const [taskId, task] of this.tasks) {
+      if (predicate(task) && taskLeaseExpired(task, now)) {
+        this.tasks.set(taskId, {
+          ...task,
+          status: 'failed',
+          statusMessage: TASK_OWNER_LOST,
+          outcome: ownerLostOutcome(),
+          lastUpdatedAt: new Date(now).toISOString()
+        })
+      }
+    }
   }
 
   private sweepExpired (): void {
@@ -138,6 +163,36 @@ export class MemoryTaskStore implements TaskStore {
 
     this.tasks.set(taskId, updated)
     return { ...updated }
+  }
+
+  async renewLease (taskId: string, leaseMs: number): Promise<boolean> {
+    const task = this.tasks.get(taskId)
+    if (!task || taskHasExpired(task) || isTerminal(task.status)) return false
+    this.tasks.set(taskId, { ...task, leaseExpiresAt: Date.now() + leaseMs })
+    return true
+  }
+
+  async failExpiredLease (
+    taskId: string,
+    options: { statusMessage: string, outcome: TaskOutcome }
+  ): Promise<TaskRecord | null> {
+    // Check and write with no intervening await, so a renewal cannot interleave
+    const task = this.tasks.get(taskId)
+    if (!task || taskHasExpired(task)) {
+      this.tasks.delete(taskId)
+      return null
+    }
+    if (!taskLeaseExpired(task)) return { ...task }
+
+    const failed: TaskRecord = {
+      ...task,
+      status: 'failed',
+      statusMessage: options.statusMessage,
+      outcome: options.outcome,
+      lastUpdatedAt: new Date().toISOString()
+    }
+    this.tasks.set(taskId, failed)
+    return { ...failed }
   }
 
   async list (authSubject?: string, options: TaskListOptions = {}): Promise<TaskListPage> {
