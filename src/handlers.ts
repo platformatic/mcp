@@ -923,7 +923,7 @@ const DEFAULT_POLL_INTERVAL = 1000
 const DEFAULT_TASK_TTL = 60_000
 
 /** Ceiling on retention, so a client cannot pin resources indefinitely */
-export const MAX_TASK_TTL = 3600_000
+const MAX_TASK_TTL = 3600_000
 
 /**
  * Floor on retention. A smaller ttl (0 included) would let the task expire

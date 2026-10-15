@@ -22,7 +22,6 @@ import oauthClientPlugin from './auth/oauth-client.ts'
 import authRoutesPlugin from './routes/auth-routes.ts'
 import { quitWithTimeout } from './redis-quit-with-timeout.ts'
 import { createJsonSchemaValidator } from './validation/json-schema-validator.ts'
-import { MAX_TASK_TTL } from './handlers.ts'
 import {
   createMcpClient,
   type McpClient,
@@ -110,11 +109,6 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     if (value !== undefined && !(Number.isSafeInteger(value) && (value as number) > 0)) {
       throw new TypeError(`${name} must be a positive integer number of milliseconds, got ${String(value)}`)
     }
-  }
-  // An unset default is capped by the ceiling, but an explicit one above it is a mistake
-  const taskMaxTtlMs = opts.taskMaxTtlMs ?? MAX_TASK_TTL
-  if (opts.taskDefaultTtlMs !== undefined && opts.taskDefaultTtlMs > taskMaxTtlMs) {
-    throw new TypeError(`taskDefaultTtlMs (${opts.taskDefaultTtlMs}) must not exceed taskMaxTtlMs (${taskMaxTtlMs})`)
   }
   const tools = new Map<string, MCPTool>()
   const resources = new Map<string, MCPResource>()
