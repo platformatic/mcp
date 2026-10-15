@@ -7,6 +7,9 @@ import { TaskLimitError, TASK_OWNER_LOST } from '../src/stores/task-store.ts'
 import type { TaskRecord } from '../src/stores/task-store.ts'
 import { InvalidTaskCursorError } from '../src/stores/task-store.ts'
 
+const ISS = 'https://idp-a.example.com:8443'
+const USER_1_INDEX = `mcp:tasks:owner:${encodeURIComponent(ISS)}:user-1`
+
 function record (overrides: Partial<TaskRecord> = {}): TaskRecord {
   const now = new Date().toISOString()
   return {
@@ -38,7 +41,7 @@ describe('RedisTaskStore', () => {
   })
 
   test('round-trips a task', async (t: TestContext) => {
-    await store.create(record({ authSubject: 'user-1' }))
+    await store.create(record({ authSubject: 'user-1', authIssuer: ISS }))
 
     const task = await store.get('task-1')
     t.assert.strictEqual(task?.taskId, 'task-1')
@@ -139,43 +142,67 @@ describe('RedisTaskStore', () => {
   })
 
   test('list is scoped to the authorization subject', async (t: TestContext) => {
-    await store.create(record({ taskId: 'a', authSubject: 'user-1' }))
-    await store.create(record({ taskId: 'b', authSubject: 'user-2' }))
+    await store.create(record({ taskId: 'a', authSubject: 'user-1', authIssuer: ISS }))
+    await store.create(record({ taskId: 'b', authSubject: 'user-2', authIssuer: ISS }))
     await store.create(record({ taskId: 'c' }))
 
-    t.assert.deepStrictEqual((await store.list('user-1')).tasks.map(x => x.taskId), ['a'])
-    t.assert.deepStrictEqual((await store.list('user-2')).tasks.map(x => x.taskId), ['b'])
+    t.assert.deepStrictEqual((await store.list({ subject: 'user-1', issuer: ISS })).tasks.map(x => x.taskId), ['a'])
+    t.assert.deepStrictEqual((await store.list({ subject: 'user-2', issuer: ISS })).tasks.map(x => x.taskId), ['b'])
     t.assert.deepStrictEqual((await store.list()).tasks.map(x => x.taskId), ['c'])
   })
 
+  test('list is scoped to the issuer as well as the subject', async (t: TestContext) => {
+    await store.create(record({ taskId: 'a', authSubject: '12345', authIssuer: 'https://idp-a.example.com' }))
+    await store.create(record({ taskId: 'b', authSubject: '12345', authIssuer: 'https://idp-b.example.com' }))
+    // Created before issuers were recorded
+    await store.create(record({ taskId: 'legacy', authSubject: '12345' }))
+
+    t.assert.deepStrictEqual((await store.list({ subject: '12345', issuer: 'https://idp-a.example.com' })).tasks.map(x => x.taskId), ['a'])
+    t.assert.deepStrictEqual((await store.list({ subject: '12345', issuer: 'https://idp-b.example.com' })).tasks.map(x => x.taskId), ['b'])
+  })
+
+  test('owner index keys cannot be confused when issuer or subject contain ":"', async (t: TestContext) => {
+    await store.create(record({ taskId: 'x', authSubject: 'c', authIssuer: 'a:b' }))
+    await store.create(record({ taskId: 'y', authSubject: 'b:c', authIssuer: 'a' }))
+
+    t.assert.deepStrictEqual(await redis.zrange('mcp:tasks:owner:a%3Ab:c', 0, -1), ['x'])
+    t.assert.deepStrictEqual(await redis.zrange('mcp:tasks:owner:a:b%3Ac', 0, -1), ['y'])
+    t.assert.deepStrictEqual((await store.list({ subject: 'c', issuer: 'a:b' })).tasks.map(x => x.taskId), ['x'])
+    t.assert.deepStrictEqual((await store.list({ subject: 'b:c', issuer: 'a' })).tasks.map(x => x.taskId), ['y'])
+
+    await store.delete('x')
+    t.assert.strictEqual(await redis.exists('mcp:tasks:owner:a%3Ab:c'), 0)
+    t.assert.deepStrictEqual(await redis.zrange('mcp:tasks:owner:a:b%3Ac', 0, -1), ['y'])
+  })
+
   test('delete removes the task and its owner index entry', async (t: TestContext) => {
-    await store.create(record({ authSubject: 'user-1' }))
-    t.assert.strictEqual(await redis.zcard('mcp:tasks:owner:user-1'), 1)
+    await store.create(record({ authSubject: 'user-1', authIssuer: ISS }))
+    t.assert.strictEqual(await redis.zcard(USER_1_INDEX), 1)
     await store.delete('task-1')
 
     t.assert.strictEqual(await store.get('task-1'), null)
-    t.assert.strictEqual(await redis.zcard('mcp:tasks:owner:user-1'), 0)
+    t.assert.strictEqual(await redis.zcard(USER_1_INDEX), 0)
   })
 
   test('list prunes index entries whose task key has expired', async (t: TestContext) => {
-    await store.create(record({ taskId: 'a', authSubject: 'user-1' }))
-    await store.create(record({ taskId: 'b', authSubject: 'user-1' }))
+    await store.create(record({ taskId: 'a', authSubject: 'user-1', authIssuer: ISS }))
+    await store.create(record({ taskId: 'b', authSubject: 'user-1', authIssuer: ISS }))
     // Stand in for Redis expiring the task key on its own
     await redis.del('mcp:task:a')
 
-    t.assert.deepStrictEqual((await store.list('user-1')).tasks.map(x => x.taskId), ['b'])
-    t.assert.deepStrictEqual(await redis.zrange('mcp:tasks:owner:user-1', 0, -1), ['b'])
+    t.assert.deepStrictEqual((await store.list({ subject: 'user-1', issuer: ISS })).tasks.map(x => x.taskId), ['b'])
+    t.assert.deepStrictEqual(await redis.zrange(USER_1_INDEX, 0, -1), ['b'])
   })
 
   test('owner index expires no earlier than its longest-lived task', async (t: TestContext) => {
-    await store.create(record({ taskId: 'long', authSubject: 'user-1', ttl: 120_000 }))
-    await store.create(record({ taskId: 'short', authSubject: 'user-1', ttl: 10_000 }))
-    const ttl = await redis.ttl('mcp:tasks:owner:user-1')
+    await store.create(record({ taskId: 'long', authSubject: 'user-1', authIssuer: ISS, ttl: 120_000 }))
+    await store.create(record({ taskId: 'short', authSubject: 'user-1', authIssuer: ISS, ttl: 10_000 }))
+    const ttl = await redis.ttl(USER_1_INDEX)
     t.assert.ok(ttl > 100 && ttl <= 120, `expected ~120s, got ${ttl}`)
 
     // A task with unlimited retention keeps the index alive indefinitely
-    await store.create(record({ taskId: 'forever', authSubject: 'user-1', ttl: null }))
-    t.assert.strictEqual(await redis.ttl('mcp:tasks:owner:user-1'), -1)
+    await store.create(record({ taskId: 'forever', authSubject: 'user-1', authIssuer: ISS, ttl: null }))
+    t.assert.strictEqual(await redis.ttl(USER_1_INDEX), -1)
   })
 
   test('list paginates newest first across pages', async (t: TestContext) => {
@@ -183,15 +210,15 @@ describe('RedisTaskStore', () => {
     // Two tasks share a creation time to exercise the id tie-break
     const times = [0, 1, 2, 2, 3]
     for (let i = 0; i < times.length; i++) {
-      await store.create(record({ taskId: `t${i}`, authSubject: 'user-1', createdAt: new Date(base + times[i]).toISOString() }))
+      await store.create(record({ taskId: `t${i}`, authSubject: 'user-1', authIssuer: ISS, createdAt: new Date(base + times[i]).toISOString() }))
     }
-    await store.create(record({ taskId: 'other', authSubject: 'user-2', createdAt: new Date(base + 1).toISOString() }))
+    await store.create(record({ taskId: 'other', authSubject: 'user-2', authIssuer: ISS, createdAt: new Date(base + 1).toISOString() }))
 
     const seen: string[] = []
     let cursor: string | undefined
     let pages = 0
     do {
-      const page = await store.list('user-1', { cursor, limit: 2 })
+      const page = await store.list({ subject: 'user-1', issuer: ISS }, { cursor, limit: 2 })
       t.assert.ok(page.tasks.length <= 2)
       seen.push(...page.tasks.map(x => x.taskId))
       cursor = page.nextCursor
@@ -206,13 +233,13 @@ describe('RedisTaskStore', () => {
     const createdAt = new Date().toISOString()
     const ids = Array.from({ length: 7 }, (_, i) => `same-${i}`)
     for (const taskId of ids) {
-      await store.create(record({ taskId, authSubject: 'user-1', createdAt }))
+      await store.create(record({ taskId, authSubject: 'user-1', authIssuer: ISS, createdAt }))
     }
 
     const seen: string[] = []
     let cursor: string | undefined
     do {
-      const page = await store.list('user-1', { cursor, limit: 3 })
+      const page = await store.list({ subject: 'user-1', issuer: ISS }, { cursor, limit: 3 })
       seen.push(...page.tasks.map(x => x.taskId))
       cursor = page.nextCursor
     } while (cursor)
@@ -226,7 +253,7 @@ describe('RedisTaskStore', () => {
       const ids = ['t0', 't1', 't2', 't3', 't4', 't5']
       for (let i = 0; i < ids.length; i++) {
         const createdAt = new Date(tied ? base : base + i).toISOString()
-        await store.create(record({ taskId: ids[i], authSubject: 'user-1', createdAt }))
+        await store.create(record({ taskId: ids[i], authSubject: 'user-1', authIssuer: ISS, createdAt }))
       }
       // The two newest tasks have expired, but their index entries remain, so
       // the first batch yields only one live task and a second batch is needed
@@ -237,30 +264,30 @@ describe('RedisTaskStore', () => {
       const original = redis.zrevrangebyscore.bind(redis)
       let calls = 0
       t.mock.method(redis, 'zrevrangebyscore', async (...args: any[]) => {
-        if (++calls === 2) await redis.zrem('mcp:tasks:owner:user-1', 't5', 't4')
+        if (++calls === 2) await redis.zrem(USER_1_INDEX, 't5', 't4')
         return (original as any)(...args)
       })
 
-      const first = await store.list('user-1', { limit: 2 })
+      const first = await store.list({ subject: 'user-1', issuer: ISS }, { limit: 2 })
       t.assert.ok(calls >= 2, 'the walk should have needed a second batch')
       t.assert.deepStrictEqual(first.tasks.map(x => x.taskId), ['t3', 't2'])
       t.assert.ok(first.nextCursor)
 
-      const second = await store.list('user-1', { cursor: first.nextCursor, limit: 2 })
+      const second = await store.list({ subject: 'user-1', issuer: ISS }, { cursor: first.nextCursor, limit: 2 })
       t.assert.deepStrictEqual(second.tasks.map(x => x.taskId), ['t1', 't0'])
       t.assert.strictEqual(second.nextCursor, undefined)
     })
   }
 
   test('list rejects an invalid cursor', async (t: TestContext) => {
-    await t.assert.rejects(store.list('user-1', { cursor: 'not-a-cursor' }), InvalidTaskCursorError)
+    await t.assert.rejects(store.list({ subject: 'user-1', issuer: ISS }, { cursor: 'not-a-cursor' }), InvalidTaskCursorError)
   })
 
   test('list does not read other owners\' tasks', async (t: TestContext) => {
     for (let i = 0; i < 20; i++) {
-      await store.create(record({ taskId: `other-${i}`, authSubject: 'user-2' }))
+      await store.create(record({ taskId: `other-${i}`, authSubject: 'user-2', authIssuer: ISS }))
     }
-    await store.create(record({ taskId: 'mine', authSubject: 'user-1' }))
+    await store.create(record({ taskId: 'mine', authSubject: 'user-1', authIssuer: ISS }))
 
     // Record every key a read command touches while listing
     const monitor = await redis.monitor()
@@ -276,7 +303,7 @@ describe('RedisTaskStore', () => {
     })
     t.after(() => monitor.disconnect())
 
-    const page = await store.list('user-1')
+    const page = await store.list({ subject: 'user-1', issuer: ISS })
     // MONITOR delivers asynchronously; a round trip flushes it
     await redis.ping()
     await new Promise(resolve => setTimeout(resolve, 50))
@@ -289,15 +316,15 @@ describe('RedisTaskStore', () => {
 
   test('caps the tasks each caller retains, finished ones included', async (t: TestContext) => {
     store = new RedisTaskStore({ redis, maxTasksPerPrincipal: 2 })
-    await store.create(record({ taskId: 'a', authSubject: 'user-1' }))
-    await store.create(record({ taskId: 'b', authSubject: 'user-1' }))
+    await store.create(record({ taskId: 'a', authSubject: 'user-1', authIssuer: ISS }))
+    await store.create(record({ taskId: 'b', authSubject: 'user-1', authIssuer: ISS }))
 
     await t.assert.rejects(
-      () => store.create(record({ taskId: 'c', authSubject: 'user-1' })),
+      () => store.create(record({ taskId: 'c', authSubject: 'user-1', authIssuer: ISS })),
       (err: any) => err instanceof TaskLimitError && err.limit === 2
     )
     t.assert.strictEqual(await store.get('c'), null)
-    t.assert.strictEqual(await redis.zcard('mcp:tasks:owner:user-1'), 2)
+    t.assert.strictEqual(await redis.zcard(USER_1_INDEX), 2)
 
     // Another caller, and the anonymous bucket, have their own quota
     await store.create(record({ taskId: 'x', authSubject: 'user-2' }))
@@ -310,31 +337,31 @@ describe('RedisTaskStore', () => {
     store = new RedisTaskStore({ redis, maxTasksPerPrincipal: 3 })
     const base = Date.now()
     const at = (ms: number) => new Date(base + ms).toISOString()
-    await store.create(record({ taskId: 'a', authSubject: 'user-1', createdAt: at(0) }))
-    await store.create(record({ taskId: 'b', authSubject: 'user-1', createdAt: at(1) }))
-    await store.create(record({ taskId: 'c', authSubject: 'user-1', createdAt: at(2) }))
+    await store.create(record({ taskId: 'a', authSubject: 'user-1', authIssuer: ISS, createdAt: at(0) }))
+    await store.create(record({ taskId: 'b', authSubject: 'user-1', authIssuer: ISS, createdAt: at(1) }))
+    await store.create(record({ taskId: 'c', authSubject: 'user-1', authIssuer: ISS, createdAt: at(2) }))
     await store.updateStatus('b', 'completed')
     await store.updateStatus('c', 'cancelled')
 
-    await store.create(record({ taskId: 'd', authSubject: 'user-1', createdAt: at(3) }))
+    await store.create(record({ taskId: 'd', authSubject: 'user-1', authIssuer: ISS, createdAt: at(3) }))
 
     t.assert.ok(await store.get('a'))
     t.assert.strictEqual(await store.get('b'), null)
     t.assert.ok(await store.get('c'))
     t.assert.ok(await store.get('d'))
-    t.assert.deepStrictEqual(await redis.zrange('mcp:tasks:owner:user-1', 0, -1), ['a', 'c', 'd'])
+    t.assert.deepStrictEqual(await redis.zrange(USER_1_INDEX, 0, -1), ['a', 'c', 'd'])
     // There is no global index, only the per-owner one
     t.assert.strictEqual(await redis.exists('mcp:tasks'), 0)
   })
 
   test('expired tasks no longer count against the quota', async (t: TestContext) => {
     store = new RedisTaskStore({ redis, maxTasksPerPrincipal: 1 })
-    await store.create(record({ taskId: 'a', authSubject: 'user-1' }))
+    await store.create(record({ taskId: 'a', authSubject: 'user-1', authIssuer: ISS }))
     // Stand in for Redis expiring the task key
     await redis.del('mcp:task:a')
 
-    await store.create(record({ taskId: 'b', authSubject: 'user-1' }))
-    t.assert.deepStrictEqual(await redis.zrange('mcp:tasks:owner:user-1', 0, -1), ['b'])
+    await store.create(record({ taskId: 'b', authSubject: 'user-1', authIssuer: ISS }))
+    t.assert.deepStrictEqual(await redis.zrange(USER_1_INDEX, 0, -1), ['b'])
   })
 
   test('fails orphaned tasks so they stop holding the caller\'s quota', async (t: TestContext) => {
@@ -342,11 +369,11 @@ describe('RedisTaskStore', () => {
     const base = Date.now()
     const at = (ms: number) => new Date(base + ms).toISOString()
     // 'b' was running on an instance that died: its lease lapsed, nobody polled it
-    await store.create(record({ taskId: 'a', authSubject: 'user-1', createdAt: at(0), leaseExpiresAt: base + 60_000 }))
-    await store.create(record({ taskId: 'b', authSubject: 'user-1', createdAt: at(1), leaseExpiresAt: base - 1 }))
-    await store.create(record({ taskId: 'c', authSubject: 'user-1', createdAt: at(2), leaseExpiresAt: base - 1 }))
+    await store.create(record({ taskId: 'a', authSubject: 'user-1', authIssuer: ISS, createdAt: at(0), leaseExpiresAt: base + 60_000 }))
+    await store.create(record({ taskId: 'b', authSubject: 'user-1', authIssuer: ISS, createdAt: at(1), leaseExpiresAt: base - 1 }))
+    await store.create(record({ taskId: 'c', authSubject: 'user-1', authIssuer: ISS, createdAt: at(2), leaseExpiresAt: base - 1 }))
 
-    await store.create(record({ taskId: 'd', authSubject: 'user-1', createdAt: at(3) }))
+    await store.create(record({ taskId: 'd', authSubject: 'user-1', authIssuer: ISS, createdAt: at(3) }))
 
     // 'b' was failed and, as the oldest finished task, evicted; 'c' stays, failed
     t.assert.strictEqual((await store.get('a'))?.status, 'working')
@@ -360,14 +387,14 @@ describe('RedisTaskStore', () => {
   })
 
   test('tasks created on one store instance are visible from another', async (t: TestContext) => {
-    await store.create(record({ authSubject: 'user-1' }))
+    await store.create(record({ authSubject: 'user-1', authIssuer: ISS }))
 
     // A second instance stands in for a second server in the cluster
     const other = new RedisTaskStore({ redis })
     const task = await other.get('task-1')
 
     t.assert.strictEqual(task?.taskId, 'task-1')
-    t.assert.deepStrictEqual((await other.list('user-1')).tasks.map(x => x.taskId), ['task-1'])
+    t.assert.deepStrictEqual((await other.list({ subject: 'user-1', issuer: ISS })).tasks.map(x => x.taskId), ['task-1'])
   })
 
   test('fails a task whose lease has lapsed, keeping its retention', async (t: TestContext) => {

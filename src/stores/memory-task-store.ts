@@ -1,5 +1,5 @@
 import type { TaskStatus } from '../schema.ts'
-import type { TaskStore, TaskRecord, TaskOutcome, TaskListOptions, TaskListPage } from './task-store.ts'
+import type { TaskStore, TaskRecord, TaskOutcome, TaskListOptions, TaskListPage, TaskOwner } from './task-store.ts'
 import {
   DEFAULT_TASK_MAX_PER_PRINCIPAL,
   TaskLimitError,
@@ -8,6 +8,7 @@ import {
   decodeTaskCursor,
   encodeTaskCursor,
   isAfterTaskCursor,
+  isTaskOwner,
   isTerminal,
   ownerLostOutcome,
   taskHasExpired,
@@ -39,8 +40,8 @@ export class MemoryTaskStore implements TaskStore {
   async create (task: TaskRecord): Promise<void> {
     // No await until the task is stored, so concurrent creates cannot both
     // pass the capacity checks and overshoot them.
-    const owner = task.authSubject
-    const ownedBy = (t: TaskRecord) => t.authSubject === owner
+    const owner = { subject: task.authSubject, issuer: task.authIssuer }
+    const ownedBy = (t: TaskRecord) => isTaskOwner(t, owner)
 
     // Finished tasks count too: otherwise one caller could hold every slot
     // with results it never collects until their ttl runs out.
@@ -195,15 +196,15 @@ export class MemoryTaskStore implements TaskStore {
     return { ...failed }
   }
 
-  async list (authSubject?: string, options: TaskListOptions = {}): Promise<TaskListPage> {
+  async list (owner: TaskOwner = {}, options: TaskListOptions = {}): Promise<TaskListPage> {
     const after = options.cursor === undefined ? undefined : decodeTaskCursor(options.cursor)
     const limit = taskPageLimit(options.limit)
 
     const matches: Array<{ createdAt: number, task: TaskRecord }> = []
     for (const task of this.tasks.values()) {
       if (taskHasExpired(task)) continue
-      // Tasks bound to a subject are only ever visible to that subject
-      if (task.authSubject !== authSubject) continue
+      // Tasks bound to an owner are only ever visible to that owner
+      if (!isTaskOwner(task, owner)) continue
       const createdAt = new Date(task.createdAt).getTime()
       if (after && !isAfterTaskCursor(createdAt, task.taskId, after)) continue
       matches.push({ createdAt, task })
