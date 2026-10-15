@@ -48,6 +48,8 @@ export class StdioTransport {
   // what `initialize` agreed on and echo it like an HTTP client would.
   private protocolVersion: string | undefined
   private closePromise: Promise<void> | null = null
+  private onSigint: (() => void) | null = null
+  private onSigterm: (() => void) | null = null
 
   constructor (
     app: FastifyInstance,
@@ -98,20 +100,22 @@ export class StdioTransport {
       })
     })
 
-    // Handle process signals for graceful shutdown
-    process.on('SIGINT', () => {
+    // Handle process signals for graceful shutdown. Keep references so stop()
+    // can remove them; otherwise every transport leaks two listeners.
+    this.onSigint = () => {
       this.log('Received SIGINT, shutting down...')
       this.stop().catch(error => {
         this.logError('Error during shutdown:', error)
       })
-    })
-
-    process.on('SIGTERM', () => {
+    }
+    this.onSigterm = () => {
       this.log('Received SIGTERM, shutting down...')
       this.stop().catch(error => {
         this.logError('Error during shutdown:', error)
       })
-    })
+    }
+    process.on('SIGINT', this.onSigint)
+    process.on('SIGTERM', this.onSigterm)
 
     this.log('MCP stdio transport started successfully')
   }
@@ -120,12 +124,25 @@ export class StdioTransport {
    * Stop the stdio transport
    */
   stop (): Promise<void> {
+    this.removeSignalListeners()
+
     // Return the same promise to every caller so that concurrent stop() calls
     // (readline close, stdin end, signals) all wait for app.close() to finish
     if (!this.closePromise) {
       this.closePromise = this.doStop()
     }
     return this.closePromise
+  }
+
+  private removeSignalListeners (): void {
+    if (this.onSigint) {
+      process.removeListener('SIGINT', this.onSigint)
+      this.onSigint = null
+    }
+    if (this.onSigterm) {
+      process.removeListener('SIGTERM', this.onSigterm)
+      this.onSigterm = null
+    }
   }
 
   private async doStop (): Promise<void> {
@@ -346,6 +363,8 @@ export async function runStdioServer (
   // Return a promise that resolves when the process should shut down
   return new Promise((resolve) => {
     const shutdown = async () => {
+      process.removeListener('SIGINT', shutdown)
+      process.removeListener('SIGTERM', shutdown)
       await transport.stop()
       resolve()
     }
