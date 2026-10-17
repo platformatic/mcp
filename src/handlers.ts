@@ -702,6 +702,9 @@ function toolCallOutcomeToJsonRpc (
     // The multi round-trip machinery answers this, not a tool result.
     case 'input-required':
       throw inputRequiredErrors.get(outcome) ?? new InputRequired({ inputRequests: outcome.inputRequests })
+    // Only ever reported to onToolCallComplete, by the 2026-07-28 dispatcher.
+    case 'task-limit':
+      return createError(id, INVALID_REQUEST, `Cannot create a task: ${outcome.message}`)
     // Only ever reported to onToolCallComplete, once a task has ended.
     case 'task-ended':
       return createError(id, INTERNAL_ERROR, outcome.message)
@@ -1261,6 +1264,7 @@ function newTaskRecord (
   method: string,
   ttl: number | undefined,
   subject: string | undefined,
+  quotaKey: string | undefined,
   bounds: { defaultTtl: number, maxTtl: number },
   leaseMs?: number
 ): TaskRecord {
@@ -1276,6 +1280,7 @@ function newTaskRecord (
     pollInterval: DEFAULT_POLL_INTERVAL,
     method,
     authSubject: subject,
+    quotaKey,
     era: 'legacy',
     // Leased from the start, so a worker that dies before its first renewal is
     // still reaped. The store stamps it with its own clock.
@@ -1576,8 +1581,8 @@ async function handleTasksCancel (
   }
 
   dependencies.taskWaiters?.notify(cancelled)
-  // A 2026-07-28 task parked for input lives in the same store; wake its
-  // worker wherever it runs instead of leaving it blocked until its ttl.
+  // Stop the worker wherever it runs (it listens for this cancellation), not
+  // only when its next lease renewal finds the task ended.
   try {
     await dependencies.taskInputs?.cancel(taskId)
   } catch (error) {
@@ -1631,13 +1636,17 @@ async function runToolCallAsTask (
     return createError(request.id, INVALID_REQUEST, 'Cannot create a task: the caller is not identified')
   }
 
-  const task = newTaskRecord('tools/call', ttl, subject, taskTtlBounds(dependencies), taskLeases?.leaseMs)
+  const task = newTaskRecord('tools/call', ttl, subject, quotaKeyOf(dependencies.authContext), taskTtlBounds(dependencies), taskLeases?.leaseMs)
 
   // Legacy tasks share the limits, ttl abort and shutdown drain of the
   // 2026-07-28 ones, so neither era can starve the other.
   const reservation = reserveTask(taskStore, task.taskId, quotaKeyOf(dependencies.authContext), dependencies.opts)
   if (!reservation.ok) {
-    return createError(request.id, INTERNAL_ERROR, `Cannot create a task: ${reservation.reason}`)
+    // A limit is the caller's to wait out, as for the store's own cap; only a
+    // shutdown is the server's fault.
+    return reservation.limited
+      ? createError(request.id, TASK_LIMIT_REACHED, reservation.reason)
+      : createError(request.id, INTERNAL_ERROR, `Cannot create a task: ${reservation.reason}`)
   }
   // Stoppable from the moment it holds a slot: a shutdown that begins while
   // the task is still being created must reach it too.

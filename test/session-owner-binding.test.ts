@@ -299,6 +299,45 @@ describe('Session owner binding', () => {
     t.assert.strictEqual(ping.statusCode, 200)
   })
 
+  test('with resolveAuthorizationContext, a session belongs to the resolved user', async (t: TestContext) => {
+    const app = Fastify({ logger: false })
+    t.after(() => app.close())
+    await app.register(mcpPlugin, {
+      capabilities: { tools: {} },
+      enableSSE: true,
+      resolveAuthorizationContext: async (request) => {
+        const user = request.headers['x-user']
+        return typeof user === 'string' ? { userId: user, authorizationServer: 'https://app.example.com' } : undefined
+      }
+    })
+    await app.ready()
+    const headers = (user: string, sessionId?: string) => ({
+      'x-user': user,
+      'mcp-protocol-version': LATEST_LEGACY_PROTOCOL_VERSION,
+      ...(sessionId ? { 'mcp-session-id': sessionId } : {})
+    })
+
+    const init = await app.inject({
+      method: 'POST',
+      url: '/mcp',
+      headers: headers('alice'),
+      payload: { jsonrpc: JSONRPC_VERSION, id: 1, method: 'initialize', params: { protocolVersion: LATEST_LEGACY_PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: 'c', version: '1' } } }
+    })
+    const sessionId = init.headers['mcp-session-id'] as string
+    t.assert.ok(sessionId)
+
+    const bobStream = await app.inject({ method: 'GET', url: '/mcp', payloadAsStream: true, headers: { ...headers('bob', sessionId), accept: 'text/event-stream' } })
+    bobStream.stream().destroy()
+    t.assert.strictEqual(bobStream.statusCode, 404)
+    const bobPost = await app.inject({ method: 'POST', url: '/mcp', headers: headers('bob', sessionId), payload: { jsonrpc: JSONRPC_VERSION, id: 2, method: 'ping' } })
+    t.assert.strictEqual(bobPost.statusCode, 404)
+    const bobDelete = await app.inject({ method: 'DELETE', url: '/mcp', headers: headers('bob', sessionId) })
+    t.assert.strictEqual(bobDelete.statusCode, 404)
+
+    const alicePost = await app.inject({ method: 'POST', url: '/mcp', headers: headers('alice', sessionId), payload: { jsonrpc: JSONRPC_VERSION, id: 3, method: 'ping' } })
+    t.assert.strictEqual(alicePost.statusCode, 200)
+  })
+
   test('memory session store keeps the owner', async (t: TestContext) => {
     const store = new MemorySessionStore()
     await store.create({ id: 's1', eventId: 0, createdAt: new Date(), lastActivity: new Date(), ownerSub: 'alice', ownerIss: 'https://auth.example.com' })

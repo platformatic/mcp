@@ -290,7 +290,8 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     const session = await sessionStore.get(sessionId)
     if (session?.ownerSub === undefined) return
 
-    if (session.ownerSub !== request.tokenPayload?.sub || session.ownerIss !== request.tokenIssuer) {
+    const owner = await sessionOwnerOf(request)
+    if (session.ownerSub !== owner?.sub || session.ownerIss !== owner?.iss) {
       request.log.warn({ sessionId }, 'Rejected MCP request for a session owned by a different user')
       return reply.code(404).type('application/json').send({ error: 'Session not found' })
     }
@@ -352,10 +353,13 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
     // Bind the session to whoever created it, so its ID alone is not enough to
     // act as that user.
+    const owner = await sessionOwnerOf(request)
+    if (owner) {
+      session.ownerSub = owner.sub
+      session.ownerIss = owner.iss
+    }
     const payload = request.tokenPayload
-    if (payload && typeof payload.sub === 'string') {
-      session.ownerSub = payload.sub
-      session.ownerIss = request.tokenIssuer
+    if (!opts.resolveAuthorizationContext && payload && typeof payload.sub === 'string') {
       session.authorization = buildAuthContext(request, payload)
     }
 
@@ -524,8 +528,40 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     }
   }
 
+  /**
+   * Who a legacy session belongs to: the user the deployment's resolver
+   * identifies when there is one, otherwise the verified token's subject at
+   * its issuer. Undefined for anonymous callers, whose sessions are unbound.
+   */
+  async function sessionOwnerOf (request: FastifyRequest): Promise<{ sub: string, iss: string | undefined } | undefined> {
+    if (opts.resolveAuthorizationContext) {
+      const authContext = await authContextFrom(request)
+      return typeof authContext?.userId === 'string'
+        ? { sub: authContext.userId, iss: authContext.authorizationServer }
+        : undefined
+    }
+    const payload = request.tokenPayload
+    return payload && typeof payload.sub === 'string' ? { sub: payload.sub, iss: request.tokenIssuer } : undefined
+  }
+
+  /**
+   * Resolved once per request, so the session owner check, telemetry,
+   * authorization hooks, state sealing and task ownership all see the same
+   * identity, and a resolver doing I/O runs only once.
+   */
+  const resolvedAuthContexts = new WeakMap<FastifyRequest, Promise<AuthorizationContext | undefined>>()
+
   /** Resolve the request identity from custom upstream auth or our validated token. */
-  async function authContextFrom (request: FastifyRequest): Promise<AuthorizationContext | undefined> {
+  function authContextFrom (request: FastifyRequest): Promise<AuthorizationContext | undefined> {
+    let resolved = resolvedAuthContexts.get(request)
+    if (!resolved) {
+      resolved = resolveAuthContext(request)
+      resolvedAuthContexts.set(request, resolved)
+    }
+    return resolved
+  }
+
+  async function resolveAuthContext (request: FastifyRequest): Promise<AuthorizationContext | undefined> {
     // stdio skips HTTP authorization; its identity is the one the operator
     // gave the transport.
     const stdioIdentity = stdioAuthContext(request)
@@ -553,6 +589,14 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
    * to run when the stream ends: the unsubscribe handler for each URI that
    * was accepted.
    */
+  /**
+   * How many open listen streams on this instance hold each resource URI. The
+   * subscribe handler runs for every stream, as it is also the access check,
+   * but the unsubscribe handler only once the last of them ends, so a handler
+   * that starts and stops a watcher keeps it while anyone still listens.
+   */
+  const listenUriHolders = new Map<string, number>()
+
   async function authorizeResourceSubscriptions (
     filter: SubscriptionFilter,
     request: FastifyRequest,
@@ -592,8 +636,16 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
     const { unsubscribeHandler } = resourceHandlers
     if (!unsubscribeHandler || accepted.length === 0) return undefined
+    for (const uri of accepted) listenUriHolders.set(uri, (listenUriHolders.get(uri) ?? 0) + 1)
     return () => {
       for (const uri of accepted) {
+        // Another stream on this instance still wants updates for it.
+        const holders = (listenUriHolders.get(uri) ?? 1) - 1
+        if (holders > 0) {
+          listenUriHolders.set(uri, holders)
+          continue
+        }
+        listenUriHolders.delete(uri)
         Promise.resolve()
           .then(async () => await unsubscribeHandler({ uri }, handlerContextFor()))
           .catch(error => app.log.warn({ err: error, uri }, 'Resource unsubscribe handler failed'))
@@ -653,6 +705,18 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     // A legacy version named in `_meta` gets the same answer, so the client
     // falls back to the handshake.
     const requestedVersion = requestedProtocolVersion(message.params)
+    // A header naming another version is a mismatch, which the transport
+    // answers with HeaderMismatch whichever of the two we implement.
+    const headerVersion = request.headers['mcp-protocol-version']
+    const sentVersion = Array.isArray(headerVersion) ? headerVersion[0] : headerVersion
+    if (!isStdioRequest(request) && requestedVersion !== undefined && sentVersion !== undefined && sentVersion !== requestedVersion) {
+      reply.code(400).type('application/json')
+      return createError(
+        message.id,
+        HEADER_MISMATCH,
+        `Header mismatch: MCP-Protocol-Version header value '${sentVersion}' does not match body value '${requestedVersion}'`
+      )
+    }
     if (requestedVersion !== undefined &&
         !(MODERN_PROTOCOL_VERSIONS as readonly string[]).includes(requestedVersion)) {
       reply.code(400).type('application/json')
@@ -680,8 +744,6 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
       // The mirrored header and the body must agree, or a gateway routing on
       // one and this server acting on the other could be made to disagree.
-      const headerVersion = request.headers['mcp-protocol-version']
-      const sentVersion = Array.isArray(headerVersion) ? headerVersion[0] : headerVersion
       if (sentVersion === undefined) {
         reply.code(400).type('application/json')
         return createError(message.id, HEADER_MISMATCH, 'Missing required MCP-Protocol-Version header')
@@ -813,7 +875,9 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         supportedVersions: SUPPORTED_PROTOCOL_VERSIONS,
         enableTasks,
         headerLayer,
-        signal: stdioCancel ? AbortSignal.any([cancelled.signal, stdioCancel]) : cancelled.signal,
+        // A shutdown aborts the handler too: `app.close()` waits for requests
+        // in flight, and a long-running tool would otherwise hold it forever.
+        signal: AbortSignal.any([cancelled.signal, ...(stdioCancel ? [stdioCancel] : []), ...(shutdownSignal ? [shutdownSignal] : [])]),
         notifiers: requestNotifiers(context, stream)
       })
     } finally {

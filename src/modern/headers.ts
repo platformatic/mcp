@@ -219,22 +219,53 @@ export function validateStandardHeaders (
 const MIRRORABLE_TYPES = new Set(['string', 'integer', 'boolean'])
 
 /**
+ * The primitive type a `const` or `enum` value list implies, for schemas that
+ * constrain a parameter to literal values without naming its type.
+ */
+function literalType (schema: Record<string, unknown>): string | undefined {
+  const values = Array.isArray(schema.enum) ? schema.enum : 'const' in schema ? [schema.const] : undefined
+  if (values === undefined || values.length === 0) return undefined
+  const types = new Set(values.map(value =>
+    value === null
+      ? 'null'
+      : typeof value === 'string' || typeof value === 'boolean'
+        ? typeof value
+        : Number.isInteger(value) ? 'integer' : 'other'
+  ))
+  types.delete('null')
+  return types.size === 1 ? [...types][0] : undefined
+}
+
+/**
  * The primitive type an annotated parameter carries, or `undefined` when it
  * cannot be mirrored into a header. A nullable parameter qualifies: the
  * transport has a rule for null (the client omits the header), so
  * `type: ["string", "null"]` and an `anyOf`/`oneOf` of a primitive and null
- * (what TypeBox's `Type.Union([..., Type.Null()])` produces) are accepted.
+ * (what TypeBox's `Type.Union([..., Type.Null()])` produces) are accepted. So
+ * is a union of literals of one type (TypeBox's `Type.Union` of
+ * `Type.Literal`s, or `Type.Enum`), and a typed schema whose alternatives only
+ * narrow it, such as `{ type: 'string', anyOf: [{ pattern }, { pattern }] }`.
  */
 function mirroredType (schema: Record<string, unknown>): string | undefined {
   const alternatives = schema.anyOf ?? schema.oneOf
-  const types: unknown[] = Array.isArray(schema.type)
-    ? schema.type
-    : Array.isArray(alternatives)
-      ? alternatives.map((entry: unknown) => (entry as { type?: unknown } | undefined)?.type)
-      : [schema.type]
-  const nonNull = types.filter(type => type !== 'null')
-  if (nonNull.length !== 1 || typeof nonNull[0] !== 'string') return undefined
-  return MIRRORABLE_TYPES.has(nonNull[0]) ? nonNull[0] : undefined
+  let types: unknown[]
+  if (typeof schema.type === 'string') {
+    types = [schema.type]
+  } else if (Array.isArray(schema.type)) {
+    types = schema.type
+  } else if (Array.isArray(alternatives)) {
+    types = alternatives.map((entry: unknown) => {
+      if (!entry || typeof entry !== 'object') return undefined
+      const branch = entry as Record<string, unknown>
+      return branch.type ?? literalType(branch)
+    })
+  } else {
+    types = [literalType(schema)]
+  }
+  const nonNull = new Set(types.filter(type => type !== 'null'))
+  if (nonNull.size !== 1) return undefined
+  const [type] = nonNull
+  return typeof type === 'string' && MIRRORABLE_TYPES.has(type) ? type : undefined
 }
 
 /**

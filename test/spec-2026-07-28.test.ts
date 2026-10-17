@@ -400,8 +400,10 @@ describe('2026-07-28: header validation', () => {
     t.assert.strictEqual(response.json().error.code, HEADER_MISMATCH)
   })
 
-  test('modern tools/list excludes definitions with unreachable x-mcp-header annotations', async (t: TestContext) => {
-    const app = await buildServer(t, (app) => {
+  test('a tool with an unreachable x-mcp-header annotation is refused at registration', async (t: TestContext) => {
+    // The annotation makes the definition invalid, and 2026-07-28 clients
+    // would never see the tool: registration says so instead of hiding it.
+    await t.assert.rejects(buildServer(t, (app) => {
       app.mcpAddTool({
         name: 'invalid-header-tool',
         inputSchema: {
@@ -409,18 +411,7 @@ describe('2026-07-28: header validation', () => {
           allOf: [{ type: 'string', 'x-mcp-header': 'Tenant' }]
         }
       }, async () => ({ content: [{ type: 'text', text: 'must not run' }] }))
-    })
-
-    const listed = await call(app, 'tools/list')
-    t.assert.deepStrictEqual(listed.json().result.tools, [])
-
-    // The broken annotation is the server's bug, not a client header mismatch:
-    // the hidden tool is reported exactly like any other unknown tool.
-    const called = await call(app, 'tools/call', {
-      params: { name: 'invalid-header-tool', arguments: {} }
-    })
-    t.assert.strictEqual(called.json().error.code, INVALID_PARAMS)
-    t.assert.match(called.json().error.message, /Unknown tool/)
+    }), /Invalid tool schema for 'invalid-header-tool': x-mcp-header at 'allOf.0' is not statically reachable/)
   })
 
   test('a tool parameter marked x-mcp-header must be mirrored and must match', async (t: TestContext) => {
@@ -1225,12 +1216,14 @@ describe('defaults, startup checks and smaller fixes', () => {
     t.assert.strictEqual(capabilities.resources.subscribe, true)
   })
 
-  test('redis without requestStateSecret is refused at startup', async (t: TestContext) => {
-    const app = Fastify()
+  test('redis without requestStateSecret warns at startup', async (t: TestContext) => {
+    const lines: string[] = []
+    const app = Fastify({ logger: { level: 'warn', stream: { write: (line: string) => { lines.push(line) } } } })
     t.after(() => app.close())
-    await t.assert.rejects(async () => {
-      await app.register(mcpPlugin, { redis: { host: '127.0.0.1', port: 1, lazyConnect: true } as any }).ready()
-    }, /requestStateSecret is required/)
+    // A legacy-only deployment upgrading keeps starting; only 2026-07-28
+    // multi round-trip retries need the shared secret.
+    await app.register(mcpPlugin, { redis: { host: '127.0.0.1', port: 1, lazyConnect: true } as any })
+    t.assert.ok(lines.some(line => /redis is configured without requestStateSecret/.test(line)), lines.join('\n'))
   })
 
   test('a public cache hint with per-caller results logs a warning', async (t: TestContext) => {
@@ -2160,7 +2153,7 @@ describe('2026-07-28: tasks extension', () => {
     t.assert.strictEqual(required.error.code, INVALID_REQUEST)
   })
 
-  test('past taskMaxConcurrent, an optional task runs synchronously', async (t: TestContext) => {
+  test('past taskMaxConcurrent, an optional task is refused rather than run synchronously', async (t: TestContext) => {
     let release: () => void = () => {}
     const blocked = new Promise<void>(resolve => { release = resolve })
     const app = await buildServer(t, (app) => {
@@ -2185,8 +2178,9 @@ describe('2026-07-28: tasks extension', () => {
       id: 2,
       params: { name: 'busy', arguments: {} },
       capabilities: tasksCapable
-    })).json().result
-    t.assert.strictEqual(second.resultType, 'complete')
+    })).json()
+    t.assert.strictEqual(second.error?.code, INVALID_REQUEST, JSON.stringify(second))
+    t.assert.match(second.error.message, /Cannot create a task: Task limit reached/)
   })
 
   test('tasks/cancel aborts the signal of the handler running the task', async (t: TestContext) => {
@@ -4384,9 +4378,11 @@ describe('round 7: answer budget, task rounds, answer checks and streaming', () 
     previous = (await retry(0)).result
     t.assert.strictEqual(previous.resultType, 'input_required')
     // Two do not: the handler would have to be told one is gone, so the
-    // request fails instead.
+    // request fails instead. The answers' size is the client's doing, so it
+    // is invalid params, not a server fault.
     const failed = await retry(1)
-    t.assert.strictEqual(failed.error?.code, INTERNAL_ERROR, JSON.stringify(failed))
+    t.assert.strictEqual(failed.error?.code, INVALID_PARAMS, JSON.stringify(failed))
+    t.assert.match(failed.error.message, /requestStateMaxAnswerBytes/)
     t.assert.deepStrictEqual(seen, [[], ['k0'], ['k0', 'k1']])
   })
 
@@ -4847,7 +4843,7 @@ describe('round 8: header BOM, answer schemas, listen deadlines and task limits'
     t.assert.strictEqual(task.result.content[0].text, 'polled 2')
   })
 
-  test('a required task over the per-caller cap is refused; an optional one runs synchronously', async (t: TestContext) => {
+  test('over the per-caller cap, required and optional tasks are both refused', async (t: TestContext) => {
     let release: () => void = () => {}
     const blocked = new Promise<void>(resolve => { release = resolve })
     t.after(() => release())
@@ -4864,7 +4860,11 @@ describe('round 8: header BOM, answer schemas, listen deadlines and task limits'
     // The only slot holds a running task, so nothing can be evicted.
     const refused = (await call(app, 'tools/call', { id: 2, params: { name: 'slow', arguments: {} }, capabilities: taskCapabilities })).json()
     t.assert.strictEqual(refused.error?.code, INVALID_REQUEST, JSON.stringify(refused))
-    const sync = (await call(app, 'tools/call', { id: 3, params: { name: 'quick', arguments: {} }, capabilities: taskCapabilities })).json()
+    const optional = (await call(app, 'tools/call', { id: 3, params: { name: 'quick', arguments: {} }, capabilities: taskCapabilities })).json()
+    t.assert.strictEqual(optional.error?.code, INVALID_REQUEST, JSON.stringify(optional))
+    t.assert.match(optional.error.message, /Task limit reached/)
+    // Without the extension the same tool simply runs.
+    const sync = (await call(app, 'tools/call', { id: 4, params: { name: 'quick', arguments: {} } })).json()
     t.assert.strictEqual(sync.result.content[0].text, 'now')
   })
 
@@ -4967,5 +4967,222 @@ describe('round 8: header BOM, answer schemas, listen deadlines and task limits'
       }
     })
     t.assert.strictEqual('extensions' in init.json().result.capabilities, false)
+  })
+})
+
+describe('round 9: request digests, header types, limits, sessions and shutdown', () => {
+  const formCapabilities: ClientCapabilities = { elicitation: { form: {} } }
+  const taskCapabilities: ClientCapabilities = { extensions: { [TASKS_EXTENSION]: {} }, elicitation: { form: {} } }
+  const confirm = elicitForm('Sure?', { type: 'object', properties: { ok: { type: 'boolean' } } })
+
+  test('a handler that normalizes its arguments in place still matches its own retry', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'greet', inputSchema: Type.Object({ who: Type.String(), limit: Type.Optional(Type.Number()) }) }, async (args: any, context: any) => {
+        args.who = args.who.trim()
+        args.limit ??= 10
+        if (!context.inputResponses?.ok) throw new InputRequired({ inputRequests: { ok: confirm } })
+        return { content: [{ type: 'text', text: `hi ${args.who}` }] }
+      })
+    })
+    const params = { name: 'greet', arguments: { who: ' bob ' } }
+    const first = (await call(app, 'tools/call', { params, capabilities: formCapabilities })).json().result
+    t.assert.strictEqual(first.resultType, 'input_required')
+    const retry = (await call(app, 'tools/call', {
+      id: 2,
+      capabilities: formCapabilities,
+      params: { ...params, requestState: first.requestState, inputResponses: { ok: { action: 'accept', content: { ok: true } } } }
+    })).json()
+    t.assert.strictEqual(retry.result?.content[0].text, 'hi bob', JSON.stringify(retry))
+  })
+
+  test('carry chooses which earlier answers the next retry keeps', async (t: TestContext) => {
+    const seen: string[][] = []
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'draft', inputSchema: Type.Object({}) }, async (_args: any, context: any) => {
+        seen.push(Object.keys(context.inputResponses ?? {}).sort())
+        const answers = context.inputResponses ?? {}
+        if (answers.ok) return { content: [{ type: 'text', text: `published ${context.requestState}` }] }
+        if (answers.draft) {
+          // The draft is summarised into state and need not travel again.
+          throw new InputRequired({ inputRequests: { ok: confirm }, state: answers.draft.content.text.length, carry: [] })
+        }
+        throw new InputRequired({ inputRequests: { draft: elicitForm('Draft', { type: 'object', properties: { text: { type: 'string' } } }) } })
+      })
+    }, { requestStateMaxAnswerBytes: 1000 })
+    const retry = async (id: number, previous: any, inputResponses: Record<string, unknown>) => (await call(app, 'tools/call', {
+      id,
+      capabilities: formCapabilities,
+      params: { name: 'draft', arguments: {}, requestState: previous.requestState, inputResponses }
+    })).json()
+
+    const first = (await call(app, 'tools/call', { params: { name: 'draft', arguments: {} }, capabilities: formCapabilities })).json().result
+    // Far past the budget, which carrying it would exceed.
+    const second = await retry(2, first, { draft: { action: 'accept', content: { text: 'x'.repeat(5000) } } })
+    t.assert.strictEqual(second.result?.resultType, 'input_required', JSON.stringify(second))
+    const third = await retry(3, second.result, { ok: { action: 'accept', content: { ok: true } } })
+    t.assert.strictEqual(third.result?.content[0].text, 'published 5000', JSON.stringify(third))
+    t.assert.deepStrictEqual(seen, [[], ['draft'], ['ok']])
+  })
+
+  test('carry must list input keys', (t: TestContext) => {
+    t.assert.throws(() => new InputRequired({ state: 1, carry: 'draft' as any }), /carry/)
+    t.assert.throws(() => new InputRequired({ state: 1, carry: [1] as any }), /carry/)
+  })
+
+  test('an x-mcp-header on a union of string literals is accepted', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({
+        name: 'deploy',
+        inputSchema: Type.Object({ region: Type.Union([Type.Literal('us'), Type.Literal('eu')], { 'x-mcp-header': 'Region' }) })
+      }, async (args: any) => ({ content: [{ type: 'text', text: args.region }] }))
+    })
+    const listed = (await call(app, 'tools/list')).json().result.tools
+    t.assert.deepStrictEqual(listed.map((tool: any) => tool.name), ['deploy'])
+    const params = { name: 'deploy', arguments: { region: 'us' } }
+    const ok = (await call(app, 'tools/call', { params, headers: { 'mcp-param-region': 'us' } })).json()
+    t.assert.strictEqual(ok.result?.content[0].text, 'us', JSON.stringify(ok))
+    const mismatch = await call(app, 'tools/call', { id: 2, params, headers: { 'mcp-param-region': 'eu' } })
+    t.assert.strictEqual(mismatch.json().error.code, HEADER_MISMATCH)
+  })
+
+  test('an x-mcp-header on an object parameter is refused at registration', async (t: TestContext) => {
+    await t.assert.rejects(buildServer(t, (app) => {
+      app.mcpAddTool({
+        name: 'bad',
+        inputSchema: { type: 'object', properties: { filter: { type: 'object', 'x-mcp-header': 'Filter' } } }
+      }, async () => ({ content: [] }))
+    }), /Invalid tool schema for 'bad': x-mcp-header 'Filter' may only annotate/)
+  })
+
+  test('a header version that differs from the body version is a HeaderMismatch', async (t: TestContext) => {
+    const app = await buildServer(t)
+    const response = await call(app, 'tools/list', { protocolVersion: LATEST_LEGACY_PROTOCOL_VERSION, headers: { 'mcp-protocol-version': LATEST_PROTOCOL_VERSION } })
+    t.assert.strictEqual(response.statusCode, 400)
+    t.assert.strictEqual(response.json().error.code, HEADER_MISMATCH)
+    // Agreeing on a version we do not implement is still -32022.
+    const agreed = await call(app, 'tools/list', { protocolVersion: '2099-01-01' })
+    t.assert.strictEqual(agreed.json().error.code, UNSUPPORTED_PROTOCOL_VERSION)
+  })
+
+  test('an initialize sent with the newest version header takes the legacy handshake', async (t: TestContext) => {
+    const app = await buildServer(t)
+    const response = await app.inject({
+      method: 'POST',
+      url: '/mcp',
+      headers: { 'mcp-protocol-version': LATEST_PROTOCOL_VERSION },
+      payload: {
+        jsonrpc: JSONRPC_VERSION,
+        id: 1,
+        method: 'initialize',
+        params: { protocolVersion: LATEST_LEGACY_PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: 'c', version: '1' } }
+      }
+    })
+    t.assert.strictEqual(response.statusCode, 200, response.body)
+    t.assert.strictEqual(response.json().result.protocolVersion, LATEST_LEGACY_PROTOCOL_VERSION)
+  })
+
+  test('a fractional progress token is refused', async (t: TestContext) => {
+    const app = await buildServer(t)
+    const body = modernBody('tools/list')
+    ;(body.params._meta as Record<string, unknown>).progressToken = 1.5
+    const response = await app.inject({ method: 'POST', url: '/mcp', headers: modernHeaders('tools/list'), payload: body })
+    t.assert.strictEqual(response.json().error.code, INVALID_PARAMS)
+    t.assert.match(response.json().error.message, /progressToken/)
+  })
+
+  test('subscription and connection limits are validated at registration', async (t: TestContext) => {
+    for (const [name, value] of [
+      ['subscriptionMaxStreams', Number.NaN],
+      ['subscriptionMaxStreamsPerPrincipal', 0],
+      ['subscriptionMaxResourceUris', 1.5],
+      ['sseMaxConnectionMs', -1]
+    ] as const) {
+      const app = Fastify()
+      t.after(() => app.close())
+      await t.assert.rejects(async () => { await app.register(mcpPlugin, { [name]: value }).ready() }, new RegExp(name))
+    }
+  })
+
+  test('the retention cap counts a user once, whichever OAuth client they use', async (t: TestContext) => {
+    let release: () => void = () => {}
+    const blocked = new Promise<void>(resolve => { release = resolve })
+    t.after(() => release())
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'slow', inputSchema: Type.Object({}), execution: { taskSupport: 'required' } } as any, async () => {
+        await blocked
+        return { content: [] }
+      })
+    }, {
+      enableTasks: true,
+      taskMaxRetainedPerPrincipal: 2,
+      taskShutdownTimeoutMs: 10,
+      resolveAuthorizationContext: async (request: any) => ({ userId: 'alice', clientId: request.headers['x-client'], authorizationServer: 'https://as' })
+    })
+    const codes: Array<string | number> = []
+    for (const client of ['one', 'two', 'three']) {
+      const body = (await call(app, 'tools/call', { params: { name: 'slow', arguments: {} }, capabilities: taskCapabilities, headers: { 'x-client': client } })).json()
+      codes.push(body.result?.resultType ?? body.error.code)
+    }
+    t.assert.deepStrictEqual(codes, ['task', 'task', INVALID_REQUEST])
+  })
+
+  test('a 2026-07-28 request is aborted when the server shuts down', async (t: TestContext) => {
+    let aborted: unknown
+    let started!: () => void
+    const running = new Promise<void>(resolve => { started = resolve })
+    // Without forcing, the server would also wait for fetch's kept-alive socket.
+    const app = Fastify({ forceCloseConnections: true })
+    await app.register(mcpPlugin, { capabilities: { tools: {} } })
+    app.mcpAddTool({ name: 'forever', inputSchema: Type.Object({}) }, async (_args: any, context: any) => {
+      started()
+      await new Promise<void>(resolve => context.signal.addEventListener('abort', () => resolve(), { once: true }))
+      aborted = context.signal.reason
+      return { content: [] }
+    })
+    await app.listen({ port: 0, host: '127.0.0.1' })
+    const { port } = app.server.address() as { port: number }
+    const response = fetch(`http://127.0.0.1:${port}/mcp`, {
+      method: 'POST',
+      headers: modernHeaders('tools/call', { params: { name: 'forever' } }),
+      body: JSON.stringify(modernBody('tools/call', { params: { name: 'forever', arguments: {} } }))
+    }).then(res => res.json(), () => undefined)
+    await running
+    const closing = Date.now()
+    await app.close()
+    t.assert.ok(Date.now() - closing < 2_000)
+    t.assert.match(String((aborted as Error)?.message), /shutting down/)
+    await response
+  })
+
+  test('the unsubscribe handler runs when the last listen stream holding a URI ends', async (t: TestContext) => {
+    const events: string[] = []
+    const app = Fastify({ forceCloseConnections: true })
+    t.after(() => app.close())
+    await app.register(mcpPlugin, { capabilities: { resources: { subscribe: true } } })
+    app.mcpSetResourceSubscribeHandler(async ({ uri }) => { events.push(`sub ${uri}`); return {} })
+    app.mcpSetResourceUnsubscribeHandler(async ({ uri }) => { events.push(`unsub ${uri}`); return {} })
+    await app.listen({ port: 0, host: '127.0.0.1' })
+    const { port } = app.server.address() as { port: number }
+    // A real connection: closing it is how a 2026-07-28 client ends a stream.
+    const open = async (id: string) => {
+      const controller = new AbortController()
+      const response = await fetch(`http://127.0.0.1:${port}/mcp`, {
+        method: 'POST',
+        signal: controller.signal,
+        headers: modernHeaders('subscriptions/listen'),
+        body: JSON.stringify(modernBody('subscriptions/listen', { id, params: { notifications: { resourceSubscriptions: ['file:///a'] } } }))
+      })
+      const reader = response.body!.getReader()
+      await reader.read()
+      return controller
+    }
+    const first = await open('a')
+    const second = await open('b')
+    first.abort()
+    await new Promise(resolve => setTimeout(resolve, 100))
+    t.assert.deepStrictEqual(events, ['sub file:///a', 'sub file:///a'])
+    second.abort()
+    await until(() => events.length === 3)
+    t.assert.deepStrictEqual(events, ['sub file:///a', 'sub file:///a', 'unsub file:///a'])
   })
 })

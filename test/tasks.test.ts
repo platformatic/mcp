@@ -401,6 +401,36 @@ describe('task store', () => {
     t.assert.ok(await store.get('x'))
   })
 
+  test('MemoryTaskStore counts a user once across the OAuth clients they act through', async (t: TestContext) => {
+    const store = new MemoryTaskStore({ maxTasksPerPrincipal: 2 })
+    const quotaKey = JSON.stringify(['user-1', 'https://as'])
+    const via = (client: string) => JSON.stringify(['user-1', client, 'https://as'])
+    await store.create(record({ taskId: 'a', authSubject: via('one'), quotaKey }))
+    await store.create(record({ taskId: 'b', authSubject: via('two'), quotaKey }))
+    await t.assert.rejects(
+      () => store.create(record({ taskId: 'c', authSubject: via('three'), quotaKey })),
+      (err: any) => err instanceof TaskLimitError
+    )
+  })
+
+  test('legacy task limits on running tasks answer "Task limit reached"', async (t: TestContext) => {
+    for (const limit of [{ taskMaxConcurrent: 1 }, { taskMaxPerPrincipal: 1, resolveAuthorizationContext: async () => ({ userId: 'alice' }) }]) {
+      const app = await buildApp(t, { ...limit, taskShutdownTimeoutMs: 10 })
+      app.mcpAddTool({
+        name: 'hang',
+        description: 'Never finishes',
+        inputSchema: Type.Object({}),
+        execution: { taskSupport: 'optional' }
+      } as any, () => new Promise<CallToolResult>(() => {}))
+
+      const first = await call(app, 'tools/call', { name: 'hang', arguments: {}, task: {} })
+      t.assert.ok(first.result.task.taskId)
+      const second = await call(app, 'tools/call', { name: 'hang', arguments: {}, task: {} })
+      t.assert.strictEqual(second.error?.code, TASK_LIMIT_REACHED, JSON.stringify(second))
+      t.assert.match(second.error.message, /limit reached/)
+    }
+  })
+
   test('MemoryTaskStore evicts the caller\'s oldest finished task to make room', async (t: TestContext) => {
     const store = new MemoryTaskStore({ maxTasksPerPrincipal: 3 })
     await store.create(record({ taskId: 'a', authSubject: 'user-1' }))

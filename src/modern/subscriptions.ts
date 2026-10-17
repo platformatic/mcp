@@ -293,7 +293,7 @@ export class SubscriptionRegistry {
             return
           }
           this.#log.info({ subscriptionId: id, reason: deadline.reason }, 'Ending subscription stream at its deadline')
-          this.#close(subscription, this.#teardownFrames(subscription, deadline.reason))
+          this.#endGracefully(subscription, deadline.reason)
         }, Math.min(remaining, MAX_TIMER_DELAY_MS))
         subscription.deadlineTimer.unref()
       }
@@ -342,14 +342,20 @@ export class SubscriptionRegistry {
   closeAll (): void {
     this.#closing = true
     for (const subscription of [...this.#subscriptions]) {
-      // `end(frame)` appends the final frames after Node's existing writable
-      // buffer even when write() previously returned false. Queuing and then
-      // clearing them would silently drop the protocol's graceful completion.
-      // Notifications still queued for a slow reader go first: a graceful end
-      // tells the client it missed nothing.
-      const pending = subscription.queue.join('')
-      this.#close(subscription, pending + this.#teardownFrames(subscription, 'Server is shutting down'))
+      this.#endGracefully(subscription, 'Server is shutting down')
     }
+  }
+
+  /**
+   * End a stream with the graceful completion. `end(frame)` appends the final
+   * frames after Node's existing writable buffer even when write() previously
+   * returned false; queuing and then clearing them would silently drop the
+   * protocol's graceful completion. Notifications still queued for a slow
+   * reader go first: a graceful end tells the client it missed nothing.
+   */
+  #endGracefully (subscription: Subscription, reason: string): void {
+    const pending = subscription.queue.join('')
+    this.#close(subscription, pending + this.#teardownFrames(subscription, reason))
   }
 
   /**

@@ -31,6 +31,7 @@ import {
 const TASK_KEY_PREFIX = 'mcp:task:v2:'
 const OWNER_INDEX_PREFIX = 'mcp:tasks:v2:owner:'
 const ANONYMOUS_INDEX_KEY = 'mcp:tasks:v2:anonymous'
+const QUOTA_INDEX_PREFIX = 'mcp:tasks:v2:quota:'
 
 /**
  * Lua's cjson cannot round-trip arbitrary JSON: it turns empty arrays into
@@ -63,6 +64,7 @@ function encodeTask (task: TaskRecord): string {
     ...task,
     ...(task.statusMessage !== undefined ? { statusMessage: toWellFormed(task.statusMessage) } : {}),
     ...(task.authSubject !== undefined ? { authSubject: toWellFormed(task.authSubject) } : {}),
+    ...(task.quotaKey !== undefined ? { quotaKey: toWellFormed(task.quotaKey) } : {}),
     outcome: task.outcome === undefined ? undefined : JSON.stringify(task.outcome),
     inputRequests: encodeOpaqueMap(task.inputRequests),
     pendingInputResponses: encodeOpaqueMap(task.pendingInputResponses)
@@ -87,14 +89,17 @@ function fromStored (stored: any): TaskRecord {
 // Store a task while enforcing its owner's retention cap, atomically so that
 // concurrent creates on different instances cannot overshoot it.
 //
-// KEYS: task key, owner index
+// KEYS: task key, owner index, quota index (the owner index again when the
+//       task has no separate quota key)
 // ARGV: task JSON, expiry seconds (-1 = none), score, task id, cap, task key
 //       prefix, then the status message, encoded outcome and timestamp for
 //       orphaned tasks, then the lease in ms ('' for none)
 //
 // The owner index is a sorted set of task ids scored by creation time (the same
-// one `list` pages through). Ids whose task key has expired are pruned first,
-// so an index nobody lists cannot grow without bound; then, at the cap, tasks
+// one `list` pages through); the quota index holds the same ids for every
+// principal of one user, whichever OAuth client they came through, and is what
+// the cap counts. Ids whose task key has expired or was evicted are pruned from
+// both first, so an index nobody lists cannot grow without bound; then, at the cap, tasks
 // whose lease has lapsed (their instance died) are failed, as expireStaleLease
 // would, and the oldest finished tasks are evicted. Returns 0 (storing nothing)
 // when the owner is at the cap with nothing finished to evict. Task keys are
@@ -109,12 +114,19 @@ local prefix = ARGV[6]
 local cap = tonumber(ARGV[5])
 local t = redis.call('TIME')
 local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+if KEYS[3] ~= KEYS[2] then
+  for _, id in ipairs(redis.call('ZRANGE', KEYS[2], 0, -1)) do
+    if redis.call('EXISTS', prefix .. id) == 0 then
+      redis.call('ZREM', KEYS[2], id)
+    end
+  end
+end
 local live = {}
-for _, id in ipairs(redis.call('ZRANGE', KEYS[2], 0, -1)) do
+for _, id in ipairs(redis.call('ZRANGE', KEYS[3], 0, -1)) do
   if redis.call('EXISTS', prefix .. id) == 1 then
     table.insert(live, id)
   else
-    redis.call('ZREM', KEYS[2], id)
+    redis.call('ZREM', KEYS[3], id)
   end
 end
 
@@ -140,9 +152,12 @@ if need > 0 then
     end
   end
   if #victims < need then return 0 end
+  -- A victim may belong to another of the user's principals; its id stays
+  -- in that owner index until the next create or list there prunes it.
   for _, id in ipairs(victims) do
     redis.call('DEL', prefix .. id)
     redis.call('ZREM', KEYS[2], id)
+    redis.call('ZREM', KEYS[3], id)
   end
 end
 
@@ -160,20 +175,24 @@ else
   redis.call('SET', KEYS[1], record, 'EX', secs)
 end
 
--- Stretch the owner index's expiry so it outlives every task it references,
--- and never expire it while it holds a task that never expires.
-local existed = redis.call('EXISTS', KEYS[2])
-redis.call('ZADD', KEYS[2], ARGV[3], ARGV[4])
-if secs < 0 then
-  redis.call('PERSIST', KEYS[2])
-elseif existed == 0 then
-  redis.call('EXPIRE', KEYS[2], secs)
-else
-  local current = redis.call('TTL', KEYS[2])
-  if current >= 0 and current < secs then
-    redis.call('EXPIRE', KEYS[2], secs)
+-- Stretch each index's expiry so it outlives every task it references, and
+-- never expire it while it holds a task that never expires.
+local function index (key)
+  local existed = redis.call('EXISTS', key)
+  redis.call('ZADD', key, ARGV[3], ARGV[4])
+  if secs < 0 then
+    redis.call('PERSIST', key)
+  elseif existed == 0 then
+    redis.call('EXPIRE', key, secs)
+  else
+    local current = redis.call('TTL', key)
+    if current >= 0 and current < secs then
+      redis.call('EXPIRE', key, secs)
+    end
   end
 end
+index(KEYS[2])
+if KEYS[3] ~= KEYS[2] then index(KEYS[3]) end
 return 1
 `
 
@@ -215,6 +234,15 @@ export class RedisTaskStore implements TaskStore {
     return authSubject === undefined ? ANONYMOUS_INDEX_KEY : `${OWNER_INDEX_PREFIX}${authSubject}`
   }
 
+  /**
+   * The index the per-caller cap counts: one per user at an issuer, shared by
+   * the principals they act as through different OAuth clients. Tasks without
+   * a quota key are counted in their owner index.
+   */
+  private quotaIndexKey (task: TaskRecord): string {
+    return task.quotaKey === undefined ? this.indexKey(task.authSubject) : `${QUOTA_INDEX_PREFIX}${task.quotaKey}`
+  }
+
   private expirySeconds (task: TaskRecord): number {
     const ttl = task.ttl ?? this.defaultTtlMs
     return Math.max(1, Math.ceil(ttl / 1000))
@@ -232,9 +260,10 @@ export class RedisTaskStore implements TaskStore {
     const leaseMs = leaseExpiresAt === undefined ? '' : String(leaseExpiresAt - Date.now())
     const stored = await this.redis.eval(
       CREATE_SCRIPT,
-      2,
+      3,
       this.key(task.taskId),
       this.indexKey(task.authSubject),
+      this.quotaIndexKey(task),
       encodeTask(rest),
       task.ttl === null ? -1 : this.expirySeconds(task),
       new Date(task.createdAt).getTime(),
@@ -596,15 +625,18 @@ export class RedisTaskStore implements TaskStore {
   async delete (taskId: string): Promise<void> {
     const key = this.key(taskId)
     const raw = await this.redis.get(key)
-    let authSubject: string | undefined
+    let record: TaskRecord | undefined
     try {
-      authSubject = raw ? (JSON.parse(raw) as TaskRecord).authSubject : undefined
+      record = raw ? JSON.parse(raw) as TaskRecord : undefined
     } catch {}
 
     const multi = this.redis.multi().del(key)
-    // Without the record we cannot tell which index holds the id; `list` prunes
-    // it lazily instead.
-    if (raw) multi.zrem(this.indexKey(authSubject), taskId)
+    // Without the record we cannot tell which indexes hold the id; `list` and
+    // `create` prune it lazily instead.
+    if (record) {
+      multi.zrem(this.indexKey(record.authSubject), taskId)
+      multi.zrem(this.quotaIndexKey(record), taskId)
+    }
     await multi.exec()
   }
 

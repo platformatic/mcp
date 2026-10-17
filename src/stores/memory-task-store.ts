@@ -23,6 +23,11 @@ import {
  * Expired tasks are treated as absent on read and swept lazily, so a task never
  * outlives its ttl even if `cleanup()` has not run recently.
  */
+/** Who a task counts against for the per-caller cap. */
+function quotaOf (task: TaskRecord): string | undefined {
+  return task.quotaKey ?? task.authSubject
+}
+
 export class MemoryTaskStore implements TaskStore {
   // Insertion order is creation order, so iteration visits the oldest first
   private tasks = new Map<string, TaskRecord>()
@@ -40,7 +45,8 @@ export class MemoryTaskStore implements TaskStore {
   async create (task: TaskRecord): Promise<void> {
     // No await until the task is stored, so concurrent creates cannot both
     // pass the capacity checks and overshoot them.
-    const ownedBy = (t: TaskRecord) => t.authSubject === task.authSubject
+    const quota = quotaOf(task)
+    const ownedBy = (t: TaskRecord) => quotaOf(t) === quota
 
     // Finished tasks count too: otherwise one caller could hold every slot
     // with results it never collects until their ttl runs out.

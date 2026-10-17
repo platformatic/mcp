@@ -1,4 +1,5 @@
 import { invalidCapabilityMember } from '../modern/request-meta.ts'
+import { collectHeaderParams } from '../modern/headers.ts'
 import type { FastifyPluginAsync } from 'fastify'
 import fp from 'fastify-plugin'
 import type {
@@ -71,6 +72,14 @@ const mcpDecoratorsPlugin: FastifyPluginAsync<MCPDecoratorsOptions> = async (app
       const schemaErrors = validateToolSchema(definition.inputSchema)
       if (schemaErrors.length > 0) {
         throw new Error(`Invalid tool schema for '${name}': ${schemaErrors.join(', ')}`)
+      }
+
+      // An `x-mcp-header` annotation the transport cannot mirror makes the
+      // definition invalid, and 2026-07-28 clients would never see the tool:
+      // say so now rather than hide it.
+      const headers = collectHeaderParams(definition.inputSchema)
+      if (!headers.ok) {
+        throw new Error(`Invalid tool schema for '${name}': ${headers.message}`)
       }
 
       // When AJV validation is on, an uncompilable plain JSON Schema must fail

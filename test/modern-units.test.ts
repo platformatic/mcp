@@ -609,6 +609,24 @@ describe('subscription backpressure', () => {
     ])
   })
 
+  test('a stream ending at its deadline sends the notifications still queued before the completion', async (t: TestContext) => {
+    const raw = new FakeResponse()
+    const registry = new SubscriptionRegistry({ ...logger, info: () => {} }, 10_000)
+    registry.open(replyFor(raw), 1, { toolsListChanged: true }, undefined, undefined, undefined, { at: Date.now() + 20, reason: 'Subscription reached its maximum duration' })
+
+    // Backpressured: the notification waits in the queue.
+    registry.deliver(changed)
+    t.assert.strictEqual(raw.writes.length, 1)
+    await delay(60)
+
+    const final = raw.writes[1].split('\n\n').filter(Boolean).map(frame => JSON.parse(frame.slice('data: '.length)))
+    t.assert.deepStrictEqual(final.map(message => message.method ?? 'response'), [
+      'notifications/tools/list_changed',
+      'notifications/cancelled',
+      'response'
+    ])
+  })
+
   test('the end hook runs once, however the stream ends', (t: TestContext) => {
     for (const end of ['shutdown', 'client'] as const) {
       const raw = new FakeResponse()
@@ -821,5 +839,99 @@ describe('request stream back-pressure', () => {
     stream.notify(notification(5))
     t.assert.strictEqual(reply.raw.written.length, 3)
     t.assert.match(reply.raw.written[2], /"progress":5/)
+  })
+})
+
+describe('round 9 units', () => {
+  test('names in name-keyed keywords survive answer-schema normalization', (t: TestContext) => {
+    const schema = normalizeAnswerSchema({
+      type: 'object',
+      properties: { title: { type: 'string', title: 'Title' }, ok: { type: 'boolean' } },
+      dependentRequired: { title: ['ok'] },
+      patternProperties: { description: { type: 'string', description: 'dropped' } }
+    }) as Record<string, any>
+    t.assert.deepStrictEqual(schema.dependentRequired, { title: ['ok'] })
+    t.assert.deepStrictEqual(schema.patternProperties, { description: { type: 'string' } })
+    t.assert.deepStrictEqual(schema.properties.title, { type: 'string' })
+    t.assert.match(new AnswerValidator().validate(schema, { title: 'x' }) ?? '', /ok/)
+  })
+
+  test('the string formats elicitation defines are checked, others are not', (t: TestContext) => {
+    const validator = new AnswerValidator()
+    const schema = {
+      type: 'object',
+      properties: {
+        email: { type: 'string', format: 'email' },
+        site: { type: 'string', format: 'uri' },
+        day: { type: 'string', format: 'date' },
+        at: { type: 'string', format: 'date-time' },
+        id: { type: 'string', format: 'uuid' }
+      }
+    }
+    for (const [field, bad] of [['email', 'not an email'], ['site', 'no scheme'], ['day', 'yesterday'], ['at', '2026-01-02']]) {
+      t.assert.match(validator.validate(schema, { [field]: bad }) ?? '', /format/, field)
+    }
+    t.assert.strictEqual(validator.validate(schema, {
+      email: 'a@example.com', site: 'https://example.com', day: '2026-01-02', at: '2026-01-02T03:04:05Z', id: 'not a uuid'
+    }), null)
+  })
+
+  test('request state sealed with any listed secret verifies; new state uses the first', (t: TestContext) => {
+    const oldSecret = 'o'.repeat(32)
+    const newSecret = 'n'.repeat(32)
+    const request = { method: 'tools/call', params: { name: 'x', arguments: {} } }
+    const before = new RequestStateSealer({ secret: oldSecret })
+    const during = new RequestStateSealer({ secret: [newSecret, oldSecret] })
+    const after = new RequestStateSealer({ secret: newSecret })
+
+    const sealedBefore = before.seal({ ...request, payload: 1 })
+    t.assert.strictEqual(during.open(sealedBefore, request).ok, true)
+    const sealedDuring = during.seal({ ...request, payload: 2 })
+    t.assert.strictEqual(after.open(sealedDuring, request).ok, true)
+    t.assert.strictEqual(before.open(sealedDuring, request).ok, false)
+
+    t.assert.throws(() => new RequestStateSealer({ secret: [] }), /at least one/)
+    t.assert.throws(() => new RequestStateSealer({ secret: [newSecret, 'short'] }), /at least 32 bytes/)
+  })
+
+  test('a precomputed request digest is what sealing and opening compare', (t: TestContext) => {
+    const sealer = new RequestStateSealer()
+    const received = { method: 'tools/call', params: { name: 'x', arguments: { who: ' bob ' } } }
+    const requestDigest = digestRequest(received.method, received.params)
+    // The handler trimmed the argument before asking.
+    const sealed = sealer.seal({ method: 'tools/call', params: { name: 'x', arguments: { who: 'bob' } }, requestDigest, payload: 1 })
+    t.assert.strictEqual(sealer.open(sealed, { ...received, requestDigest }).ok, true)
+    t.assert.strictEqual(sealer.open(sealed, { method: 'tools/call', params: { name: 'x', arguments: { who: 'bob' } } }).ok, false)
+  })
+
+  test('x-mcp-header accepts literal unions, enums and typed alternatives of one primitive', (t: TestContext) => {
+    const accepted = [
+      { anyOf: [{ const: 'us', type: 'string' }, { const: 'eu', type: 'string' }] },
+      { anyOf: [{ const: 'us' }, { const: 'eu' }, { type: 'null' }] },
+      { enum: [1, 2, 3] },
+      { type: 'string', anyOf: [{ pattern: '^us-' }, { pattern: '^eu-' }] },
+      { type: ['boolean', 'null'] }
+    ]
+    for (const schema of accepted) {
+      const collected = collectHeaderParams({ type: 'object', properties: { p: { ...schema, 'x-mcp-header': 'P' } } })
+      t.assert.strictEqual(collected.ok, true, JSON.stringify(schema))
+    }
+    const refused = [
+      { anyOf: [{ type: 'string' }, { type: 'integer' }] },
+      { enum: ['a', 1] },
+      { enum: [1.5] },
+      { type: 'number' },
+      { type: 'object' }
+    ]
+    for (const schema of refused) {
+      const collected = collectHeaderParams({ type: 'object', properties: { p: { ...schema, 'x-mcp-header': 'P' } } })
+      t.assert.strictEqual(collected.ok, false, JSON.stringify(schema))
+    }
+  })
+
+  test('an initialize without modern _meta is legacy whatever its version header says', (t: TestContext) => {
+    const initialize = { jsonrpc: JSONRPC_VERSION, id: 1, method: 'initialize', params: { protocolVersion: '2025-11-25' } }
+    t.assert.strictEqual(isModernRequest({ 'mcp-protocol-version': '2026-07-28' }, initialize, ['2026-07-28']), false)
+    t.assert.strictEqual(isModernRequest({ 'mcp-protocol-version': '2026-07-28' }, { ...initialize, method: 'tools/list' }, ['2026-07-28']), true)
   })
 })

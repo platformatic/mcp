@@ -59,7 +59,7 @@ import type { RequestContext } from './request-meta.ts'
 import { supportsTasksExtension } from './request-meta.ts'
 import { InputRequired, requiredCapabilityFor } from './input-required.ts'
 import type { ElicitationExpectation, RequestStateSealer } from './request-state.ts'
-import { AnswersTooLargeError, PrincipalRequiredError, RequestTooDeepError } from './request-state.ts'
+import { AnswersTooLargeError, PrincipalRequiredError, RequestTooDeepError, digestRequest } from './request-state.ts'
 import { AnswerValidator, normalizeAnswerSchema } from './answer-validator.ts'
 import { collectHeaderParams, validateToolParamHeaders } from './headers.ts'
 import type { TaskRecord } from '../stores/task-store.ts'
@@ -114,6 +114,30 @@ export interface ModernDependencies extends HandlerDependencies {
    * which has no header layer, so there is nothing to reconcile.
    */
   headerLayer: boolean
+  /**
+   * Digest of the request as the client sent it, for methods whose handlers
+   * may ask for input. Taken before the handler runs, which receives the
+   * arguments by reference: one that normalizes them in place (trimming,
+   * filling defaults) must still match its own retry.
+   */
+  requestDigest?: string
+}
+
+/** Methods whose handlers may throw `InputRequired`. */
+const INPUT_METHODS = new Set(['tools/call', 'resources/read', 'prompts/get'])
+
+/**
+ * The digest of `request` as received, or undefined when its parameters are
+ * too deep to digest; sealing and opening then report that themselves.
+ */
+function digestAsReceived (request: JSONRPCRequest): string | undefined {
+  if (!INPUT_METHODS.has(request.method)) return undefined
+  try {
+    return digestRequest(request.method, request.params)
+  } catch (error) {
+    if (error instanceof RequestTooDeepError) return undefined
+    throw error
+  }
 }
 
 /**
@@ -548,15 +572,19 @@ function inputMethods (inputRequests: Record<string, unknown> | undefined): Reco
 
 /**
  * The answers to seal for the next retry: everything the handler was given
- * this round, except keys it is asking again, whose fresh answer is the one
- * that counts.
+ * this round, or only the keys it chose to `carry`, except keys it is asking
+ * again, whose fresh answer is the one that counts.
  */
 function answersToCarry (
   given: Record<string, unknown> | undefined,
-  asking: Record<string, unknown> | undefined
+  asking: Record<string, unknown> | undefined,
+  carry: readonly string[] | undefined
 ): Record<string, unknown> | undefined {
   if (given === undefined) return undefined
-  return Object.fromEntries(Object.entries(given).filter(([key]) => !Object.hasOwn(asking ?? {}, key)))
+  const kept = carry === undefined ? undefined : new Set(carry)
+  return Object.fromEntries(Object.entries(given).filter(([key]) =>
+    !Object.hasOwn(asking ?? {}, key) && (kept === undefined || kept.has(key))
+  ))
 }
 
 /**
@@ -588,10 +616,11 @@ function inputRequired (
       principal: principalOf(authContext),
       method: request.method,
       params: request.params,
+      requestDigest: dependencies.requestDigest,
       payload: thrown.state,
       inputs: inputMethods(thrown.inputRequests),
       elicitations: elicitationExpectations(thrown.inputRequests),
-      answers: answersToCarry(dependencies.mrtr?.inputResponses, thrown.inputRequests)
+      answers: answersToCarry(dependencies.mrtr?.inputResponses, thrown.inputRequests, thrown.carry)
     })
   } catch (error) {
     if (error instanceof RequestTooDeepError) {
@@ -600,9 +629,11 @@ function inputRequired (
     }
     if (error instanceof AnswersTooLargeError) {
       // The handler asked again after gathering more than a retry may carry;
-      // dropping answers would leave it asking for them again.
-      dependencies.app.log.error({ err: error, method: request.method }, 'Could not seal request state: carried answers exceed requestStateMaxAnswerBytes')
-      return createError(request.id, INTERNAL_ERROR, 'Internal server error')
+      // dropping answers would leave it asking for them again. The answers'
+      // size is the client's doing as often as the handler's, so this is not
+      // a server fault.
+      dependencies.app.log.warn({ err: error, method: request.method }, 'Could not seal request state: carried answers exceed requestStateMaxAnswerBytes')
+      return createError(request.id, INVALID_PARAMS, `Invalid params: ${error.message}`)
     }
     if (error instanceof PrincipalRequiredError) {
       // Sealing refuses an unidentified caller when the deployment identifies
@@ -656,7 +687,8 @@ function openRequestState (
   const opened = dependencies.sealer.open(state, {
     principal: principalOf(dependencies.authContext),
     method: request.method,
-    params: request.params
+    params: request.params,
+    requestDigest: dependencies.requestDigest
   })
 
   if (!opened.ok) {
@@ -1150,16 +1182,18 @@ function assignWireKeys (
  * Run a tool call as a task and answer immediately with a `CreateTaskResult`.
  *
  * The task is created before we respond, so the `tasks/get` the client makes
- * next always resolves. Returns `undefined` when no task can be created right
- * now (the instance is at its task limit, the store is full, or the caller
- * cannot own one), leaving the caller to run the call synchronously or refuse.
+ * next always resolves. Returns `{ limited }` when a task limit is reached
+ * (the instance's, the caller's, or the store's retention cap), and
+ * `undefined` when no task can be created for another reason (the caller
+ * cannot own one, the server is shutting down, the store failed), leaving the
+ * caller to run the call synchronously or refuse.
  */
 async function runAsTask (
   request: JSONRPCRequest,
   execute: (resume: TaskResume | undefined, signal: AbortSignal) => Promise<JSONRPCResponse | JSONRPCError>,
   dependencies: ModernDependencies,
   settled?: (end: TaskEnd) => Promise<void>
-): Promise<JSONRPCResponse | JSONRPCError | undefined> {
+): Promise<JSONRPCResponse | JSONRPCError | { limited: string } | undefined> {
   const { taskStore, taskWaiters, taskInputs, app, opts } = dependencies
 
   // When the deployment identifies callers, a task is visible only to its
@@ -1179,6 +1213,7 @@ async function runAsTask (
     pollInterval: DEFAULT_POLL_INTERVAL_MS,
     method: request.method,
     authSubject: principalOf(dependencies.authContext),
+    quotaKey: quotaKeyOf(dependencies.authContext),
     era: 'modern',
     // Leased from the start, so a worker that dies before its first renewal is
     // still reaped. The renewal right after creation switches to the store's clock.
@@ -1200,7 +1235,7 @@ async function runAsTask (
   const reservation = reserveTask(taskStore!, record.taskId, quotaKeyOf(dependencies.authContext), opts)
   if (!reservation.ok) {
     app.log.warn({ reason: reservation.reason }, 'Not creating a task')
-    return undefined
+    return reservation.limited ? { limited: reservation.reason } : undefined
   }
   const live = reservation.live
   live.stop = stop
@@ -1210,10 +1245,12 @@ async function runAsTask (
   } catch (error) {
     reservation.release()
     // At the caller's retention cap (or a full store) with nothing finished to
-    // evict. -32029, which the handshake revisions answer, lies in the range
-    // 2026-07-28 reserves for the specification, so the caller decides how to
-    // answer instead: synchronously, or with an error when a task is required.
-    app.log.warn({ err: error }, error instanceof TaskLimitError ? 'Not creating a task: task limit reached' : 'Could not create task')
+    // evict.
+    if (error instanceof TaskLimitError) {
+      app.log.warn({ err: error }, 'Not creating a task: task limit reached')
+      return { limited: 'Task limit reached' }
+    }
+    app.log.warn({ err: error }, 'Could not create task')
     return undefined
   }
   const expiresAt = createdAt + ttl
@@ -1569,9 +1606,17 @@ async function modernToolsCall (
         await unreported?.(ended)
       }
     )
+    if (task && 'limited' in task) {
+      // Running work the caller asked to be a task synchronously instead could
+      // outlast any HTTP timeout, so a limit is reported, as the handshake
+      // revisions do. Their -32029 lies in the range 2026-07-28 reserves for
+      // the specification, so this is an invalid request.
+      await emitToolCallComplete('json-rpc', params.name, args, { ok: false, reason: 'task-limit', message: task.limited }, startedAt, dependencies)
+      return createError(request.id, INVALID_REQUEST, `Cannot create a task: ${task.limited}`)
+    }
     if (task) return task
-    // No task could be created right now. A tool that merely supports tasks
-    // still works synchronously; one that requires a task cannot run.
+    // No task could be created for this request. A tool that merely supports
+    // tasks still works synchronously; one that requires a task cannot run.
     if (taskSupport === 'required') {
       await emitToolCallComplete('json-rpc', params.name, args, { ok: false, reason: 'task-required' }, startedAt, dependencies)
       return createError(request.id, INVALID_REQUEST, `Tool '${params.name}' requires a task, and none can be created for this request`)
@@ -1673,9 +1718,10 @@ export async function dispatchModern (
   const invalidResponses = invalidInputResponses(request.params)
   if (invalidResponses) return createError(request.id, INVALID_PARAMS, invalidResponses)
 
-  const opened = openRequestState(request, dependencies)
+  const received = { ...dependencies, requestDigest: digestAsReceived(request) }
+  const opened = openRequestState(request, received)
   if (!opened.ok) return opened.error
-  const scoped = withMrtrContext(request, dependencies, opened)
+  const scoped = withMrtrContext(request, received, opened)
   const invalidAnswer = invalidAnswers(scoped.mrtr?.inputResponses, opened.inputs ?? {}, opened.elicitations)
   if (invalidAnswer) return createError(request.id, INVALID_PARAMS, invalidAnswer)
 

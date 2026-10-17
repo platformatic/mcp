@@ -294,7 +294,14 @@ Mcp-Name: get_weather
 ```
 
 `protocolVersion` and `clientCapabilities` are required — a request missing either is
-answered with `-32602` and HTTP 400. Every result comes back with `resultType`, the server's
+answered with `-32602` and HTTP 400. An `initialize` without that `_meta` always takes the
+legacy handshake, whatever `MCP-Protocol-Version` header it carries.
+
+A tool parameter annotated with `x-mcp-header` is mirrored into an `Mcp-Param-*` header and
+must be a string, integer or boolean: a plain `type`, a nullable one, an `enum`/`const` of one of
+those, or a union of such literals (TypeBox's `Type.Union` of `Type.Literal`s). `mcpAddTool`
+throws for an annotation the transport cannot mirror, or one not reachable through `properties`
+alone, since 2026-07-28 clients could never call that tool. Every result comes back with `resultType`, the server's
 identity in `_meta`, and caching hints where the revision defines them.
 
 The status codes matter, because a dual-era *client* uses them to work out which kind of
@@ -302,7 +309,7 @@ server it reached:
 
 | Condition | HTTP | JSON-RPC error |
 |---|---|---|
-| Headers disagree with the body, or a required one is missing | `400` | `-32020` `HeaderMismatch` |
+| Headers disagree with the body (the version included), or a required one is missing | `400` | `-32020` `HeaderMismatch` |
 | Client did not declare a capability the request needs | `400` | `-32021` `MissingRequiredClientCapability` |
 | Version unknown or unsupported | `400` | `-32022` `UnsupportedProtocolVersion` |
 | Method not implemented, or removed in this revision | `404` | `-32601` `Method not found` |
@@ -479,15 +486,25 @@ the latest round's, so the second step still sees the first answer, as it would 
 as a task. A key asked again is replaced by its new answer. The client echoes those answers
 back on every retry, so they are bounded by `requestStateMaxAnswerBytes` (64 KiB of JSON by
 default; `0` turns carrying off). Answers are never dropped silently: when a handler asks again
-after gathering more than that, the request fails with `-32603` (and the server logs why),
+after gathering more than that, the request fails with `-32602` (and the server logs a warning),
 since a handler that lost an earlier answer would only ask for it again. A handler that gathers
-large answers should keep what it needs in its own `state` and raise the limit, or set it to
-`0` and carry nothing.
+large answers, such as a sampled draft, should keep what it needs in its own `state` and say
+which answers are still worth carrying with `carry`:
+
+```typescript
+// The draft is summarised into state; only the confirmation is asked next.
+throw new InputRequired({
+  inputRequests: { confirm: elicitForm('Publish this summary?', confirmSchema) },
+  state: { summary: summarise(draft) },
+  carry: [] // carry no earlier answers
+})
+```
 
 An accepted form answer is validated against the `requestedSchema` exactly as written, every
 keyword included (`pattern` too, so keep patterns simple). Annotations (`title`,
 `description`, `default`, `examples`) and `$schema` / `$id` are ignored, so a draft-07 schema
-works. A schema that cannot be compiled fails the request with `-32603` when the handler asks,
+works. The formats elicitation defines (`email`, `uri`, `date`, `date-time`) are checked; any
+other `format` is accepted as is. A schema that cannot be compiled fails the request with `-32603` when the handler asks,
 rather than leaving its answers unchecked.
 
 `elicitForm`, `elicitUrl`, `requestSampling` and `requestRoots` build the entries. The
@@ -596,8 +613,11 @@ applies.
 Resource subscriptions go through the same handlers as the legacy `resources/subscribe`: the
 subscribe handler runs for each requested URI with the caller's `authContext`, and a URI whose
 handler throws is left out of the acknowledgement. Throw there for resources the caller may not
-watch; update notifications reveal what changed and when. The unsubscribe handler runs for each
-accepted URI when the stream ends, however it ends. Without a subscribe handler nothing can
+watch; update notifications reveal what changed and when. The unsubscribe handler runs for an
+accepted URI once the last listen stream on that instance holding it ends, however it ends, so a
+handler may start a watcher on subscribe (idempotently) and stop it on unsubscribe. It runs with
+the context of the stream that ended last. Legacy `resources/unsubscribe` calls are not counted:
+they still run the handler for that session. Without a subscribe handler nothing can
 check access, so no URI is accepted, even when `capabilities` declares `resources.subscribe`.
 
 ```typescript
@@ -860,18 +880,19 @@ result carries an opaque `nextCursor`; pass it back as `params.cursor` to fetch 
 page. An unrecognised cursor is rejected with `-32602` (Invalid params). The Redis store keeps
 a per-owner index, so a listing only reads the caller's own tasks.
 
-Each caller (a user at an issuer, through an OAuth client) may keep at most
+Each caller (a user at an issuer, whichever OAuth client they come through) may keep at most
 `taskMaxRetainedPerPrincipal` tasks stored (default 100), for both protocol eras. Finished tasks
 count until their `ttl` expires, so one caller cannot fill the store with results it never
 collects. When a caller is at its quota, its oldest finished task is evicted to make room; if all
-of them are still running, a 2025-11-25 `tools/call` fails with `-32029` "Task limit reached", a
-2026-07-28 tool that requires task mode gets the same error, and one that only optionally
-supports tasks runs synchronously instead. Callers the deployment cannot identify share a single
+of them are still running, a 2025-11-25 `tools/call` fails with `-32029` "Task limit reached",
+and a 2026-07-28 call that would run as a task fails with `-32600` "Cannot create a task: Task
+limit reached" (`-32029` lies in the range 2026-07-28 reserves), rather than running a long call
+synchronously. The same errors answer `taskMaxConcurrent` and `taskMaxPerPrincipal`. Callers the deployment cannot identify share a single
 quota, so raise it if you expect many concurrent anonymous tasks. The in-memory store also holds
 at most `taskStoreMaxTasks` tasks in total (default 1000); when full, it evicts the caller's
 oldest finished task, then the oldest finished task of any caller, before refusing. Eviction
 can drop a finished result its client has not read yet. The Redis store enforces the quota
-atomically with a per-caller sorted set, so it holds across instances, and prunes expired
+atomically with a per-user sorted set, so it holds across instances, and prunes expired
 entries from it whenever that caller creates or lists tasks.
 
 The instance running a task (of either era) holds a lease on it and renews it every third of
@@ -2559,10 +2580,12 @@ await app.register(import('@fastify/bearer-auth'), {
     - `scopes`: Requested OAuth scopes
     - `dynamicRegistration`: Enable dynamic client registration (default: false)
 - `requestStateSecret`: Secret (at least 32 bytes) that seals multi round-trip
-  `requestState`. Required when `redis` is configured, since any instance may serve a retry
+  `requestState`. Set it when `redis` is configured, since any instance may serve a retry
+  (the plugin warns at startup otherwise). An array rotates secrets: the first seals, any
+  verifies
 - `requestStateTtlMs`: How long sealed state stays valid (default 5 minutes). Must be a positive integer; anything else throws at startup
 - `requestStateMaxAnswerBytes`: How many bytes of JSON of earlier answers sealed state carries
-  into later rounds (default 65536); asking again past it fails with `-32603`, and `0` carries none
+  into later rounds (default 65536); asking again past it fails with `-32602`, and `0` carries none
 - `caching`: Freshness hints per cacheable operation (default `{ ttlMs: 0, cacheScope: 'private' }`)
 - `enableTasks`: Enable tasks (the 2025-11-25 core tasks and the 2026-07-28 extension)
 - `taskDefaultTtlMs` / `taskMaxTtlMs`: Task retention (defaults 60000 / 3600000)
@@ -2771,8 +2794,10 @@ All handlers receive a consistent context object containing:
   or the stdio transport's `authContext` option
 - `context.signal`: `AbortSignal` that aborts when the request is cancelled: a 2026-07-28 client
   disconnecting before the response, `notifications/cancelled` on stdio, or `tasks/cancel` for a
-  handler running as a task (in either era). Pass it to `fetch` or check it between steps to stop
-  work early. A legacy HTTP disconnect does not abort it, since it is not a cancellation there.
+  handler running as a task (in either era). A 2026-07-28 request is also aborted when the server
+  shuts down, so a long-running handler cannot hold `app.close()` open. Pass it to `fetch` or
+  check it between steps to stop work early. A legacy HTTP disconnect does not abort it, since it
+  is not a cancellation there.
 - `context.protocolVersion`: the protocol revision the request is served under.
 - `context.clientCapabilities`: what a 2026-07-28 client declared on this request, so a handler
   can choose URL-mode over form elicitation, or skip asking a client that cannot answer. Absent
@@ -3273,18 +3298,21 @@ the changes to the plugin's own API and defaults:
 - **Tasks are bound to user, OAuth client and issuer**, not the user alone, in both eras.
   `TaskRecord.authSubject` now holds that principal as a JSON string rather than a bare user
   id, so code that reads task records or calls `list(subject)` on a `MemoryTaskStore` or
-  `RedisTaskStore` directly must pass it through unchanged.
+  `RedisTaskStore` directly must pass it through unchanged. The retention cap counts
+  `TaskRecord.quotaKey` (the user at their issuer), so a user's OAuth clients share it.
 - **Task limits apply to both eras**: 2025-11-25 tasks count against `taskMaxConcurrent` and
-  `taskMaxPerPrincipal`, are aborted at their ttl and are drained on shutdown.
+  `taskMaxPerPrincipal` (answering `-32029` past them), are aborted at their ttl and are
+  drained on shutdown.
 - **Task retention is capped per caller** (`taskMaxRetainedPerPrincipal`, default 100) in both
   stores and both eras; at the cap, and when the in-memory store is full, the oldest finished
   task is evicted, so a finished result its client has not read yet can be lost.
 - **`requestStateMaxAnswerBytes` fails rather than truncates**: a retry whose carried answers
-  exceed it is answered `-32603`.
+  exceed it is answered `-32602`; handlers choose what is carried with `InputRequired`'s `carry`.
 - **`HandlerContext.authContext.authorizationServer` is the normalized issuer** the token
   validator vouched for (no trailing slash; `introspection:<endpoint>` for an introspected
   token without `iss`), as sessions already used.
-- **`requestStateSecret` is required with `redis`**, and must be at least 32 bytes.
+- **`requestStateSecret` must be at least 32 bytes**; with `redis` and no secret the plugin
+  warns at startup, as multi round-trip retries would fail across instances.
 - **Default capabilities declare `listChanged: true`** for tools, prompts and resources, and
   registering one after ready broadcasts `list_changed`. Legacy clients only see `listChanged`
   when `enableSSE` is on.
@@ -3312,8 +3340,8 @@ the changes to the plugin's own API and defaults:
   identified caller). `resolveAuthorizationContext` is not called for them; use the exported
   `isStdioRequest(request)` to let them through your own authentication hooks.
 - **`subscriptions/listen` calls the resource subscribe handlers**: `mcpSetResourceSubscribeHandler`
-  runs for each requested URI (a throw drops the URI), and the unsubscribe handler when the stream
-  ends. Without a subscribe handler no resource URI is accepted, as `resources/subscribe` answers
+  runs for each requested URI (a throw drops the URI), and the unsubscribe handler when the last
+  stream on the instance holding that URI ends. Without a subscribe handler no resource URI is accepted, as `resources/subscribe` answers
   `-32601` then.
 - **Legacy clients without `enableSSE` no longer see `resources.subscribe`**, since updates could
   never reach them.
@@ -3329,8 +3357,8 @@ the changes to the plugin's own API and defaults:
 ### Upgrading to MCP 2026-07-28
 
 Clients that speak `2025-11-25` or earlier need no changes, and adopting the new revision is
-opt-in per client. Deployments may need a configuration change: a `redis` deployment must now
-set `requestStateSecret`, or it fails at startup, and the other items under
+opt-in per client. Deployments may need a configuration change: a `redis` deployment should
+set `requestStateSecret` (it warns at startup otherwise), and the other items under
 [Breaking changes](#breaking-changes-in-300) apply to the legacy path too.
 
 **What is new**
@@ -3350,7 +3378,9 @@ set `requestStateSecret`, or it fails at startup, and the other items under
    [Multi Round-Trip Requests](#multi-round-trip-requests-2026-07-28).
 2. **Set `requestStateSecret`** if more than one instance can serve a retry. Without it each
    process seals with its own random key and a retry landing elsewhere is refused. The
-   secret must be at least 32 bytes; a shorter or empty one is rejected at startup.
+   secret must be at least 32 bytes; a shorter or empty one is rejected at startup. To rotate
+   it, pass an array with the new secret first, and drop the old one after
+   `requestStateTtlMs`.
 3. **Decide your caching hints.** The default of `ttlMs: 0` is safe but means clients never
    cache. See [Result Caching](#result-caching-2026-07-28).
 4. **Sessions do not exist for modern clients.** `context.sessionId` is `undefined` on that

@@ -10,6 +10,8 @@
 
 import { Ajv2020 } from 'ajv/dist/2020.js'
 import type { ValidateFunction } from 'ajv/dist/2020.js'
+import ajvFormatsModule from 'ajv-formats'
+import type { FormatsPlugin } from 'ajv-formats'
 import stringify from 'safe-stable-stringify'
 
 /** Compiled answer validators kept at once; older ones are compiled again on demand. */
@@ -24,6 +26,24 @@ const MAX_COMPILED_SCHEMAS = 256
  */
 const IGNORED_KEYWORDS = new Set(['$schema', '$id', 'title', 'description', 'default', 'examples', '$comment'])
 
+/**
+ * Keywords whose value maps names (property names, patterns, definition
+ * names) to schemas or lists: the names are data, so a property called
+ * `title` survives, and only the values are normalized.
+ */
+const NAME_MAP_KEYWORDS = new Set([
+  'properties',
+  'patternProperties',
+  '$defs',
+  'definitions',
+  'dependentSchemas',
+  'dependentRequired',
+  'dependencies'
+])
+
+/** The string formats elicitation defines; any other is not checked. */
+const ANSWER_FORMATS = ['email', 'uri', 'date', 'date-time'] as const
+
 /** A copy of `schema` with only the keywords that constrain a value. */
 export function normalizeAnswerSchema (schema: unknown): unknown {
   if (Array.isArray(schema)) return schema.map(normalizeAnswerSchema)
@@ -35,8 +55,8 @@ export function normalizeAnswerSchema (schema: unknown): unknown {
     if (key === 'enum' || key === 'const') {
       // Values, not schemas: an object among them must match as written.
       normalized.push([key, value])
-    } else if (key === 'properties' && value !== null && typeof value === 'object' && !Array.isArray(value)) {
-      // Property names are data, not keywords: keep every one of them.
+    } else if (NAME_MAP_KEYWORDS.has(key) && value !== null && typeof value === 'object' && !Array.isArray(value)) {
+      // Names are data, not keywords: keep every one of them.
       normalized.push([key, Object.fromEntries(Object.entries(value).map(([name, property]) => [name, normalizeAnswerSchema(property)]))])
     } else {
       normalized.push([key, normalizeAnswerSchema(value)])
@@ -50,12 +70,21 @@ export class AnswerValidator {
     addUsedSchema: false,
     allErrors: false,
     strict: false,
-    validateFormats: false,
+    // Unknown formats are accepted rather than logged on every compile.
+    logger: false,
     // Answers reach handlers exactly as the client sent them.
     coerceTypes: false,
     useDefaults: false,
     removeAdditional: false
   })
+
+  constructor () {
+    // A CommonJS module whose `default` is the plugin, under Node's ESM interop
+    // and TypeScript's alike.
+    const module = ajvFormatsModule as unknown as FormatsPlugin & { default?: FormatsPlugin }
+    const addFormats = module.default ?? module
+    addFormats(this.#ajv, [...ANSWER_FORMATS])
+  }
 
   /** Most recently used last. */
   #compiled = new Map<string, { schema: object, validate: ValidateFunction }>()

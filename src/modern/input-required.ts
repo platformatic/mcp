@@ -29,12 +29,26 @@ import type {
 export class InputRequired extends Error {
   readonly inputRequests?: InputRequests
   readonly state?: unknown
+  /**
+   * Which earlier answers the next retry carries. By default it carries every
+   * answer this round was given, except keys asked again; a handler that has
+   * folded an answer into its `state`, or no longer needs it, lists only the
+   * keys it still wants (`[]` for none), keeping the retry within
+   * `requestStateMaxAnswerBytes`.
+   */
+  readonly carry?: readonly string[]
 
-  constructor (options: { inputRequests?: InputRequests, state?: unknown, message?: string } = {}) {
+  constructor (options: { inputRequests?: InputRequests, state?: unknown, carry?: readonly string[], message?: string } = {}) {
     super(options.message ?? 'Additional client input is required')
     this.name = 'InputRequired'
     this.inputRequests = options.inputRequests
     this.state = options.state
+    if (options.carry !== undefined) {
+      if (!Array.isArray(options.carry) || !options.carry.every(key => typeof key === 'string')) {
+        throw new TypeError('InputRequired "carry" must be an array of input keys')
+      }
+      this.carry = [...options.carry]
+    }
 
     if (options.inputRequests === undefined && options.state === undefined) {
       throw new TypeError('InputRequired needs at least one of "inputRequests" or "state"')

@@ -13,14 +13,17 @@ export interface SessionMetadata {
   clientCapabilities?: ClientCapabilities
   authSession?: any // OAuth session data (legacy - for Phase 2 compatibility)
   /**
-   * Subject (`sub`) of the verified access token that created the session.
-   * When set, only requests bearing a token for the same issuer and subject
-   * may use the session. Unset when authorization is disabled.
+   * The user who created the session: the `userId` from
+   * `resolveAuthorizationContext` when one is configured, otherwise the
+   * subject (`sub`) of the verified access token. When set, only requests
+   * from the same user at the same issuer may use the session. Unset for
+   * anonymous callers.
    */
   ownerSub?: string
   /**
-   * Issuer identity of that token (see TokenValidationResult.issuer). A subject
-   * is only unique per issuer, so the owner is the (ownerIss, ownerSub) pair.
+   * That user's issuer (the resolver's `authorizationServer`, or see
+   * TokenValidationResult.issuer). A subject is only unique per issuer, so the
+   * owner is the (ownerIss, ownerSub) pair.
    */
   ownerIss?: string
 

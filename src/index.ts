@@ -109,8 +109,11 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
 
   // Several instances serve each other's MRTR retries, so they must share the
   // key that seals request state; without one each would refuse the others'.
+  // Only 2026-07-28 multi round-trip requests need it, so a deployment serving
+  // legacy clients keeps working after an upgrade, and is told why a retry
+  // landing on another instance would fail.
   if (opts.redis && opts.requestStateSecret === undefined) {
-    throw new Error('requestStateSecret is required when redis is configured: every instance must verify the request state the others seal')
+    app.log.warn('MCP: redis is configured without requestStateSecret; a 2026-07-28 multi round-trip retry served by another instance will be refused. Set the same requestStateSecret on every instance')
   }
 
   // Recognise stdio-injected requests before any other hook (authorization
@@ -128,6 +131,17 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
 
   if (opts.sessionTtlMs !== undefined && !(Number.isFinite(opts.sessionTtlMs) && opts.sessionTtlMs > 0)) {
     throw new Error('sessionTtlMs must be a positive number of milliseconds')
+  }
+  // A NaN (an unset environment variable through `Number()`) would compare
+  // false against every count, silently removing the limit.
+  for (const name of ['subscriptionMaxStreams', 'subscriptionMaxStreamsPerPrincipal', 'subscriptionMaxResourceUris'] as const) {
+    if (opts[name] !== undefined && (!Number.isSafeInteger(opts[name]) || opts[name] < 1)) {
+      throw new TypeError(`${name} must be a positive integer`)
+    }
+  }
+  // 0 turns the limit off, as it always has.
+  if (opts.sseMaxConnectionMs !== undefined && (!Number.isFinite(opts.sseMaxConnectionMs) || opts.sseMaxConnectionMs < 0)) {
+    throw new TypeError('sseMaxConnectionMs must be a non-negative number of milliseconds')
   }
   if (opts.taskMaxRetainedPerPrincipal !== undefined) {
     // Checked before any Redis connection is opened, so a bad value cannot leak one
@@ -190,7 +204,7 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
   // holding the server open until that work finishes.
   const shutdownController = new AbortController()
   app.addHook('preClose', async () => {
-    shutdownController.abort()
+    shutdownController.abort(new Error('Server is shutting down'))
   })
 
   // Leases let any instance notice that the one running a task has died.

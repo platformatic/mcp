@@ -536,6 +536,32 @@ describe('RedisTaskStore', () => {
     t.assert.strictEqual(await redis.zcard('mcp:tasks:v2:anonymous'), 1)
   })
 
+  test('the cap counts a user once across the OAuth clients they act through', async (t: TestContext) => {
+    store = new RedisTaskStore({ redis, maxTasksPerPrincipal: 2 })
+    const quotaKey = JSON.stringify(['user-1', ISS])
+    const via = (client: string) => JSON.stringify(['user-1', client, ISS])
+    await store.create(record({ taskId: 'a', authSubject: via('one'), quotaKey }))
+    await store.create(record({ taskId: 'b', authSubject: via('two'), quotaKey }))
+    await t.assert.rejects(
+      () => store.create(record({ taskId: 'c', authSubject: via('three'), quotaKey })),
+      (err: any) => err instanceof TaskLimitError
+    )
+
+    // A finished task of another client is evicted to make room, from both
+    // the quota and its own owner index once that is next touched.
+    await store.updateStatus('a', 'completed')
+    await store.create(record({ taskId: 'c', authSubject: via('three'), quotaKey }))
+    t.assert.strictEqual(await store.get('a'), null)
+    t.assert.deepStrictEqual((await store.list(via('one'))).tasks, [])
+    t.assert.deepStrictEqual((await store.list(via('three'))).tasks.map(x => x.taskId), ['c'])
+    t.assert.deepStrictEqual(await redis.zrange(`mcp:tasks:v2:quota:${quotaKey}`, 0, -1), ['b', 'c'])
+
+    // Deleting a task removes it from both indexes.
+    await store.delete('b')
+    t.assert.deepStrictEqual(await redis.zrange(`mcp:tasks:v2:quota:${quotaKey}`, 0, -1), ['c'])
+    t.assert.strictEqual(await redis.zcard(`mcp:tasks:v2:owner:${via('two')}`), 0)
+  })
+
   test('evicts the caller\'s oldest finished task to make room', async (t: TestContext) => {
     store = new RedisTaskStore({ redis, maxTasksPerPrincipal: 3 })
     const base = Date.now()

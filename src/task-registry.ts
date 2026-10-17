@@ -64,7 +64,8 @@ export function quotaKeyOf (authContext: AuthorizationContext | undefined): stri
 }
 
 /**
- * Reserve a slot for a new task, or say why there is none. Reservation is
+ * Reserve a slot for a new task, or say why there is none; `limited` tells a
+ * limit being reached from the server shutting down. Reservation is
  * synchronous, so concurrent requests cannot all pass the check before any of
  * them is counted. `release()` gives the slot back.
  */
@@ -73,18 +74,18 @@ export function reserveTask (
   taskId: string,
   quotaKey: string | undefined,
   opts: MCPPluginOptions
-): { ok: true, live: LiveTask, release: () => void } | { ok: false, reason: string } {
+): { ok: true, live: LiveTask, release: () => void } | { ok: false, reason: string, limited: boolean } {
   const registry = registryFor(store)
-  if (registry.closing) return { ok: false, reason: 'The server is shutting down' }
+  if (registry.closing) return { ok: false, reason: 'The server is shutting down', limited: false }
 
   const maxConcurrent = opts.taskMaxConcurrent ?? DEFAULT_TASK_MAX_CONCURRENT
-  if (registry.live.size >= maxConcurrent) return { ok: false, reason: 'Task limit reached' }
+  if (registry.live.size >= maxConcurrent) return { ok: false, reason: 'Task limit reached', limited: true }
 
   if (quotaKey !== undefined) {
     const maxPerPrincipal = opts.taskMaxPerPrincipal ?? DEFAULT_TASK_MAX_PER_PRINCIPAL
     let mine = 0
     for (const task of registry.live.values()) if (task.quotaKey === quotaKey) mine++
-    if (mine >= maxPerPrincipal) return { ok: false, reason: 'Per-caller task limit reached' }
+    if (mine >= maxPerPrincipal) return { ok: false, reason: 'Per-caller task limit reached', limited: true }
   }
 
   let settle!: () => void

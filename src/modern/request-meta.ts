@@ -130,10 +130,11 @@ export function parseRequestContext (params: unknown): RequestContextResult {
   const rawProgressToken = (record as { progressToken?: unknown }).progressToken
   let progressToken: string | number | undefined
   if (rawProgressToken !== undefined) {
-    if (typeof rawProgressToken !== 'string' && typeof rawProgressToken !== 'number') {
-      return { ok: false, message: 'Invalid "_meta.progressToken": expected a string or number' }
+    // Progress tokens MUST be a string or an integer.
+    if (typeof rawProgressToken !== 'string' && !Number.isSafeInteger(rawProgressToken)) {
+      return { ok: false, message: 'Invalid "_meta.progressToken": expected a string or integer' }
     }
-    progressToken = rawProgressToken
+    progressToken = rawProgressToken as string | number
   }
 
   return {
@@ -206,7 +207,8 @@ export function bodyClaimsModern (body: unknown): boolean {
  * "Server Validation" exists to prevent.
  *
  * So: a modern version header, or a body claiming one, means modern. A request
- * that does neither is legacy. A modern header with a body that lacks `_meta`
+ * that does neither is legacy, and so is an `initialize` without modern
+ * `_meta`, which the versioning rules say selects legacy semantics. A modern header with a body that lacks `_meta`
  * now correctly earns `-32602` rather than silently being served.
  */
 export function isModernRequest (
@@ -214,11 +216,16 @@ export function isModernRequest (
   body: unknown,
   modernVersions: readonly string[]
 ): boolean {
+  const claimsModern = bodyClaimsModern(body)
+  // An `initialize` selects legacy semantics: a legacy client that echoes the
+  // library's newest version in the header still gets its handshake.
+  if (!claimsModern && (body as { method?: unknown } | null)?.method === 'initialize' && !Array.isArray(body)) return false
+
   const header = headers['mcp-protocol-version']
   const version = Array.isArray(header) ? header[0] : header
   if (version !== undefined && modernVersions.includes(version)) return true
 
-  return bodyClaimsModern(body)
+  return claimsModern
 }
 
 /** Did the client declare support for elicitation in this request? */

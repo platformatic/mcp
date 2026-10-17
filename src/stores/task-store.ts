@@ -16,6 +16,13 @@ export interface TaskRecord extends Task {
    * belonging to a different context.
    */
   authSubject?: string
+  /**
+   * Who the task counts against for the per-caller retention cap (see
+   * `quotaKeyOf`: the user at their issuer, whichever OAuth client they come
+   * through), so registering more clients does not raise the cap. Falls back
+   * to `authSubject` when absent.
+   */
+  quotaKey?: string
   /** The method of the request the task wraps, e.g. `tools/call` */
   method: string
   /** Terminal outcome, present once the task reaches completed/failed/cancelled */

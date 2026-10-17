@@ -318,6 +318,12 @@ export type McpCallToolOutcome =
   | { ok: false, reason: 'invalid-arguments', detail: string }
   | { ok: false, reason: 'task-required' }
   /**
+   * A 2026-07-28 call that would run as a task was refused because a task
+   * limit was reached (`taskMaxConcurrent`, `taskMaxPerPrincipal` or the
+   * retention cap).
+   */
+  | { ok: false, reason: 'task-limit', message: string }
+  /**
    * The handler threw `InputRequired`: it needs the client to answer
    * `inputRequests` first. In-process there is no client to ask, so the call
    * cannot complete.
@@ -408,16 +414,16 @@ export interface MCPPluginOptions {
   /**
    * Most tasks one instance runs in the background at once, for both protocol
    * eras (default 1000). A task counts until its handler settles, even past
-   * its ttl. Past the limit, a 2026-07-28 tool that only optionally supports
-   * tasks runs synchronously, and a task is otherwise refused.
+   * its ttl. Past the limit a task is refused: -32029 on 2025-11-25, -32600
+   * on 2026-07-28 (whose reserved range -32029 falls in).
    */
   taskMaxConcurrent?: number
   /**
    * Most tasks one caller (a user at an issuer, whichever OAuth client they
    * come through) may run on an instance at once, for both protocol eras
    * (default 100). Not applied to callers the deployment cannot identify,
-   * who are bounded by `taskMaxConcurrent` only. Past it, the same fallback
-   * as `taskMaxConcurrent` applies.
+   * who are bounded by `taskMaxConcurrent` only. Past it, the call is refused
+   * as for `taskMaxConcurrent`.
    */
   taskMaxPerPrincipal?: number
   /**
@@ -493,15 +499,21 @@ export interface MCPPluginOptions {
    * serve a retry, otherwise a retry landing on another replica is rejected.
    * Defaults to a per-process random key, which is correct for a single
    * instance only.
+   *
+   * A list rotates secrets: state is sealed with the first and accepted under
+   * any. Put the new secret first, deploy, and remove the old one once state
+   * sealed with it has expired (`requestStateTtlMs`).
    */
-  requestStateSecret?: string
+  requestStateSecret?: string | string[]
   /** How long a sealed `requestState` stays valid. Defaults to 5 minutes. */
   requestStateTtlMs?: number
   /**
    * How many bytes of JSON of earlier answers a sealed `requestState` carries
-   * into later rounds. When the answers exceed it the oldest are dropped, so
-   * a handler that must keep a large or old answer stores what it needs in
-   * its own state. `0` disables carrying. Defaults to 64 KiB.
+   * into later rounds. When the answers to carry exceed it the request fails
+   * with -32602 rather than dropping any, so a handler that gathers large
+   * answers stores what it needs in its own state and lists the answers still
+   * worth carrying in `InputRequired`'s `carry`. `0` disables carrying.
+   * Defaults to 64 KiB.
    */
   requestStateMaxAnswerBytes?: number
   /**

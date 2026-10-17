@@ -144,7 +144,8 @@ function withinBudget (answers: Record<string, unknown> | undefined, maxBytes: n
  * instances must configure a shared secret.
  */
 export class RequestStateSealer {
-  #secret: Buffer
+  /** The first seals; any of them verifies, so a secret can be rotated. */
+  #secrets: Buffer[]
   #ttlMs: number
 
   #requirePrincipal: boolean
@@ -152,7 +153,12 @@ export class RequestStateSealer {
   #maxAnswerBytes: number
 
   constructor (options: {
-    secret?: string | Buffer
+    /**
+     * A list rotates secrets: state is sealed with the first and accepted
+     * under any, so add the new secret in front, deploy, and drop the old one
+     * once state sealed with it has expired.
+     */
+    secret?: string | Buffer | ReadonlyArray<string | Buffer>
     ttlMs?: number
     requirePrincipal?: boolean
     audience?: string
@@ -161,16 +167,25 @@ export class RequestStateSealer {
     this.#audience = options.audience
     this.#maxAnswerBytes = options.maxAnswerBytes ?? DEFAULT_MAX_CARRIED_ANSWER_BYTES
     if (options.secret === undefined) {
-      this.#secret = randomBytes(MIN_SECRET_BYTES)
+      this.#secrets = [randomBytes(MIN_SECRET_BYTES)]
     } else {
+      const configured = Array.isArray(options.secret) ? options.secret : [options.secret as string | Buffer]
+      if (configured.length === 0) {
+        throw new Error('requestStateSecret must name at least one secret')
+      }
       // A configured but empty secret (say, an unset environment variable
       // expanded to '') must not silently fall back to a per-process key:
       // retries would then fail on every other instance.
-      const secret = Buffer.isBuffer(options.secret) ? options.secret : Buffer.from(options.secret, 'utf8')
-      if (secret.length < MIN_SECRET_BYTES) {
-        throw new Error(`requestStateSecret must be at least ${MIN_SECRET_BYTES} bytes`)
-      }
-      this.#secret = secret
+      this.#secrets = configured.map(entry => {
+        if (typeof entry !== 'string' && !Buffer.isBuffer(entry)) {
+          throw new TypeError('requestStateSecret must be a string, a Buffer or an array of them')
+        }
+        const secret = Buffer.isBuffer(entry) ? entry : Buffer.from(entry, 'utf8')
+        if (secret.length < MIN_SECRET_BYTES) {
+          throw new Error(`requestStateSecret must be at least ${MIN_SECRET_BYTES} bytes`)
+        }
+        return secret
+      })
     }
     this.#ttlMs = options.ttlMs ?? DEFAULT_TTL_MS
     this.#requirePrincipal = options.requirePrincipal ?? false
@@ -181,6 +196,11 @@ export class RequestStateSealer {
     principal?: string
     method: string
     params: unknown
+    /**
+     * The digest of the request as the client sent it, taken before any
+     * handler ran; computed from `params` when absent.
+     */
+    requestDigest?: string
     payload?: unknown
     inputs?: Record<string, string>
     elicitations?: Record<string, ElicitationExpectation>
@@ -197,7 +217,7 @@ export class RequestStateSealer {
     const claims: RequestStateClaims = {
       principal: input.principal,
       method: input.method,
-      requestDigest: digestRequest(input.method, input.params),
+      requestDigest: input.requestDigest ?? digestRequest(input.method, input.params),
       expiresAt: Date.now() + (input.ttlMs ?? this.#ttlMs),
       ...(this.#audience !== undefined ? { audience: this.#audience } : {}),
       // Omitted, not null, when the handler saved nothing, so the retry sees
@@ -221,6 +241,8 @@ export class RequestStateSealer {
     principal?: string
     method: string
     params: unknown
+    /** As for `seal`: computed from `params` when absent. */
+    requestDigest?: string
     now?: number
   }): VerifyResult {
     const separator = state.lastIndexOf('.')
@@ -265,7 +287,7 @@ export class RequestStateSealer {
 
     let digest: string
     try {
-      digest = digestRequest(expected.method, expected.params)
+      digest = expected.requestDigest ?? digestRequest(expected.method, expected.params)
     } catch (error) {
       if (error instanceof RequestTooDeepError) return { ok: false, reason: error.message }
       throw error
@@ -277,14 +299,18 @@ export class RequestStateSealer {
     return { ok: true, claims }
   }
 
-  #sign (body: string): string {
-    return createHmac('sha256', this.#secret).update(SIGNATURE_DOMAIN).update(body).digest('base64url')
+  #sign (body: string, secret: Buffer = this.#secrets[0]): string {
+    return createHmac('sha256', secret).update(SIGNATURE_DOMAIN).update(body).digest('base64url')
   }
 
   #verify (body: string, signature: string): boolean {
-    const expected = Buffer.from(this.#sign(body), 'utf8')
     const actual = Buffer.from(signature, 'utf8')
-    if (expected.length !== actual.length) return false
-    return timingSafeEqual(expected, actual)
+    let valid = false
+    // Every secret is tried, so the time taken does not tell which matched.
+    for (const secret of this.#secrets) {
+      const expected = Buffer.from(this.#sign(body, secret), 'utf8')
+      if (expected.length === actual.length && timingSafeEqual(expected, actual)) valid = true
+    }
+    return valid
   }
 }
