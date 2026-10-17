@@ -16,7 +16,8 @@ async function createApp (t: TestContext, redis?: { host: string, port: number, 
     serverInfo: { name: 'test', version: '1.0.0' },
     capabilities: { resources: { subscribe: true } },
     enableSSE: true,
-    redis
+    redis,
+    ...(redis ? { requestStateSecret: 'test-request-state-secret-32-bytes!!' } : {})
   })
 
   app.mcpSetResourceSubscribeHandler(async () => ({}))

@@ -1,8 +1,21 @@
 import { randomUUID } from 'crypto'
-import type { FastifyRequest, FastifyReply, FastifyPluginAsync, FastifySchema, FastifyError, FastifyInstance, preHandlerHookHandler } from 'fastify'
+import type { FastifyError, FastifyInstance, FastifyRequest, FastifyReply, FastifyPluginAsync, FastifySchema, preHandlerHookHandler } from 'fastify'
 import fp from 'fastify-plugin'
-import type { JSONRPCMessage } from '../schema.ts'
-import { JSONRPC_VERSION, INTERNAL_ERROR, PARSE_ERROR, INVALID_REQUEST, SUPPORTED_PROTOCOL_VERSIONS, DEFAULT_NEGOTIATED_PROTOCOL_VERSION } from '../schema.ts'
+import type { JSONRPCMessage, JSONRPCNotification, JSONRPCRequest, JSONRPCResponse, JSONRPCError } from '../schema.ts'
+import {
+  JSONRPC_VERSION,
+  INTERNAL_ERROR,
+  INVALID_PARAMS,
+  PARSE_ERROR,
+  INVALID_REQUEST,
+  METHOD_NOT_FOUND,
+  HEADER_MISMATCH,
+  MISSING_REQUIRED_CLIENT_CAPABILITY,
+  UNSUPPORTED_PROTOCOL_VERSION,
+  SUPPORTED_PROTOCOL_VERSIONS,
+  MODERN_PROTOCOL_VERSIONS,
+  DEFAULT_NEGOTIATED_PROTOCOL_VERSION
+} from '../schema.ts'
 import { isOriginAllowed } from '../security.ts'
 import type {
   MCPPluginOptions,
@@ -18,9 +31,27 @@ import { DEFAULT_SESSION_TTL_MS } from '../stores/memory-session-store.ts'
 import type { TaskStore, TaskWaiters, TaskLeases } from '../stores/task-store.ts'
 import type { MessageBroker } from '../brokers/message-broker.ts'
 import type { AuthorizationContext } from '../types/auth-types.ts'
+import { processMessage, checkRequestId, createError, handlerContext, withMcpServerSpan } from '../handlers.ts'
+import type { CachingConfig } from '../modern/handlers.ts'
+import { coversInputCapabilities, dispatchModern } from '../modern/handlers.ts'
+import {
+  invalidModernMessage,
+  isModernRequest,
+  parseRequestContext,
+  requestedProtocolVersion,
+  requestIdOf
+} from '../modern/request-meta.ts'
+import type { RequestContext } from '../modern/request-meta.ts'
+import { repeatedMirroredHeader, validateStandardHeaders } from '../modern/headers.ts'
+import type { RequestStateSealer } from '../modern/request-state.ts'
+import { DEFAULT_MAX_RESOURCE_SUBSCRIPTIONS, SubscriptionRegistry, invalidFilter, negotiateFilter } from '../modern/subscriptions.ts'
+import type { SubscriptionDeadline } from '../modern/subscriptions.ts'
+import { quotaKeyOf } from '../task-registry.ts'
+import type { ClientCapabilities as ModernClientCapabilities, SubscriptionFilter } from '../schema-2026.ts'
+import { isStdioRequest, stdioAuthContext, stdioRequestSignal } from '../stdio-trust.ts'
+import { RequestStream, acceptsMediaType, requestNotifiers } from '../modern/request-stream.ts'
+import type { TaskInputChannel } from '../modern/task-inputs.ts'
 import type { JsonSchemaValidator } from '../validation/json-schema-validator.ts'
-import { processMessage, checkRequestId } from '../handlers.ts'
-import { isStdioRequest } from '../stdio-marker.ts'
 
 const MAX_TIMER_DELAY_MS = 2 ** 31 - 1
 
@@ -41,7 +72,31 @@ interface MCPPubSubRoutesOptions {
   shutdownSignal?: AbortSignal
   taskLeases?: TaskLeases
   jsonSchemaValidator?: JsonSchemaValidator
+  taskInputs: TaskInputChannel
+  sealer: RequestStateSealer
+  caching: CachingConfig
+  subscriptions: SubscriptionRegistry
+  enableTasks: boolean
   authPreHandler?: preHandlerHookHandler
+}
+
+const PARSE_ERROR_CODES = new Set(['FST_ERR_CTP_INVALID_JSON_BODY', 'FST_ERR_CTP_EMPTY_JSON_BODY'])
+const INVALID_BODY_CODES = new Set([
+  'FST_ERR_CTP_BODY_TOO_LARGE',
+  'FST_ERR_CTP_INVALID_MEDIA_TYPE',
+  'FST_ERR_CTP_INVALID_CONTENT_LENGTH'
+])
+
+// A hook or parser can throw/reject with a non-Error value (a string, a plain
+// object). Fastify would send such a value as the response body, so give the
+// parent handler a generic Error instead and keep the original as `cause`.
+function toError (value: unknown): FastifyError {
+  if (value instanceof Error) {
+    return value as FastifyError
+  }
+  const error = new Error('Internal Server Error', { cause: value }) as FastifyError
+  error.statusCode = 500
+  return error
 }
 
 function resolveRouteUrl (prefix: string | undefined, url: string): string {
@@ -81,54 +136,23 @@ function resolveMcpRouteSchema (
   return transformed
 }
 
-// Body-parser failures happen before the handler runs, so without this they
-// would surface as Fastify's default error body instead of a JSON-RPC error.
-const BODY_PARSER_ERRORS: Record<string, { code: number, message: string }> = {
-  FST_ERR_CTP_INVALID_JSON_BODY: { code: PARSE_ERROR, message: 'Parse error' },
-  FST_ERR_CTP_EMPTY_JSON_BODY: { code: PARSE_ERROR, message: 'Parse error' },
-  FST_ERR_CTP_BODY_TOO_LARGE: { code: INVALID_REQUEST, message: 'Invalid Request' },
-  FST_ERR_CTP_INVALID_MEDIA_TYPE: { code: INVALID_REQUEST, message: 'Invalid Request' }
-}
-
-// A hook or parser can throw/reject with a non-Error value (a string, a plain
-// object). Fastify would send such a value as the response body, so give the
-// parent handler a generic Error instead and keep the original as `cause`.
-function toError (value: unknown): FastifyError {
-  if (value instanceof Error) {
-    return value as FastifyError
-  }
-  const error = new Error('Internal Server Error', { cause: value }) as FastifyError
-  error.statusCode = 500
-  return error
-}
-
-function buildMcpPostErrorHandler (app: FastifyInstance) {
-  return function mcpPostErrorHandler (thrown: unknown, request: FastifyRequest, reply: FastifyReply) {
-    const error = toError(thrown)
-    const mapped = error.code ? BODY_PARSER_ERRORS[error.code] : undefined
-    if (!mapped) {
-      // Call the encapsulating instance's handler (the user's setErrorHandler,
-      // or Fastify's default) directly: rethrowing only delegates for Errors.
-      return app.errorHandler(error, request, reply)
-    }
-
-    request.log.info({ err: error }, 'Rejected MCP request body')
-    return reply.code(error.statusCode ?? 400).type('application/json').send({
-      jsonrpc: JSONRPC_VERSION,
-      id: null,
-      error: mapped
-    })
-  }
-}
-
 const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async (app, options) => {
-  const { enableSSE, opts, capabilities, serverInfo, tools, resources, prompts, resourceHandlers, sessionStore, messageBroker, localStreams, taskStore, taskWaiters, shutdownSignal, taskLeases, jsonSchemaValidator, authPreHandler } = options
+  const {
+    enableSSE, opts, capabilities, serverInfo, tools, resources, prompts, resourceHandlers,
+    sessionStore, messageBroker, localStreams, taskStore, taskWaiters, jsonSchemaValidator,
+    taskInputs, sealer, caching, subscriptions, enableTasks, authPreHandler, shutdownSignal, taskLeases
+  } = options
   const mcpUrl = resolveRouteUrl(app.prefix, '/mcp')
 
   const allowedOrigins = opts.allowedOrigins
 
   if (allowedOrigins === undefined) {
     app.log.warn('MCP: no allowedOrigins configured, Origin validation is disabled. Set allowedOrigins to protect browser clients against DNS rebinding.')
+  }
+
+  /** Which protocol era this request belongs to. See `isModernRequest`. */
+  function isModern (request: FastifyRequest): boolean {
+    return isModernRequest(request.headers, request.body, MODERN_PROTOCOL_VERSIONS)
   }
 
   // Guard against DNS rebinding: reject browser origins we do not trust.
@@ -145,6 +169,11 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
   // Clients must echo the negotiated protocol version on every request after
   // `initialize`. An absent header means 2025-03-26, which predates the header.
+  //
+  // POSTs are exempt from the rejection below: only the body tells us whether
+  // the caller is modern, and a modern client must be answered with a JSON-RPC
+  // `UnsupportedProtocolVersionError` rather than this legacy shape. The POST
+  // handler makes that call once it has parsed the body.
   async function validateProtocolVersionHeader (request: FastifyRequest, reply: FastifyReply): Promise<void> {
     const header = request.headers['mcp-protocol-version']
     if (header === undefined) {
@@ -153,6 +182,10 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     }
 
     const version = Array.isArray(header) ? header[0] : header
+    ;(request as any).mcpProtocolVersion = version
+
+    if (request.method === 'POST') return
+
     if (!(SUPPORTED_PROTOCOL_VERSIONS as readonly string[]).includes(version)) {
       request.log.warn({ version }, 'Rejected MCP request with unsupported MCP-Protocol-Version header')
       return reply.code(400).type('application/json').send({
@@ -160,8 +193,6 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         supported: SUPPORTED_PROTOCOL_VERSIONS
       })
     }
-
-    ;(request as any).mcpProtocolVersion = version
   }
 
   /**
@@ -176,6 +207,30 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
   }
 
   /**
+   * Reject an unsupported version header on a legacy POST.
+   *
+   * Runs as a preHandler because only the body distinguishes the eras: a modern
+   * request must be answered with a JSON-RPC `UnsupportedProtocolVersionError`,
+   * which `handleModernPost` does, whereas a legacy client expects this plain
+   * 400 shape and has no way to act on the JSON-RPC one.
+   */
+  async function enforceProtocolVersionHeader (request: FastifyRequest, reply: FastifyReply): Promise<void> {
+    if (isModern(request)) return
+
+    const header = request.headers['mcp-protocol-version']
+    if (header === undefined) return
+
+    const version = Array.isArray(header) ? header[0] : header
+    if ((SUPPORTED_PROTOCOL_VERSIONS as readonly string[]).includes(version)) return
+
+    request.log.warn({ version }, 'Rejected MCP request with unsupported MCP-Protocol-Version header')
+    return reply.code(400).type('application/json').send({
+      error: `Bad Request: unsupported MCP-Protocol-Version '${version}'`,
+      supported: SUPPORTED_PROTOCOL_VERSIONS
+    })
+  }
+
+  /**
    * Reconcile the header against what the session actually negotiated.
    *
    * The session is authoritative: a client that agreed on 2025-03-26 must not be
@@ -183,6 +238,10 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
    * preHandler because deciding whether this is an `initialize` needs the body.
    */
   async function reconcileProtocolVersion (request: FastifyRequest, reply: FastifyReply): Promise<void> {
+    // Modern requests are stateless and carry their own version; there is no
+    // session to reconcile against, and a stray `Mcp-Session-Id` is ignored.
+    if (isModern(request)) return
+
     const sessionId = request.headers['mcp-session-id'] as string | undefined
     if (!sessionId) return
 
@@ -216,19 +275,23 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
   /**
    * A session created under an access token belongs to that token's issuer and
    * subject: two authorization servers may assign the same `sub` to different
-   * users, so the subject alone does not identify the owner. Anyone else presenting its ID gets the same 404 as for an unknown session:
-   * the Streamable HTTP transport defines 404 as "this session does not exist
-   * for you", and a 403 would confirm to an attacker that the ID is live.
-   * Runs ahead of anything else that reads the session.
+   * users, so the subject alone does not identify the owner. Anyone else
+   * presenting its ID gets the same 404 as for an unknown session: the
+   * Streamable HTTP transport defines 404 as "this session does not exist for
+   * you", and a 403 would confirm to an attacker that the ID is live. Runs
+   * ahead of anything else that reads the session. Modern requests have no
+   * session, and ignore a stray `Mcp-Session-Id`.
    */
   async function enforceSessionOwner (request: FastifyRequest, reply: FastifyReply): Promise<void> {
+    if (isModern(request)) return
     const sessionId = getRequestSessionId(request)
     if (!sessionId) return
 
     const session = await sessionStore.get(sessionId)
     if (session?.ownerSub === undefined) return
 
-    if (session.ownerSub !== request.tokenPayload?.sub || session.ownerIss !== request.tokenIssuer) {
+    const owner = await sessionOwnerOf(request)
+    if (session.ownerSub !== owner?.sub || session.ownerIss !== owner?.iss) {
       request.log.warn({ sessionId }, 'Rejected MCP request for a session owned by a different user')
       return reply.code(404).type('application/json').send({ error: 'Session not found' })
     }
@@ -241,27 +304,29 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
   // as it would if it were registered as a global preHandler hook, so the
   // session owner check sees the verified token.
   const mcpPreHandler: preHandlerHookHandler[] = authPreHandler
-    ? [authPreHandler, enforceSessionOwner, reconcileProtocolVersion]
-    : [enforceSessionOwner, reconcileProtocolVersion]
+    ? [authPreHandler, enforceProtocolVersionHeader, enforceSessionOwner, reconcileProtocolVersion]
+    : [enforceProtocolVersionHeader, enforceSessionOwner, reconcileProtocolVersion]
 
   // Heartbeats refresh session activity, so they must come more often than the
   // idle TTL or a live stream's session could expire between two of them
   const heartbeatIntervalMs = Math.min(30_000, Math.max(1, Math.floor((opts.sessionTtlMs ?? DEFAULT_SESSION_TTL_MS) / 2)))
 
-  function buildAuthContext (payload: any): AuthorizationContext {
+  /**
+   * The identity a validated token carries. The issuer is the normalized one
+   * the validator vouched for (a trailing slash dropped, or the introspection
+   * endpoint for an introspected token without `iss`), so the same user is the
+   * same principal for sessions, tasks, quotas and sealed request state.
+   */
+  function buildAuthContext (request: FastifyRequest, payload: any): AuthorizationContext {
     return {
       userId: payload.sub,
       clientId: payload.client_id || payload.azp,
-      scopes: typeof payload.scope === 'string'
-        ? payload.scope.split(' ')
-        : payload.scopes,
-      audience: Array.isArray(payload.aud)
-        ? payload.aud
-        : payload.aud ? [payload.aud] : undefined,
+      scopes: typeof payload.scope === 'string' ? payload.scope.split(' ') : payload.scopes,
+      audience: Array.isArray(payload.aud) ? payload.aud : payload.aud ? [payload.aud] : undefined,
       tokenType: 'Bearer',
       expiresAt: payload.exp ? new Date(payload.exp * 1000) : undefined,
       issuedAt: payload.iat ? new Date(payload.iat * 1000) : undefined,
-      authorizationServer: payload.iss
+      authorizationServer: request.tokenIssuer ?? payload.iss
     }
   }
 
@@ -288,11 +353,14 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
     // Bind the session to whoever created it, so its ID alone is not enough to
     // act as that user.
+    const owner = await sessionOwnerOf(request)
+    if (owner) {
+      session.ownerSub = owner.sub
+      session.ownerIss = owner.iss
+    }
     const payload = request.tokenPayload
-    if (payload && typeof payload.sub === 'string') {
-      session.ownerSub = payload.sub
-      session.ownerIss = request.tokenIssuer
-      session.authorization = buildAuthContext(payload)
+    if (!opts.resolveAuthorizationContext && payload && typeof payload.sub === 'string') {
+      session.authorization = buildAuthContext(request, payload)
     }
 
     await sessionStore.create(session)
@@ -335,6 +403,19 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
   function supportsSSE (request: FastifyRequest): boolean {
     const accept = request.headers.accept
     return accept ? accept.includes('text/event-stream') : false
+  }
+
+  /**
+   * 2026-07-28 removed the GET stream and sessions, so neither GET nor DELETE
+   * may allocate or terminate a legacy session for a modern caller.
+   * Answers 405 as the transport spec requires and reports whether it did.
+   */
+  function rejectModernSessionMethod (request: FastifyRequest, reply: FastifyReply): boolean {
+    if (!isModern(request)) return false
+    reply.header('Allow', 'POST').type('application/json').code(405).send({
+      error: `Method Not Allowed: ${request.method} is not part of the stateless protocol revision`
+    })
+    return true
   }
 
   function hasActiveSSESession (sessionId?: string): boolean {
@@ -403,69 +484,498 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     }
   }
 
-  {
-    const schema = resolveMcpRouteSchema(undefined, {
-      routeId: 'mcp.post',
-      method: 'POST',
-      url: mcpUrl
-    }, opts.transformRouteSchema)
-    const mcpPostErrorHandler = buildMcpPostErrorHandler(app)
-    const routeOptions = schema === undefined
-      ? { onRequest: mcpOnRequest, preHandler: mcpPreHandler, errorHandler: mcpPostErrorHandler }
-      : { onRequest: mcpOnRequest, preHandler: mcpPreHandler, errorHandler: mcpPostErrorHandler, schema }
+  /**
+   * The HTTP status a modern response carries.
+   *
+   * The revision pins specific statuses to specific JSON-RPC errors, and
+   * clients rely on them: a dual-era client uses `400` plus a recognised
+   * modern error body to tell a modern server from a legacy one, and `404`
+   * with `-32601` to tell an unimplemented method from a legacy HTTP+SSE
+   * server that does not host this endpoint at all.
+   */
+  /** Can this request not end in -32021 for input the client cannot give? */
+  function cannotNeedMissingInput (message: JSONRPCRequest, clientCapabilities: ModernClientCapabilities): boolean {
+    switch (message.method) {
+      case 'tools/call': {
+        const name = (message.params as { name?: unknown } | undefined)?.name
+        const tool = typeof name === 'string' ? tools.get(name) : undefined
+        return coversInputCapabilities(clientCapabilities, tool?.definition.inputCapabilities)
+      }
+      case 'prompts/get':
+      case 'resources/read':
+        return coversInputCapabilities(clientCapabilities)
+      default:
+        return true
+    }
+  }
 
-    app.post('/mcp', routeOptions, async (request: FastifyRequest, reply: FastifyReply) => {
-      // null, numbers, strings, a text/plain body, ... are not JSON-RPC
-      // messages; answer before a session is created for them.
-      if (!isJSONRPCMessageShape(request.body)) {
-        return reply.type('application/json').code(400).send({
-          jsonrpc: JSONRPC_VERSION,
-          id: null,
-          error: {
-            code: INVALID_REQUEST,
-            message: 'Invalid Request: body is not a JSON-RPC message'
-          }
-        })
+  function statusForResponse (response: JSONRPCResponse | JSONRPCError): number {
+    if (!('error' in response)) return 200
+
+    switch (response.error.code) {
+      case HEADER_MISMATCH:
+      case UNSUPPORTED_PROTOCOL_VERSION:
+      case MISSING_REQUIRED_CLIENT_CAPABILITY:
+        return 400
+      case METHOD_NOT_FOUND:
+        return 404
+      default:
+        // Application-level failures — an unknown tool, a missing resource —
+        // stay on 200 with a JSON-RPC error. Only the three errors above are
+        // the ones a dual-era client reads a 400 body for, so widening this
+        // would make an unknown tool look like a legacy server.
+        return 200
+    }
+  }
+
+  /**
+   * Who a legacy session belongs to: the user the deployment's resolver
+   * identifies when there is one, otherwise the verified token's subject at
+   * its issuer. Undefined for anonymous callers, whose sessions are unbound.
+   */
+  async function sessionOwnerOf (request: FastifyRequest): Promise<{ sub: string, iss: string | undefined } | undefined> {
+    if (opts.resolveAuthorizationContext) {
+      const authContext = await authContextFrom(request)
+      return typeof authContext?.userId === 'string'
+        ? { sub: authContext.userId, iss: authContext.authorizationServer }
+        : undefined
+    }
+    const payload = request.tokenPayload
+    return payload && typeof payload.sub === 'string' ? { sub: payload.sub, iss: request.tokenIssuer } : undefined
+  }
+
+  /**
+   * Resolved once per request, so the session owner check, telemetry,
+   * authorization hooks, state sealing and task ownership all see the same
+   * identity, and a resolver doing I/O runs only once.
+   */
+  const resolvedAuthContexts = new WeakMap<FastifyRequest, Promise<AuthorizationContext | undefined>>()
+
+  /** Resolve the request identity from custom upstream auth or our validated token. */
+  function authContextFrom (request: FastifyRequest): Promise<AuthorizationContext | undefined> {
+    let resolved = resolvedAuthContexts.get(request)
+    if (!resolved) {
+      resolved = resolveAuthContext(request)
+      resolvedAuthContexts.set(request, resolved)
+    }
+    return resolved
+  }
+
+  async function resolveAuthContext (request: FastifyRequest): Promise<AuthorizationContext | undefined> {
+    // stdio skips HTTP authorization; its identity is the one the operator
+    // gave the transport.
+    const stdioIdentity = stdioAuthContext(request)
+    if (stdioIdentity) return stdioIdentity
+    // The resolver reads HTTP credentials, which a stdio request never has:
+    // without a transport identity it is anonymous.
+    if (isStdioRequest(request)) return undefined
+
+    if (opts.resolveAuthorizationContext) {
+      return await opts.resolveAuthorizationContext(request)
+    }
+
+    const payload = request.tokenPayload
+    if (!payload) return undefined
+    return buildAuthContext(request, payload)
+  }
+
+  /**
+   * Ask the application about each resource a listen stream subscribes to,
+   * through the same handlers as `resources/subscribe`. A URI whose handler
+   * throws is dropped from the filter (all of them are when no handler is
+   * registered), so the acknowledgement shows the
+   * client what it was refused; the server must check access to resources,
+   * and update notifications can reveal what changed and when. Returns what
+   * to run when the stream ends: the unsubscribe handler for each URI that
+   * was accepted.
+   */
+  /**
+   * How many open listen streams on this instance hold each resource URI. The
+   * subscribe handler runs for every stream, as it is also the access check,
+   * but the unsubscribe handler only once the last of them ends, so a handler
+   * that starts and stops a watcher keeps it while anyone still listens.
+   */
+  const listenUriHolders = new Map<string, number>()
+
+  async function authorizeResourceSubscriptions (
+    filter: SubscriptionFilter,
+    request: FastifyRequest,
+    reply: FastifyReply,
+    authContext: AuthorizationContext | undefined,
+    context: RequestContext
+  ): Promise<(() => void) | undefined> {
+    if (!filter.resourceSubscriptions) return undefined
+    const { subscribeHandler } = resourceHandlers
+    // Without a handler nothing can check access, and update notifications
+    // reveal what changed and when: refuse them all, as `resources/subscribe`
+    // does on the handshake revisions.
+    if (!subscribeHandler) {
+      request.log.info({ refused: filter.resourceSubscriptions.length }, 'Resource subscriptions refused: no subscribe handler is registered')
+      delete filter.resourceSubscriptions
+      return undefined
+    }
+
+    const handlerContextFor = () => handlerContext({
+      request,
+      reply,
+      authContext,
+      protocolVersion: context.protocolVersion,
+      clientCapabilities: context.clientCapabilities
+    }, undefined)
+    const uris = filter.resourceSubscriptions
+    const outcomes = await Promise.allSettled(uris.map(async uri => await subscribeHandler({ uri }, handlerContextFor())))
+    const accepted = uris.filter((_uri, index) => outcomes[index].status === 'fulfilled')
+    const refused = uris.length - accepted.length
+    if (refused > 0) request.log.info({ refused }, 'Resource subscriptions refused by the subscribe handler')
+
+    if (accepted.length > 0) {
+      filter.resourceSubscriptions = accepted
+    } else {
+      delete filter.resourceSubscriptions
+    }
+
+    const { unsubscribeHandler } = resourceHandlers
+    if (!unsubscribeHandler || accepted.length === 0) return undefined
+    for (const uri of accepted) listenUriHolders.set(uri, (listenUriHolders.get(uri) ?? 0) + 1)
+    return () => {
+      for (const uri of accepted) {
+        // Another stream on this instance still wants updates for it.
+        const holders = (listenUriHolders.get(uri) ?? 1) - 1
+        if (holders > 0) {
+          listenUriHolders.set(uri, holders)
+          continue
+        }
+        listenUriHolders.delete(uri)
+        Promise.resolve()
+          .then(async () => await unsubscribeHandler({ uri }, handlerContextFor()))
+          .catch(error => app.log.warn({ err: error, uri }, 'Resource unsubscribe handler failed'))
+      }
+    }
+  }
+
+  /**
+   * When a listen stream must end: when the token that opened it expires, or
+   * after `sseMaxConnectionMs`, whichever comes first. Access is only checked
+   * when the stream opens, as for the legacy GET stream.
+   */
+  function listenDeadline (authContext: AuthorizationContext | undefined): SubscriptionDeadline | undefined {
+    // A resolver typed loosely may hand back something other than a Date.
+    const expiresAt = authContext?.expiresAt instanceof Date ? authContext.expiresAt.getTime() : undefined
+    const maxAt = opts.sseMaxConnectionMs ? Date.now() + opts.sseMaxConnectionMs : undefined
+    if (expiresAt !== undefined && Number.isFinite(expiresAt) && (maxAt === undefined || expiresAt <= maxAt)) {
+      return { at: expiresAt, reason: 'The access token that opened this subscription expired' }
+    }
+    if (maxAt !== undefined) return { at: maxAt, reason: 'Subscription reached its maximum duration' }
+    return undefined
+  }
+
+  /**
+   * Serve a request that speaks 2026-07-28.
+   *
+   * Nothing here consults or creates a session: the request's `_meta` carries
+   * everything needed to serve it, which is what lets an instance behind a
+   * plain round-robin balancer handle any request.
+   */
+  async function handleModernPost (
+    request: FastifyRequest,
+    reply: FastifyReply,
+    authContext: AuthorizationContext | undefined
+  ): Promise<unknown> {
+    const body = request.body as unknown
+
+    // The transport carries exactly one JSON-RPC request or notification. A
+    // batch must not be mistaken for a notification and silently dropped.
+    const invalid = invalidModernMessage(body)
+    if (invalid !== undefined) {
+      reply.code(400).type('application/json')
+      return createError(requestIdOf(body), INVALID_REQUEST, invalid)
+    }
+
+    // A notification has no id and gets no body back.
+    if (!('id' in (body as object))) {
+      request.log.debug({ method: (body as JSONRPCNotification).method }, 'Accepted modern notification')
+      reply.code(202)
+      return undefined
+    }
+
+    const message = body as JSONRPCRequest
+
+    // The version decides which rules apply, so check it before anything this
+    // revision requires: a client on a version we do not implement must learn
+    // which ones we do, rather than fail a requirement it never signed up for.
+    // A legacy version named in `_meta` gets the same answer, so the client
+    // falls back to the handshake.
+    const requestedVersion = requestedProtocolVersion(message.params)
+    // A header naming another version is a mismatch, which the transport
+    // answers with HeaderMismatch whichever of the two we implement.
+    const headerVersion = request.headers['mcp-protocol-version']
+    const sentVersion = Array.isArray(headerVersion) ? headerVersion[0] : headerVersion
+    if (!isStdioRequest(request) && requestedVersion !== undefined && sentVersion !== undefined && sentVersion !== requestedVersion) {
+      reply.code(400).type('application/json')
+      return createError(
+        message.id,
+        HEADER_MISMATCH,
+        `Header mismatch: MCP-Protocol-Version header value '${sentVersion}' does not match body value '${requestedVersion}'`
+      )
+    }
+    if (requestedVersion !== undefined &&
+        !(MODERN_PROTOCOL_VERSIONS as readonly string[]).includes(requestedVersion)) {
+      reply.code(400).type('application/json')
+      return createError(message.id, UNSUPPORTED_PROTOCOL_VERSION, 'Unsupported protocol version', {
+        supported: [...SUPPORTED_PROTOCOL_VERSIONS],
+        requested: requestedVersion
+      })
+    }
+
+    const parsed = parseRequestContext(message.params)
+    if (!parsed.ok) {
+      reply.code(400).type('application/json')
+      return createError(message.id, INVALID_PARAMS, parsed.message)
+    }
+    const context = parsed.context
+
+    // stdio has no header layer, so there is nothing to reconcile there.
+    const headerLayer = !isStdioRequest(request)
+    if (headerLayer) {
+      const repeated = repeatedMirroredHeader(request.raw.rawHeaders)
+      if (repeated !== undefined) {
+        reply.code(400).type('application/json')
+        return createError(message.id, HEADER_MISMATCH, `Header mismatch: ${repeated} must be sent only once`)
       }
 
+      // The mirrored header and the body must agree, or a gateway routing on
+      // one and this server acting on the other could be made to disagree.
+      if (sentVersion === undefined) {
+        reply.code(400).type('application/json')
+        return createError(message.id, HEADER_MISMATCH, 'Missing required MCP-Protocol-Version header')
+      }
+      if (sentVersion !== context.protocolVersion) {
+        reply.code(400).type('application/json')
+        return createError(
+          message.id,
+          HEADER_MISMATCH,
+          `Header mismatch: MCP-Protocol-Version header value '${sentVersion}' does not match body value '${context.protocolVersion}'`
+        )
+      }
+
+      const headerCheck = validateStandardHeaders(request.headers, message.method, message.params)
+      if (!headerCheck.ok) {
+        reply.code(400).type('application/json')
+        return createError(message.id, HEADER_MISMATCH, headerCheck.message)
+      }
+    }
+
+    // `subscriptions/listen` answers with a stream rather than a value, so it
+    // never reaches the dispatcher.
+    if (message.method === 'subscriptions/listen') {
+      const requested = (message.params as { notifications?: unknown } | undefined)?.notifications
+      const invalidListen = invalidFilter(requested)
+      if (invalidListen !== undefined) {
+        reply.code(400).type('application/json')
+        return createError(message.id, INVALID_PARAMS, invalidListen)
+      }
+
+      const maxUris = opts.subscriptionMaxResourceUris ?? DEFAULT_MAX_RESOURCE_SUBSCRIPTIONS
+      const uriCount = (requested as SubscriptionFilter).resourceSubscriptions?.length ?? 0
+      if (uriCount > maxUris) {
+        reply.code(400).type('application/json')
+        return createError(message.id, INVALID_PARAMS, `Too many resourceSubscriptions: at most ${maxUris} per stream`)
+      }
+
+      // A stdio client may cancel a listen before it is even opened; opening it
+      // then would leak a stream nobody will ever close.
+      const listenCancel = stdioRequestSignal(request)
+      if (listenCancel?.aborted) {
+        reply.code(204)
+        return undefined
+      }
+
+      // A stream opened on an expired token would be ended at once and the
+      // client told to reconnect, which it would do in a tight loop.
+      if (authContext?.expiresAt instanceof Date && authContext.expiresAt.getTime() <= Date.now()) {
+        reply.code(401).header('WWW-Authenticate', 'Bearer error="invalid_token", error_description="The access token expired"').type('application/json')
+        return createError(message.id, INVALID_REQUEST, 'The access token expired')
+      }
+
+      // Computed before any subscribe handler runs, so nothing can throw
+      // between accepting URIs and the stream that releases them.
+      const deadline = listenDeadline(authContext)
+      const quotaKey = quotaKeyOf(authContext)
+      const reserved = subscriptions.reserve(quotaKey)
+      if (typeof reserved === 'string') {
+        reply.code(429).type('application/json')
+        return createError(message.id, INVALID_REQUEST, reserved)
+      }
+
+      let opened: boolean
       try {
-        const message = request.body as JSONRPCMessage
-        const idError = checkRequestId(message)
-        if (idError) {
-          return reply.code(400).type('application/json').send(idError)
+        const filter = negotiateFilter(requested as SubscriptionFilter, capabilities)
+        const onEnd = await authorizeResourceSubscriptions(filter, request, reply, authContext, context)
+        // The filter can be large and is the client's to choose: log its shape.
+        request.log.info({
+          subscriptionId: message.id,
+          types: Object.keys(filter).filter(key => key !== 'resourceSubscriptions'),
+          resourceSubscriptions: filter.resourceSubscriptions?.length ?? 0
+        }, 'Opening subscription stream')
+        opened = subscriptions.open(reply, message.id, filter, quotaKey, listenCancel, onEnd, deadline)
+      } finally {
+        reserved()
+      }
+      if (!opened && !reply.sent) {
+        if (listenCancel?.aborted) {
+          reply.code(204)
+          return undefined
         }
+        reply.code(503).type('application/json')
+        return createError(message.id, INTERNAL_ERROR, 'Server is shutting down')
+      }
+      return reply
+    }
 
-        let sessionId = request.headers['mcp-session-id'] as string | undefined
-        const existingSession = sessionId ? await sessionStore.get(sessionId) : null
+    // On this revision closing the response stream is the client's way to
+    // cancel, so a close while the request is still being handled aborts the
+    // handler. A close after that is just the connection ending: in-process
+    // injection (stdio, mcpClient) emits it before `writableFinished` is set,
+    // so the response state alone cannot tell the two apart.
+    const cancelled = new AbortController()
+    // On stdio there is no stream to close: `notifications/cancelled` does it.
+    const stdioCancel = stdioRequestSignal(request)
+    let handled = false
+    reply.raw.once('close', () => {
+      if (!handled) cancelled.abort(new Error('client disconnected'))
+    })
+    // A client that went away while hooks ran (token validation, say) closed
+    // the connection before the listener above existed.
+    // (The request stream itself is destroyed once its body is read, so it
+    // cannot tell; the socket and the response can.)
+    if (reply.raw.destroyed || request.raw.socket?.destroyed === true) cancelled.abort(new Error('client disconnected'))
 
-        // Sessions belong to Streamable HTTP, not to SSE. Without SSE we only open
-        // one on initialize: other requests keep working statelessly as before,
-        // and stateless clients do not each leave a session behind. Stdio
-        // requests never carry a session id or open a GET stream, so a session
-        // created for them would never be freed.
-        if (!existingSession && !isStdioRequest(request) && (enableSSE || isInitializeRequest(message))) {
-          const session = await createSession(request)
-          reply.header('Mcp-Session-Id', session.id)
-          sessionId = session.id
+    // Progress and log notifications ride the response stream, so only open
+    // one when the client asked for them and can read it.
+    const wantsNotifications = context.progressToken !== undefined || context.logLevel !== undefined
+    // A handler that asks for input the client cannot give is refused with
+    // -32021, which must go out as a 400; once the stream opens the status is
+    // 200. So it opens early only when that refusal cannot happen, or over
+    // stdio, which has no status to protect.
+    const stream = wantsNotifications && acceptsMediaType(request.headers.accept, 'text/event-stream')
+      ? new RequestStream(reply, { openEarly: !headerLayer || cannotNeedMissingInput(message, context.clientCapabilities) })
+      : undefined
+
+    let response: JSONRPCResponse | JSONRPCError
+    try {
+      response = await dispatchModern(message, {
+        app,
+        opts,
+        capabilities,
+        serverInfo,
+        tools,
+        resources,
+        prompts,
+        resourceHandlers,
+        request,
+        reply,
+        authContext,
+        tracer: opts.telemetry?.tracer,
+        taskStore,
+        taskWaiters,
+        jsonSchemaValidator,
+        taskInputs,
+        protocolVersion: context.protocolVersion,
+        context,
+        sealer,
+        caching,
+        supportedVersions: SUPPORTED_PROTOCOL_VERSIONS,
+        enableTasks,
+        headerLayer,
+        // A shutdown aborts the handler too: `app.close()` waits for requests
+        // in flight, and a long-running tool would otherwise hold it forever.
+        signal: AbortSignal.any([cancelled.signal, ...(stdioCancel ? [stdioCancel] : []), ...(shutdownSignal ? [shutdownSignal] : [])]),
+        notifiers: requestNotifiers(context, stream)
+      })
+    } finally {
+      handled = true
+    }
+
+    // The stream opened because the tool declared the input it may need and
+    // the client has all of it; asking for more is the tool's bug, and a 400
+    // can no longer be sent.
+    if (stream?.opened && 'error' in response && response.error.code === MISSING_REQUIRED_CLIENT_CAPABILITY) {
+      request.log.error({ method: message.method, data: response.error.data }, 'Handler asked for input beyond its declared inputCapabilities after progress had streamed')
+      response = createError(message.id, INTERNAL_ERROR, 'Internal server error')
+    }
+
+    // Serialize here, once: a result a handler built with a BigInt or a cycle
+    // must still answer this id, and must not fail after a stream has opened.
+    let serialized: string
+    try {
+      serialized = JSON.stringify(response)
+    } catch (error) {
+      request.log.error({ err: error, method: message.method }, 'MCP response could not be serialized')
+      response = createError(message.id, INTERNAL_ERROR, 'Internal server error')
+      serialized = JSON.stringify(response)
+    }
+
+    // Concluding the stream also closes it to late notifications, which would
+    // otherwise take over a reply that is about to be sent as JSON.
+    if (stream?.finish(response, serialized, headerLayer && statusForResponse(response) !== 200)) {
+      // The stream carried the response. Returning it as well (Fastify sends
+      // nothing for a hijacked reply) lets telemetry record its outcome.
+      if (!reply.sent) reply.hijack()
+      return response
+    }
+
+    // The response object is still returned so telemetry can read its outcome;
+    // the serializer reuses the string instead of encoding it a second time.
+    reply.type('application/json').code(statusForResponse(response)).serializer(() => serialized)
+    return response
+  }
+
+  const postSchema = resolveMcpRouteSchema(undefined, {
+    routeId: 'mcp.post',
+    method: 'POST',
+    url: mcpUrl
+  }, opts.transformRouteSchema)
+  /**
+   * Answer body-parser failures in JSON-RPC, keeping their HTTP status. A
+   * client reads a 400 without a JSON-RPC error as a server that does not
+   * speak this revision. Anything else goes to the application's handler.
+   */
+  function bodyParserErrorHandler (thrown: unknown, request: FastifyRequest, reply: FastifyReply) {
+    const error = toError(thrown)
+    const code = PARSE_ERROR_CODES.has(error.code) || (error instanceof SyntaxError && error.statusCode === 400)
+      ? PARSE_ERROR
+      : INVALID_BODY_CODES.has(error.code) ? INVALID_REQUEST : undefined
+    if (code === undefined) {
+      // Call the encapsulating instance's handler (the user's setErrorHandler,
+      // or Fastify's default) directly: rethrowing only delegates for Errors.
+      return (app as FastifyInstance).errorHandler(error, request, reply)
+    }
+    request.log.info({ err: error }, 'Rejected MCP request body')
+    return reply.code(error.statusCode ?? 400).type('application/json')
+      .send(createError(null, code, code === PARSE_ERROR ? 'Parse error' : 'Invalid Request'))
+  }
+
+  const postRouteOptions = {
+    onRequest: mcpOnRequest,
+    preHandler: mcpPreHandler,
+    errorHandler: bodyParserErrorHandler,
+    ...(postSchema === undefined ? {} : { schema: postSchema })
+  }
+
+  app.post('/mcp', postRouteOptions, async (request: FastifyRequest, reply: FastifyReply) => {
+    try {
+      // Resolve once so telemetry, authorization hooks, state sealing and task
+      // ownership all observe exactly the same identity for this request.
+      const resolvedAuthContext = await authContextFrom(request)
+
+      if (isModern(request)) {
+        // A body that is not a JSON-RPC message has nothing to trace; the span
+        // would only fail reading it, turning a 400 into a 500.
+        if (invalidModernMessage(request.body) !== undefined) {
+          return await handleModernPost(request, reply, resolvedAuthContext)
         }
-
-        // Each request on a session counts as activity, so sessions that are in
-        // use are not expired by the store's idle TTL
-        if (existingSession) {
-          await sessionStore.touch?.(existingSession.id)
-        }
-
-        // Build auth context from validated token payload
-        let authContext: AuthorizationContext | undefined
-        if (request.tokenPayload) {
-          authContext = buildAuthContext(request.tokenPayload)
-        } else if (sessionId) {
-        // Fallback to session-stored auth context
-          const session = await sessionStore.get(sessionId)
-          authContext = session?.authorization
-        }
-
-        const response = await processMessage(message, sessionId, {
+        const message = request.body as JSONRPCRequest | JSONRPCNotification
+        return await withMcpServerSpan(message, undefined, {
           app,
           opts,
           capabilities,
@@ -476,54 +986,134 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
           resourceHandlers,
           request,
           reply,
-          authContext,
+          authContext: resolvedAuthContext,
           tracer: opts.telemetry?.tracer,
-          sessionStore,
           taskStore,
           taskWaiters,
-          shutdownSignal,
-          taskLeases,
           jsonSchemaValidator,
-          sessionId,
-          protocolVersion: (request as any).mcpProtocolVersion ?? DEFAULT_NEGOTIATED_PROTOCOL_VERSION
-        })
-        if (response) {
-          return response
-        } else {
-          reply.code(202)
-        }
-      } catch (error) {
-        app.log.error({ err: error }, 'Error processing MCP message')
-        reply.type('application/json').code(500).send({
-          jsonrpc: JSONRPC_VERSION,
-          id: null,
-          error: {
-            code: INTERNAL_ERROR,
-            message: 'Internal server error'
-          }
-        })
+          taskInputs,
+          // The body is authoritative on this path (stdio sends no header).
+          protocolVersion: requestedProtocolVersion((message as { params?: unknown } | null)?.params)
+        }, async () => await handleModernPost(request, reply, resolvedAuthContext))
       }
-    })
-  }
 
-  // GET endpoint for server-initiated communication via SSE
+      // null, numbers, strings, a text/plain body, ... are not JSON-RPC
+      // messages; answer before a session is created for them.
+      if (!isJSONRPCMessageShape(request.body)) {
+        reply.code(400).type('application/json')
+        return createError(null, INVALID_REQUEST, 'Invalid Request: body is not a JSON-RPC message')
+      }
+
+      const message = request.body as JSONRPCMessage
+      const idError = checkRequestId(message)
+      if (idError) {
+        reply.code(400).type('application/json')
+        return idError
+      }
+
+      let sessionId = request.headers['mcp-session-id'] as string | undefined
+      const existingSession = sessionId ? await sessionStore.get(sessionId) : null
+
+      // Sessions belong to Streamable HTTP, not to SSE. Without SSE we only open
+      // one on initialize: other requests keep working statelessly as before,
+      // and stateless clients do not each leave a session behind. Stdio
+      // requests never carry a session id or open a GET stream, so a session
+      // created for them would never be freed.
+      if (!existingSession && !isStdioRequest(request) && (enableSSE || isInitializeRequest(message))) {
+        const session = await createSession(request)
+        reply.header('Mcp-Session-Id', session.id)
+        sessionId = session.id
+      }
+
+      // Each request on a session counts as activity, so sessions that are in
+      // use are not expired by the store's idle TTL
+      if (existingSession) {
+        await sessionStore.touch?.(existingSession.id)
+      }
+
+      // Build auth context from validated token payload or the custom resolver.
+      let authContext = resolvedAuthContext
+      if (!authContext && !opts.resolveAuthorizationContext && sessionId) {
+        // Built-in OAuth may persist identity on a legacy SSE session.
+        const session = await sessionStore.get(sessionId)
+        authContext = session?.authorization
+      }
+
+      const response = await processMessage(message, sessionId, {
+        app,
+        opts,
+        capabilities,
+        serverInfo,
+        tools,
+        resources,
+        prompts,
+        resourceHandlers,
+        request,
+        reply,
+        authContext,
+        tracer: opts.telemetry?.tracer,
+        sessionStore,
+        taskStore,
+        taskWaiters,
+        shutdownSignal,
+        taskLeases,
+        taskInputs,
+        jsonSchemaValidator,
+        sessionId,
+        protocolVersion: (request as any).mcpProtocolVersion ?? DEFAULT_NEGOTIATED_PROTOCOL_VERSION,
+        // Over HTTP a legacy disconnect is not a cancellation, but on stdio
+        // `notifications/cancelled` is, whichever revision the client speaks.
+        signal: stdioRequestSignal(request)
+      })
+      if (response) {
+        return response
+      } else {
+        reply.code(202)
+      }
+    } catch (error) {
+      app.log.error({ err: error }, 'Error processing MCP message')
+      // A response already under way (a hijacked stream) cannot become a 500;
+      // end it so the client is not left waiting.
+      if (reply.sent || reply.raw.headersSent) {
+        reply.raw.destroy()
+        return
+      }
+      reply.type('application/json').code(500).send({
+        jsonrpc: JSONRPC_VERSION,
+        // Keep the request's id when it has one, so the client can correlate.
+        id: requestIdOf(request.body),
+        error: {
+          code: INTERNAL_ERROR,
+          message: 'Internal server error'
+        }
+      })
+    }
+  })
+
+  // Without SSE there is no standing stream to open, so GET answers 405 as the
+  // transport asks, naming what is allowed. Sessions can still be ended.
   if (!enableSSE) {
-    app.get('/mcp', { onRequest: mcpOnRequest, preHandler: mcpPreHandler }, async (_request: FastifyRequest, reply: FastifyReply) => {
-      reply.header('Allow', 'POST, DELETE').type('application/json').code(405).send({ error: 'Method Not Allowed: SSE not enabled' })
+    app.get('/mcp', { onRequest: mcpOnRequest, preHandler: mcpPreHandler }, async (request: FastifyRequest, reply: FastifyReply) => {
+      if (rejectModernSessionMethod(request, reply)) return
+      reply.header('Allow', 'POST, DELETE').type('application/json').code(405).send({
+        error: `Method Not Allowed: ${request.method} requires SSE, which is not enabled`
+      })
     })
   }
 
   if (enableSSE) {
-    const schema = resolveMcpRouteSchema(undefined, {
+    const getSchema = resolveMcpRouteSchema(undefined, {
       routeId: 'mcp.get',
       method: 'GET',
       url: mcpUrl
     }, opts.transformRouteSchema)
-    const routeOptions = schema === undefined
+    const getRouteOptions = getSchema === undefined
       ? { onRequest: mcpOnRequest, preHandler: mcpPreHandler }
-      : { onRequest: mcpOnRequest, preHandler: mcpPreHandler, schema }
+      : { onRequest: mcpOnRequest, preHandler: mcpPreHandler, schema: getSchema }
 
-    app.get('/mcp', routeOptions, async (request: FastifyRequest, reply: FastifyReply) => {
+    app.get('/mcp', getRouteOptions, async (request: FastifyRequest, reply: FastifyReply) => {
+      if (rejectModernSessionMethod(request, reply)) return
+
       if (!supportsSSE(request)) {
         reply.header('Allow', 'GET, POST, DELETE').type('application/json').code(405).send({ error: 'Method Not Allowed: SSE not supported' })
         return
@@ -542,6 +1132,17 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
         request.log.info({ sessionId }, 'Handling SSE request')
 
+        // Find or create the session before taking the reply over, so a store
+        // or resolver failure is still answered through Fastify.
+        let session: SessionMetadata | null = sessionId ? await sessionStore.get(sessionId) : null
+        let created = false
+        if (session) {
+          await sessionStore.touch?.(session.id)
+        } else {
+          session = await createSession(request)
+          created = true
+        }
+
         // We are opting out of Fastify proper
         reply.hijack()
 
@@ -550,21 +1151,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         // Set up SSE stream
         raw.setHeader('Content-type', 'text/event-stream')
         raw.setHeader('Cache-Control', 'no-cache')
-
-        let session: SessionMetadata
-        if (sessionId) {
-          const existingSession = await sessionStore.get(sessionId)
-          if (existingSession) {
-            session = existingSession
-            await sessionStore.touch?.(session.id)
-          } else {
-            session = await createSession(request)
-            raw.setHeader('Mcp-Session-Id', session.id)
-          }
-        } else {
-          session = await createSession(request)
-          raw.setHeader('Mcp-Session-Id', session.id)
-        }
+        if (created) raw.setHeader('Mcp-Session-Id', session.id)
 
         raw.writeHead(200)
 
@@ -686,23 +1273,33 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         })
       } catch (error) {
         app.log.error({ err: error }, 'Error setting up SSE stream')
-        reply.type('application/json').code(500).send({ error: 'Internal server error' })
+        if (!reply.sent) {
+          reply.type('application/json').code(500).send({ error: 'Internal server error' })
+        } else if (!reply.raw.headersSent) {
+          // Hijacked: Fastify sends nothing for us any more.
+          reply.raw.writeHead(500, { 'Content-Type': 'application/json' })
+          reply.raw.end(JSON.stringify({ error: 'Internal server error' }))
+        } else {
+          reply.raw.destroy()
+        }
       }
     })
   }
 
   // DELETE endpoint for explicit session termination (MCP spec)
   {
-    const schema = resolveMcpRouteSchema(undefined, {
+    const deleteSchema = resolveMcpRouteSchema(undefined, {
       routeId: 'mcp.delete',
       method: 'DELETE',
       url: mcpUrl
     }, opts.transformRouteSchema)
-    const routeOptions = schema === undefined
+    const deleteRouteOptions = deleteSchema === undefined
       ? { onRequest: mcpOnRequest, preHandler: mcpPreHandler }
-      : { onRequest: mcpOnRequest, preHandler: mcpPreHandler, schema }
+      : { onRequest: mcpOnRequest, preHandler: mcpPreHandler, schema: deleteSchema }
 
-    app.delete('/mcp', routeOptions, async (request: FastifyRequest, reply: FastifyReply) => {
+    app.delete('/mcp', deleteRouteOptions, async (request: FastifyRequest, reply: FastifyReply) => {
+      if (rejectModernSessionMethod(request, reply)) return
+
       const sessionId = request.headers['mcp-session-id'] as string
       if (!sessionId) {
         reply.code(400).send({ error: 'Missing Mcp-Session-Id header' })
@@ -739,34 +1336,50 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     })
   }
 
-  // Subscribe to broadcast notifications
-  if (enableSSE) {
-    messageBroker.subscribe('mcp/broadcast/notification', async (notification: JSONRPCMessage) => {
-      const isResourceUpdate = 'method' in notification && notification.method === 'notifications/resources/updated'
-      const resourceUri = isResourceUpdate ? (notification.params as { uri?: unknown } | undefined)?.uri : undefined
+  // Subscribe to broadcast notifications.
+  //
+  // The same broadcast feeds both eras: legacy SSE sessions get it on their
+  // standing stream, and modern `subscriptions/listen` streams get whichever
+  // notification types they opted in to. Registering unconditionally means
+  // modern subscriptions work without `enableSSE`, which is a legacy concept.
+  //
+  // The broker does not await the handler, so anything it throws must be
+  // caught here or it becomes an unhandled rejection.
+  await messageBroker.subscribe('mcp/broadcast/notification', async (notification: JSONRPCMessage) => {
+    try {
+      await deliverBroadcast(notification)
+    } catch (error) {
+      app.log.error({ err: error }, 'Failed to deliver broadcast notification')
+    }
+  })
 
-      // Send to all local streams
-      for (const [sessionId, streams] of localStreams.entries()) {
-        if (streams.size === 0) continue
+  async function deliverBroadcast (notification: JSONRPCMessage): Promise<void> {
+    subscriptions.deliver(notification as JSONRPCNotification)
 
-        // resources/updated only goes to sessions subscribed to that URI
-        if (isResourceUpdate) {
-          try {
-            const session = await sessionStore.get(sessionId)
-            if (typeof resourceUri !== 'string' || !session?.resourceSubscriptions?.includes(resourceUri)) {
-              continue
-            }
-          } catch (error) {
-            app.log.error({ err: error, sessionId }, 'Failed to check resource subscriptions')
+    if (!enableSSE) return
+    const isResourceUpdate = 'method' in notification && notification.method === 'notifications/resources/updated'
+    const resourceUri = isResourceUpdate ? (notification.params as { uri?: unknown } | undefined)?.uri : undefined
+
+    for (const [sessionId, streams] of localStreams.entries()) {
+      if (streams.size === 0) continue
+
+      // resources/updated only goes to legacy sessions subscribed to that URI
+      if (isResourceUpdate) {
+        try {
+          const session = await sessionStore.get(sessionId)
+          if (typeof resourceUri !== 'string' || !session?.resourceSubscriptions?.includes(resourceUri)) {
             continue
           }
+        } catch (error) {
+          app.log.error({ err: error, sessionId }, 'Failed to check resource subscriptions')
+          continue
         }
-
-        sendSSEToStreams(sessionId, notification, streams).catch((error) => {
-          app.log.error({ err: error, sessionId }, 'Failed to deliver broadcast notification to session')
-        })
       }
-    })
+
+      sendSSEToStreams(sessionId, notification, streams).catch((error) => {
+        app.log.error({ err: error, sessionId }, 'Failed to deliver broadcast notification to session')
+      })
+    }
   }
 }
 

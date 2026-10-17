@@ -3,7 +3,7 @@ import type { TestContext } from 'node:test'
 import Fastify from 'fastify'
 import { Type } from '@sinclair/typebox'
 import mcpPlugin from '../src/index.ts'
-import { JSONRPC_VERSION, LATEST_PROTOCOL_VERSION, METHOD_NOT_FOUND, INVALID_PARAMS } from '../src/schema.ts'
+import { JSONRPC_VERSION, LATEST_LEGACY_PROTOCOL_VERSION, METHOD_NOT_FOUND, INVALID_PARAMS, INVALID_REQUEST } from '../src/schema.ts'
 import type { Task, CreateTaskResult, ListTasksResult, CallToolResult } from '../src/schema.ts'
 import { MemoryTaskStore } from '../src/stores/memory-task-store.ts'
 import { canTransition, isTerminal, taskHasExpired, toWireTask, InvalidTaskCursorError, DEFAULT_TASK_PAGE_SIZE, TaskLimitError, TASK_LIMIT_REACHED, TaskLeases, TASK_OWNER_LOST } from '../src/stores/task-store.ts'
@@ -11,6 +11,10 @@ import type { TaskRecord } from '../src/stores/task-store.ts'
 import { resolveTaskAugmentation, RELATED_TASK_META_KEY } from '../src/handlers.ts'
 
 const ISS = 'https://auth.example.com'
+/** A principal as `principalOf` builds it: user, OAuth client and issuer. */
+function owner (subject: string, issuer: string): string {
+  return JSON.stringify([subject, null, issuer])
+}
 import { createTestAuthConfig, createTestJWT, setupMockAgent, generateMockJWKSResponse } from './auth-test-utils.ts'
 
 function record (overrides: Partial<TaskRecord> = {}): TaskRecord {
@@ -31,7 +35,7 @@ async function call (app: any, method: string, params: unknown, id = 1) {
   const response = await app.inject({
     method: 'POST',
     url: '/mcp',
-    headers: { 'mcp-protocol-version': LATEST_PROTOCOL_VERSION },
+    headers: { 'mcp-protocol-version': LATEST_LEGACY_PROTOCOL_VERSION },
     payload: { jsonrpc: JSONRPC_VERSION, id, method, params }
   })
   return response.json()
@@ -120,11 +124,22 @@ describe('task store', () => {
   })
 
   test('toWireTask drops storage-only fields', (t: TestContext) => {
-    const wire = toWireTask(record({ authSubject: 'user-1', authIssuer: ISS, outcome: { jsonrpc: '2.0', id: 1, result: {} } }))
+    const wire = toWireTask(record({
+      authSubject: 'user-1',
+      outcome: { jsonrpc: '2.0', id: 1, result: {} },
+      inputRequestRound: 1,
+      pendingInputResponses: { confirmation: true },
+      pendingInputResponseIds: { confirmation: 'delivery-1' },
+      pendingInputResponseRounds: { confirmation: 1 }
+    }))
     t.assert.strictEqual('authSubject' in wire, false)
     t.assert.strictEqual('authIssuer' in wire, false)
     t.assert.strictEqual('method' in wire, false)
     t.assert.strictEqual('outcome' in wire, false)
+    t.assert.strictEqual('inputRequestRound' in wire, false)
+    t.assert.strictEqual('pendingInputResponses' in wire, false)
+    t.assert.strictEqual('pendingInputResponseIds' in wire, false)
+    t.assert.strictEqual('pendingInputResponseRounds' in wire, false)
     t.assert.strictEqual(wire.taskId, 'task-1')
   })
 
@@ -138,12 +153,12 @@ describe('task store', () => {
     await store.create(record({ leaseExpiresAt: Date.now() - 1 }))
     const outcome = { jsonrpc: '2.0' as const, id: 1, error: { code: -32603, message: 'lost' } }
 
-    const failed = await store.failExpiredLease('task-1', { statusMessage: 'Task owner lost', outcome })
+    const failed = await store.expireStaleLease('task-1', 'Task owner lost', outcome)
     t.assert.strictEqual(failed?.status, 'failed')
     t.assert.strictEqual(failed?.statusMessage, 'Task owner lost')
     t.assert.deepStrictEqual((await store.get('task-1'))?.outcome, outcome)
-    // Once terminal the lease can no longer be renewed
-    t.assert.strictEqual(await store.renewLease('task-1', 1000), false)
+    // Once terminal the lease is no longer renewed: the worker learns it ended
+    t.assert.strictEqual(await store.renewLease('task-1', 1000), 'failed')
   })
 
   test('MemoryTaskStore leaves tasks with a live or no lease alone', async (t: TestContext) => {
@@ -153,10 +168,26 @@ describe('task store', () => {
     await store.create(record({ taskId: 'none' }))
 
     // A renewal that lands before the reaper wins
-    t.assert.strictEqual(await store.renewLease('live', 60_000), true)
-    t.assert.strictEqual((await store.failExpiredLease('live', { statusMessage: 'x', outcome }))?.status, 'working')
-    t.assert.strictEqual((await store.failExpiredLease('none', { statusMessage: 'x', outcome }))?.status, 'working')
-    t.assert.strictEqual(await store.failExpiredLease('missing', { statusMessage: 'x', outcome }), null)
+    t.assert.strictEqual(await store.renewLease('live', 60_000), 'working')
+    t.assert.strictEqual(await store.expireStaleLease('live', 'x', outcome), null)
+    t.assert.strictEqual(await store.expireStaleLease('none', 'x', outcome), null)
+    t.assert.strictEqual(await store.expireStaleLease('missing', 'x', outcome), null)
+    t.assert.strictEqual((await store.get('live'))?.status, 'working')
+    t.assert.strictEqual((await store.get('none'))?.status, 'working')
+  })
+
+  test('TaskLeases tells the worker when its task ended elsewhere', async (t: TestContext) => {
+    const store = new MemoryTaskStore()
+    await store.create(record({ taskId: 'a' }))
+    const leases = new TaskLeases(store, 30)
+    t.after(() => leases.close())
+    const ended: unknown[] = []
+    await leases.start('a', status => ended.push(status))
+
+    // A cancellation whose broker message was lost: the next renewal finds it.
+    await store.updateStatus('a', 'cancelled')
+    await new Promise(resolve => setTimeout(resolve, 60))
+    t.assert.deepStrictEqual(ended, ['cancelled'])
   })
 
   test('TaskLeases renews until stopped and stops everything on close', async (t: TestContext) => {
@@ -200,26 +231,68 @@ describe('task store', () => {
     t.assert.strictEqual(await store.get('task-1'), null)
   })
 
+  test('MemoryTaskStore retries staged input until publication is accepted', async (t: TestContext) => {
+    const store = new MemoryTaskStore()
+    await store.create(record({
+      status: 'input_required',
+      inputRequests: { confirmation: { method: 'elicitation/create' } }
+    }))
+
+    const first = await store.updateInputResponses('task-1', { confirmation: 'yes' }, 'delivery-1')
+    t.assert.deepStrictEqual(first?.responses, { confirmation: 'yes' })
+    t.assert.strictEqual((await store.get('task-1'))?.inputRequests, undefined)
+    t.assert.deepStrictEqual((await store.get('task-1'))?.pendingInputResponses, { confirmation: 'yes' })
+
+    // Simulate broker publication failure: delivery acceptance was not recorded.
+    const retry = await store.updateInputResponses('task-1', { confirmation: 'changed replay' }, 'delivery-2')
+    t.assert.deepStrictEqual(retry?.responses, { confirmation: 'yes' })
+    t.assert.deepStrictEqual(retry?.responseIds, { confirmation: 'delivery-1' })
+
+    await store.acknowledgeInputResponses('task-1', { confirmation: 'wrong-delivery' })
+    t.assert.deepStrictEqual((await store.get('task-1'))?.pendingInputResponses, { confirmation: 'yes' })
+
+    await store.acknowledgeInputResponses('task-1', { confirmation: 'delivery-1' })
+    t.assert.strictEqual((await store.get('task-1'))?.pendingInputResponses, undefined)
+    t.assert.deepStrictEqual(
+      (await store.updateInputResponses('task-1', { confirmation: 'yes' }, 'delivery-3'))?.responses,
+      {}
+    )
+  })
+
+  test('MemoryTaskStore republishes outbox entries created before input rounds were recorded', async (t: TestContext) => {
+    const store = new MemoryTaskStore()
+    await store.create(record({
+      status: 'input_required',
+      pendingInputResponses: { confirmation: 'legacy' },
+      pendingInputResponseIds: { confirmation: 'delivery-1' },
+      answeredInputKeys: ['confirmation']
+    }))
+
+    const retry = await store.updateInputResponses('task-1', { confirmation: 'retry' }, 'delivery-2')
+    t.assert.deepStrictEqual(retry?.responses, { confirmation: 'legacy' })
+    t.assert.deepStrictEqual(retry?.responseIds, { confirmation: 'delivery-1' })
+  })
+
   test('MemoryTaskStore isolates tasks by authorization subject', async (t: TestContext) => {
     const store = new MemoryTaskStore()
-    await store.create(record({ taskId: 'a', authSubject: 'user-1', authIssuer: ISS }))
-    await store.create(record({ taskId: 'b', authSubject: 'user-2', authIssuer: ISS }))
+    await store.create(record({ taskId: 'a', authSubject: owner('user-1', ISS) }))
+    await store.create(record({ taskId: 'b', authSubject: owner('user-2', ISS) }))
     await store.create(record({ taskId: 'c' }))
 
-    t.assert.deepStrictEqual((await store.list({ subject: 'user-1', issuer: ISS })).tasks.map(x => x.taskId), ['a'])
-    t.assert.deepStrictEqual((await store.list({ subject: 'user-2', issuer: ISS })).tasks.map(x => x.taskId), ['b'])
+    t.assert.deepStrictEqual((await store.list(owner('user-1', ISS))).tasks.map(x => x.taskId), ['a'])
+    t.assert.deepStrictEqual((await store.list(owner('user-2', ISS))).tasks.map(x => x.taskId), ['b'])
     t.assert.deepStrictEqual((await store.list()).tasks.map(x => x.taskId), ['c'])
   })
 
   test('MemoryTaskStore isolates tasks by issuer as well as subject', async (t: TestContext) => {
     const store = new MemoryTaskStore()
-    await store.create(record({ taskId: 'a', authSubject: '12345', authIssuer: 'https://idp-a.example.com' }))
-    await store.create(record({ taskId: 'b', authSubject: '12345', authIssuer: 'https://idp-b.example.com' }))
+    await store.create(record({ taskId: 'a', authSubject: owner('12345', 'https://idp-a.example.com') }))
+    await store.create(record({ taskId: 'b', authSubject: owner('12345', 'https://idp-b.example.com') }))
     // Created before issuers were recorded
     await store.create(record({ taskId: 'legacy', authSubject: '12345' }))
 
-    t.assert.deepStrictEqual((await store.list({ subject: '12345', issuer: 'https://idp-a.example.com' })).tasks.map(x => x.taskId), ['a'])
-    t.assert.deepStrictEqual((await store.list({ subject: '12345', issuer: 'https://idp-b.example.com' })).tasks.map(x => x.taskId), ['b'])
+    t.assert.deepStrictEqual((await store.list(owner('12345', 'https://idp-a.example.com'))).tasks.map(x => x.taskId), ['a'])
+    t.assert.deepStrictEqual((await store.list(owner('12345', 'https://idp-b.example.com'))).tasks.map(x => x.taskId), ['b'])
   })
 
   test('MemoryTaskStore paginates list newest first with an opaque cursor', async (t: TestContext) => {
@@ -228,15 +301,15 @@ describe('task store', () => {
     // Two tasks share a creation time to exercise the id tie-break
     const times = [0, 1, 2, 2, 3]
     for (let i = 0; i < times.length; i++) {
-      await store.create(record({ taskId: `t${i}`, authSubject: 'user-1', authIssuer: ISS, createdAt: new Date(base + times[i]).toISOString() }))
+      await store.create(record({ taskId: `t${i}`, authSubject: owner('user-1', ISS), createdAt: new Date(base + times[i]).toISOString() }))
     }
-    await store.create(record({ taskId: 'other', authSubject: 'user-2', authIssuer: ISS, createdAt: new Date(base + 10).toISOString() }))
+    await store.create(record({ taskId: 'other', authSubject: owner('user-2', ISS), createdAt: new Date(base + 10).toISOString() }))
 
     const seen: string[] = []
     let cursor: string | undefined
     let pages = 0
     do {
-      const page = await store.list({ subject: 'user-1', issuer: ISS }, { cursor, limit: 2 })
+      const page = await store.list(owner('user-1', ISS), { cursor, limit: 2 })
       t.assert.ok(page.tasks.length <= 2)
       seen.push(...page.tasks.map(x => x.taskId))
       cursor = page.nextCursor
@@ -249,18 +322,34 @@ describe('task store', () => {
 
   test('MemoryTaskStore omits nextCursor on the last page', async (t: TestContext) => {
     const store = new MemoryTaskStore()
-    await store.create(record({ taskId: 'a', authSubject: 'user-1', authIssuer: ISS }))
-    await store.create(record({ taskId: 'b', authSubject: 'user-1', authIssuer: ISS }))
+    await store.create(record({ taskId: 'a', authSubject: owner('user-1', ISS) }))
+    await store.create(record({ taskId: 'b', authSubject: owner('user-1', ISS) }))
 
-    const page = await store.list({ subject: 'user-1', issuer: ISS }, { limit: 2 })
+    const page = await store.list(owner('user-1', ISS), { limit: 2 })
     t.assert.strictEqual(page.tasks.length, 2)
     t.assert.strictEqual(page.nextCursor, undefined)
   })
 
+  test('MemoryTaskStore fills a page with tasks of the requested era', async (t: TestContext) => {
+    const store = new MemoryTaskStore()
+    const base = Date.now()
+    // Modern tasks are newer, so filtering after paging would leave the page empty
+    for (let i = 0; i < 3; i++) {
+      await store.create(record({ taskId: `legacy-${i}`, authSubject: 'user-1', createdAt: new Date(base + i).toISOString() }))
+      await store.create(record({ taskId: `modern-${i}`, authSubject: 'user-1', era: 'modern', createdAt: new Date(base + 10 + i).toISOString() }))
+    }
+
+    const page = await store.list('user-1', { limit: 2, era: 'legacy' })
+    t.assert.deepStrictEqual(page.tasks.map(x => x.taskId), ['legacy-2', 'legacy-1'])
+    const rest = await store.list('user-1', { limit: 2, era: 'legacy', cursor: page.nextCursor })
+    t.assert.deepStrictEqual(rest.tasks.map(x => x.taskId), ['legacy-0'])
+    t.assert.strictEqual(rest.nextCursor, undefined)
+  })
+
   test('MemoryTaskStore rejects an invalid cursor', async (t: TestContext) => {
     const store = new MemoryTaskStore()
-    await t.assert.rejects(store.list({ subject: 'user-1', issuer: ISS }, { cursor: 'not-a-cursor' }), InvalidTaskCursorError)
-    await t.assert.rejects(store.list({ subject: 'user-1', issuer: ISS }, { cursor: Buffer.from('{"t":"x"}').toString('base64url') }), InvalidTaskCursorError)
+    await t.assert.rejects(store.list(owner('user-1', ISS), { cursor: 'not-a-cursor' }), InvalidTaskCursorError)
+    await t.assert.rejects(store.list(owner('user-1', ISS), { cursor: Buffer.from('{"t":"x"}').toString('base64url') }), InvalidTaskCursorError)
   })
 
   test('concurrent cancel and completion cannot overwrite each other', async (t: TestContext) => {
@@ -310,6 +399,52 @@ describe('task store', () => {
     // Another caller is unaffected
     await store.create(record({ taskId: 'x', authSubject: 'user-2' }))
     t.assert.ok(await store.get('x'))
+  })
+
+  test('MemoryTaskStore counts a user once across the OAuth clients they act through', async (t: TestContext) => {
+    const store = new MemoryTaskStore({ maxTasksPerPrincipal: 2 })
+    const quotaKey = JSON.stringify(['user-1', 'https://as'])
+    const via = (client: string) => JSON.stringify(['user-1', client, 'https://as'])
+    await store.create(record({ taskId: 'a', authSubject: via('one'), quotaKey }))
+    await store.create(record({ taskId: 'b', authSubject: via('two'), quotaKey }))
+    await t.assert.rejects(
+      () => store.create(record({ taskId: 'c', authSubject: via('three'), quotaKey })),
+      (err: any) => err instanceof TaskLimitError
+    )
+  })
+
+  test('MemoryTaskStore evicts the creating client\'s own finished task first', async (t: TestContext) => {
+    const store = new MemoryTaskStore({ maxTasksPerPrincipal: 2 })
+    const quotaKey = JSON.stringify(['user-1', 'https://as'])
+    const via = (client: string) => JSON.stringify(['user-1', client, 'https://as'])
+    await store.create(record({ taskId: 'a', authSubject: via('app-1'), quotaKey }))
+    await store.create(record({ taskId: 'b', authSubject: via('app-2'), quotaKey }))
+    await store.updateStatus('a', 'completed')
+    await store.updateStatus('b', 'completed')
+    await store.create(record({ taskId: 'c', authSubject: via('app-2'), quotaKey }))
+    t.assert.ok(await store.get('a'))
+    t.assert.strictEqual(await store.get('b'), null)
+
+    await store.create(record({ taskId: 'd', authSubject: via('app-3'), quotaKey }))
+    t.assert.strictEqual(await store.get('a'), null)
+  })
+
+  test('legacy task limits on running tasks answer "Task limit reached"', async (t: TestContext) => {
+    for (const limit of [{ taskMaxConcurrent: 1 }, { taskMaxPerPrincipal: 1, resolveAuthorizationContext: async () => ({ userId: 'alice' }) }]) {
+      const app = await buildApp(t, { ...limit, taskShutdownTimeoutMs: 10 })
+      app.mcpAddTool({
+        name: 'hang',
+        description: 'Never finishes',
+        inputSchema: Type.Object({}),
+        execution: { taskSupport: 'optional' }
+      } as any, () => new Promise<CallToolResult>(() => {}))
+
+      const first = await call(app, 'tools/call', { name: 'hang', arguments: {}, task: {} })
+      t.assert.ok(first.result.task.taskId)
+      const second = await call(app, 'tools/call', { name: 'hang', arguments: {}, task: {} })
+      t.assert.strictEqual(second.error?.code, TASK_LIMIT_REACHED, JSON.stringify(second))
+      t.assert.match(second.error.message, /limit reached/)
+    }
   })
 
   test('MemoryTaskStore evicts the caller\'s oldest finished task to make room', async (t: TestContext) => {
@@ -635,7 +770,7 @@ describe('tasks over the wire', () => {
       const res = await app.inject({
         method: 'POST',
         url: '/mcp',
-        headers: { authorization: `Bearer ${token}`, 'mcp-protocol-version': LATEST_PROTOCOL_VERSION },
+        headers: { authorization: `Bearer ${token}`, 'mcp-protocol-version': LATEST_LEGACY_PROTOCOL_VERSION },
         payload: { jsonrpc: JSONRPC_VERSION, id: 1, method, params }
       })
       return res.json()
@@ -645,7 +780,7 @@ describe('tasks over the wire', () => {
     const tokenB = createTestJWT({ sub: 'user-b' })
 
     // With auth, the capability is advertised
-    const init = await authedCall(tokenA, 'initialize', { protocolVersion: LATEST_PROTOCOL_VERSION, capabilities: {} })
+    const init = await authedCall(tokenA, 'initialize', { protocolVersion: LATEST_LEGACY_PROTOCOL_VERSION, capabilities: {} })
     t.assert.deepStrictEqual(init.result.capabilities.tasks.list, {})
 
     // Each subject creates a task
@@ -662,6 +797,58 @@ describe('tasks over the wire', () => {
     // A cannot reach B's task by id either
     const cross = await authedCall(tokenA, 'tasks/get', { taskId: taskB })
     t.assert.strictEqual(cross.error.code, INVALID_PARAMS)
+  })
+
+  test('custom upstream authentication scopes legacy tasks by subject', async (t: TestContext) => {
+    const app = Fastify({ logger: false })
+    t.after(() => app.close())
+    app.addHook('preHandler', async (request) => {
+      ;(request as any).upstreamUserId = request.headers['x-auth-user']
+    })
+    await app.register(mcpPlugin, {
+      enableTasks: true,
+      resolveAuthorizationContext: (request) => {
+        const userId = (request as any).upstreamUserId
+        return typeof userId === 'string' ? { userId } : undefined
+      }
+    })
+    app.mcpAddTool({
+      name: 'noop',
+      inputSchema: Type.Object({}),
+      execution: { taskSupport: 'optional' }
+    } as any, async (): Promise<CallToolResult> => ({ content: [{ type: 'text', text: 'ok' }] }))
+    await app.ready()
+
+    const upstreamCall = async (userId: string, method: string, params: unknown) => {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/mcp',
+        headers: {
+          'x-auth-user': userId,
+          'mcp-protocol-version': LATEST_LEGACY_PROTOCOL_VERSION
+        },
+        payload: { jsonrpc: JSONRPC_VERSION, id: 1, method, params }
+      })
+      return response.json()
+    }
+
+    const initialized = await upstreamCall('user-a', 'initialize', {
+      protocolVersion: LATEST_LEGACY_PROTOCOL_VERSION,
+      capabilities: {}
+    })
+    t.assert.deepStrictEqual(initialized.result.capabilities.tasks.list, {})
+
+    const created = await upstreamCall('user-a', 'tools/call', {
+      name: 'noop',
+      arguments: {},
+      task: {}
+    })
+    const taskId = (created.result as CreateTaskResult).task.taskId
+
+    const rejected = await upstreamCall('user-b', 'tasks/get', { taskId })
+    t.assert.strictEqual(rejected.error.code, INVALID_PARAMS)
+    const listed = (await upstreamCall('user-a', 'tasks/list', {})).result as ListTasksResult
+    t.assert.deepStrictEqual(listed.tasks.map(task => task.taskId), [taskId])
   })
 
   test('tasks/list paginates, stays subject-scoped across pages and rejects invalid cursors', async (t: TestContext) => {
@@ -685,7 +872,7 @@ describe('tasks over the wire', () => {
       const res = await app.inject({
         method: 'POST',
         url: '/mcp',
-        headers: { authorization: `Bearer ${token}`, 'mcp-protocol-version': LATEST_PROTOCOL_VERSION },
+        headers: { authorization: `Bearer ${token}`, 'mcp-protocol-version': LATEST_LEGACY_PROTOCOL_VERSION },
         payload: { jsonrpc: JSONRPC_VERSION, id: 1, method, params }
       })
       return res.json()
@@ -725,6 +912,32 @@ describe('tasks over the wire', () => {
     }
   })
 
+  test('a caller the resolver cannot identify cannot create a task', async (t: TestContext) => {
+    const app = Fastify({ logger: false })
+    t.after(() => app.close())
+    await app.register(mcpPlugin, {
+      enableTasks: true,
+      // Authenticated upstream, but with no user to bind a task to
+      resolveAuthorizationContext: async () => ({ scopes: ['read'] })
+    })
+    app.mcpAddTool({
+      name: 'noop',
+      inputSchema: Type.Object({}),
+      execution: { taskSupport: 'optional' }
+    } as any, async (): Promise<CallToolResult> => ({ content: [{ type: 'text', text: 'ok' }] }))
+    await app.ready()
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/mcp',
+      headers: { 'mcp-protocol-version': LATEST_LEGACY_PROTOCOL_VERSION },
+      payload: { jsonrpc: JSONRPC_VERSION, id: 1, method: 'tools/call', params: { name: 'noop', arguments: {}, task: {} } }
+    })
+    // A task nobody could reach again, and that no per-caller limit covers,
+    // is refused rather than created.
+    t.assert.strictEqual(response.json().error?.code, INVALID_REQUEST)
+  })
+
   test('a token without sub is rejected before it can create subject-less tasks', async (t: TestContext) => {
     const restoreMock = setupMockAgent({
       'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse()
@@ -749,7 +962,7 @@ describe('tasks over the wire', () => {
     const res = await app.inject({
       method: 'POST',
       url: '/mcp',
-      headers: { authorization: `Bearer ${anonA}`, 'mcp-protocol-version': LATEST_PROTOCOL_VERSION },
+      headers: { authorization: `Bearer ${anonA}`, 'mcp-protocol-version': LATEST_LEGACY_PROTOCOL_VERSION },
       payload: { jsonrpc: JSONRPC_VERSION, id: 1, method: 'tools/call', params: { name: 'noop', arguments: {}, task: {} } }
     })
     t.assert.strictEqual(res.statusCode, 401)
@@ -795,5 +1008,149 @@ describe('tasks over the wire', () => {
 
     const init = await call(app, 'initialize', { protocolVersion: '2025-11-25', capabilities: {} })
     t.assert.strictEqual(init.result.capabilities.tasks, undefined)
+  })
+})
+
+/** Poll until `check` passes, for up to a second. */
+async function until (check: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 100 && !check(); attempt++) await new Promise(resolve => setTimeout(resolve, 10))
+}
+
+describe('round 4: legacy tasks', () => {
+  test('tasks/cancel aborts the worker and frees its slot', async (t: TestContext) => {
+    const app = Fastify({ logger: false })
+    t.after(() => app.close())
+    await app.register(mcpPlugin, { enableTasks: true, taskMaxConcurrent: 1 })
+    let aborted = false
+    app.mcpAddTool({
+      name: 'wait',
+      description: 'Waits until cancelled',
+      inputSchema: Type.Object({}),
+      execution: { taskSupport: 'optional' }
+    } as any, async (_params: any, context: any): Promise<CallToolResult> => {
+      await new Promise<void>(resolve => {
+        if (context.signal.aborted) return resolve()
+        context.signal.addEventListener('abort', () => resolve(), { once: true })
+      })
+      aborted = context.signal.aborted
+      return { content: [{ type: 'text', text: 'stopped' }] }
+    })
+    await app.ready()
+
+    const created = await call(app, 'tools/call', { name: 'wait', arguments: {}, task: {} })
+    const taskId = (created.result as CreateTaskResult).task.taskId
+    const cancelled = await call(app, 'tasks/cancel', { taskId })
+    t.assert.strictEqual(cancelled.result.status, 'cancelled')
+
+    await until(() => aborted)
+    t.assert.strictEqual(aborted, true)
+
+    // With a limit of one, a second task fits only once the first let go.
+    let second: any
+    for (let attempt = 0; attempt < 50; attempt++) {
+      second = await call(app, 'tools/call', { name: 'wait', arguments: {}, task: {} }, 2)
+      if (second.result) break
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+    t.assert.ok(second.result?.task?.taskId, JSON.stringify(second))
+    await call(app, 'tasks/cancel', { taskId: second.result.task.taskId }, 3)
+  })
+
+  test('legacy task responses carry only the spec Task fields', async (t: TestContext) => {
+    const app = await buildApp(t)
+    const created = await call(app, 'tools/call', { name: 'slow-add', arguments: { a: 1, b: 2 }, task: {} })
+    const task = (created.result as CreateTaskResult).task
+    t.assert.deepStrictEqual(
+      Object.keys(task).sort(),
+      ['createdAt', 'lastUpdatedAt', 'pollInterval', 'status', 'taskId', 'ttl']
+    )
+    const wire = toWireTask(record({ era: 'legacy', leaseExpiresAt: 1, authSubject: 'x', answeredInputKeys: ['a'] } as any))
+    t.assert.strictEqual('era' in wire, false)
+    t.assert.strictEqual('leaseExpiresAt' in wire, false)
+    t.assert.strictEqual('answeredInputKeys' in wire, false)
+  })
+
+  test('a terminal task cannot be rewritten, even with the same status', async (t: TestContext) => {
+    const store = new MemoryTaskStore()
+    await store.create(record())
+    await store.updateStatus('task-1', 'failed', { statusMessage: 'first' })
+    await t.assert.rejects(store.updateStatus('task-1', 'failed', { statusMessage: 'second' }), /terminal/)
+    t.assert.strictEqual((await store.get('task-1'))?.statusMessage, 'first')
+  })
+})
+
+describe('round 4: legacy capabilities without SSE', () => {
+  test('resources.subscribe is not advertised when updates cannot be delivered', async (t: TestContext) => {
+    for (const enableSSE of [false, true]) {
+      const app = Fastify({ logger: false })
+      t.after(() => app.close())
+      await app.register(mcpPlugin, { enableSSE })
+      app.mcpSetResourceSubscribeHandler(async () => ({}))
+      await app.ready()
+      const init = await call(app, 'initialize', { protocolVersion: LATEST_LEGACY_PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: 'c', version: '1' } })
+      t.assert.strictEqual(init.result.capabilities.resources?.subscribe, enableSSE ? true : undefined)
+    }
+  })
+})
+
+describe('round 5: legacy task slots', () => {
+  test('a task past its ttl keeps its slot until its handler settles', async (t: TestContext) => {
+    const app = Fastify({ logger: false })
+    t.after(() => app.close())
+    await app.register(mcpPlugin, { enableTasks: true, taskMaxConcurrent: 1 })
+    let running = 0
+    app.mcpAddTool({
+      name: 'stubborn',
+      description: 'Ignores its signal',
+      inputSchema: Type.Object({}),
+      execution: { taskSupport: 'optional' }
+    } as any, async (): Promise<CallToolResult> => {
+      running++
+      await new Promise(resolve => setTimeout(resolve, 400))
+      running--
+      return { content: [{ type: 'text', text: 'late' }] }
+    })
+    await app.ready()
+
+    const first = await call(app, 'tools/call', { name: 'stubborn', arguments: {}, task: { ttl: 50 } })
+    t.assert.ok(first.result?.task?.taskId, JSON.stringify(first))
+    await new Promise(resolve => setTimeout(resolve, 150))
+
+    // Expired, but its handler is still running: no room for another.
+    t.assert.strictEqual(running, 1)
+    const second = await call(app, 'tools/call', { name: 'stubborn', arguments: {}, task: { ttl: 50 } }, 2)
+    t.assert.match(second.error?.message ?? '', /Task limit reached/, JSON.stringify(second))
+
+    await until(() => running === 0)
+    const third = await call(app, 'tools/call', { name: 'stubborn', arguments: {}, task: {} }, 3)
+    t.assert.ok(third.result?.task?.taskId, JSON.stringify(third))
+  })
+
+  test('a task still being created when the server closes never starts', async (t: TestContext) => {
+    let started = false
+    const original = MemoryTaskStore.prototype.create
+    t.mock.method(MemoryTaskStore.prototype, 'create', async function (this: MemoryTaskStore, ...args: Parameters<MemoryTaskStore['create']>) {
+      await new Promise(resolve => setTimeout(resolve, 200))
+      return await original.apply(this, args)
+    })
+    const app = Fastify({ logger: false })
+    await app.register(mcpPlugin, { enableTasks: true, taskShutdownTimeoutMs: 50 })
+    app.mcpAddTool({
+      name: 'work',
+      description: 'Records that it ran',
+      inputSchema: Type.Object({}),
+      execution: { taskSupport: 'optional' }
+    } as any, async (): Promise<CallToolResult> => {
+      started = true
+      return { content: [{ type: 'text', text: 'done' }] }
+    })
+    await app.ready()
+
+    const pending = call(app, 'tools/call', { name: 'work', arguments: {}, task: {} })
+    await new Promise(resolve => setTimeout(resolve, 50))
+    await app.close()
+    await pending.catch(() => {})
+    await new Promise(resolve => setTimeout(resolve, 100))
+    t.assert.strictEqual(started, false)
   })
 })
