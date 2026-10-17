@@ -3,6 +3,7 @@ import { promises as fs, watch } from 'fs'
 import { join, relative } from 'path'
 import { Type } from '@sinclair/typebox'
 import mcpPlugin from '../src/index.ts'
+import { resolveWithinRoot } from './file-listing-security.ts'
 
 const fastify = Fastify({
   logger: {
@@ -124,7 +125,7 @@ fastify.mcpAddTool({
   const { path = '.', showHidden = false } = params
 
   try {
-    const fullPath = join(process.cwd(), path)
+    const fullPath = await resolveWithinRoot(path)
     const items = await fs.readdir(fullPath, { withFileTypes: true })
 
     const filteredItems = items.filter(item => {
@@ -173,7 +174,7 @@ fastify.mcpAddTool({
   const { path } = params
 
   try {
-    const fullPath = join(process.cwd(), path)
+    const fullPath = await resolveWithinRoot(path)
     const stats = await fs.stat(fullPath)
 
     return {
@@ -226,7 +227,7 @@ fastify.mcpAddResource({
   }
 
   try {
-    const fullPath = join(process.cwd(), filePath)
+    const fullPath = await resolveWithinRoot(filePath)
     const content = await fs.readFile(fullPath, 'utf-8')
 
     return {
@@ -288,7 +289,7 @@ fastify.mcpAddTool({
       }
     }
 
-    const fullPath = join(process.cwd(), path)
+    const fullPath = await resolveWithinRoot(path)
 
     // Verify path exists
     await fs.stat(fullPath)
