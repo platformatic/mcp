@@ -167,11 +167,10 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
   /**
    * `initialize` is the negotiation itself, so it is exempt from having to match
    * a version agreed earlier — a client is allowed to re-negotiate on a session.
+   * An `initialize` inside a batch does not count: it is refused (it MUST NOT be
+   * batched), so it must neither open a session nor exempt the rest of the batch.
    */
   function isInitializeRequest (body: unknown): boolean {
-    if (Array.isArray(body)) {
-      return body.some(entry => (entry as { method?: string })?.method === 'initialize')
-    }
     return (body as { method?: string } | undefined)?.method === 'initialize'
   }
 
@@ -268,7 +267,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
   /**
    * Whether a POST body can be handed to `processMessage`: a request, a
    * notification, a response to a server-initiated request, or a batch (which
-   * `processMessage` refuses itself).
+   * `processMessage` accepts or refuses from the negotiated protocol version).
    */
   function isJSONRPCMessageShape (body: unknown): boolean {
     if (Array.isArray(body)) return true
