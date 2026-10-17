@@ -386,6 +386,57 @@ describe('RedisTaskStore', () => {
     t.assert.ok(await store.get('d'))
   })
 
+  test('does not share one per-principal quota across anonymous callers', async (t: TestContext) => {
+    // #320: every anonymous task across the fleet lands in one index, so the
+    // per-principal cap would let any caller evict or lock out everyone else
+    store = new RedisTaskStore({ redis, maxTasksPerPrincipal: 2 })
+    const base = Date.now()
+    const at = (ms: number) => new Date(base + ms).toISOString()
+    await store.create(record({ taskId: 'a', createdAt: at(0), ttl: 3600_000 }))
+    await store.updateStatus('a', 'completed')
+
+    for (const [i, id] of ['b', 'c', 'd'].entries()) {
+      await store.create(record({ taskId: id, createdAt: at(i + 1) }))
+    }
+
+    t.assert.strictEqual((await store.get('a'))?.status, 'completed')
+    t.assert.strictEqual(await redis.zcard('mcp:tasks:anonymous'), 4)
+  })
+
+  test('bounds anonymous tasks fleet-wide by the anonymous cap', async (t: TestContext) => {
+    store = new RedisTaskStore({ redis, maxTasksPerPrincipal: 1, maxAnonymousTasks: 3 })
+    // A second instance shares the same cap
+    const other = new RedisTaskStore({ redis, maxTasksPerPrincipal: 1, maxAnonymousTasks: 3 })
+    const base = Date.now()
+    const at = (ms: number) => new Date(base + ms).toISOString()
+    await store.create(record({ taskId: 'a', createdAt: at(0) }))
+    await other.create(record({ taskId: 'b', createdAt: at(1) }))
+    await store.create(record({ taskId: 'c', createdAt: at(2) }))
+
+    await t.assert.rejects(
+      () => other.create(record({ taskId: 'd', createdAt: at(3) })),
+      (err: any) => err instanceof TaskLimitError && err.limit === 3
+    )
+    t.assert.strictEqual(await store.get('d'), null)
+
+    // Once one finishes, the oldest finished anonymous task makes room
+    await store.updateStatus('b', 'completed')
+    await other.create(record({ taskId: 'd', createdAt: at(3) }))
+    t.assert.strictEqual(await store.get('b'), null)
+    t.assert.deepStrictEqual(await redis.zrange('mcp:tasks:anonymous', 0, -1), ['a', 'c', 'd'])
+
+    // Identified callers keep their own per-principal quota
+    await store.create(record({ taskId: 'x', authSubject: 'user-1', authIssuer: ISS }))
+    await t.assert.rejects(
+      () => store.create(record({ taskId: 'y', authSubject: 'user-1', authIssuer: ISS })),
+      (err: any) => err instanceof TaskLimitError && err.limit === 1
+    )
+  })
+
+  test('validates maxAnonymousTasks', (t: TestContext) => {
+    t.assert.throws(() => new RedisTaskStore({ redis, maxAnonymousTasks: 0 }), /maxAnonymousTasks must be a positive integer/)
+  })
+
   test('tasks created on one store instance are visible from another', async (t: TestContext) => {
     await store.create(record({ authSubject: 'user-1', authIssuer: ISS }))
 

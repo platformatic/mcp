@@ -102,6 +102,9 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     // Checked before any Redis connection is opened, so a bad value cannot leak one
     validateTaskLimit('taskMaxRetainedPerPrincipal', opts.taskMaxRetainedPerPrincipal)
   }
+  if (opts.taskMaxRetainedAnonymous !== undefined) {
+    validateTaskLimit('taskMaxRetainedAnonymous', opts.taskMaxRetainedAnonymous)
+  }
   const tools = new Map<string, MCPTool>()
   const resources = new Map<string, MCPResource>()
   const prompts = new Map<string, MCPPrompt>()
@@ -134,7 +137,8 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
       taskStore = new RedisTaskStore({
         redis,
         defaultTtlMs: opts.taskDefaultTtlMs,
-        maxTasksPerPrincipal: opts.taskMaxRetainedPerPrincipal
+        maxTasksPerPrincipal: opts.taskMaxRetainedPerPrincipal,
+        maxAnonymousTasks: opts.taskMaxRetainedAnonymous
       })
     }
   } else {
@@ -142,7 +146,10 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     sessionStore = new MemorySessionStore(100, { sessionTtlMs: opts.sessionTtlMs })
     messageBroker = new MemoryMessageBroker()
     if (enableTasks) {
-      taskStore = new MemoryTaskStore({ maxTasksPerPrincipal: opts.taskMaxRetainedPerPrincipal })
+      taskStore = new MemoryTaskStore({
+        maxTasksPerPrincipal: opts.taskMaxRetainedPerPrincipal,
+        maxAnonymousTasks: opts.taskMaxRetainedAnonymous
+      })
     }
   }
 
