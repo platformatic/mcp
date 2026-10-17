@@ -1,6 +1,7 @@
 import { test, describe } from 'node:test'
 import type { TestContext } from 'node:test'
 import Fastify from 'fastify'
+import type { FastifyInstance } from 'fastify'
 import { Type } from '@sinclair/typebox'
 import mcpPlugin from '../src/index.ts'
 import type {
@@ -281,17 +282,123 @@ describe('Resource Templates', () => {
       t.assert.strictEqual(result.contents[0].text, 'concrete')
     })
 
-    test('unsupported template operators never match', async (t: TestContext) => {
+    async function setup (t: TestContext) {
       const app = Fastify()
       t.after(() => app.close())
       await app.register(mcpPlugin)
       await app.ready()
+      return app
+    }
 
-      app.mcpAddResource({ name: 'path', uriPattern: 'files://{+path}' }, async (uri) => ({
-        contents: [{ uri, text: 'ok' }]
+    function addEcho (app: FastifyInstance, name: string, uriPattern: string) {
+      app.mcpAddResource({ name, uriPattern }, async (uri, context) => ({
+        contents: [{ uri, text: JSON.stringify({ name, params: context.uriParams }) }]
       }))
+    }
 
-      t.assert.strictEqual((await read(app, 'files://a')).error?.code, -32002)
+    async function readEcho (app: ReturnType<typeof Fastify>, uri: string) {
+      const body = await read(app, uri)
+      if (body.error) return body.error
+      const content = (body.result as ReadResourceResult).contents[0]
+      return 'text' in content ? JSON.parse(content.text) : undefined
+    }
+
+    test('{+var} reserved expansion matches values containing slashes', async (t: TestContext) => {
+      const app = await setup(t)
+      addEcho(app, 'file', 'files://{+path}')
+
+      t.assert.deepStrictEqual(await readEcho(app, 'files://a/b/c.txt'), { name: 'file', params: { path: 'a/b/c.txt' } })
+      t.assert.deepStrictEqual(await readEcho(app, 'files://a%20b/c'), { name: 'file', params: { path: 'a b/c' } })
+      t.assert.strictEqual((await readEcho(app, 'files://')).code, -32002)
+    })
+
+    test('{/var} path segment expansion is optional and does not span slashes', async (t: TestContext) => {
+      const app = await setup(t)
+      addEcho(app, 'items', 'x://items{/id,rev}')
+
+      t.assert.deepStrictEqual(await readEcho(app, 'x://items/42'), { name: 'items', params: { id: '42' } })
+      t.assert.deepStrictEqual(await readEcho(app, 'x://items/42/7'), { name: 'items', params: { id: '42', rev: '7' } })
+      t.assert.deepStrictEqual(await readEcho(app, 'x://items'), { name: 'items', params: {} })
+      t.assert.strictEqual((await readEcho(app, 'x://items/1/2/3')).code, -32002)
+      t.assert.strictEqual((await readEcho(app, 'x://items/')).code, -32002)
+    })
+
+    test('{?a,b} and {&c} query expansions match in any order and are optional', async (t: TestContext) => {
+      const app = await setup(t)
+      addEcho(app, 'search', 'search://docs{?q,limit}{&page}')
+
+      t.assert.deepStrictEqual(
+        await readEcho(app, 'search://docs?page=2&limit=5&q=hello%20world'),
+        { name: 'search', params: { q: 'hello world', limit: '5', page: '2' } }
+      )
+      t.assert.deepStrictEqual(await readEcho(app, 'search://docs?q='), { name: 'search', params: { q: '' } })
+      t.assert.deepStrictEqual(await readEcho(app, 'search://docs'), { name: 'search', params: {} })
+
+      // Not an expansion of the template: unknown or repeated parameters
+      t.assert.strictEqual((await readEcho(app, 'search://docs?other=1')).code, -32002)
+      t.assert.strictEqual((await readEcho(app, 'search://docs?q=a&q=b')).code, -32002)
+      t.assert.strictEqual((await readEcho(app, 'search://docsx?q=a')).code, -32002)
+    })
+
+    test('query expansions combine with path expressions', async (t: TestContext) => {
+      const app = await setup(t)
+      addEcho(app, 'file', 'files://{+path}{?rev}')
+      addEcho(app, 'user', 'users://{id}{?fields}')
+
+      t.assert.deepStrictEqual(await readEcho(app, 'files://a/b?rev=3'), { name: 'file', params: { path: 'a/b', rev: '3' } })
+      t.assert.deepStrictEqual(await readEcho(app, 'files://a/b'), { name: 'file', params: { path: 'a/b' } })
+      t.assert.deepStrictEqual(await readEcho(app, 'users://7?fields=name'), { name: 'user', params: { id: '7', fields: 'name' } })
+      t.assert.strictEqual((await readEcho(app, 'users://7/8?fields=name')).code, -32002)
+    })
+
+    test('unsupported templates are rejected at registration', async (t: TestContext) => {
+      const app = await setup(t)
+
+      for (const uriPattern of [
+        'x://doc{#section}',
+        'x://file{.ext}',
+        'x://map{;x,y}',
+        'x://{a,b}',
+        'x://{+a,b}',
+        'x://{list*}',
+        'x://{name:3}',
+        'x://{?q}/more',
+        'x://s?v=1{&q}',
+        'x://s{&q}',
+        'x://{a-b}',
+        'x://{}x{=a}'
+      ]) {
+        t.assert.throws(
+          () => app.mcpAddResource({ name: 'bad', uriPattern }),
+          (err: Error) => err.message.includes(`'${uriPattern}'`),
+          uriPattern
+        )
+      }
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/mcp',
+        payload: { jsonrpc: JSONRPC_VERSION, id: 1, method: 'resources/templates/list' } satisfies JSONRPCRequest
+      })
+      const result = (response.json() as JSONRPCResultResponse).result as ListResourceTemplatesResult
+      t.assert.deepStrictEqual(result.resourceTemplates, [])
+    })
+
+    test('prefers the template with the most literal characters', async (t: TestContext) => {
+      const app = await setup(t)
+      addEcho(app, 'generic', 'x://{a}/{b}')
+      addEcho(app, 'files', 'x://files/{name}')
+
+      t.assert.deepStrictEqual(await readEcho(app, 'x://files/a'), { name: 'files', params: { name: 'a' } })
+      t.assert.deepStrictEqual(await readEcho(app, 'x://other/a'), { name: 'generic', params: { a: 'other', b: 'a' } })
+    })
+
+    test('equally specific templates are tried in registration order', async (t: TestContext) => {
+      const app = await setup(t)
+      addEcho(app, 'first', 'x://{a}/b')
+      addEcho(app, 'second', 'x://a/{b}')
+
+      t.assert.deepStrictEqual(await readEcho(app, 'x://a/b'), { name: 'first', params: { a: 'a' } })
     })
   })
 

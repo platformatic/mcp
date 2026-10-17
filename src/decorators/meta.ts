@@ -11,6 +11,7 @@ import type {
   ResourceUnsubscribeHandler
 } from '../types.ts'
 import { callRegisteredTool } from '../handlers.ts'
+import { isTemplateUri, compileUriTemplate } from '../uri-template.ts'
 import { schemaToArguments, validateToolSchema, isTypeBoxSchema } from '../validation/index.ts'
 import type { JsonSchemaValidator } from '../validation/json-schema-validator.ts'
 
@@ -96,6 +97,9 @@ const mcpDecoratorsPlugin: FastifyPluginAsync<MCPDecoratorsOptions> = async (app
     if (!uriPattern) {
       throw new Error('Resource definition must have a uri or uriPattern')
     }
+
+    // Throws for templates resources/read could never route to
+    if (isTemplateUri(uriPattern)) compileUriTemplate(uriPattern)
 
     // Convert uriPattern to uri for the definition
     const resourceDefinition = {
