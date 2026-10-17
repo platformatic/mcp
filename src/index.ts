@@ -226,20 +226,25 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
 
     // Register OAuth client plugin if configured
     if (opts.authorization.oauth2Client) {
-      await app.register(oauthClientPlugin, opts.authorization.oauth2Client)
+      await app.register(oauthClientPlugin, {
+        ...opts.authorization.oauth2Client,
+        transformRouteSchema: opts.transformRouteSchema
+      })
     }
   }
 
   // Register well-known routes for OAuth metadata
   await app.register(wellKnownRoutes, {
-    authConfig: opts.authorization
+    authConfig: opts.authorization,
+    transformRouteSchema: opts.transformRouteSchema
   })
 
   // Register OAuth client routes if OAuth client is configured
   if (opts.authorization?.enabled && opts.authorization?.oauth2Client) {
     await app.register(authRoutesPlugin, {
       sessionStore,
-      dcrHooks: opts.authorization.dcrHooks
+      dcrHooks: opts.authorization.dcrHooks,
+      transformRouteSchema: opts.transformRouteSchema
     })
   }
 

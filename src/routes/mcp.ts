@@ -1,5 +1,5 @@
 import { randomUUID } from 'crypto'
-import type { FastifyRequest, FastifyReply, FastifyPluginAsync, FastifySchema, FastifyError, FastifyInstance, preHandlerHookHandler } from 'fastify'
+import type { FastifyRequest, FastifyReply, FastifyPluginAsync, FastifyError, FastifyInstance, preHandlerHookHandler } from 'fastify'
 import fp from 'fastify-plugin'
 import type { JSONRPCMessage } from '../schema.ts'
 import { JSONRPC_VERSION, INTERNAL_ERROR, PARSE_ERROR, INVALID_REQUEST, SUPPORTED_PROTOCOL_VERSIONS, DEFAULT_NEGOTIATED_PROTOCOL_VERSION } from '../schema.ts'
@@ -9,9 +9,7 @@ import type {
   MCPTool,
   MCPResource,
   MCPPrompt,
-  ResourceHandlers,
-  MCPRouteSchemaContext,
-  MCPRouteSchemaTransformer
+  ResourceHandlers
 } from '../types.ts'
 import type { SessionStore, SessionMetadata } from '../stores/session-store.ts'
 import { DEFAULT_SESSION_TTL_MS } from '../stores/memory-session-store.ts'
@@ -21,6 +19,7 @@ import type { AuthorizationContext } from '../types/auth-types.ts'
 import type { JsonSchemaValidator } from '../validation/json-schema-validator.ts'
 import { processMessage, checkRequestId } from '../handlers.ts'
 import { isStdioRequest } from '../stdio-marker.ts'
+import { resolveMcpRouteSchema, resolveRouteUrl, routeSchemaOptions } from './route-schema.ts'
 
 const MAX_TIMER_DELAY_MS = 2 ** 31 - 1
 
@@ -42,43 +41,6 @@ interface MCPPubSubRoutesOptions {
   taskLeases?: TaskLeases
   jsonSchemaValidator?: JsonSchemaValidator
   authPreHandler?: preHandlerHookHandler
-}
-
-function resolveRouteUrl (prefix: string | undefined, url: string): string {
-  if (!prefix || prefix === '/') {
-    return url
-  }
-
-  const normalizedPrefix = prefix.endsWith('/') ? prefix.slice(0, -1) : prefix
-  return `${normalizedPrefix}${url}`
-}
-
-function isThenable (value: unknown): value is PromiseLike<unknown> {
-  return (
-    typeof value === 'object' &&
-    value !== null &&
-    'then' in value &&
-    typeof value.then === 'function'
-  )
-}
-
-function resolveMcpRouteSchema (
-  defaultSchema: FastifySchema | undefined,
-  context: MCPRouteSchemaContext,
-  transform?: MCPRouteSchemaTransformer
-): FastifySchema | undefined {
-  if (!transform) {
-    return defaultSchema
-  }
-
-  const schema = defaultSchema ?? {}
-  const transformed = transform(schema, context)
-
-  if (typeof transformed !== 'object' || transformed === null || Array.isArray(transformed) || isThenable(transformed)) {
-    throw new TypeError(`transformRouteSchema must return a synchronous Fastify schema object for ${context.routeId}`)
-  }
-
-  return transformed
 }
 
 // Body-parser failures happen before the handler runs, so without this they
@@ -508,7 +470,12 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
   // GET endpoint for server-initiated communication via SSE
   if (!enableSSE) {
-    app.get('/mcp', { onRequest: mcpOnRequest, preHandler: mcpPreHandler }, async (_request: FastifyRequest, reply: FastifyReply) => {
+    const routeOptions = {
+      onRequest: mcpOnRequest,
+      preHandler: mcpPreHandler,
+      ...routeSchemaOptions(app, 'mcp.get', 'GET', '/mcp', undefined, opts.transformRouteSchema)
+    }
+    app.get('/mcp', routeOptions, async (_request: FastifyRequest, reply: FastifyReply) => {
       reply.header('Allow', 'POST, DELETE').type('application/json').code(405).send({ error: 'Method Not Allowed: SSE not enabled' })
     })
   }
