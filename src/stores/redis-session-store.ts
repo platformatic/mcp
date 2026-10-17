@@ -212,30 +212,29 @@ export class RedisSessionStore implements SessionStore {
     } while (cursor !== '0')
   }
 
-  async addMessage (sessionId: string, eventId: string, message: JSONRPCMessage): Promise<void> {
-    const historyKey = `session:${sessionId}:history`
-    const sessionKey = `session:${sessionId}`
+  async addMessage (sessionId: string, message: JSONRPCMessage): Promise<string | null> {
+    // One script so the id is allocated and the entry appended atomically:
+    // HINCRBY hands every concurrent caller a distinct id, and running XADD in
+    // the same step keeps stream ids ascending (XADD rejects an id lower than
+    // the last one). Skips sessions that are gone instead of recreating them.
+    const eventId = await this.redis.eval(
+      `if redis.call('EXISTS', KEYS[1]) == 0 then return false end
+       local id = redis.call('HINCRBY', KEYS[1], 'eventId', 1)
+       redis.call('XADD', KEYS[2], id .. '-0', 'message', ARGV[1])
+       redis.call('XTRIM', KEYS[2], 'MAXLEN', ARGV[2])
+       redis.call('HSET', KEYS[1], 'lastEventId', id, 'lastActivity', ARGV[3])
+       redis.call('PEXPIRE', KEYS[1], ARGV[4])
+       return tostring(id)`,
+      2,
+      `session:${sessionId}`,
+      `session:${sessionId}:history`,
+      JSON.stringify(message),
+      String(this.maxMessages),
+      new Date().toISOString(),
+      String(this.sessionTtlMs)
+    ) as string | null
 
-    // Use Redis pipeline for atomic operations
-    const pipeline = this.redis.pipeline()
-
-    // Add message to Redis stream
-    pipeline.xadd(historyKey, `${eventId}-0`, 'message', JSON.stringify(message))
-
-    // Trim to max messages (exact trimming)
-    pipeline.xtrim(historyKey, 'MAXLEN', this.maxMessages)
-
-    // Update session metadata
-    pipeline.hset(sessionKey, {
-      eventId,
-      lastEventId: eventId,
-      lastActivity: new Date().toISOString()
-    })
-
-    // Reset session expiration
-    pipeline.pexpire(sessionKey, this.sessionTtlMs)
-
-    await pipeline.exec()
+    return eventId ?? null
   }
 
   async getMessagesFrom (sessionId: string, fromEventId: string): Promise<Array<{ eventId: string, message: JSONRPCMessage }>> {
