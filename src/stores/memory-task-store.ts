@@ -53,7 +53,13 @@ export class MemoryTaskStore implements TaskStore {
     if (this.count(ownedBy) >= this.maxTasksPerPrincipal) {
       this.sweepExpired()
       this.failLapsedLeases(ownedBy)
-      if (this.count(ownedBy) >= this.maxTasksPerPrincipal && !this.evictOldestFinished(ownedBy)) {
+      // The caller's own finished work goes first; only then results another
+      // of the user's OAuth clients has not collected yet.
+      if (
+        this.count(ownedBy) >= this.maxTasksPerPrincipal &&
+        !this.evictOldestFinished(t => t.authSubject === task.authSubject && ownedBy(t)) &&
+        !this.evictOldestFinished(ownedBy)
+      ) {
         throw new TaskLimitError(this.maxTasksPerPrincipal)
       }
     }

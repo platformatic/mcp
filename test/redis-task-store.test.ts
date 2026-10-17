@@ -12,7 +12,7 @@ const ISS = 'https://idp-a.example.com:8443'
 function owner (subject: string, issuer: string): string {
   return JSON.stringify([subject, null, issuer])
 }
-const USER_1_INDEX = `mcp:tasks:v2:owner:${owner('user-1', ISS)}`
+const USER_1_INDEX = `mcp:tasks:v3:owner:${owner('user-1', ISS)}`
 
 function record (overrides: Partial<TaskRecord> = {}): TaskRecord {
   const now = new Date().toISOString()
@@ -183,7 +183,7 @@ describe('RedisTaskStore', () => {
 
   test('records live under a versioned keyspace', async (t: TestContext) => {
     await store.create(record())
-    t.assert.strictEqual(await redis.exists('mcp:task:v2:task-1'), 1)
+    t.assert.strictEqual(await redis.exists('mcp:task:v3:task-1'), 1)
     t.assert.strictEqual(await redis.exists('mcp:task:task-1'), 0)
   })
 
@@ -257,10 +257,10 @@ describe('RedisTaskStore', () => {
 
   test('a status change does not extend the retention window', async (t: TestContext) => {
     await store.create(record({ ttl: 60_000 }))
-    const before = await redis.ttl('mcp:task:v2:task-1')
+    const before = await redis.ttl('mcp:task:v3:task-1')
 
     await store.updateStatus('task-1', 'completed')
-    const after = await redis.ttl('mcp:task:v2:task-1')
+    const after = await redis.ttl('mcp:task:v3:task-1')
 
     t.assert.ok(after <= before, `ttl should not grow: ${before} -> ${after}`)
     t.assert.ok(after > 0, 'task should still be retained')
@@ -270,7 +270,7 @@ describe('RedisTaskStore', () => {
     await store.create(record({ ttl: null }))
 
     // -1 is Redis for "key exists but has no expiry"; the default must not apply
-    t.assert.strictEqual(await redis.ttl('mcp:task:v2:task-1'), -1)
+    t.assert.strictEqual(await redis.ttl('mcp:task:v3:task-1'), -1)
     t.assert.strictEqual((await store.get('task-1'))?.ttl, null)
   })
 
@@ -278,7 +278,7 @@ describe('RedisTaskStore', () => {
     // As seen by an instance whose clock runs 10s ahead of the creator's.
     await store.create(record({ createdAt: new Date(Date.now() - 10_000).toISOString(), ttl: 1_000 }))
     t.assert.ok(await store.get('task-1'), 'a skewed clock must not delete a live task')
-    t.assert.ok(await redis.exists('mcp:task:v2:task-1'))
+    t.assert.ok(await redis.exists('mcp:task:v3:task-1'))
 
     await new Promise(resolve => setTimeout(resolve, 1_100))
     t.assert.strictEqual(await store.get('task-1'), null, 'gone once Redis expires the key')
@@ -286,13 +286,13 @@ describe('RedisTaskStore', () => {
 
   test('treats a task whose key has expired as absent', async (t: TestContext) => {
     await store.create(record({ ttl: 1_000 }))
-    await redis.pexpire('mcp:task:v2:task-1', 1)
+    await redis.pexpire('mcp:task:v3:task-1', 1)
     await new Promise(resolve => setTimeout(resolve, 20))
 
     t.assert.strictEqual(await store.get('task-1'), null)
     // The stale index entry is pruned by the next list
     t.assert.deepStrictEqual((await store.list()).tasks, [])
-    t.assert.strictEqual(await redis.zcard('mcp:tasks:v2:anonymous'), 0)
+    t.assert.strictEqual(await redis.zcard('mcp:tasks:v3:anonymous'), 0)
   })
 
   test('does not delete a live task that looks expired by the local clock', async (t: TestContext) => {
@@ -302,8 +302,8 @@ describe('RedisTaskStore', () => {
 
     const task = await store.get('task-1')
     t.assert.strictEqual(task?.taskId, 'task-1')
-    t.assert.strictEqual(await redis.exists('mcp:task:v2:task-1'), 1)
-    t.assert.strictEqual(await redis.zcard('mcp:tasks:v2:anonymous'), 1)
+    t.assert.strictEqual(await redis.exists('mcp:task:v3:task-1'), 1)
+    t.assert.strictEqual(await redis.zcard('mcp:tasks:v3:anonymous'), 1)
     t.assert.deepStrictEqual((await store.list()).tasks.map(x => x.taskId), ['task-1'])
   })
 
@@ -332,30 +332,30 @@ describe('RedisTaskStore', () => {
     await store.create(record({ taskId: 'y', authSubject: owner('b:c', 'a') }))
 
     // The principal is a JSON array, so each part stays delimited
-    t.assert.deepStrictEqual(await redis.zrange(`mcp:tasks:v2:owner:${owner('c', 'a:b')}`, 0, -1), ['x'])
-    t.assert.deepStrictEqual(await redis.zrange(`mcp:tasks:v2:owner:${owner('b:c', 'a')}`, 0, -1), ['y'])
+    t.assert.deepStrictEqual(await redis.zrange(`mcp:tasks:v3:owner:${owner('c', 'a:b')}`, 0, -1), ['x'])
+    t.assert.deepStrictEqual(await redis.zrange(`mcp:tasks:v3:owner:${owner('b:c', 'a')}`, 0, -1), ['y'])
     t.assert.deepStrictEqual((await store.list(owner('c', 'a:b'))).tasks.map(x => x.taskId), ['x'])
     t.assert.deepStrictEqual((await store.list(owner('b:c', 'a'))).tasks.map(x => x.taskId), ['y'])
 
     await store.delete('x')
-    t.assert.strictEqual(await redis.exists(`mcp:tasks:v2:owner:${owner('c', 'a:b')}`), 0)
-    t.assert.deepStrictEqual(await redis.zrange(`mcp:tasks:v2:owner:${owner('b:c', 'a')}`, 0, -1), ['y'])
+    t.assert.strictEqual(await redis.exists(`mcp:tasks:v3:owner:${owner('c', 'a:b')}`), 0)
+    t.assert.deepStrictEqual(await redis.zrange(`mcp:tasks:v3:owner:${owner('b:c', 'a')}`, 0, -1), ['y'])
   })
 
   test('delete removes the task and its owner index entry', async (t: TestContext) => {
     await store.create(record({ authSubject: 'user-1' }))
-    t.assert.strictEqual(await redis.zcard('mcp:tasks:v2:owner:user-1'), 1)
+    t.assert.strictEqual(await redis.zcard('mcp:tasks:v3:owner:user-1'), 1)
     await store.delete('task-1')
 
     t.assert.strictEqual(await store.get('task-1'), null)
-    t.assert.strictEqual(await redis.zcard('mcp:tasks:v2:owner:user-1'), 0)
+    t.assert.strictEqual(await redis.zcard('mcp:tasks:v3:owner:user-1'), 0)
   })
 
   test('list prunes index entries whose task key has expired', async (t: TestContext) => {
     await store.create(record({ taskId: 'a', authSubject: owner('user-1', ISS) }))
     await store.create(record({ taskId: 'b', authSubject: owner('user-1', ISS) }))
     // Stand in for Redis expiring the task key on its own
-    await redis.del('mcp:task:v2:a')
+    await redis.del('mcp:task:v3:a')
 
     t.assert.deepStrictEqual((await store.list(owner('user-1', ISS))).tasks.map(x => x.taskId), ['b'])
     t.assert.deepStrictEqual(await redis.zrange(USER_1_INDEX, 0, -1), ['b'])
@@ -364,12 +364,12 @@ describe('RedisTaskStore', () => {
   test('owner index expires no earlier than its longest-lived task', async (t: TestContext) => {
     await store.create(record({ taskId: 'long', authSubject: 'user-1', ttl: 120_000 }))
     await store.create(record({ taskId: 'short', authSubject: 'user-1', ttl: 10_000 }))
-    const ttl = await redis.ttl('mcp:tasks:v2:owner:user-1')
+    const ttl = await redis.ttl('mcp:tasks:v3:owner:user-1')
     t.assert.ok(ttl > 100 && ttl <= 120, `expected ~120s, got ${ttl}`)
 
     // A task with unlimited retention keeps the index alive indefinitely
     await store.create(record({ taskId: 'forever', authSubject: 'user-1', ttl: null }))
-    t.assert.strictEqual(await redis.ttl('mcp:tasks:v2:owner:user-1'), -1)
+    t.assert.strictEqual(await redis.ttl('mcp:tasks:v3:owner:user-1'), -1)
   })
 
   test('list paginates newest first across pages', async (t: TestContext) => {
@@ -424,14 +424,14 @@ describe('RedisTaskStore', () => {
       }
       // The two newest tasks have expired, but their index entries remain, so
       // the first batch yields only one live task and a second batch is needed
-      await redis.del('mcp:task:v2:t5', 'mcp:task:v2:t4')
+      await redis.del('mcp:task:v3:t5', 'mcp:task:v3:t4')
 
       // Between the two batches another request prunes those stale entries, as
       // a concurrent list or delete would
       const original = redis.zrevrangebyscore.bind(redis)
       let calls = 0
       t.mock.method(redis, 'zrevrangebyscore', async (...args: any[]) => {
-        if (++calls === 2) await redis.zrem('mcp:tasks:v2:owner:user-1', 't5', 't4')
+        if (++calls === 2) await redis.zrem('mcp:tasks:v3:owner:user-1', 't5', 't4')
         return (original as any)(...args)
       })
 
@@ -464,11 +464,11 @@ describe('RedisTaskStore', () => {
     // Modern and anonymous tasks are indexed but never listed, so only create
     // keeps their index from growing with every expired task.
     for (let i = 0; i < 5; i++) await store.create(record({ taskId: `old-${i}` }))
-    await redis.del(...Array.from({ length: 5 }, (_, i) => `mcp:task:v2:old-${i}`))
-    t.assert.strictEqual(await redis.zcard('mcp:tasks:v2:anonymous'), 5)
+    await redis.del(...Array.from({ length: 5 }, (_, i) => `mcp:task:v3:old-${i}`))
+    t.assert.strictEqual(await redis.zcard('mcp:tasks:v3:anonymous'), 5)
 
     await store.create(record({ taskId: 'new' }))
-    t.assert.deepStrictEqual(await redis.zrange('mcp:tasks:v2:anonymous', 0, -1), ['new'])
+    t.assert.deepStrictEqual(await redis.zrange('mcp:tasks:v3:anonymous', 0, -1), ['new'])
   })
 
   test('a new task\'s lease is stamped by the Redis clock', async (t: TestContext) => {
@@ -533,7 +533,7 @@ describe('RedisTaskStore', () => {
     await store.create(record({ taskId: 'x', authSubject: 'user-2' }))
     await store.create(record({ taskId: 'y' }))
     t.assert.ok(await store.get('x'))
-    t.assert.strictEqual(await redis.zcard('mcp:tasks:v2:anonymous'), 1)
+    t.assert.strictEqual(await redis.zcard('mcp:tasks:v3:anonymous'), 1)
   })
 
   test('the cap counts a user once across the OAuth clients they act through', async (t: TestContext) => {
@@ -554,12 +554,30 @@ describe('RedisTaskStore', () => {
     t.assert.strictEqual(await store.get('a'), null)
     t.assert.deepStrictEqual((await store.list(via('one'))).tasks, [])
     t.assert.deepStrictEqual((await store.list(via('three'))).tasks.map(x => x.taskId), ['c'])
-    t.assert.deepStrictEqual(await redis.zrange(`mcp:tasks:v2:quota:${quotaKey}`, 0, -1), ['b', 'c'])
+    t.assert.deepStrictEqual(await redis.zrange(`mcp:tasks:v3:quota:${quotaKey}`, 0, -1), ['b', 'c'])
 
     // Deleting a task removes it from both indexes.
     await store.delete('b')
-    t.assert.deepStrictEqual(await redis.zrange(`mcp:tasks:v2:quota:${quotaKey}`, 0, -1), ['c'])
-    t.assert.strictEqual(await redis.zcard(`mcp:tasks:v2:owner:${via('two')}`), 0)
+    t.assert.deepStrictEqual(await redis.zrange(`mcp:tasks:v3:quota:${quotaKey}`, 0, -1), ['c'])
+    t.assert.strictEqual(await redis.zcard(`mcp:tasks:v3:owner:${via('two')}`), 0)
+  })
+
+  test('at the per-user cap, the creating client\'s own finished task is evicted first', async (t: TestContext) => {
+    store = new RedisTaskStore({ redis, maxTasksPerPrincipal: 2 })
+    const quotaKey = JSON.stringify(['user-1', ISS])
+    const via = (client: string) => JSON.stringify(['user-1', client, ISS])
+    // app-1's uncollected result is the oldest, so plain age would evict it.
+    await store.create(record({ taskId: 'a', authSubject: via('app-1'), quotaKey }))
+    await store.create(record({ taskId: 'b', authSubject: via('app-2'), quotaKey }))
+    await store.updateStatus('a', 'completed')
+    await store.updateStatus('b', 'completed')
+    await store.create(record({ taskId: 'c', authSubject: via('app-2'), quotaKey }))
+    t.assert.ok(await store.get('a'))
+    t.assert.strictEqual(await store.get('b'), null)
+
+    // With nothing of its own finished, another client's result still makes room.
+    await store.create(record({ taskId: 'd', authSubject: via('app-3'), quotaKey }))
+    t.assert.strictEqual(await store.get('a'), null)
   })
 
   test('evicts the caller\'s oldest finished task to make room', async (t: TestContext) => {
@@ -587,7 +605,7 @@ describe('RedisTaskStore', () => {
     store = new RedisTaskStore({ redis, maxTasksPerPrincipal: 1 })
     await store.create(record({ taskId: 'a', authSubject: owner('user-1', ISS) }))
     // Stand in for Redis expiring the task key
-    await redis.del('mcp:task:v2:a')
+    await redis.del('mcp:task:v3:a')
 
     await store.create(record({ taskId: 'b', authSubject: owner('user-1', ISS) }))
     t.assert.deepStrictEqual(await redis.zrange(USER_1_INDEX, 0, -1), ['b'])
@@ -611,7 +629,7 @@ describe('RedisTaskStore', () => {
     t.assert.strictEqual(orphan?.status, 'failed')
     t.assert.strictEqual(orphan?.statusMessage, TASK_OWNER_LOST)
     t.assert.strictEqual((orphan?.outcome as any)?.error?.message, TASK_OWNER_LOST)
-    t.assert.ok(await redis.ttl('mcp:task:v2:c') > 0)
+    t.assert.ok(await redis.ttl('mcp:task:v3:c') > 0)
     t.assert.ok(await store.get('d'))
   })
 
@@ -628,7 +646,7 @@ describe('RedisTaskStore', () => {
 
   test('fails a task whose lease has lapsed, keeping its retention', async (t: TestContext) => {
     await store.create(record({ leaseExpiresAt: Date.now() - 1 }))
-    const ttlBefore = await redis.pttl('mcp:task:v2:task-1')
+    const ttlBefore = await redis.pttl('mcp:task:v3:task-1')
     const outcome = { jsonrpc: '2.0' as const, id: 1, error: { code: -32603, message: 'lost' } }
 
     const failed = await store.expireStaleLease('task-1', 'Task owner lost', outcome)
@@ -636,7 +654,7 @@ describe('RedisTaskStore', () => {
     t.assert.strictEqual(failed?.statusMessage, 'Task owner lost')
     t.assert.deepStrictEqual(failed?.outcome, outcome)
     t.assert.deepStrictEqual(await store.get('task-1'), failed)
-    const ttlAfter = await redis.pttl('mcp:task:v2:task-1')
+    const ttlAfter = await redis.pttl('mcp:task:v3:task-1')
     t.assert.ok(ttlAfter > 0 && ttlAfter <= ttlBefore)
     // Once terminal the lease is no longer renewed: the worker learns it ended
     t.assert.strictEqual(await store.renewLease('task-1', 1000), 'failed')

@@ -340,7 +340,7 @@ describe('Redis task integration (multi-instance)', () => {
 
     // As written by an instance that died right after its last renewal
     const now = new Date().toISOString()
-    await redis.set('mcp:task:v2:orphan', JSON.stringify({
+    await redis.set('mcp:task:v3:orphan', JSON.stringify({
       taskId: 'orphan',
       status: 'working',
       createdAt: now,

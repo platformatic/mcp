@@ -25,13 +25,14 @@ import {
   validateTaskLimit
 } from './task-store.ts'
 
-// Versioned: records here store opaque fields as JSON strings, which earlier
-// releases cannot read. A separate keyspace keeps old and new instances from
-// misreading each other's tasks during a rolling deploy or a rollback.
-const TASK_KEY_PREFIX = 'mcp:task:v2:'
-const OWNER_INDEX_PREFIX = 'mcp:tasks:v2:owner:'
-const ANONYMOUS_INDEX_KEY = 'mcp:tasks:v2:anonymous'
-const QUOTA_INDEX_PREFIX = 'mcp:tasks:v2:quota:'
+// Versioned: records here store opaque fields as JSON strings and count
+// against a per-user quota index, neither of which earlier releases know
+// about. A separate keyspace keeps old and new instances from misreading or
+// miscounting each other's tasks during a rolling deploy or a rollback.
+const TASK_KEY_PREFIX = 'mcp:task:v3:'
+const OWNER_INDEX_PREFIX = 'mcp:tasks:v3:owner:'
+const ANONYMOUS_INDEX_KEY = 'mcp:tasks:v3:anonymous'
+const QUOTA_INDEX_PREFIX = 'mcp:tasks:v3:quota:'
 
 /**
  * Lua's cjson cannot round-trip arbitrary JSON: it turns empty arrays into
@@ -93,7 +94,8 @@ function fromStored (stored: any): TaskRecord {
 //       task has no separate quota key)
 // ARGV: task JSON, expiry seconds (-1 = none), score, task id, cap, task key
 //       prefix, then the status message, encoded outcome and timestamp for
-//       orphaned tasks, then the lease in ms ('' for none)
+//       orphaned tasks, then the lease in ms ('' for none), then the
+//       creating principal ('' for none)
 //
 // The owner index is a sorted set of task ids scored by creation time (the same
 // one `list` pages through); the quota index holds the same ids for every
@@ -101,7 +103,8 @@ function fromStored (stored: any): TaskRecord {
 // the cap counts. Ids whose task key has expired or was evicted are pruned from
 // both first, so an index nobody lists cannot grow without bound; then, at the cap, tasks
 // whose lease has lapsed (their instance died) are failed, as expireStaleLease
-// would, and the oldest finished tasks are evicted. Returns 0 (storing nothing)
+// would, and the oldest finished tasks are evicted, the creating principal's own
+// before those of the user's other clients. Returns 0 (storing nothing)
 // when the owner is at the cap with nothing finished to evict. Task keys are
 // derived from index members, so this needs a standalone Redis (or every key
 // in one slot).
@@ -132,13 +135,14 @@ end
 
 local need = #live - cap + 1
 if need > 0 then
-  local victims = {}
+  -- The caller's own finished tasks go first; only then those another of the
+  -- user's OAuth clients has not collected yet.
+  local own, other = {}, {}
   for _, id in ipairs(live) do
     local ok, cur = pcall(cjson.decode, redis.call('GET', prefix .. id))
     local s = ok and type(cur) == 'table' and cur.status
-    if s == 'completed' or s == 'failed' or s == 'cancelled' then
-      if #victims < need then table.insert(victims, id) end
-    elseif s and type(cur.leaseExpiresAt) == 'number' and cur.leaseExpiresAt <= now then
+    local finished = s == 'completed' or s == 'failed' or s == 'cancelled'
+    if not finished and s and type(cur.leaseExpiresAt) == 'number' and cur.leaseExpiresAt <= now then
       cur.status = 'failed'
       cur.statusMessage = ARGV[7]
       cur.outcome = ARGV[8]
@@ -148,6 +152,19 @@ if need > 0 then
       cur.pendingInputResponseIds = nil
       cur.pendingInputResponseRounds = nil
       redis.call('SET', prefix .. id, cjson.encode(cur), 'KEEPTTL')
+      finished = true
+    end
+    if finished then
+      if type(cur.authSubject) == 'string' and cur.authSubject == ARGV[11] then
+        table.insert(own, id)
+      else
+        table.insert(other, id)
+      end
+    end
+  end
+  local victims = {}
+  for _, list in ipairs({ own, other }) do
+    for _, id in ipairs(list) do
       if #victims < need then table.insert(victims, id) end
     end
   end
@@ -273,7 +290,8 @@ export class RedisTaskStore implements TaskStore {
       toWellFormed(TASK_OWNER_LOST),
       JSON.stringify(ownerLostOutcome()),
       new Date().toISOString(),
-      leaseMs
+      leaseMs,
+      task.authSubject === undefined ? '' : toWellFormed(task.authSubject)
     )
     if (stored !== 1) {
       throw new TaskLimitError(this.maxTasksPerPrincipal)

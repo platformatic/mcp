@@ -25,6 +25,7 @@ import {
   META_CLIENT_INFO,
   META_CLIENT_CAPABILITIES,
   META_SERVER_INFO,
+  META_LOG_LEVEL,
   TASKS_EXTENSION
 } from '../src/schema-2026.ts'
 import { InputRequired, elicitForm, elicitUrl, requestSampling } from '../src/modern/input-required.ts'
@@ -5184,5 +5185,153 @@ describe('round 9: request digests, header types, limits, sessions and shutdown'
     second.abort()
     await until(() => events.length === 3)
     t.assert.deepStrictEqual(events, ['sub file:///a', 'sub file:///a', 'unsub file:///a'])
+  })
+})
+
+describe('round 10: stdio, held notifications, SSE setup and listen deadlines', () => {
+  function stdioPipe (t: TestContext, app: FastifyInstance) {
+    const input = new PassThrough()
+    const output = new PassThrough()
+    const transport = createStdioTransport(app, { input, output, error: new PassThrough() })
+    transport.start()
+    t.after(() => transport.stop())
+    const lines: any[] = []
+    let buffered = ''
+    output.on('data', (chunk: Buffer) => {
+      buffered += chunk.toString()
+      const parts = buffered.split('\n')
+      buffered = parts.pop() ?? ''
+      for (const line of parts) if (line.trim()) lines.push(JSON.parse(line))
+    })
+    const send = (body: unknown) => input.write(JSON.stringify(body) + '\n')
+    return { transport, lines, send }
+  }
+
+  test('stdio answers a message that is not a valid request, even without an id', async (t: TestContext) => {
+    const app = await buildServer(t)
+    const { lines, send } = stdioPipe(t, app)
+    const badMethod = modernBody('tools/list') as any
+    delete badMethod.id
+    badMethod.method = 5
+
+    send({ foo: 1 })
+    send(badMethod)
+    await until(() => lines.length >= 2)
+    t.assert.strictEqual(lines.length, 2, JSON.stringify(lines))
+    for (const line of lines) {
+      t.assert.strictEqual(line.id, null)
+      t.assert.strictEqual(line.error.code, INVALID_REQUEST)
+    }
+  })
+
+  test('stdio streams progress while the handler runs, whatever input the client declared', async (t: TestContext) => {
+    let release: (by: string) => void = () => {}
+    const released = new Promise<string>(resolve => { release = resolve })
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'slow', inputSchema: Type.Object({}) }, async (_args: any, context: any) => {
+        context.sendProgress(1, 2)
+        setTimeout(() => release('timeout'), 1500).unref()
+        return { content: [{ type: 'text', text: await released }] }
+      })
+    })
+    const { lines, send } = stdioPipe(t, app)
+    const body = modernBody('tools/call', { params: { name: 'slow', arguments: {} } }) as any
+    body.params._meta.progressToken = 'p'
+    send(body)
+
+    await until(() => lines.some(line => line.method === 'notifications/progress'))
+    // Before the handler returns: held notifications would only arrive with the result.
+    t.assert.ok(lines.some(line => line.method === 'notifications/progress'))
+    release('progress')
+    await until(() => lines.some(line => line.id === 1))
+    t.assert.strictEqual(lines.find(line => line.id === 1)?.result.content[0].text, 'progress')
+  })
+
+  test('stopping the stdio transport ends a listen stream gracefully', async (t: TestContext) => {
+    const app = await buildServer(t, undefined, { capabilities: { tools: { listChanged: true } } })
+    const { transport, lines, send } = stdioPipe(t, app)
+    send(modernBody('subscriptions/listen', { id: 'L1', params: { notifications: { toolsListChanged: true } } }))
+    await until(() => lines.some(line => line.method === 'notifications/subscriptions/acknowledged'))
+
+    await transport.stop()
+    await until(() => lines.some(line => line.id === 'L1'))
+    const cancelled = lines.find(line => line.method === 'notifications/cancelled')
+    t.assert.strictEqual(cancelled?.params.requestId, 'L1')
+    t.assert.strictEqual(lines.find(line => line.id === 'L1')?.result.resultType, 'complete')
+  })
+
+  test('a log sent before an error that keeps status 200 still reaches the client', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddPrompt({ name: 'broken' }, async (_name: string, _args: any, context: any) => {
+        context.log('error', 'upstream unavailable')
+        throw new Error('boom')
+      })
+    })
+    const body = modernBody('prompts/get', { params: { name: 'broken' } }) as any
+    body.params._meta[META_LOG_LEVEL] = 'debug'
+    const response = await app.inject({
+      method: 'POST',
+      url: '/mcp',
+      headers: modernHeaders('prompts/get', { params: { name: 'broken' } }),
+      payload: body
+    })
+    t.assert.strictEqual(response.statusCode, 200)
+    t.assert.match(response.body, /upstream unavailable/)
+    t.assert.match(response.body, /"code":-32603/)
+  })
+
+  test('a legacy SSE GET whose setup fails is answered instead of hanging', async (t: TestContext) => {
+    const app = await buildServer(t, undefined, {
+      enableSSE: true,
+      resolveAuthorizationContext: (request: any) => ({ userId: request.user.id })
+    })
+    const response = await Promise.race([
+      app.inject({ method: 'GET', url: '/mcp', headers: { accept: 'text/event-stream' } }),
+      new Promise<undefined>(resolve => setTimeout(() => resolve(undefined), 2000).unref())
+    ])
+    t.assert.strictEqual(response?.statusCode, 500)
+  })
+
+  test('a listen on an already-expired token is refused', async (t: TestContext) => {
+    const app = await buildServer(t, undefined, {
+      capabilities: { tools: { listChanged: true } },
+      resolveAuthorizationContext: () => ({ userId: 'alice', expiresAt: new Date(Date.now() - 1000) })
+    })
+    const response = await call(app, 'subscriptions/listen', { params: { notifications: { toolsListChanged: true } } })
+    t.assert.strictEqual(response.statusCode, 401)
+    t.assert.match(String(response.headers['www-authenticate']), /invalid_token/)
+  })
+
+  test('an expiresAt that is not a Date does not break an accepted listen', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpSetResourceSubscribeHandler(async () => ({}))
+    }, {
+      capabilities: { resources: { subscribe: true } },
+      resolveAuthorizationContext: () => ({ userId: 'alice', expiresAt: Date.now() + 60_000 as any })
+    })
+    const response = await app.inject({
+      method: 'POST',
+      url: '/mcp',
+      headers: modernHeaders('subscriptions/listen'),
+      payload: modernBody('subscriptions/listen', { params: { notifications: { resourceSubscriptions: ['file:///a'] } } }),
+      payloadAsStream: true
+    })
+    t.assert.strictEqual(response.statusCode, 200)
+    t.assert.strictEqual(response.headers['content-type'], 'text/event-stream')
+    response.stream().destroy()
+  })
+
+  test('a requestedSchema with a non-finite number is the handler\'s error', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'ask', inputSchema: Type.Object({}) }, async () => {
+        throw new InputRequired({
+          inputRequests: { n: elicitForm('How many?', { type: 'object', properties: { n: { type: 'number', maximum: Infinity } } }) }
+        })
+      })
+    })
+    const response = await call(app, 'tools/call', { params: { name: 'ask', arguments: {} }, capabilities: { elicitation: { form: {} } } })
+    const json = response.json()
+    t.assert.strictEqual(json.result?.resultType, undefined, JSON.stringify(json))
+    t.assert.ok(json.error ?? json.result?.isError, JSON.stringify(json))
   })
 })

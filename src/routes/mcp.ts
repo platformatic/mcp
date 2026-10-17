@@ -659,7 +659,8 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
    * when the stream opens, as for the legacy GET stream.
    */
   function listenDeadline (authContext: AuthorizationContext | undefined): SubscriptionDeadline | undefined {
-    const expiresAt = authContext?.expiresAt?.getTime()
+    // A resolver typed loosely may hand back something other than a Date.
+    const expiresAt = authContext?.expiresAt instanceof Date ? authContext.expiresAt.getTime() : undefined
     const maxAt = opts.sseMaxConnectionMs ? Date.now() + opts.sseMaxConnectionMs : undefined
     if (expiresAt !== undefined && Number.isFinite(expiresAt) && (maxAt === undefined || expiresAt <= maxAt)) {
       return { at: expiresAt, reason: 'The access token that opened this subscription expired' }
@@ -789,6 +790,16 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         return undefined
       }
 
+      // A stream opened on an expired token would be ended at once and the
+      // client told to reconnect, which it would do in a tight loop.
+      if (authContext?.expiresAt instanceof Date && authContext.expiresAt.getTime() <= Date.now()) {
+        reply.code(401).header('WWW-Authenticate', 'Bearer error="invalid_token", error_description="The access token expired"').type('application/json')
+        return createError(message.id, INVALID_REQUEST, 'The access token expired')
+      }
+
+      // Computed before any subscribe handler runs, so nothing can throw
+      // between accepting URIs and the stream that releases them.
+      const deadline = listenDeadline(authContext)
       const quotaKey = quotaKeyOf(authContext)
       const reserved = subscriptions.reserve(quotaKey)
       if (typeof reserved === 'string') {
@@ -806,7 +817,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
           types: Object.keys(filter).filter(key => key !== 'resourceSubscriptions'),
           resourceSubscriptions: filter.resourceSubscriptions?.length ?? 0
         }, 'Opening subscription stream')
-        opened = subscriptions.open(reply, message.id, filter, quotaKey, listenCancel, onEnd, listenDeadline(authContext))
+        opened = subscriptions.open(reply, message.id, filter, quotaKey, listenCancel, onEnd, deadline)
       } finally {
         reserved()
       }
@@ -844,9 +855,10 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     const wantsNotifications = context.progressToken !== undefined || context.logLevel !== undefined
     // A handler that asks for input the client cannot give is refused with
     // -32021, which must go out as a 400; once the stream opens the status is
-    // 200. So it opens early only when that refusal cannot happen.
+    // 200. So it opens early only when that refusal cannot happen, or over
+    // stdio, which has no status to protect.
     const stream = wantsNotifications && acceptsMediaType(request.headers.accept, 'text/event-stream')
-      ? new RequestStream(reply, { openEarly: cannotNeedMissingInput(message, context.clientCapabilities) })
+      ? new RequestStream(reply, { openEarly: !headerLayer || cannotNeedMissingInput(message, context.clientCapabilities) })
       : undefined
 
     let response: JSONRPCResponse | JSONRPCError
@@ -905,7 +917,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
     // Concluding the stream also closes it to late notifications, which would
     // otherwise take over a reply that is about to be sent as JSON.
-    if (stream?.finish(response, serialized)) {
+    if (stream?.finish(response, serialized, headerLayer && statusForResponse(response) !== 200)) {
       // The stream carried the response. Returning it as well (Fastify sends
       // nothing for a hijacked reply) lets telemetry record its outcome.
       if (!reply.sent) reply.hijack()
@@ -1120,6 +1132,17 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
         request.log.info({ sessionId }, 'Handling SSE request')
 
+        // Find or create the session before taking the reply over, so a store
+        // or resolver failure is still answered through Fastify.
+        let session: SessionMetadata | null = sessionId ? await sessionStore.get(sessionId) : null
+        let created = false
+        if (session) {
+          await sessionStore.touch?.(session.id)
+        } else {
+          session = await createSession(request)
+          created = true
+        }
+
         // We are opting out of Fastify proper
         reply.hijack()
 
@@ -1128,21 +1151,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         // Set up SSE stream
         raw.setHeader('Content-type', 'text/event-stream')
         raw.setHeader('Cache-Control', 'no-cache')
-
-        let session: SessionMetadata
-        if (sessionId) {
-          const existingSession = await sessionStore.get(sessionId)
-          if (existingSession) {
-            session = existingSession
-            await sessionStore.touch?.(session.id)
-          } else {
-            session = await createSession(request)
-            raw.setHeader('Mcp-Session-Id', session.id)
-          }
-        } else {
-          session = await createSession(request)
-          raw.setHeader('Mcp-Session-Id', session.id)
-        }
+        if (created) raw.setHeader('Mcp-Session-Id', session.id)
 
         raw.writeHead(200)
 
@@ -1264,7 +1273,15 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         })
       } catch (error) {
         app.log.error({ err: error }, 'Error setting up SSE stream')
-        reply.type('application/json').code(500).send({ error: 'Internal server error' })
+        if (!reply.sent) {
+          reply.type('application/json').code(500).send({ error: 'Internal server error' })
+        } else if (!reply.raw.headersSent) {
+          // Hijacked: Fastify sends nothing for us any more.
+          reply.raw.writeHead(500, { 'Content-Type': 'application/json' })
+          reply.raw.end(JSON.stringify({ error: 'Internal server error' }))
+        } else {
+          reply.raw.destroy()
+        }
       }
     })
   }

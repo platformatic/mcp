@@ -78,16 +78,17 @@ export class RequestStream {
   /**
    * Conclude the request. Returns true when the response went out on the
    * stream; false when the caller should send it as plain JSON, which happens
-   * when nothing was reported or the response is an error that has not
-   * already been committed to a 200 stream.
+   * when nothing was reported or the response needs a status other than 200
+   * (`needsOwnStatus`) and has not already been committed to a 200 stream.
+   * An error that goes out with 200 anyway still carries the notifications
+   * held before it, such as a log message explaining the failure.
    */
-  finish (response: JSONRPCMessage, serialized: string = JSON.stringify(response)): boolean {
+  finish (response: JSONRPCMessage, serialized: string = JSON.stringify(response), needsOwnStatus = 'error' in (response as object)): boolean {
     this.#finished = true
     if (this.#timer) clearTimeout(this.#timer)
 
     if (!this.#opened) {
-      const isError = 'error' in (response as object)
-      if (this.#held.length === 0 || isError) {
+      if (this.#held.length === 0 || needsOwnStatus) {
         this.#held = []
         this.#heldBytes = 0
         return false

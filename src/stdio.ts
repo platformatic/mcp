@@ -62,6 +62,9 @@ function invalidRequest (): JSONRPCError {
   return { jsonrpc: '2.0', id: null as unknown as string, error: { code: -32600, message: 'Invalid Request' } }
 }
 
+/** How long stop() waits for listen streams to write their teardown frames. */
+const LISTEN_FLUSH_MS = 1000
+
 /** A request id as a map key: `1` and `"1"` are different requests. */
 function requestKey (id: string | number): string {
   return `${typeof id}:${id}`
@@ -76,6 +79,8 @@ export class StdioTransport {
   private transportOpts: StdioTransportOptions
   /** Requests still being served, by JSON-RPC id, so a client can cancel them. */
   private inFlight = new Map<string, AbortController>()
+  /** Open `subscriptions/listen` streams, settled once each has been forwarded to the end. */
+  private listens = new Map<AbortController, Promise<void>>()
   // There is no session over stdio, so the transport itself has to remember
   // what a legacy `initialize` agreed on and echo it like an HTTP client would.
   private protocolVersion: string | undefined
@@ -187,9 +192,13 @@ export class StdioTransport {
       this.readline.close()
     }
 
-    // Nobody is left to read a response: cancel what is still running, so
-    // handlers stop rather than outlive the resources app.close() tears down.
-    for (const cancel of this.inFlight.values()) cancel.abort(new Error('stdio transport closed'))
+    // Cancel what is still running, so handlers stop rather than outlive the
+    // resources app.close() tears down. Listen streams are left open: closing
+    // the app ends each one gracefully (notifications/cancelled, then the
+    // empty result), and the spec requires the client to be told.
+    for (const cancel of this.inFlight.values()) {
+      if (!this.listens.has(cancel)) cancel.abort(new Error('stdio transport closed'))
+    }
 
     // Close the Fastify app gracefully
     try {
@@ -197,6 +206,18 @@ export class StdioTransport {
       this.log('Fastify app closed successfully')
     } catch (error) {
       this.logError('Error closing Fastify app:', error)
+    }
+
+    // Let the teardown frames reach stdout, but never wait on a client that
+    // stopped reading: whatever is still open after that is dropped.
+    if (this.listens.size > 0) {
+      let timer: NodeJS.Timeout | undefined
+      await Promise.race([
+        Promise.allSettled(this.listens.values()),
+        new Promise<void>(resolve => { timer = setTimeout(resolve, LISTEN_FLUSH_MS) })
+      ])
+      clearTimeout(timer)
+      for (const cancel of this.listens.keys()) cancel.abort(new Error('stdio transport closed'))
     }
   }
 
@@ -302,6 +323,7 @@ export class StdioTransport {
     if (key !== undefined) this.inFlight.set(key, cancel)
     const registration = registerStdioRequest(cancel.signal, this.transportOpts.authContext)
     const isInitialize = (message as { method?: string }).method === 'initialize'
+    const isListen = (message as { method?: string }).method === 'subscriptions/listen'
 
     try {
       const headers: Record<string, string> = {
@@ -334,13 +356,15 @@ export class StdioTransport {
           return null
         }
         cancel.signal.addEventListener('abort', () => stream.destroy(), { once: true })
-        await this.forwardEvents(stream, cancel.signal)
+        const forwarded = this.forwardEvents(stream, cancel.signal)
+        if (isListen) this.listens.set(cancel, forwarded)
+        await forwarded
         return null
       }
 
       let body = ''
       for await (const chunk of stream) body += chunk
-      if (cancel.signal.aborted || id === undefined) return null
+      if (cancel.signal.aborted) return null
       if (response.statusCode === 202 || body === '') return null
 
       // Only JSON-RPC goes to stdout. A plain HTTP error from Fastify or a
@@ -350,6 +374,12 @@ export class StdioTransport {
         parsed = JSON.parse(body)
       } catch {
         parsed = undefined
+      }
+      if (id === undefined) {
+        // A notification gets no answer, but a message that is not a valid
+        // request at all (no id, a non-string method, the wrong jsonrpc) is
+        // answered with an Invalid Request error that has a null id.
+        return isJsonRpcResponse(parsed) && parsed.id === null && 'error' in parsed ? parsed : null
       }
       if (isJsonRpcResponse(parsed)) {
         const negotiated = (parsed as { result?: { protocolVersion?: unknown } }).result?.protocolVersion
@@ -383,6 +413,7 @@ export class StdioTransport {
       return errorResponse
     } finally {
       registration.release()
+      this.listens.delete(cancel)
       if (key !== undefined && this.inFlight.get(key) === cancel) this.inFlight.delete(key)
     }
   }

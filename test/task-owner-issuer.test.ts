@@ -135,13 +135,13 @@ describe('Task ownership is bound to issuer and subject', () => {
     const taskId = await createTask(alice)
 
     // Rewrite the stored record as a pre-upgrade instance would have written it
-    const key = `mcp:task:v2:${taskId}`
+    const key = `mcp:task:v3:${taskId}`
     const stored = JSON.parse((await redis.get(key))!)
     t.assert.strictEqual(stored.authSubject, JSON.stringify(['alice', null, IDP_A]))
     stored.authSubject = 'alice'
     await redis.set(key, JSON.stringify(stored), 'KEEPTTL')
     // ...and indexed under the old subject-only key
-    await redis.zadd('mcp:tasks:v2:owner:alice', Date.now(), taskId)
+    await redis.zadd('mcp:tasks:v3:owner:alice', Date.now(), taskId)
 
     for (const method of ['tasks/get', 'tasks/result', 'tasks/cancel']) {
       const body = await call(alice, method, { taskId })

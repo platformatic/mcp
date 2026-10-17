@@ -413,6 +413,22 @@ describe('task store', () => {
     )
   })
 
+  test('MemoryTaskStore evicts the creating client\'s own finished task first', async (t: TestContext) => {
+    const store = new MemoryTaskStore({ maxTasksPerPrincipal: 2 })
+    const quotaKey = JSON.stringify(['user-1', 'https://as'])
+    const via = (client: string) => JSON.stringify(['user-1', client, 'https://as'])
+    await store.create(record({ taskId: 'a', authSubject: via('app-1'), quotaKey }))
+    await store.create(record({ taskId: 'b', authSubject: via('app-2'), quotaKey }))
+    await store.updateStatus('a', 'completed')
+    await store.updateStatus('b', 'completed')
+    await store.create(record({ taskId: 'c', authSubject: via('app-2'), quotaKey }))
+    t.assert.ok(await store.get('a'))
+    t.assert.strictEqual(await store.get('b'), null)
+
+    await store.create(record({ taskId: 'd', authSubject: via('app-3'), quotaKey }))
+    t.assert.strictEqual(await store.get('a'), null)
+  })
+
   test('legacy task limits on running tasks answer "Task limit reached"', async (t: TestContext) => {
     for (const limit of [{ taskMaxConcurrent: 1 }, { taskMaxPerPrincipal: 1, resolveAuthorizationContext: async () => ({ userId: 'alice' }) }]) {
       const app = await buildApp(t, { ...limit, taskShutdownTimeoutMs: 10 })

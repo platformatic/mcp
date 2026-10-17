@@ -479,7 +479,14 @@ Answers are checked before the handler sees them: each must be a result of the m
 answered, and an accepted elicitation must match what was asked — content conforming to the
 form's `requestedSchema`, or no content for a URL-mode elicitation. A non-conforming answer is
 refused with `-32602`, on a retry and on `tasks/update` alike. Content sent with `decline` or
-`cancel` is not checked, so handlers should look at `action` first.
+`cancel` is not checked against the `requestedSchema` (only its shape is), so handlers should
+look at `action` first. A `requestedSchema` holding a non-finite number (`Infinity`, `NaN`) is
+the handler's error, since JSON would hand the client `null` in its place.
+
+`requestState` is signed, not encrypted. Besides the handler's `state`, a client that decodes it
+can read the caller's identity (`userId`, OAuth client id and issuer), the answers being carried
+and the forms asked. None of that is more than the client already knows, but do not forward
+`requestState` to a third party, and keep secrets out of `state`.
 
 A handler may ask in several steps. Each retry hands it the answers given so far, not just
 the latest round's, so the second step still sees the first answer, as it would when running
@@ -540,16 +547,16 @@ app.addHook('preHandler', async (request, reply) => {
 })
 
 await app.register(mcpPlugin, {
-  resolveAuthorizationContext: (request) => ({
-    userId: request.user.id,
-    scopes: request.user.scopes
-  })
+  resolveAuthorizationContext: (request) => request.user
+    ? { userId: request.user.id, scopes: request.user.scopes }
+    : undefined
 })
 ```
 
-The resolver runs once per MCP POST after Fastify preHandlers and is authoritative when
-configured. It only maps an already-authenticated request; it does **not** reject anonymous
-requests for you. Return a stable `userId` so `requestState`, modern and legacy tasks, tool
+The resolver runs once per MCP request after Fastify preHandlers (POST, and the legacy SSE
+GET and DELETE, which check who owns the session) and is authoritative when configured. It
+only maps an already-authenticated request; it does **not** reject anonymous requests for you,
+so it must not throw for one. Return a stable string `userId` so legacy sessions, `requestState`, modern and legacy tasks, tool
 access hooks, and handler contexts all use the same principal. If the resolver returns no
 `userId`, principal-bound request state is refused and the caller owns no tasks.
 
@@ -647,7 +654,11 @@ delivered here; they belong on the response stream of the request they relate to
 
 A stream ends when the access token that opened it expires, or after `sseMaxConnectionMs` when
 that comes first, with `notifications/cancelled` and the graceful completion response, so the
-client listens again with fresh credentials and misses nothing. Callers the deployment cannot
+client listens again with fresh credentials and misses nothing. A listen whose `expiresAt` has
+already passed is refused with HTTP `401` instead. Access is checked only when the stream opens:
+a token with no expiry, or one revoked before it expires, keeps its stream open, so deployments
+that revoke tokens should set `sseMaxConnectionMs`. The stream limits above are per instance, so
+behind a balancer with N instances a caller may hold up to N times as many. Callers the deployment cannot
 identify all share `subscriptionMaxStreams` (1000 by default) and have no per-caller limit, so
 one anonymous client can hold every slot; deployments that accept anonymous listeners should
 bound them upstream (per IP, say) or lower the limit.
@@ -883,7 +894,9 @@ a per-owner index, so a listing only reads the caller's own tasks.
 Each caller (a user at an issuer, whichever OAuth client they come through) may keep at most
 `taskMaxRetainedPerPrincipal` tasks stored (default 100), for both protocol eras. Finished tasks
 count until their `ttl` expires, so one caller cannot fill the store with results it never
-collects. When a caller is at its quota, its oldest finished task is evicted to make room; if all
+collects. When a caller is at its quota, its oldest finished task is evicted to make room (one
+created through the same OAuth client first, and only then one another of the user's clients has
+not collected yet); if all
 of them are still running, a 2025-11-25 `tools/call` fails with `-32029` "Task limit reached",
 and a 2026-07-28 call that would run as a task fails with `-32600` "Cannot create a task: Task
 limit reached" (`-32029` lies in the range 2026-07-28 reserves), rather than running a long call
@@ -3290,7 +3303,7 @@ the changes to the plugin's own API and defaults:
   `create` throws `TaskLimitError` at a caller's retention cap. The plugin builds its own store
   (there is no option to supply one); code that implements the exported `TaskStore` interface
   for its own use must follow these.
-- **Redis task records moved** to the `mcp:task:v2:` keyspace, so instances of different
+- **Redis task records moved** to the `mcp:task:v3:` keyspace, so instances of different
   versions never misread each other's tasks. During a rolling deploy, tasks created by an
   instance of the previous version are invisible to upgraded instances (and the reverse): a
   client polling such a task through an upgraded instance gets "Task not found". Drain tasks

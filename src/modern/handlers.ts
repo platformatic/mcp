@@ -404,6 +404,11 @@ function invalidElicitation (params: unknown): string | undefined {
     if (type === 'array' && isMultiSelectItems((property as { items?: unknown }).items)) continue
     return `has requestedSchema property '${name}' that is neither a primitive nor a multi-select enum`
   }
+  // The client gets the schema as JSON, which turns Infinity and NaN into
+  // null: what it receives would no longer be the schema checked here.
+  if (hasNonFiniteNumber(requestedSchema)) {
+    return 'has a requestedSchema with a non-finite number, which JSON cannot carry'
+  }
   // Compiled now, so a schema the answer could never be checked against is
   // the handler's error rather than a check that silently switches off.
   try {
@@ -412,6 +417,12 @@ function invalidElicitation (params: unknown): string | undefined {
     return `has a requestedSchema that cannot be compiled: ${error instanceof Error ? error.message : String(error)}`
   }
   return undefined
+}
+
+function hasNonFiniteNumber (value: unknown, depth = 0): boolean {
+  if (typeof value === 'number') return !Number.isFinite(value)
+  if (!value || typeof value !== 'object' || depth > 64) return false
+  return Object.values(value).some(entry => hasNonFiniteNumber(entry, depth + 1))
 }
 
 /** The `items` of a multi-select enum: string values, listed or titled. */
