@@ -6,7 +6,7 @@ import mcpPlugin from '../src/index.ts'
 import { JSONRPC_VERSION, LATEST_LEGACY_PROTOCOL_VERSION, METHOD_NOT_FOUND, INVALID_PARAMS, INVALID_REQUEST } from '../src/schema.ts'
 import type { Task, CreateTaskResult, ListTasksResult, CallToolResult } from '../src/schema.ts'
 import { MemoryTaskStore } from '../src/stores/memory-task-store.ts'
-import { canTransition, isTerminal, taskHasExpired, toWireTask, InvalidTaskCursorError, DEFAULT_TASK_PAGE_SIZE, TaskLimitError, TASK_LIMIT_REACHED, TaskLeases, TASK_OWNER_LOST } from '../src/stores/task-store.ts'
+import { canTransition, isTerminal, taskHasExpired, toWireTask, InvalidTaskCursorError, DEFAULT_TASK_PAGE_SIZE, TaskLimitError, TASK_LIMIT_REACHED, TaskLeases, TASK_OWNER_LOST, TaskWaiters } from '../src/stores/task-store.ts'
 import type { TaskRecord } from '../src/stores/task-store.ts'
 import { resolveTaskAugmentation, RELATED_TASK_META_KEY } from '../src/handlers.ts'
 
@@ -1152,5 +1152,80 @@ describe('round 5: legacy task slots', () => {
     await pending.catch(() => {})
     await new Promise(resolve => setTimeout(resolve, 100))
     t.assert.strictEqual(started, false)
+  })
+})
+
+describe('round 11: task waiters, eviction, telemetry and shutdown', () => {
+  test('waiting with an already-aborted signal rejects and registers nothing', async (t: TestContext) => {
+    const waiters = new TaskWaiters()
+    const controller = new AbortController()
+    controller.abort()
+    const settled = await Promise.race([
+      waiters.wait('task-1', controller.signal).then(() => 'resolved', () => 'rejected'),
+      new Promise(resolve => setTimeout(() => resolve('pending'), 200))
+    ])
+    t.assert.strictEqual(settled, 'rejected')
+    t.assert.strictEqual((waiters as any).waiters.size, 0)
+  })
+
+  test('a full MemoryTaskStore evicts the creating client\'s own finished task first', async (t: TestContext) => {
+    const store = new MemoryTaskStore({ maxTasks: 2 })
+    const quotaKey = JSON.stringify(['user-1', 'https://as'])
+    const via = (client: string) => JSON.stringify(['user-1', client, 'https://as'])
+    await store.create(record({ taskId: 'a', authSubject: via('c2'), quotaKey }))
+    await store.create(record({ taskId: 'b', authSubject: via('c1'), quotaKey }))
+    await store.updateStatus('a', 'completed')
+    await store.updateStatus('b', 'completed')
+    await store.create(record({ taskId: 'c', authSubject: via('c1'), quotaKey }))
+    t.assert.ok(await store.get('a'))
+    t.assert.strictEqual(await store.get('b'), null)
+  })
+
+  test('legacy task calls report task-limit and task-ended to onToolCallComplete', async (t: TestContext) => {
+    const events: any[] = []
+    const app = await buildApp(t, {
+      taskMaxConcurrent: 1,
+      taskShutdownTimeoutMs: 10,
+      onToolCallComplete: (event: any) => { events.push({ source: event.source, outcome: event.outcome }) }
+    })
+    let release!: () => void
+    app.mcpAddTool({
+      name: 'wait',
+      description: 'Waits to be released',
+      inputSchema: Type.Object({}),
+      execution: { taskSupport: 'optional' }
+    } as any, async (): Promise<CallToolResult> => {
+      await new Promise<void>(resolve => { release = resolve })
+      return { content: [{ type: 'text', text: 'ok' }] }
+    })
+
+    const first = await call(app, 'tools/call', { name: 'wait', arguments: {}, task: {} })
+    const second = await call(app, 'tools/call', { name: 'wait', arguments: {}, task: {} })
+    t.assert.strictEqual(second.error?.code, TASK_LIMIT_REACHED)
+    t.assert.deepStrictEqual(events, [{ source: 'json-rpc', outcome: { ok: false, reason: 'task-limit', message: 'Task limit reached' } }])
+
+    await call(app, 'tasks/cancel', { taskId: first.result.task.taskId })
+    release()
+    for (let i = 0; i < 100 && events.length < 2; i++) await new Promise(resolve => setTimeout(resolve, 10))
+    t.assert.deepStrictEqual(events[1], { source: 'task', outcome: { ok: false, reason: 'task-ended', status: 'cancelled', message: 'Task cancelled' } })
+  })
+
+  test('a blocked tasks/result for a task on this instance gets its outcome through a shutdown', async (t: TestContext) => {
+    const app = await buildApp(t, { taskShutdownTimeoutMs: 2000 })
+    app.mcpAddTool({
+      name: 'brief',
+      description: 'Finishes soon',
+      inputSchema: Type.Object({}),
+      execution: { taskSupport: 'optional' }
+    } as any, async (): Promise<CallToolResult> => {
+      await new Promise(resolve => setTimeout(resolve, 200))
+      return { content: [{ type: 'text', text: 'finished' }] }
+    })
+    const created = await call(app, 'tools/call', { name: 'brief', arguments: {}, task: {} })
+    const result = call(app, 'tasks/result', { taskId: created.result.task.taskId }, 2)
+    await new Promise(resolve => setTimeout(resolve, 20))
+    await app.close()
+    const body = await result
+    t.assert.strictEqual(body.result?.content?.[0]?.text, 'finished', JSON.stringify(body))
   })
 })

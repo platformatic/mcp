@@ -49,6 +49,7 @@ import type { SubscriptionDeadline } from '../modern/subscriptions.ts'
 import { quotaKeyOf } from '../task-registry.ts'
 import type { ClientCapabilities as ModernClientCapabilities, SubscriptionFilter } from '../schema-2026.ts'
 import { isStdioRequest, stdioAuthContext, stdioRequestSignal } from '../stdio-trust.ts'
+import { generateWWWAuthenticateHeader } from '../auth/prehandler.ts'
 import { RequestStream, acceptsMediaType, requestNotifiers } from '../modern/request-stream.ts'
 import type { TaskInputChannel } from '../modern/task-inputs.ts'
 import type { JsonSchemaValidator } from '../validation/json-schema-validator.ts'
@@ -596,6 +597,8 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
    * that starts and stops a watcher keeps it while anyone still listens.
    */
   const listenUriHolders = new Map<string, number>()
+  /** URIs a subscribe handler accepted and no unsubscribe has stopped yet. */
+  const listenUriWatched = new Set<string>()
 
   async function authorizeResourceSubscriptions (
     filter: SubscriptionFilter,
@@ -623,6 +626,27 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
       clientCapabilities: context.clientCapabilities
     }, undefined)
     const uris = filter.resourceSubscriptions
+    const { unsubscribeHandler } = resourceHandlers
+    // Held from before the subscribe handlers run: a stream ending meanwhile
+    // must not stop a watcher this one is about to rely on.
+    if (unsubscribeHandler) {
+      for (const uri of uris) listenUriHolders.set(uri, (listenUriHolders.get(uri) ?? 0) + 1)
+    }
+    const release = (uri: string) => {
+      // Another stream on this instance still wants updates for it.
+      const holders = (listenUriHolders.get(uri) ?? 1) - 1
+      if (holders > 0) {
+        listenUriHolders.set(uri, holders)
+        return
+      }
+      listenUriHolders.delete(uri)
+      // Only a URI some stream subscribed to has anything to stop.
+      if (!listenUriWatched.delete(uri) || !unsubscribeHandler) return
+      Promise.resolve()
+        .then(async () => await unsubscribeHandler({ uri }, handlerContextFor()))
+        .catch(error => app.log.warn({ err: error, uri }, 'Resource unsubscribe handler failed'))
+    }
+
     const outcomes = await Promise.allSettled(uris.map(async uri => await subscribeHandler({ uri }, handlerContextFor())))
     const accepted = uris.filter((_uri, index) => outcomes[index].status === 'fulfilled')
     const refused = uris.length - accepted.length
@@ -634,22 +658,12 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
       delete filter.resourceSubscriptions
     }
 
-    const { unsubscribeHandler } = resourceHandlers
-    if (!unsubscribeHandler || accepted.length === 0) return undefined
-    for (const uri of accepted) listenUriHolders.set(uri, (listenUriHolders.get(uri) ?? 0) + 1)
+    if (!unsubscribeHandler) return undefined
+    for (const uri of accepted) listenUriWatched.add(uri)
+    uris.forEach((uri, index) => { if (outcomes[index].status !== 'fulfilled') release(uri) })
+    if (accepted.length === 0) return undefined
     return () => {
-      for (const uri of accepted) {
-        // Another stream on this instance still wants updates for it.
-        const holders = (listenUriHolders.get(uri) ?? 1) - 1
-        if (holders > 0) {
-          listenUriHolders.set(uri, holders)
-          continue
-        }
-        listenUriHolders.delete(uri)
-        Promise.resolve()
-          .then(async () => await unsubscribeHandler({ uri }, handlerContextFor()))
-          .catch(error => app.log.warn({ err: error, uri }, 'Resource unsubscribe handler failed'))
-      }
+      for (const uri of accepted) release(uri)
     }
   }
 
@@ -793,7 +807,12 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
       // A stream opened on an expired token would be ended at once and the
       // client told to reconnect, which it would do in a tight loop.
       if (authContext?.expiresAt instanceof Date && authContext.expiresAt.getTime() <= Date.now()) {
-        reply.code(401).header('WWW-Authenticate', 'Bearer error="invalid_token", error_description="The access token expired"').type('application/json')
+        // Shaped like every other 401 when this plugin runs OAuth, so the
+        // client finds the metadata it needs to re-authorize.
+        if (opts.authorization?.enabled) {
+          reply.header('WWW-Authenticate', generateWWWAuthenticateHeader(opts.authorization, { error: 'invalid_token', error_description: 'The access token expired' }))
+        }
+        reply.code(401).type('application/json')
         return createError(message.id, INVALID_REQUEST, 'The access token expired')
       }
 
@@ -899,7 +918,8 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     // The stream opened because the tool declared the input it may need and
     // the client has all of it; asking for more is the tool's bug, and a 400
     // can no longer be sent.
-    if (stream?.opened && 'error' in response && response.error.code === MISSING_REQUIRED_CLIENT_CAPABILITY) {
+    // Over stdio there is no status to protect, so the real error still goes out.
+    if (headerLayer && stream?.opened && 'error' in response && response.error.code === MISSING_REQUIRED_CLIENT_CAPABILITY) {
       request.log.error({ method: message.method, data: response.error.data }, 'Handler asked for input beyond its declared inputCapabilities after progress had streamed')
       response = createError(message.id, INTERNAL_ERROR, 'Internal server error')
     }

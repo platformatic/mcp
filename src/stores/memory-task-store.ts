@@ -47,6 +47,7 @@ export class MemoryTaskStore implements TaskStore {
     // pass the capacity checks and overshoot them.
     const quota = quotaOf(task)
     const ownedBy = (t: TaskRecord) => quotaOf(t) === quota
+    const ownClient = (t: TaskRecord) => t.authSubject === task.authSubject && ownedBy(t)
 
     // Finished tasks count too: otherwise one caller could hold every slot
     // with results it never collects until their ttl runs out.
@@ -57,7 +58,7 @@ export class MemoryTaskStore implements TaskStore {
       // of the user's OAuth clients has not collected yet.
       if (
         this.count(ownedBy) >= this.maxTasksPerPrincipal &&
-        !this.evictOldestFinished(t => t.authSubject === task.authSubject && ownedBy(t)) &&
+        !this.evictOldestFinished(ownClient) &&
         !this.evictOldestFinished(ownedBy)
       ) {
         throw new TaskLimitError(this.maxTasksPerPrincipal)
@@ -67,10 +68,12 @@ export class MemoryTaskStore implements TaskStore {
     if (this.tasks.size >= this.maxTasks) {
       this.sweepExpired()
       this.failLapsedLeases(() => true)
-      // Prefer the caller's own finished work; failing that, the oldest
-      // finished task of anyone, as stale results matter less than new work.
+      // Prefer the caller's own finished work (this client's, then the
+      // user's others); failing that, the oldest finished task of anyone, as
+      // stale results matter less than new work.
       if (
         this.tasks.size >= this.maxTasks &&
+        !this.evictOldestFinished(ownClient) &&
         !this.evictOldestFinished(ownedBy) &&
         !this.evictOldestFinished(() => true)
       ) {

@@ -67,7 +67,7 @@ import { TASK_OWNER_LOST, TaskLimitError, isTerminal } from '../stores/task-stor
 import { principalOf } from '../principal.ts'
 import { validateElicitationRequest, validateElicitationUrl } from '../security.ts'
 import { NO_NOTIFIERS } from './request-stream.ts'
-import { TaskStopped, quotaKeyOf, reserveTask, setLongTimeout } from '../task-registry.ts'
+import { TaskStopped, quotaKeyOf, reserveTask, setLongTimeout, setWaitingForInput } from '../task-registry.ts'
 
 /** Freshness hints applied to one cacheable operation. */
 export interface CacheHint {
@@ -364,6 +364,10 @@ function invalidInputRequests (inputRequests: Record<string, unknown>): string |
       return `input request '${key}' has unsupported method '${method}'`
     }
     const params = (entry as { params?: unknown }).params
+    // The client gets the request as JSON, which turns Infinity and NaN into
+    // null: what it receives would no longer be what was asked (a sampling
+    // request with `maxTokens: null` is not even valid).
+    if (hasNonFiniteNumber(params)) return `input request '${key}' has a non-finite number, which JSON cannot carry`
     const problem = method === 'elicitation/create'
       ? invalidElicitation(params)
       : method === 'sampling/createMessage'
@@ -403,11 +407,6 @@ function invalidElicitation (params: unknown): string | undefined {
     if (typeof type === 'string' && FLAT_SCHEMA_TYPES.has(type)) continue
     if (type === 'array' && isMultiSelectItems((property as { items?: unknown }).items)) continue
     return `has requestedSchema property '${name}' that is neither a primitive nor a multi-select enum`
-  }
-  // The client gets the schema as JSON, which turns Infinity and NaN into
-  // null: what it receives would no longer be the schema checked here.
-  if (hasNonFiniteNumber(requestedSchema)) {
-    return 'has a requestedSchema with a non-finite number, which JSON cannot carry'
   }
   // Compiled now, so a schema the answer could never be checked against is
   // the handler's error rather than a check that silently switches off.
@@ -596,6 +595,12 @@ function answersToCarry (
   return Object.fromEntries(Object.entries(given).filter(([key]) =>
     !Object.hasOwn(asking ?? {}, key) && (kept === undefined || kept.has(key))
   ))
+}
+
+/** A value as it would come back from the client: through JSON. Throws when JSON cannot carry it. */
+function jsonCopy (value: unknown): unknown {
+  const text = JSON.stringify(value)
+  return text === undefined ? undefined : JSON.parse(text)
 }
 
 /**
@@ -1366,8 +1371,19 @@ async function runAsTask (
           // its state, as a client would retry. Waiting the poll interval first
           // keeps a handler that is waiting on something else from spinning.
           const requests = error.inputRequests ?? {}
+          // The next round sees what a sync retry would: the state as it comes
+          // back through JSON, and only the answers the handler chose to carry.
+          let nextState: unknown
+          try {
+            nextState = jsonCopy(error.state)
+          } catch (stateError) {
+            app.log.error({ err: stateError, taskId: record.taskId }, 'Task handler state could not be serialized')
+            fail('Internal server error')
+            break
+          }
+          gathered = answersToCarry(gathered, requests, error.carry)
           if (Object.keys(requests).length === 0) {
-            state = error.state
+            state = nextState
             await sleep(record.pollInterval ?? DEFAULT_POLL_INTERVAL_MS, stopped)
             if (stopped.aborted) {
               fail(stopMessage())
@@ -1414,14 +1430,20 @@ async function runAsTask (
             })
             if (parked) taskWaiters?.notify(parked)
 
-            const responses = await awaitTaskRound(record.taskId, [...handlerKeys.keys()], remaining, stopped, dependencies)
+            setWaitingForInput(taskStore!, live, true)
+            let responses: Record<string, unknown>
+            try {
+              responses = await awaitTaskRound(record.taskId, [...handlerKeys.keys()], remaining, stopped, dependencies)
+            } finally {
+              setWaitingForInput(taskStore!, live, false)
+            }
             gathered = { ...(gathered ?? {}) }
             for (const [wireKey, value] of Object.entries(responses)) {
               const handlerKey = handlerKeys.get(wireKey)
               if (handlerKey === undefined) continue
               Object.defineProperty(gathered, handlerKey, { value, enumerable: true, configurable: true, writable: true })
             }
-            state = error.state
+            state = nextState
 
             // Nothing is outstanding now, so nothing may be answered while the
             // handler runs, and the round's prompt no longer describes the task.

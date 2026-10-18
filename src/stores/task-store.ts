@@ -357,6 +357,12 @@ export class TaskWaiters {
 
   wait (taskId: string, signal?: AbortSignal): Promise<TaskRecord> {
     return new Promise((resolve, reject) => {
+      // An abort listener added now would never fire, leaving the waiter
+      // registered until a notify that may never come.
+      if (signal?.aborted) {
+        reject(new Error('aborted'))
+        return
+      }
       const resolveAndCleanup = (task: TaskRecord) => {
         this.remove(taskId, resolveAndCleanup)
         resolve(task)

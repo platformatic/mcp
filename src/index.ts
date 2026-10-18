@@ -147,6 +147,69 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     // Checked before any Redis connection is opened, so a bad value cannot leak one
     validateTaskLimit('taskMaxRetainedPerPrincipal', opts.taskMaxRetainedPerPrincipal)
   }
+  // Everything below that can refuse an option runs before any Redis
+  // connection is opened: a connection opened first would be left behind,
+  // keeping the process alive after registration fails.
+  // Cacheable results must always carry hints, so anything unconfigured
+  // defaults to "immediately stale, never shared" — correct for every server,
+  // and something deployments opt out of knowingly.
+  const noCache: CacheHint = { ttlMs: 0, cacheScope: 'private' }
+  const hintFor = (which: keyof CachingConfig): CacheHint => {
+    const hint = opts.caching?.[which]
+    if (hint === undefined) return noCache
+    // `ttlMs` goes on the wire as a non-negative integer; NaN would serialize
+    // as null and a fraction is not a valid value.
+    if (!Number.isSafeInteger(hint.ttlMs) || hint.ttlMs < 0) {
+      throw new Error(`caching.${which}.ttlMs must be a non-negative integer`)
+    }
+    if (hint.cacheScope !== 'public' && hint.cacheScope !== 'private') {
+      throw new Error(`caching.${which}.cacheScope must be "public" or "private"`)
+    }
+    return hint
+  }
+  const caching: CachingConfig = {
+    discover: hintFor('discover'),
+    toolsList: hintFor('toolsList'),
+    promptsList: hintFor('promptsList'),
+    resourcesList: hintFor('resourcesList'),
+    resourceTemplatesList: hintFor('resourceTemplatesList'),
+    resourcesRead: hintFor('resourcesRead')
+  }
+
+  // A `public` hint lets shared caches serve one caller's result to another,
+  // which is wrong when results depend on who asks.
+  const perCaller = opts.authorization?.enabled === true || opts.resolveAuthorizationContext !== undefined || opts.canAccessTool !== undefined
+  if (perCaller) {
+    const shared = (Object.keys(caching) as Array<keyof CachingConfig>).filter(which => caching[which].cacheScope === 'public')
+    if (shared.length > 0) {
+      app.log.warn({ operations: shared }, 'MCP: cacheScope "public" is configured while results may differ per caller (authorization, resolveAuthorizationContext or canAccessTool); shared caches could serve one caller\'s result to another')
+    }
+  }
+
+  // A NaN (say, an unset environment variable through `Number()`) would make
+  // every retry fail as expired, silently.
+  if (opts.requestStateTtlMs !== undefined && (!Number.isSafeInteger(opts.requestStateTtlMs) || opts.requestStateTtlMs <= 0)) {
+    throw new Error('requestStateTtlMs must be a positive integer')
+  }
+  if (opts.taskMaxInputRounds !== undefined && (!Number.isSafeInteger(opts.taskMaxInputRounds) || opts.taskMaxInputRounds < 0)) {
+    throw new Error('taskMaxInputRounds must be a non-negative integer')
+  }
+  if (opts.requestStateMaxAnswerBytes !== undefined && (!Number.isSafeInteger(opts.requestStateMaxAnswerBytes) || opts.requestStateMaxAnswerBytes < 0)) {
+    throw new Error('requestStateMaxAnswerBytes must be a non-negative integer')
+  }
+
+  const sealer = new RequestStateSealer({
+    secret: opts.requestStateSecret,
+    audience: serverInfo.name,
+    ttlMs: opts.requestStateTtlMs,
+    maxAnswerBytes: opts.requestStateMaxAnswerBytes,
+    // With identity resolution on, a request carrying no `userId` identifies
+    // nobody, and two such callers would share the undefined principal — so state
+    // sealed for one would verify for the other. Refuse rather than bind to
+    // nobody.
+    requirePrincipal: opts.authorization?.enabled === true || opts.resolveAuthorizationContext !== undefined
+  })
+
   const tools = new Map<string, MCPTool>()
   const resources = new Map<string, MCPResource>()
   const prompts = new Map<string, MCPPrompt>()
@@ -231,66 +294,6 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
       }
     }
   }
-
-  // Cacheable results must always carry hints, so anything unconfigured
-  // defaults to "immediately stale, never shared" — correct for every server,
-  // and something deployments opt out of knowingly.
-  const noCache: CacheHint = { ttlMs: 0, cacheScope: 'private' }
-  const hintFor = (which: keyof CachingConfig): CacheHint => {
-    const hint = opts.caching?.[which]
-    if (hint === undefined) return noCache
-    // `ttlMs` goes on the wire as a non-negative integer; NaN would serialize
-    // as null and a fraction is not a valid value.
-    if (!Number.isSafeInteger(hint.ttlMs) || hint.ttlMs < 0) {
-      throw new Error(`caching.${which}.ttlMs must be a non-negative integer`)
-    }
-    if (hint.cacheScope !== 'public' && hint.cacheScope !== 'private') {
-      throw new Error(`caching.${which}.cacheScope must be "public" or "private"`)
-    }
-    return hint
-  }
-  const caching: CachingConfig = {
-    discover: hintFor('discover'),
-    toolsList: hintFor('toolsList'),
-    promptsList: hintFor('promptsList'),
-    resourcesList: hintFor('resourcesList'),
-    resourceTemplatesList: hintFor('resourceTemplatesList'),
-    resourcesRead: hintFor('resourcesRead')
-  }
-
-  // A `public` hint lets shared caches serve one caller's result to another,
-  // which is wrong when results depend on who asks.
-  const perCaller = opts.authorization?.enabled === true || opts.resolveAuthorizationContext !== undefined || opts.canAccessTool !== undefined
-  if (perCaller) {
-    const shared = (Object.keys(caching) as Array<keyof CachingConfig>).filter(which => caching[which].cacheScope === 'public')
-    if (shared.length > 0) {
-      app.log.warn({ operations: shared }, 'MCP: cacheScope "public" is configured while results may differ per caller (authorization, resolveAuthorizationContext or canAccessTool); shared caches could serve one caller\'s result to another')
-    }
-  }
-
-  // A NaN (say, an unset environment variable through `Number()`) would make
-  // every retry fail as expired, silently.
-  if (opts.requestStateTtlMs !== undefined && (!Number.isSafeInteger(opts.requestStateTtlMs) || opts.requestStateTtlMs <= 0)) {
-    throw new Error('requestStateTtlMs must be a positive integer')
-  }
-  if (opts.taskMaxInputRounds !== undefined && (!Number.isSafeInteger(opts.taskMaxInputRounds) || opts.taskMaxInputRounds < 0)) {
-    throw new Error('taskMaxInputRounds must be a non-negative integer')
-  }
-  if (opts.requestStateMaxAnswerBytes !== undefined && (!Number.isSafeInteger(opts.requestStateMaxAnswerBytes) || opts.requestStateMaxAnswerBytes < 0)) {
-    throw new Error('requestStateMaxAnswerBytes must be a non-negative integer')
-  }
-
-  const sealer = new RequestStateSealer({
-    secret: opts.requestStateSecret,
-    audience: serverInfo.name,
-    ttlMs: opts.requestStateTtlMs,
-    maxAnswerBytes: opts.requestStateMaxAnswerBytes,
-    // With identity resolution on, a request carrying no `userId` identifies
-    // nobody, and two such callers would share the undefined principal — so state
-    // sealed for one would verify for the other. Refuse rather than bind to
-    // nobody.
-    requirePrincipal: opts.authorization?.enabled === true || opts.resolveAuthorizationContext !== undefined
-  })
 
   if (opts.requestStateSecret === undefined) {
     app.log.debug('MCP: no requestStateSecret configured; multi round-trip retries will only verify on the instance that issued them')
@@ -462,13 +465,15 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
   // waiting until `onClose` would deadlock the close on the very streams it is
   // trying to end.
   app.addHook('preClose', async () => {
-    // End modern subscription streams with the graceful-closure response, so
-    // clients can tell a shutdown from a dropped connection.
-    subscriptions.closeAll()
     // Let running tasks finish (or record them as failed) while the task
     // channel and Redis are still up to carry their outcome.
     if (taskStore) await drainTasks(taskStore, opts.taskShutdownTimeoutMs ?? 5_000)
     taskInputs.close()
+    // Then end modern subscription streams with the graceful-closure
+    // response, so clients can tell a shutdown from a dropped connection. Not
+    // before: what the draining tasks change (a list, a resource) must still
+    // reach them, since the graceful end tells them they missed nothing.
+    subscriptions.closeAll()
 
     for (const streams of localStreams.values()) {
       for (const stream of streams) {

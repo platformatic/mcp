@@ -19,6 +19,13 @@ import {
 } from '../schema-2026.ts'
 
 /**
+ * The id is echoed in every response, and a listen stream's id in every
+ * notification it carries: an id of the client's choosing, unbounded, would
+ * make each broadcast cost what the client wants it to.
+ */
+export const MAX_REQUEST_ID_LENGTH = 256
+
+/**
  * What is wrong with a modern POST body at the JSON-RPC level, or `undefined`
  * when it is a well-formed request or notification.
  *
@@ -37,6 +44,9 @@ export function invalidModernMessage (body: unknown): string | undefined {
   if ('id' in message && typeof message.id !== 'string' && !Number.isSafeInteger(message.id)) {
     return 'Invalid request: "id" must be a string or a safe integer'
   }
+  if (typeof message.id === 'string' && message.id.length > MAX_REQUEST_ID_LENGTH) {
+    return `Invalid request: "id" must be at most ${MAX_REQUEST_ID_LENGTH} characters`
+  }
   return undefined
 }
 
@@ -48,7 +58,8 @@ export function requestIdOf (body: unknown): RequestId | null {
   const id = (body && typeof body === 'object' && !Array.isArray(body))
     ? (body as { id?: unknown }).id
     : undefined
-  return typeof id === 'string' || Number.isSafeInteger(id) ? id as RequestId : null
+  if (typeof id === 'string') return id.length <= MAX_REQUEST_ID_LENGTH ? id : null
+  return Number.isSafeInteger(id) ? id as RequestId : null
 }
 
 /** The protocol version a request names in `_meta`, if it names one. */

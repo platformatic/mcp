@@ -3,7 +3,7 @@ import { createInterface } from 'readline'
 import type { FastifyInstance } from 'fastify'
 import { STDIO_REQUEST_HEADER, registerStdioRequest } from './stdio-trust.ts'
 import type { AuthorizationContext } from './types/auth-types.ts'
-import { bodyClaimsModern } from './modern/request-meta.ts'
+import { MAX_REQUEST_ID_LENGTH, bodyClaimsModern } from './modern/request-meta.ts'
 import type {
   JSONRPCMessage,
   JSONRPCResponse,
@@ -319,6 +319,11 @@ export class StdioTransport {
 
     const id = 'id' in message ? (message as { id: string | number }).id : undefined
     const key = id === undefined ? undefined : requestKey(id)
+    // A cancellation names the request by id, so two in flight under one id
+    // would leave the first beyond the client's reach.
+    if (key !== undefined && this.inFlight.has(key)) {
+      return { jsonrpc: '2.0', id, error: { code: -32600, message: 'Invalid Request: a request with this id is still in progress' } }
+    }
     const cancel = new AbortController()
     if (key !== undefined) this.inFlight.set(key, cancel)
     const registration = registerStdioRequest(cancel.signal, this.transportOpts.authContext)
@@ -386,7 +391,10 @@ export class StdioTransport {
         if (isInitialize && typeof negotiated === 'string') this.protocolVersion = negotiated
         // A body-parser error cannot know the id (HTTP never parsed the
         // body), but this transport did: answer the request it belongs to.
-        return parsed.id === null ? { ...parsed, id } as JSONRPCError : parsed
+        // Only an id the request could carry: an invalid one (a boolean, an
+        // object) is exactly why the error has none.
+        const validId = (typeof id === 'string' && id.length <= MAX_REQUEST_ID_LENGTH) || Number.isSafeInteger(id)
+        return parsed.id === null && validId ? { ...parsed, id } as JSONRPCError : parsed
       }
       this.logError(`Non-JSON-RPC response (status ${response.statusCode}):`, body)
       return {

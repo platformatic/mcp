@@ -54,7 +54,7 @@ import type { TaskStore, TaskRecord, TaskWaiters, TaskLeases } from './stores/ta
 import { InvalidTaskCursorError, TaskLimitError, TASK_LIMIT_REACHED, TASK_OWNER_LOST, decodeTaskCursor, isTerminal, ownerLostOutcome, toWireTask } from './stores/task-store.ts'
 import type { AuthorizationContext } from './types/auth-types.ts'
 import { principalOf } from './principal.ts'
-import { TaskStopped, quotaKeyOf, reserveTask, setLongTimeout } from './task-registry.ts'
+import { TASK_CANCELLED, TaskStopped, isRunningHere, quotaKeyOf, reserveTask, setLongTimeout } from './task-registry.ts'
 import type { TaskInputChannel } from './modern/task-inputs.ts'
 import { InputRequired } from './modern/input-required.ts'
 import type { RequestNotifiers } from './modern/request-stream.ts'
@@ -591,14 +591,19 @@ async function handleToolsCall (
     return createError(request.id, METHOD_NOT_FOUND, augmentation.error)
   }
   if (augmentation.mode === 'task') {
-    return await runToolCallAsTask(
+    const response = await runToolCallAsTask(
       request,
       ttl,
       // Timed from when the task actually starts executing, not from when it
       // was queued, so `durationMs` reflects work done rather than wait time.
-      (signal) => executeToolCall(request, resolved.tool, params, sessionId, { ...dependencies, signal }, { source: 'task', startedAt: performance.now() }),
+      (signal, defer) => executeToolCall(request, resolved.tool, params, sessionId, { ...dependencies, signal }, { source: 'task', startedAt: performance.now(), defer }),
       dependencies
     )
+    // Refused at a limit, the call never ran; it still happened, as on 2026-07-28.
+    if ('error' in response && response.error.code === TASK_LIMIT_REACHED) {
+      await emitToolCallComplete('json-rpc', toolName, params.arguments || {}, { ok: false, reason: 'task-limit', message: response.error.message }, startedAt, dependencies)
+    }
+    return response
   }
 
   return await executeToolCall(request, resolved.tool, params, sessionId, dependencies, { source: 'json-rpc', startedAt })
@@ -702,7 +707,7 @@ function toolCallOutcomeToJsonRpc (
     // The multi round-trip machinery answers this, not a tool result.
     case 'input-required':
       throw inputRequiredErrors.get(outcome) ?? new InputRequired({ inputRequests: outcome.inputRequests })
-    // Only ever reported to onToolCallComplete, by the 2026-07-28 dispatcher.
+    // Only ever reported to onToolCallComplete, when a task could not be created.
     case 'task-limit':
       return createError(id, INVALID_REQUEST, `Cannot create a task: ${outcome.message}`)
     // Only ever reported to onToolCallComplete, once a task has ended.
@@ -1437,10 +1442,17 @@ async function handleTasksResult (
     const onClose = () => controller.abort()
     res.on('close', onClose)
     if (res.destroyed || res.socket?.destroyed) controller.abort()
+    // On stdio the client cancels with `notifications/cancelled`, which only
+    // the request's own signal reports. A shutdown gives up on tasks running
+    // elsewhere, but one running here is drained, and its outcome is recorded
+    // before the server closes: wait for that instead.
     const { shutdownSignal } = dependencies
-    const signal = shutdownSignal
-      ? AbortSignal.any([controller.signal, shutdownSignal])
-      : controller.signal
+    const local = dependencies.taskStore !== undefined && isRunningHere(dependencies.taskStore, taskId)
+    const signal = AbortSignal.any([
+      controller.signal,
+      ...(shutdownSignal && !local ? [shutdownSignal] : []),
+      ...(dependencies.signal ? [dependencies.signal] : [])
+    ])
     try {
       const settled = await awaitTaskTerminal(taskId, task, dependencies, signal)
       if (!settled) {
@@ -1620,7 +1632,7 @@ async function notifyTaskStatus (task: TaskRecord, dependencies: HandlerDependen
 async function runToolCallAsTask (
   request: JSONRPCRequest,
   ttl: number | undefined,
-  execute: (signal: AbortSignal) => Promise<JSONRPCResponse | JSONRPCError>,
+  execute: (signal: AbortSignal, defer: NonNullable<ToolCallObservationContext['defer']>) => Promise<JSONRPCResponse | JSONRPCError>,
   dependencies: HandlerDependencies
 ): Promise<JSONRPCResponse | JSONRPCError> {
   const { taskStore, taskWaiters, taskLeases, app } = dependencies
@@ -1669,7 +1681,7 @@ async function runToolCallAsTask (
   // lost) stops the handler too.
   try {
     await taskLeases?.start(task.taskId, (status) => {
-      reservation.live.stop(new TaskStopped(status === 'cancelled' ? 'Task cancelled' : 'Task ended'))
+      reservation.live.stop(new TaskStopped(status === 'cancelled' ? TASK_CANCELLED : 'Task ended'))
     })
   } catch (error) {
     // Without a lease the task simply cannot be reaped early; it still runs
@@ -1678,7 +1690,7 @@ async function runToolCallAsTask (
 
   // `tasks/cancel` may arrive on any instance; it reaches the worker here.
   const stopListening = dependencies.taskInputs?.onCancel(task.taskId, () => {
-    reservation.live.stop(new TaskStopped('Task cancelled'))
+    reservation.live.stop(new TaskStopped(TASK_CANCELLED))
   })
   // The slot stays held until the handler settles, even past the ttl, so a
   // caller cannot pile up background work by outliving it.
@@ -1694,11 +1706,18 @@ async function runToolCallAsTask (
     let outcome: TaskRecord['outcome']
     let status: 'completed' | 'failed' = 'completed'
     let statusMessage: string | undefined
+    // The call's event waits for the task to end, which may not be how the
+    // handler's own result read (it was cancelled while running, say).
+    let handlerOutcome: McpCallToolOutcome | undefined
+    let unreported: ((override?: McpCallToolOutcome) => Promise<void>) | undefined
 
     try {
       // Stopped before it ever ran: the handler must not start.
       if (stopped.aborted) throw stopped.reason
-      const result = await execute(stopped)
+      const result = await execute(stopped, (handled, emit) => {
+        handlerOutcome = handled
+        unreported = emit
+      })
       outcome = result
       // A tool result carrying isError counts as a failed task
       if ('result' in result && (result.result as CallToolResult)?.isError === true) {
@@ -1714,11 +1733,17 @@ async function runToolCallAsTask (
       outcome = createError(request.id, INTERNAL_ERROR, statusMessage)
     }
     // A stopped task ends for the reason it was stopped.
+    let ended: McpCallToolOutcome | undefined
     if (stopped.aborted && stopped.reason instanceof TaskStopped) {
       status = 'failed'
       statusMessage = stopped.reason.message
       outcome = createError(request.id, INTERNAL_ERROR, statusMessage)
+      if (handlerOutcome?.ok || handlerOutcome?.reason === 'input-required') {
+        const endStatus = stopped.reason.message === TASK_CANCELLED ? 'cancelled' : 'failed'
+        ended = { ok: false, reason: 'task-ended', status: endStatus, message: statusMessage }
+      }
     }
+    await unreported?.(ended)
 
     try {
       const updated = await taskStore.updateStatus(task.taskId, status, { statusMessage, outcome })

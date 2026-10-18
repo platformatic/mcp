@@ -318,7 +318,7 @@ export type McpCallToolOutcome =
   | { ok: false, reason: 'invalid-arguments', detail: string }
   | { ok: false, reason: 'task-required' }
   /**
-   * A 2026-07-28 call that would run as a task was refused because a task
+   * A call that would run as a task (in either era) was refused because a task
    * limit was reached (`taskMaxConcurrent`, `taskMaxPerPrincipal` or the
    * retention cap).
    */

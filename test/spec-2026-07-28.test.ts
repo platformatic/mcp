@@ -5,6 +5,7 @@ import Fastify from 'fastify'
 import type { FastifyInstance } from 'fastify'
 import { Type } from '@sinclair/typebox'
 import mcpPlugin, { isStdioRequest } from '../src/index.ts'
+import { createServer } from 'node:net'
 import { createStdioTransport } from '../src/stdio.ts'
 import { MemoryTaskStore } from '../src/stores/memory-task-store.ts'
 import {
@@ -5188,25 +5189,25 @@ describe('round 9: request digests, header types, limits, sessions and shutdown'
   })
 })
 
-describe('round 10: stdio, held notifications, SSE setup and listen deadlines', () => {
-  function stdioPipe (t: TestContext, app: FastifyInstance) {
-    const input = new PassThrough()
-    const output = new PassThrough()
-    const transport = createStdioTransport(app, { input, output, error: new PassThrough() })
-    transport.start()
-    t.after(() => transport.stop())
-    const lines: any[] = []
-    let buffered = ''
-    output.on('data', (chunk: Buffer) => {
-      buffered += chunk.toString()
-      const parts = buffered.split('\n')
-      buffered = parts.pop() ?? ''
-      for (const line of parts) if (line.trim()) lines.push(JSON.parse(line))
-    })
-    const send = (body: unknown) => input.write(JSON.stringify(body) + '\n')
-    return { transport, lines, send }
-  }
+function stdioPipe (t: TestContext, app: FastifyInstance) {
+  const input = new PassThrough()
+  const output = new PassThrough()
+  const transport = createStdioTransport(app, { input, output, error: new PassThrough() })
+  transport.start()
+  t.after(() => transport.stop())
+  const lines: any[] = []
+  let buffered = ''
+  output.on('data', (chunk: Buffer) => {
+    buffered += chunk.toString()
+    const parts = buffered.split('\n')
+    buffered = parts.pop() ?? ''
+    for (const line of parts) if (line.trim()) lines.push(JSON.parse(line))
+  })
+  const send = (body: unknown) => input.write(JSON.stringify(body) + '\n')
+  return { transport, lines, send }
+}
 
+describe('round 10: stdio, held notifications, SSE setup and listen deadlines', () => {
   test('stdio answers a message that is not a valid request, even without an id', async (t: TestContext) => {
     const app = await buildServer(t)
     const { lines, send } = stdioPipe(t, app)
@@ -5299,7 +5300,8 @@ describe('round 10: stdio, held notifications, SSE setup and listen deadlines', 
     })
     const response = await call(app, 'subscriptions/listen', { params: { notifications: { toolsListChanged: true } } })
     t.assert.strictEqual(response.statusCode, 401)
-    t.assert.match(String(response.headers['www-authenticate']), /invalid_token/)
+    // This server runs no OAuth of its own, so it has no challenge to offer.
+    t.assert.strictEqual(response.headers['www-authenticate'], undefined)
   })
 
   test('an expiresAt that is not a Date does not break an accepted listen', async (t: TestContext) => {
@@ -5333,5 +5335,177 @@ describe('round 10: stdio, held notifications, SSE setup and listen deadlines', 
     const json = response.json()
     t.assert.strictEqual(json.result?.resultType, undefined, JSON.stringify(json))
     t.assert.ok(json.error ?? json.result?.isError, JSON.stringify(json))
+  })
+})
+
+describe('round 11: stdio errors, listen holders, task rounds and shutdown', () => {
+  const taskCapabilities: ClientCapabilities = { extensions: { [TASKS_EXTENSION]: {} }, elicitation: { form: {} } }
+
+  test('over stdio a missing capability is still -32021 after progress streamed', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'ask', inputSchema: Type.Object({}) }, async (_args: any, context: any) => {
+        context.sendProgress(1, 2)
+        await new Promise(resolve => setTimeout(resolve, 300))
+        throw new InputRequired({ inputRequests: { ok: elicitForm('Sure?', { type: 'object', properties: {} }) } })
+      })
+    })
+    const { lines, send } = stdioPipe(t, app)
+    const body = modernBody('tools/call', { params: { name: 'ask', arguments: {} } }) as any
+    body.params._meta.progressToken = 'p'
+    send(body)
+    await until(() => lines.some(line => line.id === 1))
+    const response = lines.find(line => line.id === 1)
+    t.assert.strictEqual(response?.error?.code, MISSING_REQUIRED_CLIENT_CAPABILITY, JSON.stringify(response))
+    t.assert.deepStrictEqual(response.error.data.requiredCapabilities, { elicitation: {} })
+  })
+
+  test('stdio answers an invalid id with a null id', async (t: TestContext) => {
+    const app = await buildServer(t)
+    const { lines, send } = stdioPipe(t, app)
+    send({ ...modernBody('tools/list'), id: false })
+    await until(() => lines.length > 0)
+    t.assert.strictEqual(lines[0].id, null)
+    t.assert.strictEqual(lines[0].error.code, INVALID_REQUEST)
+  })
+
+  test('stdio refuses a request whose id is still in flight', async (t: TestContext) => {
+    const app = await buildServer(t, undefined, { capabilities: { tools: { listChanged: true } } })
+    const { lines, send } = stdioPipe(t, app)
+    send(modernBody('subscriptions/listen', { id: 5, params: { notifications: { toolsListChanged: true } } }))
+    await until(() => lines.some(line => line.method === 'notifications/subscriptions/acknowledged'))
+    send(modernBody('subscriptions/listen', { id: 5, params: { notifications: { toolsListChanged: true } } }))
+    await until(() => lines.some(line => line.id === 5 && line.error))
+    t.assert.strictEqual(lines.find(line => line.id === 5 && line.error)?.error.code, INVALID_REQUEST)
+  })
+
+  test('request ids longer than 256 characters are refused', async (t: TestContext) => {
+    const app = await buildServer(t)
+    const response = await call(app, 'tools/list', { id: 'x'.repeat(257) })
+    t.assert.strictEqual(response.statusCode, 400)
+    t.assert.strictEqual(response.json().error.code, INVALID_REQUEST)
+    t.assert.strictEqual(response.json().id, null)
+    t.assert.strictEqual((await call(app, 'tools/list', { id: 'x'.repeat(256) })).statusCode, 200)
+  })
+
+  test('a stream ending while another\'s subscribe handler runs leaves the watcher running', async (t: TestContext) => {
+    const events: string[] = []
+    let slow = false
+    const app = await buildServer(t, (app) => {
+      app.mcpSetResourceSubscribeHandler(async ({ uri }: any) => {
+        events.push(`sub ${uri}`)
+        if (slow) await new Promise(resolve => setTimeout(resolve, 200))
+        return {}
+      })
+      app.mcpSetResourceUnsubscribeHandler(async ({ uri }: any) => {
+        events.push(`unsub ${uri}`)
+        return {}
+      })
+    }, { capabilities: { resources: { subscribe: true } } })
+    const { lines, send } = stdioPipe(t, app)
+    const listen = (id: string) => modernBody('subscriptions/listen', { id, params: { notifications: { resourceSubscriptions: ['file:///x'] } } })
+    const acked = (id: string) => lines.some(line => line.method === 'notifications/subscriptions/acknowledged' && line.params._meta['io.modelcontextprotocol/subscriptionId'] === id)
+
+    send(listen('A'))
+    await until(() => acked('A'))
+    slow = true
+    send(listen('B'))
+    await until(() => events.length === 2)
+    // A ends while B's subscribe handler is still running.
+    send({ jsonrpc: JSONRPC_VERSION, method: 'notifications/cancelled', params: { requestId: 'A' } })
+    await until(() => acked('B'))
+    await new Promise(resolve => setTimeout(resolve, 50))
+    t.assert.deepStrictEqual(events, ['sub file:///x', 'sub file:///x'])
+  })
+
+  test('a task handler sees the answers it carries and its state as JSON, like a sync retry', async (t: TestContext) => {
+    const seen: any[] = []
+    const ask = (key: string) => elicitForm(key, { type: 'object', properties: { v: { type: 'string' } } })
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'steps', inputSchema: Type.Object({}), execution: { taskSupport: 'required' } } as any, async (_args: any, context: any) => {
+        const answers = context.inputResponses ?? {}
+        seen.push({ keys: Object.keys(answers).sort(), state: context.requestState })
+        if (answers.second) return { content: [{ type: 'text', text: 'done' }] }
+        if (answers.first) throw new InputRequired({ inputRequests: { second: ask('second') }, state: { at: new Date(0), skip: undefined }, carry: [] })
+        throw new InputRequired({ inputRequests: { first: ask('first') } })
+      })
+    }, { enableTasks: true })
+    const created = (await call(app, 'tools/call', { params: { name: 'steps', arguments: {} }, capabilities: taskCapabilities })).json().result
+    const answer = async (key: string) => {
+      let task: any
+      for (let i = 0; i < 100; i++) {
+        task = (await call(app, 'tasks/get', { params: { taskId: created.taskId }, capabilities: taskCapabilities })).json().result
+        if (task.status === 'input_required' && task.inputRequests?.[key]) break
+        await new Promise(resolve => setTimeout(resolve, 10))
+      }
+      await call(app, 'tasks/update', { params: { taskId: created.taskId, inputResponses: { [key]: { action: 'accept', content: { v: key } } } }, capabilities: taskCapabilities })
+    }
+    await answer('first')
+    await answer('second')
+    await until(() => seen.length === 3)
+    t.assert.deepStrictEqual(seen[2], { keys: ['second'], state: { at: '1970-01-01T00:00:00.000Z' } })
+  })
+
+  test('a sampling request with a non-finite number is the handler\'s error', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'draft', inputSchema: Type.Object({}) }, async () => {
+        throw new InputRequired({
+          inputRequests: { draft: requestSampling({ messages: [{ role: 'user', content: { type: 'text', text: 'hi' } }], maxTokens: Infinity } as any) }
+        })
+      })
+    })
+    const json = (await call(app, 'tools/call', { params: { name: 'draft', arguments: {} }, capabilities: { sampling: {} } })).json()
+    t.assert.strictEqual(json.result?.resultType, undefined, JSON.stringify(json))
+    t.assert.ok(json.error, JSON.stringify(json))
+  })
+
+  test('a task parked for input does not hold close() for the whole drain', async (t: TestContext) => {
+    const app = Fastify()
+    await app.register(mcpPlugin, { serverInfo: { name: 's', version: '1' }, enableTasks: true, taskShutdownTimeoutMs: 5000 })
+    app.mcpAddTool({ name: 'blocked', inputSchema: Type.Object({}), execution: { taskSupport: 'required' } } as any, async () => {
+      throw new InputRequired({ inputRequests: { ok: elicitForm('Sure?', { type: 'object', properties: {} }) } })
+    })
+    await app.ready()
+    const created = (await call(app, 'tools/call', { params: { name: 'blocked', arguments: {} }, capabilities: taskCapabilities })).json().result
+    for (let i = 0; i < 100; i++) {
+      const task = (await call(app, 'tasks/get', { params: { taskId: created.taskId }, capabilities: taskCapabilities })).json().result
+      if (task.status === 'input_required') break
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+    const started = Date.now()
+    await app.close()
+    t.assert.ok(Date.now() - started < 2000, `close took ${Date.now() - started}ms`)
+  })
+
+  test('listen streams still get what changes while tasks drain, before their graceful end', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'publish', inputSchema: Type.Object({}), execution: { taskSupport: 'required' } } as any, async () => {
+        await new Promise(resolve => setTimeout(resolve, 200))
+        await app.mcpBroadcastNotification({ jsonrpc: JSONRPC_VERSION, method: 'notifications/tools/list_changed' })
+        return { content: [{ type: 'text', text: 'published' }] }
+      })
+    }, { enableTasks: true, capabilities: { tools: { listChanged: true } } })
+    const { lines, send } = stdioPipe(t, app)
+    send(modernBody('subscriptions/listen', { id: 'L', params: { notifications: { toolsListChanged: true } } }))
+    await until(() => lines.some(line => line.method === 'notifications/subscriptions/acknowledged'))
+    t.assert.strictEqual((await call(app, 'tools/call', { params: { name: 'publish', arguments: {} }, capabilities: taskCapabilities })).json().result.resultType, 'task')
+
+    await app.close()
+    await until(() => lines.some(line => line.id === 'L'))
+    const methods = lines.map(line => line.method ?? `response ${line.id}`)
+    t.assert.deepStrictEqual(methods, ['notifications/subscriptions/acknowledged', 'notifications/tools/list_changed', 'notifications/cancelled', 'response L'])
+  })
+
+  test('an option refused at registration opens no Redis connection', async (t: TestContext) => {
+    let connections = 0
+    const server = createServer(socket => { connections++; socket.destroy() })
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+    t.after(() => server.close())
+    const port = (server.address() as { port: number }).port
+    const app = Fastify()
+    app.register(mcpPlugin, { redis: { host: '127.0.0.1', port, lazyConnect: false, retryStrategy: () => null }, caching: { toolsList: { ttlMs: -1, cacheScope: 'private' } } } as any)
+    await t.assert.rejects(async () => { await app.ready() }, /ttlMs/)
+    await app.close()
+    await new Promise(resolve => setTimeout(resolve, 100))
+    t.assert.strictEqual(connections, 0)
   })
 })

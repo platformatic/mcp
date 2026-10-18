@@ -24,10 +24,18 @@ export const MAX_TIMER_MS = 2 ** 31 - 1
 /** Why a running task was stopped, recorded as its failure. */
 export class TaskStopped extends Error {}
 
+/** Why a task stopped when its requestor cancelled it. */
+export const TASK_CANCELLED = 'Task cancelled'
+
 export interface LiveTask {
   /** Whose allowance the task counts against; absent for unidentified callers. */
   quotaKey?: string
   stop: (reason: TaskStopped) => void
+  /**
+   * Parked in `input_required`. During a shutdown no `tasks/update` can reach
+   * it (new requests are refused), so the drain stops it rather than wait.
+   */
+  waitingForInput?: boolean
   /**
    * Settles when the slot is released. A task still being created already
    * holds its slot, so the shutdown drain waits for it like any other.
@@ -126,6 +134,21 @@ export function sleep (ms: number): Promise<void> {
 }
 
 /**
+ * Mark a task as parked waiting for client input, or done waiting. A task that
+ * parks while the server is shutting down is stopped at once: the answer it
+ * waits for can no longer arrive.
+ */
+export function setWaitingForInput (store: TaskStore, live: LiveTask, waiting: boolean): void {
+  live.waitingForInput = waiting
+  if (waiting && registries.get(store)?.closing) live.stop(new TaskStopped(SHUTTING_DOWN))
+}
+
+/** Whether this instance is running the task, so a shutdown will record its outcome. */
+export function isRunningHere (store: TaskStore, taskId: string): boolean {
+  return registries.get(store)?.live.has(taskId) === true
+}
+
+/**
  * Stop taking new tasks and let running ones finish, for up to `timeoutMs`.
  * Whatever is still running then is aborted through its signal and recorded
  * as failed, so a restart never leaves a task `working` until its ttl.
@@ -134,6 +157,9 @@ export async function drainTasks (store: TaskStore, timeoutMs: number): Promise<
   const registry = registries.get(store)
   if (!registry) return
   registry.closing = true
+  for (const task of registry.live.values()) {
+    if (task.waitingForInput) task.stop(new TaskStopped(SHUTTING_DOWN))
+  }
 
   const running = () => [...registry.live.values()]
   await Promise.race([Promise.allSettled(running().map(task => task.done)), sleep(timeoutMs)])

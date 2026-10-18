@@ -480,8 +480,13 @@ answered, and an accepted elicitation must match what was asked — content conf
 form's `requestedSchema`, or no content for a URL-mode elicitation. A non-conforming answer is
 refused with `-32602`, on a retry and on `tasks/update` alike. Content sent with `decline` or
 `cancel` is not checked against the `requestedSchema` (only its shape is), so handlers should
-look at `action` first. A `requestedSchema` holding a non-finite number (`Infinity`, `NaN`) is
-the handler's error, since JSON would hand the client `null` in its place.
+look at `action` first. An input request holding a non-finite number (`Infinity`, `NaN`), in a
+`requestedSchema` or in sampling parameters, is the handler's error, since JSON would hand the
+client `null` in its place.
+
+An accepted answer may carry properties the form did not ask for, unless its `requestedSchema`
+sets `additionalProperties: false`. Pick the fields you asked for rather than spreading
+`content` into a record, or a client could set ones you never offered (`isAdmin`, say).
 
 `requestState` is signed, not encrypted. Besides the handler's `state`, a client that decodes it
 can read the caller's identity (`userId`, OAuth client id and issuer), the answers being carried
@@ -613,7 +618,9 @@ stdout stops draining.
 Each stream holds a socket and buffers, so streams are bounded:
 `subscriptionMaxStreamsPerPrincipal` per caller (default 10, refused with HTTP `429`),
 `subscriptionMaxStreams` per instance (default 1000), and `subscriptionMaxResourceUris` per
-stream (default 1000, each at most 2048 characters). A caller is a user at an issuer, whichever
+stream (default 1000, each at most 2048 characters). A stream's id goes into every notification
+it carries, so 2026-07-28 request ids are limited to 256 characters (longer ones are refused
+with `-32600`). A caller is a user at an issuer, whichever
 OAuth client they use; when the deployment cannot identify callers, only the per-instance limit
 applies.
 
@@ -862,9 +869,10 @@ On `2025-11-25`, the client opts in per call instead:
 
 and may then use `tasks/get`, `tasks/result` (blocks until the task is terminal),
 `tasks/list` and `tasks/cancel`, plus optional `notifications/tasks/status` pushes over SSE.
-A blocked `tasks/result` stops waiting when its client disconnects, and when the server
-closes it answers with a JSON-RPC `-32603` "Server shutting down" error, so `app.close()`
-never waits on a task running on another instance.
+A blocked `tasks/result` stops waiting when its client disconnects. When the server closes it
+answers with a JSON-RPC `-32603` "Server shutting down" error, so `app.close()` never waits on a
+task running on another instance; for a task running on this one it waits for the drain (see
+`taskShutdownTimeoutMs`) and answers with the task's outcome.
 
 Retention defaults to 60 seconds when the client does not request a `ttl`. Tasks are meant
 for long-running work, so if your tools can outlive that, raise the bounds — otherwise a task
@@ -2595,7 +2603,9 @@ await app.register(import('@fastify/bearer-auth'), {
 - `requestStateSecret`: Secret (at least 32 bytes) that seals multi round-trip
   `requestState`. Set it when `redis` is configured, since any instance may serve a retry
   (the plugin warns at startup otherwise). An array rotates secrets: the first seals, any
-  verifies
+  verifies. Rotate in three deploys so no retry fails mid-rollout: `[old, new]` (every
+  instance accepts the new one), then `[new, old]` (instances seal with it), then `[new]`
+  once `requestStateTtlMs` has passed
 - `requestStateTtlMs`: How long sealed state stays valid (default 5 minutes). Must be a positive integer; anything else throws at startup
 - `requestStateMaxAnswerBytes`: How many bytes of JSON of earlier answers sealed state carries
   into later rounds (default 65536); asking again past it fails with `-32602`, and `0` carries none
@@ -2616,7 +2626,9 @@ await app.register(import('@fastify/bearer-auth'), {
 - `taskMaxInputRounds`: How many times a 2026-07-28 task's handler may ask the client for input
   before the task fails (default 32). Rounds that only carry state do not count
 - `taskShutdownTimeoutMs`: How long `close()` waits for running tasks before failing them
-  (default 5000; keep it below Fastify's `pluginTimeout`)
+  (default 5000; keep it below Fastify's `pluginTimeout`). Tasks parked in `input_required`
+  are failed at once, since no answer can reach them during a shutdown, and
+  `subscriptions/listen` streams are ended gracefully only after the drain
 - `subscriptionMaxStreams` / `subscriptionMaxStreamsPerPrincipal` /
   `subscriptionMaxResourceUris`: Bounds on `subscriptions/listen` (defaults 1000 / 10 / 1000)
 - `redis`: Redis configuration for horizontal scaling (optional)
@@ -3392,8 +3404,9 @@ set `requestStateSecret` (it warns at startup otherwise), and the other items un
 2. **Set `requestStateSecret`** if more than one instance can serve a retry. Without it each
    process seals with its own random key and a retry landing elsewhere is refused. The
    secret must be at least 32 bytes; a shorter or empty one is rejected at startup. To rotate
-   it, pass an array with the new secret first, and drop the old one after
-   `requestStateTtlMs`.
+   it without failing retries mid-rollout, deploy `[old, new]` everywhere first, then
+   `[new, old]`, then `[new]` once `requestStateTtlMs` has passed. Deploying `[new, old]`
+   straight away would seal state that instances still on `[old]` refuse.
 3. **Decide your caching hints.** The default of `ttlMs: 0` is safe but means clients never
    cache. See [Result Caching](#result-caching-2026-07-28).
 4. **Sessions do not exist for modern clients.** `context.sessionId` is `undefined` on that
