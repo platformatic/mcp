@@ -5,6 +5,13 @@ import { getResourceMetadataUrl } from './resource-metadata.ts'
 
 export const BEARER_SCHEME = /^bearer +(.*)$/i
 
+/**
+ * Route config key marking the plugin's own public routes (protected resource
+ * metadata, OAuth flow entry points). Matching the route rather than the URL
+ * keeps them public whatever prefix the plugin is registered under.
+ */
+export const kPublicRoute = Symbol('mcp.publicRoute')
+
 export function createAuthPreHandler (
   config: AuthorizationConfig,
   tokenValidator: TokenValidator
@@ -15,7 +22,13 @@ export function createAuthPreHandler (
       return
     }
 
-    // Skip authorization for well-known endpoints
+    // Skip authorization for the plugin's discovery and OAuth flow routes
+    if (request.routeOptions.config?.[kPublicRoute] === true) {
+      return
+    }
+
+    // Skip authorization for well-known endpoints at the origin root. Kept so
+    // application routes under /.well-known/ stay public as before.
     if (request.url.startsWith('/.well-known/') || request.url.startsWith('/mcp/.well-known')) {
       return
     }
@@ -163,7 +176,7 @@ export function generateWWWAuthenticateHeader (config: AuthorizationConfig, chal
   if (!config.enabled) {
     throw new Error('Authorization is disabled')
   }
-  const resourceMetadataUrl = getResourceMetadataUrl(config.resourceUri)
+  const resourceMetadataUrl = config.resourceMetadataUrl ?? getResourceMetadataUrl(config.resourceUri)
   const params = ['realm="MCP Server"', `resource_metadata="${resourceMetadataUrl}"`]
 
   if (challenge.error) {
@@ -184,6 +197,9 @@ export function generateWWWAuthenticateHeader (config: AuthorizationConfig, chal
 
 // Type augmentation for FastifyRequest to include tokenPayload
 declare module 'fastify' {
+  interface FastifyContextConfig {
+    [kPublicRoute]?: boolean
+  }
   interface FastifyRequest {
     tokenPayload?: any
     /** Canonical issuer identity of the validated token, see TokenValidationResult.issuer */

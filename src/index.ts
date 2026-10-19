@@ -18,6 +18,7 @@ import routes from './routes/mcp.ts'
 import wellKnownRoutes from './routes/well-known.ts'
 import { TokenValidator } from './auth/token-validator.ts'
 import { createAuthPreHandler } from './auth/prehandler.ts'
+import { resolveResourceMetadataUrl } from './auth/resource-metadata.ts'
 import oauthClientPlugin from './auth/oauth-client.ts'
 import authRoutesPlugin from './routes/auth-routes.ts'
 import { quitWithTimeout } from './redis-quit-with-timeout.ts'
@@ -216,7 +217,11 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
   if (opts.authorization?.enabled) {
     tokenValidator = new TokenValidator(opts.authorization, app)
 
-    const authPreHandler = createAuthPreHandler(opts.authorization, tokenValidator)
+    const authPreHandler = createAuthPreHandler({
+      ...opts.authorization,
+      resourceMetadataUrl: opts.authorization.resourceMetadataUrl ??
+        resolveResourceMetadataUrl(opts.authorization.resourceUri, app.prefix)
+    }, tokenValidator)
     if (opts.authorization.protectedRoutes === 'mcp') {
       mcpAuthPreHandler = authPreHandler
     } else {
@@ -416,6 +421,11 @@ export type {
 } from './types/auth-types.ts'
 
 export { colonScopeHierarchy } from './auth/prehandler.ts'
+
+// Well-known routes, for mounting the RFC 9728 metadata at the origin root when
+// the plugin itself is registered under a prefix
+export { wellKnownRoutes }
+export { getResourceMetadataUrl, getResourceMetadataPath } from './auth/resource-metadata.ts'
 
 // Rate limiting helper
 export { RateLimiter } from './security.ts'
