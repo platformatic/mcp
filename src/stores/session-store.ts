@@ -26,6 +26,11 @@ export interface SessionMetadata {
    * owner is the (ownerIss, ownerSub) pair.
    */
   ownerIss?: string
+  /**
+   * The OAuth client the owner came through (`client_id` or `azp`), so another
+   * app acting for the same user cannot use the session.
+   */
+  ownerClient?: string
 
   // Enhanced authorization context
   authorization?: AuthorizationContext

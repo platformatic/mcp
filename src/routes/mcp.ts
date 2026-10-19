@@ -274,9 +274,11 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
   }
 
   /**
-   * A session created under an access token belongs to that token's issuer and
-   * subject: two authorization servers may assign the same `sub` to different
-   * users, so the subject alone does not identify the owner. Anyone else
+   * A session created under an access token belongs to that token's issuer,
+   * subject and OAuth client: two authorization servers may assign the same
+   * `sub` to different users, so the subject alone does not identify the
+   * owner, and another app acting for the same user is a different principal
+   * (as for tasks and sealed request state). Anyone else
    * presenting its ID gets the same 404 as for an unknown session: the
    * Streamable HTTP transport defines 404 as "this session does not exist for
    * you", and a 403 would confirm to an attacker that the ID is live. Runs
@@ -292,7 +294,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     if (session?.ownerSub === undefined) return
 
     const owner = await sessionOwnerOf(request)
-    if (session.ownerSub !== owner?.sub || session.ownerIss !== owner?.iss) {
+    if (session.ownerSub !== owner?.sub || session.ownerIss !== owner?.iss || session.ownerClient !== owner?.client) {
       request.log.warn({ sessionId }, 'Rejected MCP request for a session owned by a different user')
       return reply.code(404).type('application/json').send({ error: 'Session not found' })
     }
@@ -358,6 +360,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     if (owner) {
       session.ownerSub = owner.sub
       session.ownerIss = owner.iss
+      session.ownerClient = owner.client
     }
     const payload = request.tokenPayload
     if (!opts.resolveAuthorizationContext && payload && typeof payload.sub === 'string') {
@@ -532,17 +535,20 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
   /**
    * Who a legacy session belongs to: the user the deployment's resolver
    * identifies when there is one, otherwise the verified token's subject at
-   * its issuer. Undefined for anonymous callers, whose sessions are unbound.
+   * its issuer, and the OAuth client either way. Undefined for anonymous
+   * callers, whose sessions are unbound. A user id that is not a string is
+   * refused rather than leaving the session unbound for anyone to use.
    */
-  async function sessionOwnerOf (request: FastifyRequest): Promise<{ sub: string, iss: string | undefined } | undefined> {
-    if (opts.resolveAuthorizationContext) {
-      const authContext = await authContextFrom(request)
-      return typeof authContext?.userId === 'string'
-        ? { sub: authContext.userId, iss: authContext.authorizationServer }
-        : undefined
+  async function sessionOwnerOf (request: FastifyRequest): Promise<{ sub: string, iss: string | undefined, client: string | undefined } | undefined> {
+    const authContext = opts.resolveAuthorizationContext
+      ? await authContextFrom(request)
+      : request.tokenPayload ? buildAuthContext(request, request.tokenPayload) : undefined
+    if (authContext?.userId === undefined) return undefined
+    if (typeof authContext.userId !== 'string') {
+      throw new Error('The caller\'s user id is not a string, so its session cannot be bound to it')
     }
-    const payload = request.tokenPayload
-    return payload && typeof payload.sub === 'string' ? { sub: payload.sub, iss: request.tokenIssuer } : undefined
+    const client = typeof authContext.clientId === 'string' ? authContext.clientId : undefined
+    return { sub: authContext.userId, iss: authContext.authorizationServer, client }
   }
 
   /**
@@ -599,6 +605,12 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
   const listenUriHolders = new Map<string, number>()
   /** URIs a subscribe handler accepted and no unsubscribe has stopped yet. */
   const listenUriWatched = new Set<string>()
+  /**
+   * Unsubscribe handlers still running, by URI. A stream subscribing to the
+   * URI meanwhile waits for it, or the late unsubscribe would stop the watcher
+   * the new stream just started.
+   */
+  const listenUriStopping = new Map<string, Promise<void>>()
 
   async function authorizeResourceSubscriptions (
     filter: SubscriptionFilter,
@@ -642,12 +654,17 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
       listenUriHolders.delete(uri)
       // Only a URI some stream subscribed to has anything to stop.
       if (!listenUriWatched.delete(uri) || !unsubscribeHandler) return
-      Promise.resolve()
-        .then(async () => await unsubscribeHandler({ uri }, handlerContextFor()))
+      const stopped: Promise<void> = Promise.resolve()
+        .then(async () => { await unsubscribeHandler({ uri }, handlerContextFor()) })
         .catch(error => app.log.warn({ err: error, uri }, 'Resource unsubscribe handler failed'))
+        .finally(() => { if (listenUriStopping.get(uri) === stopped) listenUriStopping.delete(uri) })
+      listenUriStopping.set(uri, stopped)
     }
 
-    const outcomes = await Promise.allSettled(uris.map(async uri => await subscribeHandler({ uri }, handlerContextFor())))
+    const outcomes = await Promise.allSettled(uris.map(async uri => {
+      await listenUriStopping.get(uri)
+      return await subscribeHandler({ uri }, handlerContextFor())
+    }))
     const accepted = uris.filter((_uri, index) => outcomes[index].status === 'fulfilled')
     const refused = uris.length - accepted.length
     if (refused > 0) request.log.info({ refused }, 'Resource subscriptions refused by the subscribe handler')
@@ -1029,6 +1046,22 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
       if (idError) {
         reply.code(400).type('application/json')
         return idError
+      }
+
+      // The legacy revisions define no mirrored headers, but one that is sent
+      // (an `initialize` from a dual-era client, say) must still agree with
+      // the body: a gateway routing on it would otherwise see another method.
+      if (!isStdioRequest(request) && !Array.isArray(message) && typeof (message as { method?: unknown }).method === 'string' &&
+          (request.headers['mcp-method'] !== undefined || request.headers['mcp-name'] !== undefined)) {
+        const legacyRequest = message as JSONRPCRequest
+        const repeated = repeatedMirroredHeader(request.raw.rawHeaders)
+        const headerCheck = repeated !== undefined
+          ? { ok: false as const, message: `Header mismatch: ${repeated} must be sent only once` }
+          : validateStandardHeaders(request.headers, legacyRequest.method, legacyRequest.params)
+        if (!headerCheck.ok) {
+          reply.code(400).type('application/json')
+          return createError('id' in legacyRequest ? legacyRequest.id : null, HEADER_MISMATCH, headerCheck.message)
+        }
       }
 
       let sessionId = request.headers['mcp-session-id'] as string | undefined

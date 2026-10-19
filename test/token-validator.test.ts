@@ -1,7 +1,9 @@
 import { test, describe, beforeEach, afterEach } from 'node:test'
 import type { TestContext } from 'node:test'
 import Fastify from 'fastify'
+import { createServer } from 'node:http'
 import { TokenValidator } from '../src/auth/token-validator.ts'
+import { JwksCache } from '../src/auth/jwks.ts'
 import {
   createTestAuthConfig,
   createTestJWT,
@@ -842,5 +844,66 @@ describe('TokenValidator', () => {
       t.assert.strictEqual(result.error, 'Missing subject claim')
       validator.close()
     })
+  })
+})
+
+describe('round 12: signing keys', () => {
+  test('tokens naming unknown signing keys do not each fetch the key set', async (t: TestContext) => {
+    let fetches = 0
+    const jwks = JSON.stringify(generateMockJWKSResponse())
+    const server = createServer((_req, res) => { fetches++; res.setHeader('content-type', 'application/json'); res.end(jwks) })
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+    t.after(() => server.close())
+    const { port } = server.address() as { port: number }
+    const app = Fastify({ logger: false })
+    t.after(() => app.close())
+    const validator = new TokenValidator(createTestAuthConfig({
+      tokenValidation: { jwksUri: `http://127.0.0.1:${port}/jwks.json`, validateAudience: true }
+    }), app)
+    t.after(() => validator.close())
+
+    t.assert.strictEqual((await validator.validateToken(createTestJWT({ kid: 'forged-0' } as any))).valid, false)
+    t.assert.strictEqual(fetches, 1)
+    for (let i = 1; i <= 10; i++) {
+      t.assert.strictEqual((await validator.validateToken(createTestJWT({ kid: `forged-${i % 2}` } as any))).valid, false)
+    }
+    t.assert.strictEqual(fetches, 1)
+
+    // The real key came with that one fetch, so forged tokens never lock it out.
+    const real = await validator.validateToken(createTestJWT())
+    t.assert.strictEqual(real.valid, true, real.error)
+    t.assert.strictEqual(fetches, 1)
+  })
+
+  test('a key rotated in is picked up by the next refresh a token may cause', async (t: TestContext) => {
+    let fetches = 0
+    let keys: unknown[] = [{ ...generateMockJWKSResponse().keys[0], kid: 'old' }]
+    const server = createServer((_req, res) => { fetches++; res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ keys })) })
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+    t.after(() => server.close())
+    const { port } = server.address() as { port: number }
+    const cache = new JwksCache(`http://127.0.0.1:${port}/jwks.json`, { minRefreshMs: 100 })
+
+    t.assert.match(await cache.getPublicKey('old', 'RS256'), /BEGIN PUBLIC KEY/)
+    keys = [...keys, { ...generateMockJWKSResponse().keys[0], kid: 'new' }]
+    await t.assert.rejects(cache.getPublicKey('new', 'RS256'), /No matching signing key/)
+    t.assert.strictEqual(fetches, 1)
+    await new Promise(resolve => setTimeout(resolve, 120))
+    t.assert.match(await cache.getPublicKey('new', 'RS256'), /BEGIN PUBLIC KEY/)
+    t.assert.strictEqual(fetches, 2)
+  })
+
+  test('a JWT whose sub is not a non-empty string is refused', async (t: TestContext) => {
+    const restore = setupMockAgent({ 'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse() })
+    t.after(restore)
+    const app = Fastify({ logger: false })
+    t.after(() => app.close())
+    const validator = new TokenValidator(createTestAuthConfig(), app)
+    t.after(() => validator.close())
+    for (const sub of [12345, '', { id: 'alice' }]) {
+      const result = await validator.validateToken(createTestJWT({ sub } as any))
+      t.assert.strictEqual(result.valid, false, JSON.stringify(sub))
+      t.assert.strictEqual(result.error, 'Invalid subject claim')
+    }
   })
 })

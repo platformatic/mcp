@@ -1229,3 +1229,28 @@ describe('round 11: task waiters, eviction, telemetry and shutdown', () => {
     t.assert.strictEqual(body.result?.content?.[0]?.text, 'finished', JSON.stringify(body))
   })
 })
+
+describe('round 12: shutdown drain', () => {
+  test('tasks/result learns the outcome the drain records before close() resolves', async (t: TestContext) => {
+    const app = await buildApp(t, { taskShutdownTimeoutMs: 50 })
+    app.mcpAddTool({
+      name: 'stubborn',
+      description: 'Ignores its signal',
+      inputSchema: Type.Object({}),
+      execution: { taskSupport: 'optional' }
+    } as any, async (): Promise<CallToolResult> => {
+      await new Promise(resolve => setTimeout(resolve, 4000).unref())
+      return { content: [{ type: 'text', text: 'too late' }] }
+    })
+    const created = await call(app, 'tools/call', { name: 'stubborn', arguments: {}, task: {} })
+    let answeredAt = Infinity
+    const result = call(app, 'tasks/result', { taskId: created.result.task.taskId }, 2)
+      .then(body => { answeredAt = Date.now(); return body })
+    await new Promise(resolve => setTimeout(resolve, 20))
+    await app.close()
+    const closedAt = Date.now()
+    const body = await result
+    t.assert.strictEqual(body.error?.message, 'The server shut down before this task finished', JSON.stringify(body))
+    t.assert.ok(answeredAt <= closedAt, `answered ${answeredAt - closedAt}ms after close`)
+  })
+})

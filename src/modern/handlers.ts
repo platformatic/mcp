@@ -450,6 +450,30 @@ function isPlainObject (value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
+/** Whether `block` is a well-formed sampling content block (`SamplingMessageContentBlock`). */
+function isSamplingBlock (block: unknown): boolean {
+  if (!isPlainObject(block)) return false
+  switch (block.type) {
+    case 'text':
+      return typeof block.text === 'string'
+    case 'image':
+    case 'audio':
+      return typeof block.data === 'string' && typeof block.mimeType === 'string'
+    case 'tool_use':
+      return typeof block.id === 'string' && typeof block.name === 'string' && isPlainObject(block.input)
+    case 'tool_result':
+      return typeof block.toolUseId === 'string' && Array.isArray(block.content)
+    default:
+      return false
+  }
+}
+
+/** A root as `roots/list` defines it: a `file://` URI and an optional name. */
+function isRoot (root: unknown): boolean {
+  return isPlainObject(root) && typeof root.uri === 'string' && root.uri.startsWith('file://') &&
+    (root.name === undefined || typeof root.name === 'string')
+}
+
 /** Which field of `value` is wrong as a result to `method`, and what it should be. */
 function invalidResult (method: string, value: Record<string, unknown>): [field: string, expected: string] | undefined {
   switch (method) {
@@ -466,12 +490,14 @@ function invalidResult (method: string, value: Record<string, unknown>): [field:
       return undefined
     case 'sampling/createMessage':
       if (!SAMPLING_ROLES.has(value.role as string)) return ['role', 'user or assistant']
-      if (!isPlainObject(value.content) && !Array.isArray(value.content)) return ['content', 'a content block or an array of them']
+      if (Array.isArray(value.content) ? !value.content.every(isSamplingBlock) : !isSamplingBlock(value.content)) {
+        return ['content', 'a content block or an array of them']
+      }
       if (typeof value.model !== 'string') return ['model', 'a string']
       return undefined
     case 'roots/list':
-      if (!Array.isArray(value.roots) || !value.roots.every(root => isPlainObject(root) && typeof root.uri === 'string')) {
-        return ['roots', 'an array of roots']
+      if (!Array.isArray(value.roots) || !value.roots.every(isRoot)) {
+        return ['roots', 'an array of roots with file:// URIs']
       }
       return undefined
     default:
@@ -523,6 +549,9 @@ function invalidAnswers (
   for (const [key, value] of Object.entries(inputResponses ?? {})) {
     if (onlyAsked && !Object.hasOwn(asked, key)) continue
     if (!isPlainObject(value)) return `Invalid "inputResponses.${key}": expected a result object`
+    // JSON parses 1e400 as Infinity, which passes a numeric bound and then
+    // turns into null once the answer is carried to the next round.
+    if (hasNonFiniteNumber(value)) return `Invalid "inputResponses.${key}": a number is out of range`
     const method = asked[key]
     const problem = method === undefined
       ? undefined

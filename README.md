@@ -262,7 +262,9 @@ A request is served as **modern** when its `params._meta` carries
 `io.modelcontextprotocol/protocolVersion` or its `MCP-Protocol-Version` header names a modern
 revision. A request with neither takes the legacy path, so the two eras can interleave freely
 on one server. Header-based detection ensures modern routing headers can never bypass their
-required header/body validation.
+required header/body validation. A legacy request that sends `Mcp-Method` or `Mcp-Name` anyway
+(an `initialize` from a dual-era client, say) must also match its body, or it is answered with
+`-32020` and HTTP 400.
 
 ### Modern requests (2026-07-28)
 
@@ -295,7 +297,8 @@ Mcp-Name: get_weather
 
 `protocolVersion` and `clientCapabilities` are required — a request missing either is
 answered with `-32602` and HTTP 400. An `initialize` without that `_meta` always takes the
-legacy handshake, whatever `MCP-Protocol-Version` header it carries.
+legacy handshake, whatever supported `MCP-Protocol-Version` header it carries (an
+unsupported one is answered with HTTP 400).
 
 A tool parameter annotated with `x-mcp-header` is mirrored into an `Mcp-Param-*` header and
 must be a string, integer or boolean: a plain `type`, a nullable one, an `enum`/`const` of one of
@@ -480,7 +483,9 @@ answered, and an accepted elicitation must match what was asked — content conf
 form's `requestedSchema`, or no content for a URL-mode elicitation. A non-conforming answer is
 refused with `-32602`, on a retry and on `tasks/update` alike. Content sent with `decline` or
 `cancel` is not checked against the `requestedSchema` (only its shape is), so handlers should
-look at `action` first. An input request holding a non-finite number (`Infinity`, `NaN`), in a
+look at `action` first. Sampling answers must carry well-formed content blocks, `roots/list`
+answers `file://` URIs, and an answer holding a number JSON cannot carry (`1e400`, which parses
+as `Infinity`) is refused rather than turning into `null` on the next round. An input request holding a non-finite number (`Infinity`, `NaN`), in a
 `requestedSchema` or in sampling parameters, is the handler's error, since JSON would hand the
 client `null` in its place.
 
@@ -1916,6 +1921,9 @@ The stdio transport follows the MCP stdio transport specification:
 - 2026-07-28 has no header layer on stdio: everything travels in the body's `_meta`
 - The protocol version negotiated by a legacy `initialize` applies to every later legacy message
   on the stream (a new `initialize` re-negotiates it)
+- Closing stdin shuts the transport down gracefully: requests already read get up to a second
+  to finish and be answered before they are cancelled (a cancelled request is still answered), so `printf '<request>\n' | server`
+  prints its response
 
 ### Error Handling
 
@@ -3163,7 +3171,7 @@ await app.register(mcpPlugin, {
 #### Session Management
 
 - **Session IDs are cryptographically secure:** Generated using Node.js crypto
-- **Sessions are bound to their owner:** With authorization enabled, a session remembers the issuer and `sub` of the token that created it; a subject is only unique per issuer, so both must match. Requests (POST, GET, DELETE) presenting that `Mcp-Session-Id` with a token from a different issuer or for a different subject get `404 Session not found`, the same answer as for an unknown session, so a leaked session ID cannot be used by another user. The issuer is the verified JWT `iss` (a trailing slash is ignored). Introspection responses may omit `iss` (RFC 7662); the issuer is then taken from configuration as `introspection:<introspectionEndpoint>`, the endpoint that vouched for the token, so such sessions never match a JWT or an introspection response that names an issuer
+- **Sessions are bound to their owner:** With authorization enabled, a session remembers the issuer, `sub` and OAuth client (`client_id` or `azp`) of the token that created it; a subject is only unique per issuer, so both must match, and another app acting for the same user is a different owner, as for tasks. Requests (POST, GET, DELETE) presenting that `Mcp-Session-Id` with a token from a different issuer, for a different subject or from a different client get `404 Session not found`, the same answer as for an unknown session, so a leaked session ID cannot be used by another user. The issuer is the verified JWT `iss` (a trailing slash is ignored). Introspection responses may omit `iss` (RFC 7662); the issuer is then taken from configuration as `introspection:<introspectionEndpoint>`, the endpoint that vouched for the token, so such sessions never match a JWT or an introspection response that names an issuer
 - **Automatic cleanup:** Sessions expire after 1 hour by default
 - **Message history limits:** Prevents unbounded memory growth
 - **Cross-instance isolation:** Sessions are properly isolated between instances
@@ -3320,6 +3328,9 @@ the changes to the plugin's own API and defaults:
   instance of the previous version are invisible to upgraded instances (and the reverse): a
   client polling such a task through an upgraded instance gets "Task not found". Drain tasks
   before upgrading, or accept that tasks in flight may have to be restarted.
+- **Legacy sessions are bound to the OAuth client too** (`SessionMetadata.ownerClient`), so a
+  session opened through one app is `404` to another app the same user authorized. JWTs whose
+  `sub` is not a non-empty string are refused, as introspection already did.
 - **Tasks are bound to user, OAuth client and issuer**, not the user alone, in both eras.
   `TaskRecord.authSubject` now holds that principal as a JSON string rather than a bare user
   id, so code that reads task records or calls `list(subject)` on a `MemoryTaskStore` or

@@ -467,7 +467,7 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
   app.addHook('preClose', async () => {
     // Let running tasks finish (or record them as failed) while the task
     // channel and Redis are still up to carry their outcome.
-    if (taskStore) await drainTasks(taskStore, opts.taskShutdownTimeoutMs ?? 5_000)
+    if (taskStore) await drainTasks(taskStore, opts.taskShutdownTimeoutMs ?? 5_000, taskWaiters)
     taskInputs.close()
     // Then end modern subscription streams with the graceful-closure
     // response, so clients can tell a shutdown from a dropped connection. Not

@@ -169,6 +169,9 @@ const OBJECT_CAPABILITIES: Record<string, string[]> = {
   extensions: []
 }
 
+/** Capabilities whose every member is a settings object. */
+const MAP_CAPABILITIES = new Set(['experimental', 'extensions'])
+
 function isObject (value: unknown): boolean {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
@@ -183,6 +186,13 @@ export function invalidCapabilityMember (capabilities: Record<string, unknown>):
     const declared = capabilities[name]
     if (declared === undefined) continue
     if (!isObject(declared)) return name
+    // Maps of identifiers to settings objects: a non-object value is not a
+    // declaration (`{ "io.modelcontextprotocol/tasks": null }` opts into nothing).
+    if (MAP_CAPABILITIES.has(name)) {
+      for (const [member, value] of Object.entries(declared as Record<string, unknown>)) {
+        if (!isObject(value)) return `${name}.${member}`
+      }
+    }
     for (const member of members) {
       const value = (declared as Record<string, unknown>)[member]
       if (value !== undefined && !isObject(value)) return `${name}.${member}`

@@ -5509,3 +5509,162 @@ describe('round 11: stdio errors, listen holders, task rounds and shutdown', () 
     t.assert.strictEqual(connections, 0)
   })
 })
+
+describe('round 12: stdin close, listen reconnects, answer shapes and mirrored headers', () => {
+  test('closing stdin right after the last request still answers it', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'quick', inputSchema: Type.Object({}) }, async () => {
+        await new Promise(resolve => setTimeout(resolve, 50))
+        return { content: [{ type: 'text', text: 'ok' }] }
+      })
+    })
+    const input = new PassThrough()
+    const output = new PassThrough()
+    let written = ''
+    output.on('data', (chunk: Buffer) => { written += chunk.toString() })
+    const transport = createStdioTransport(app, { input, output, error: new PassThrough() })
+    transport.start()
+    // Like `printf '<request>\n' | server`.
+    input.end(JSON.stringify(modernBody('tools/call', { id: 'q', params: { name: 'quick', arguments: {} } })) + '\n' +
+      JSON.stringify(modernBody('server/discover', { id: 'd' })) + '\n')
+    await transport.stop()
+    const ids = written.split('\n').filter(Boolean).map(line => JSON.parse(line).id).sort()
+    t.assert.deepStrictEqual(ids, ['d', 'q'])
+  })
+
+  test('a request cancelled because stdin closed is still answered', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'long', inputSchema: Type.Object({}) }, async (_args: any, context: any) => {
+        await new Promise<void>(resolve => {
+          const timer = setTimeout(resolve, 5_000)
+          context.signal.addEventListener('abort', () => { clearTimeout(timer); resolve() }, { once: true })
+        })
+        return { content: [{ type: 'text', text: `aborted ${context.signal.aborted}` }] }
+      })
+    })
+    const input = new PassThrough()
+    const output = new PassThrough()
+    let written = ''
+    output.on('data', (chunk: Buffer) => { written += chunk.toString() })
+    const transport = createStdioTransport(app, { input, output, error: new PassThrough() })
+    transport.start()
+    input.end(JSON.stringify(modernBody('tools/call', { id: 'x', params: { name: 'long', arguments: {} } })) + '\n')
+    await transport.stop()
+    const answer = written.split('\n').filter(Boolean).map(line => JSON.parse(line)).find(line => line.id === 'x')
+    t.assert.strictEqual(answer?.result?.content[0].text, 'aborted true', written)
+  })
+
+  test('a listen reconnecting while the unsubscribe handler runs keeps its watcher', async (t: TestContext) => {
+    const watched = new Set<string>()
+    const app = await buildServer(t, (app) => {
+      app.mcpSetResourceSubscribeHandler(async ({ uri }: any) => { watched.add(uri); return {} })
+      app.mcpSetResourceUnsubscribeHandler(async ({ uri }: any) => {
+        await new Promise(resolve => setTimeout(resolve, 100))
+        watched.delete(uri)
+        return {}
+      })
+    }, { capabilities: { resources: { subscribe: true } } })
+    const { lines, send } = stdioPipe(t, app)
+    const listen = (id: string) => modernBody('subscriptions/listen', { id, params: { notifications: { resourceSubscriptions: ['file:///x'] } } })
+    const acked = (id: string) => lines.some(line => line.method === 'notifications/subscriptions/acknowledged' && line.params._meta['io.modelcontextprotocol/subscriptionId'] === id)
+
+    send(listen('A'))
+    await until(() => acked('A'))
+    send({ jsonrpc: JSONRPC_VERSION, method: 'notifications/cancelled', params: { requestId: 'A' } })
+    await new Promise(resolve => setTimeout(resolve, 10))
+    send(listen('B'))
+    await until(() => acked('B'))
+    await new Promise(resolve => setTimeout(resolve, 250))
+    t.assert.deepStrictEqual([...watched], ['file:///x'])
+  })
+
+  test('an answer holding a number JSON cannot carry is refused', async (t: TestContext) => {
+    const seen: unknown[] = []
+    const schema = { type: 'object', properties: { n: { type: 'number', maximum: 100 } }, required: ['n'] }
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'count', inputSchema: Type.Object({}) }, async (_args: any, context: any) => {
+        const answer = context.inputResponses?.n
+        if (!answer) throw new InputRequired({ inputRequests: { n: elicitForm('How many?', schema as any) } })
+        seen.push(answer.content.n)
+        return { content: [{ type: 'text', text: String(answer.content.n) }] }
+      })
+    })
+    const capabilities = { elicitation: { form: {} } }
+    const first = (await call(app, 'tools/call', { params: { name: 'count', arguments: {} }, capabilities })).json().result
+    const params = { name: 'count', arguments: {}, requestState: first.requestState, inputResponses: { n: { action: 'accept', content: { n: 'HUGE' } } } }
+    const response = await app.inject({
+      method: 'POST',
+      url: '/mcp',
+      headers: modernHeaders('tools/call', { params }),
+      // JSON.parse reads -1e400 as -Infinity, which is under the maximum.
+      payload: JSON.stringify(modernBody('tools/call', { id: 2, params, capabilities })).replace('"HUGE"', '-1e400')
+    })
+    t.assert.strictEqual(response.json().error?.code, INVALID_PARAMS, response.body)
+    t.assert.deepStrictEqual(seen, [])
+  })
+
+  test('sampling answers need well-formed content and roots answers file:// URIs', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'draft', inputSchema: Type.Object({}) }, async (_args: any, context: any) => {
+        if (!context.inputResponses?.m) {
+          throw new InputRequired({ inputRequests: { m: requestSampling({ messages: [{ role: 'user', content: { type: 'text', text: 'hi' } }], maxTokens: 10 }) } })
+        }
+        return { content: [{ type: 'text', text: 'ok' }] }
+      })
+      app.mcpAddTool({ name: 'where', inputSchema: Type.Object({}) }, async (_args: any, context: any) => {
+        if (!context.inputResponses?.r) throw new InputRequired({ inputRequests: { r: { method: 'roots/list' } } as any })
+        return { content: [{ type: 'text', text: 'ok' }] }
+      })
+    })
+    const retry = async (name: string, key: string, answer: unknown, capabilities: ClientCapabilities) => {
+      const first = (await call(app, 'tools/call', { params: { name, arguments: {} }, capabilities })).json().result
+      return (await call(app, 'tools/call', {
+        id: 2,
+        capabilities,
+        params: { name, arguments: {}, requestState: first.requestState, inputResponses: { [key]: answer } }
+      })).json()
+    }
+    const sampling = { sampling: {} }
+    for (const content of [{}, [1, 2], { type: 'text' }]) {
+      const json = await retry('draft', 'm', { role: 'assistant', model: 'x', content }, sampling)
+      t.assert.strictEqual(json.error?.code, INVALID_PARAMS, JSON.stringify(json))
+    }
+    const ok = await retry('draft', 'm', { role: 'assistant', model: 'x', content: { type: 'text', text: 'hello' } }, sampling)
+    t.assert.strictEqual(ok.result?.content[0].text, 'ok', JSON.stringify(ok))
+
+    const roots = { roots: {} }
+    const bad = await retry('where', 'r', { roots: [{ uri: 'javascript:alert(1)' }] }, roots)
+    t.assert.strictEqual(bad.error?.code, INVALID_PARAMS, JSON.stringify(bad))
+    const good = await retry('where', 'r', { roots: [{ uri: 'file:///home', name: 'home' }] }, roots)
+    t.assert.strictEqual(good.result?.content[0].text, 'ok', JSON.stringify(good))
+  })
+
+  test('an initialize whose Mcp-Method header disagrees with the body is a HeaderMismatch', async (t: TestContext) => {
+    const app = await buildServer(t)
+    const response = await app.inject({
+      method: 'POST',
+      url: '/mcp',
+      headers: { 'mcp-protocol-version': LATEST_PROTOCOL_VERSION, 'mcp-method': 'tools/call', 'mcp-name': 'evil' },
+      payload: {
+        jsonrpc: JSONRPC_VERSION,
+        id: 1,
+        method: 'initialize',
+        params: { protocolVersion: LATEST_LEGACY_PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: 'c', version: '1' } }
+      }
+    })
+    t.assert.strictEqual(response.statusCode, 400, response.body)
+    t.assert.strictEqual(response.json().error.code, HEADER_MISMATCH)
+    t.assert.strictEqual(response.headers['mcp-session-id'], undefined)
+  })
+
+  test('an extension declared with something other than a settings object is refused', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'job', inputSchema: Type.Object({}), execution: { taskSupport: 'optional' } } as any, async () => ({ content: [] }))
+    }, { enableTasks: true })
+    for (const settings of [null, 'yes']) {
+      const response = await call(app, 'tools/call', { params: { name: 'job', arguments: {} }, capabilities: { extensions: { [TASKS_EXTENSION]: settings } } as any })
+      t.assert.strictEqual(response.statusCode, 400, response.body)
+      t.assert.strictEqual(response.json().error.code, INVALID_PARAMS)
+    }
+  })
+})

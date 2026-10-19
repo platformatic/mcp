@@ -355,3 +355,40 @@ describe('Session owner binding', () => {
     t.assert.strictEqual((await store.get('s2'))?.ownerIss, undefined)
   })
 })
+
+describe('round 12: session owners include the OAuth client and a string subject', () => {
+  const trusted = { sub: 'alice', client_id: 'trusted-app' }
+  const other = { sub: 'alice', client_id: 'other-app' }
+
+  test('another app acting for the same user cannot use the session', async (t: TestContext) => {
+    await assertHijackRejected(t, undefined, undefined, trusted, other)
+  })
+
+  testWithRedis('another app acting for the same user cannot use the session (redis)', async (redis, t: TestContext) => {
+    await assertHijackRejected(t, redis, undefined, trusted, other)
+  })
+
+  test('the same app keeps using its session', async (t: TestContext) => {
+    const app = await buildApp(t)
+    const sessionId = await initialize(app, createTestJWT(trusted))
+    const response = await callWhoami(app, createTestJWT(trusted), sessionId)
+    t.assert.strictEqual(response.statusCode, 200, response.body)
+  })
+
+  test('a token whose sub is not a string opens no session', async (t: TestContext) => {
+    const app = await buildApp(t)
+    const response = await app.inject({
+      method: 'POST',
+      url: '/mcp',
+      headers: { authorization: `Bearer ${createTestJWT({ sub: 12345 } as any)}` },
+      payload: {
+        jsonrpc: JSONRPC_VERSION,
+        id: 1,
+        method: 'initialize',
+        params: { protocolVersion: LATEST_LEGACY_PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: 'test', version: '1.0.0' } }
+      }
+    })
+    t.assert.strictEqual(response.statusCode, 401, response.body)
+    t.assert.strictEqual(response.headers['mcp-session-id'], undefined)
+  })
+})

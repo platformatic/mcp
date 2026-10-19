@@ -65,6 +65,16 @@ function invalidRequest (): JSONRPCError {
 /** How long stop() waits for listen streams to write their teardown frames. */
 const LISTEN_FLUSH_MS = 1000
 
+/**
+ * How long stop() lets requests already read finish before cancelling them.
+ * Closing stdin is how a client asks for a graceful shutdown, often right
+ * after writing its last request, which still deserves its answer.
+ */
+const REQUEST_DRAIN_MS = 1000
+
+/** Why a request was aborted when the client cancelled it: it gets no response. */
+class CancelledByClient extends Error {}
+
 /** A request id as a map key: `1` and `"1"` are different requests. */
 function requestKey (id: string | number): string {
   return `${typeof id}:${id}`
@@ -81,6 +91,8 @@ export class StdioTransport {
   private inFlight = new Map<string, AbortController>()
   /** Open `subscriptions/listen` streams, settled once each has been forwarded to the end. */
   private listens = new Map<AbortController, Promise<void>>()
+  /** Every message being processed other than listen streams, which never end on their own. */
+  private processing = new Set<Promise<unknown>>()
   // There is no session over stdio, so the transport itself has to remember
   // what a legacy `initialize` agreed on and echo it like an HTTP client would.
   private protocolVersion: string | undefined
@@ -192,6 +204,19 @@ export class StdioTransport {
       this.readline.close()
     }
 
+    // Let what was already read finish and be answered, for a while.
+    if (this.processing.size > 0) {
+      const deadline = Date.now() + REQUEST_DRAIN_MS
+      while (this.processing.size > 0 && Date.now() < deadline) {
+        let timer: NodeJS.Timeout | undefined
+        await Promise.race([
+          Promise.allSettled(this.processing),
+          new Promise<void>(resolve => { timer = setTimeout(resolve, deadline - Date.now()) })
+        ])
+        clearTimeout(timer)
+      }
+    }
+
     // Cancel what is still running, so handlers stop rather than outlive the
     // resources app.close() tears down. Listen streams are left open: closing
     // the app ends each one gracefully (notifications/cancelled, then the
@@ -270,7 +295,7 @@ export class StdioTransport {
     if ((message as { method?: string }).method === 'notifications/cancelled') {
       const requestId = (message as { params?: { requestId?: unknown } }).params?.requestId
       if (typeof requestId === 'string' || typeof requestId === 'number') {
-        this.inFlight.get(requestKey(requestId))?.abort(new Error('cancelled by the client'))
+        this.inFlight.get(requestKey(requestId))?.abort(new CancelledByClient('cancelled by the client'))
       }
     }
 
@@ -310,7 +335,17 @@ export class StdioTransport {
    * as it arrives, rather than after it ends, which a subscription never does
    * on its own.
    */
-  private async processMessage (message: JSONRPCMessage): Promise<JSONRPCResponse | JSONRPCError | null> {
+  private processMessage (message: JSONRPCMessage): Promise<JSONRPCResponse | JSONRPCError | null> {
+    const processed = this.runMessage(message)
+    if ((message as { method?: string }).method !== 'subscriptions/listen') {
+      const settled = processed.then(() => {}, () => {})
+      this.processing.add(settled)
+      settled.finally(() => this.processing.delete(settled))
+    }
+    return processed
+  }
+
+  private async runMessage (message: JSONRPCMessage): Promise<JSONRPCResponse | JSONRPCError | null> {
     // Check before inject re-serializes the message: an id such as 1e400
     // parses to Infinity, which JSON.stringify would turn into null, and an
     // unsafe integer would come back as a different id.
@@ -369,7 +404,8 @@ export class StdioTransport {
 
       let body = ''
       for await (const chunk of stream) body += chunk
-      if (cancel.signal.aborted) return null
+      // Stopped by a shutdown rather than the client, the request is still answered.
+      if (cancel.signal.reason instanceof CancelledByClient) return null
       if (response.statusCode === 202 || body === '') return null
 
       // Only JSON-RPC goes to stdout. A plain HTTP error from Fastify or a
@@ -406,7 +442,7 @@ export class StdioTransport {
         }
       }
     } catch (error) {
-      if (cancel.signal.aborted || id === undefined) return null
+      if (cancel.signal.reason instanceof CancelledByClient || id === undefined) return null
       this.logError('Error processing message via inject:', error)
 
       // Return a generic error response

@@ -6,7 +6,7 @@
 
 import type { AuthorizationContext } from './types/auth-types.ts'
 import type { MCPPluginOptions } from './types.ts'
-import type { TaskOutcome, TaskStore } from './stores/task-store.ts'
+import type { TaskOutcome, TaskStore, TaskWaiters } from './stores/task-store.ts'
 import { JSONRPC_VERSION, INTERNAL_ERROR } from './schema.ts'
 
 const DEFAULT_TASK_MAX_CONCURRENT = 1000
@@ -152,8 +152,10 @@ export function isRunningHere (store: TaskStore, taskId: string): boolean {
  * Stop taking new tasks and let running ones finish, for up to `timeoutMs`.
  * Whatever is still running then is aborted through its signal and recorded
  * as failed, so a restart never leaves a task `working` until its ttl.
+ * `tasks/result` requests waiting here are told at once, so they answer
+ * before the server closes rather than on a poll that comes too late.
  */
-export async function drainTasks (store: TaskStore, timeoutMs: number): Promise<void> {
+export async function drainTasks (store: TaskStore, timeoutMs: number, waiters?: TaskWaiters): Promise<void> {
   const registry = registries.get(store)
   if (!registry) return
   registry.closing = true
@@ -171,12 +173,13 @@ export async function drainTasks (store: TaskStore, timeoutMs: number): Promise<
   // A handler that ignores its signal is still running; record the outcome for it.
   for (const taskId of registry.live.keys()) {
     try {
-      await store.updateStatus(taskId, 'failed', {
+      const failed = await store.updateStatus(taskId, 'failed', {
         statusMessage: SHUTTING_DOWN,
         outcome: SHUTDOWN_OUTCOME,
         inputRequests: null,
         clearPendingInputResponses: true
       })
+      if (failed) waiters?.notify(failed)
     } catch {
       // already terminal
     }
