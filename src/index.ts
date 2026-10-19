@@ -15,6 +15,7 @@ import type { MCPPluginOptions, MCPTool, MCPResource, MCPPrompt, ResourceHandler
 import pubsubDecorators from './decorators/pubsub.ts'
 import metaDecorators from './decorators/meta.ts'
 import routes from './routes/mcp.ts'
+import type { SessionLifecycle } from './routes/mcp.ts'
 import wellKnownRoutes from './routes/well-known.ts'
 import { TokenValidator } from './auth/token-validator.ts'
 import { createAuthPreHandler } from './auth/prehandler.ts'
@@ -182,32 +183,8 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
   // Local stream management per server instance
   const localStreams = new Map<string, Set<any>>()
 
-  // Redis expires idle sessions itself through key TTLs. The memory store has no
-  // such mechanism, so sweep it periodically: otherwise every session a client
-  // abandons without DELETE would stay in memory forever. Reads already treat an
-  // expired session as gone; this sweep is what actually frees the memory.
-  let sessionCleanupTimer: NodeJS.Timeout | undefined
-  if (sessionStore instanceof MemorySessionStore) {
-    const memoryStore = sessionStore
-    const sweep = async () => {
-      await memoryStore.cleanup()
-      // An SSE session created by POST that never opened a stream keeps an empty
-      // stream set and a broker subscription; drop both once the session is gone
-      for (const [sessionId, streams] of localStreams) {
-        if (streams.size === 0 && !(await memoryStore.get(sessionId))) {
-          localStreams.delete(sessionId)
-          await messageBroker.unsubscribe(`mcp/session/${sessionId}/message`)
-        }
-      }
-    }
-    sessionCleanupTimer = setInterval(() => {
-      sweep().catch((err: unknown) => {
-        app.log.error({ err }, 'Failed to clean up expired sessions')
-      })
-    }, Math.min(memoryStore.sessionTtlMs, 60_000))
-    // Never keep the process alive just to sweep sessions
-    sessionCleanupTimer.unref()
-  }
+  // Filled in by the routes plugin, which owns the SSE streams
+  const sessionLifecycle: SessionLifecycle = {}
 
   // Initialize authorization components if enabled
   let tokenValidator: TokenValidator | null = null
@@ -282,37 +259,18 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     shutdownSignal: shutdownController.signal,
     taskLeases,
     jsonSchemaValidator,
-    authPreHandler: mcpAuthPreHandler
+    authPreHandler: mcpAuthPreHandler,
+    sessionLifecycle
   })
 
   // Add close hook to clean up Redis connections and authorization components
   app.addHook('onClose', async () => {
-    clearInterval(sessionCleanupTimer)
-
     // Tasks still running here are abandoned: stop vouching for them so their
     // leases lapse and other instances report them failed.
     taskLeases?.close()
 
-    // Clean up all SSE streams and sessions
-    const unsubscribePromises: Promise<void>[] = []
-    for (const [sessionId, streams] of localStreams.entries()) {
-      for (const stream of streams) {
-        try {
-          if (stream.raw && !stream.raw.destroyed) {
-            stream.raw.destroy()
-          }
-        } catch (error) {
-          app.log.debug({ error, sessionId }, 'Error destroying SSE stream')
-        }
-      }
-      streams.clear()
-      // Collect unsubscribe promises for parallel execution
-      unsubscribePromises.push(messageBroker.unsubscribe(`mcp/session/${sessionId}/message`))
-    }
-    localStreams.clear()
-
-    // Execute all unsubscribes in parallel
-    await Promise.all(unsubscribePromises)
+    // Close every SSE stream and drop the session subscriptions
+    await sessionLifecycle.close?.()
 
     try {
       await messageBroker.close()

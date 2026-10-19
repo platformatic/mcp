@@ -987,6 +987,11 @@ app.mcpSendToSession('session-xyz', {
 })
 ```
 
+**How session messages are delivered:**
+- `mcpSendToSession` (and everything built on it: elicitation, task status updates) first records the message in the session's history, then publishes it on `mcp/session/<id>/message`. It returns `false` if the session is gone or the message could not be recorded.
+- An instance subscribes to that topic only while it holds one of the session's GET streams, wherever the session was created. A message sent while no stream is open is not lost: the client gets it on its next GET with `Last-Event-ID`.
+- `DELETE /mcp` ends the session's streams on every instance. Streams and subscriptions held for a session that expired, or was deleted elsewhere, are released by a periodic sweep that runs with both backends.
+
 ### Implementation Design Decisions
 
 This plugin implements certain behaviors that differ from the strict MCP specification to provide enhanced scalability and resilience in production environments:
