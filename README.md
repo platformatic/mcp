@@ -1843,8 +1843,7 @@ clients can discover them.
 
 - `GET /.well-known/oauth-protected-resource` - OAuth 2.0 Protected Resource Metadata (RFC 9728). Its `resource` field is `resourceUri`.
 - `GET /.well-known/oauth-protected-resource{path}` - Same metadata, served when `resourceUri` has a path (e.g. `resourceUri: 'https://mcp.example.com/mcp'` is served at `/.well-known/oauth-protected-resource/mcp`). This is the URL advertised in the `resource_metadata` parameter of `WWW-Authenticate` challenges, as required by RFC 9728 §3.1, and its `resource` field equals `resourceUri` exactly.
-- `GET /.well-known/oauth-protected-resource/mcp` - Legacy MCP-specific metadata route, kept for backwards compatibility. Its `resource` field is `resourceUri` with `/mcp` appended. When `resourceUri` already ends in `/mcp`, this path is the RFC 9728 route above instead.
-- `GET /.well-known/openid-configuration/mcp` - OpenID Connect style discovery document built from the first entry of `authorizationServers`, plus `mcp_resource_uri` and `mcp_authorization_servers`
+- `GET /.well-known/oauth-protected-resource/mcp` - Legacy MCP-specific metadata route, kept for backwards compatibility. Its `resource` field is `resourceUri`, the only audience the server accepts, so a client that discovers it by path insertion for an endpoint at `/mcp` obtains tokens the server takes. When `resourceUri` already ends in `/mcp`, this path is the RFC 9728 route above instead. To advertise a resource identifier of `https://host/mcp`, set `resourceUri` to it.
 - `GET /.well-known/mcp-resource-health` - Health check for the resource server: `{ status: 'healthy', resource, timestamp }`
 
 Authorization server metadata is not served by this plugin. Clients discover it from the authorization servers listed in `authorization_servers` of the protected resource metadata (RFC 8414 / OpenID Connect Discovery on the authorization server itself).
@@ -2388,8 +2387,7 @@ Registered only when authorization is enabled, and always unauthenticated:
 
 - `GET /.well-known/oauth-protected-resource`: OAuth 2.0 Protected Resource Metadata (RFC 9728)
 - `GET /.well-known/oauth-protected-resource{path}`: Same metadata at the RFC 9728 §3.1 location when `resourceUri` has a path
-- `GET /.well-known/oauth-protected-resource/mcp`: Legacy MCP-specific protected resource metadata
-- `GET /.well-known/openid-configuration/mcp`: OpenID Connect style discovery document
+- `GET /.well-known/oauth-protected-resource/mcp`: Legacy MCP-specific protected resource metadata (its `resource` is `resourceUri`)
 - `GET /.well-known/mcp-resource-health`: Resource server health check
 
 The plugin does not register a `/health` route; add your own if you need one.
