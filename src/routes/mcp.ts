@@ -23,6 +23,7 @@ import { processMessage, checkRequestId } from '../handlers.ts'
 import { isStdioRequest } from '../stdio-marker.ts'
 import { appendToHistory, publishSessionTerminated, SessionTopicSubscriptions } from '../session-topic.ts'
 import type { SessionTopicPayload } from '../session-topic.ts'
+import { ResourceSubscriptionHolders } from '../resource-subscription-holders.ts'
 
 const MAX_TIMER_DELAY_MS = 2 ** 31 - 1
 
@@ -334,6 +335,25 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
   }
 
   const streamStates = new WeakMap<FastifyReply, StreamState>()
+  const resourceHolders = new ResourceSubscriptionHolders()
+
+  /**
+   * A session stopped holding some URIs without asking (DELETE, expiry, or an
+   * unsubscribe handled by another instance): run the unsubscribe handler for
+   * each URI no other session on this instance still holds.
+   */
+  async function releaseResourceSubscriptions (sessionId: string, uris?: string[], authContext?: AuthorizationContext): Promise<void> {
+    const released = resourceHolders.release(sessionId, uris)
+    const handler = resourceHandlers.unsubscribeHandler
+    if (!handler) return
+    for (const uri of released) {
+      try {
+        await handler({ uri }, { sessionId, authContext })
+      } catch (error) {
+        app.log.error({ err: error, sessionId, uri }, 'Resource unsubscribe handler failed while releasing a session subscription')
+      }
+    }
+  }
 
   // This instance is subscribed to a session's topic exactly while it holds one
   // of the session's streams; the subscription is what lets a stream on any
@@ -353,6 +373,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
   async function onSessionTopicMessage (sessionId: string, payload: SessionTopicPayload): Promise<void> {
     if (payload.kind === 'terminated') {
       endLocalStreams(sessionId)
+      await releaseResourceSubscriptions(sessionId)
       return
     }
 
@@ -545,6 +566,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
           shutdownSignal,
           taskLeases,
           jsonSchemaValidator,
+          resourceHolders,
           sessionId,
           protocolVersion: (request as any).mcpProtocolVersion ?? DEFAULT_NEGOTIATED_PROTOCOL_VERSION
         })
@@ -762,6 +784,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
       // End this instance's streams, and tell the others to end theirs
       endLocalStreams(sessionId)
+      await releaseResourceSubscriptions(sessionId, undefined, session.authorization)
       if (enableSSE) {
         try {
           await publishSessionTerminated(messageBroker, sessionId)
@@ -820,6 +843,23 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
       if (!(await sessionStore.get(sessionId))) {
         app.log.info({ sessionId }, 'Session is gone, closing its SSE streams')
         endLocalStreams(sessionId)
+      }
+    }
+
+    // Resource subscriptions this instance ran the subscribe handler for, whose
+    // session ended or which were unsubscribed through another instance. The
+    // snapshot is taken before reading the store: a subscribe is recorded in the
+    // store before it is recorded here, so it cannot look stale.
+    for (const [sessionId, uris] of resourceHolders.entries()) {
+      const session = await sessionStore.get(sessionId)
+      if (!session) {
+        await releaseResourceSubscriptions(sessionId, uris)
+        continue
+      }
+      const stored = new Set(session.resourceSubscriptions ?? [])
+      const stale = uris.filter(uri => !stored.has(uri))
+      if (stale.length > 0) {
+        await releaseResourceSubscriptions(sessionId, stale, session.authorization)
       }
     }
   }

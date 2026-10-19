@@ -2333,6 +2333,11 @@ app.mcpAddPrompt({
 - `app.mcpBroadcastNotification(notification)`: Broadcast a notification to all connected SSE clients (works across Redis instances). `notifications/resources/updated` only reaches sessions subscribed to its `params.uri`
 - `app.mcpSendToSession(sessionId, message)`: Send a message/request to a specific SSE session (works across Redis instances)
 
+### Resource Subscription Handlers
+
+- `app.mcpSetResourceSubscribeHandler(handler)`: called for every `resources/subscribe`; its return value is the response result.
+- `app.mcpSetResourceUnsubscribeHandler(handler)`: called for every `resources/unsubscribe`. It is also called when a session ends without unsubscribing (DELETE, or idle expiry), for each URI it held, but only on the instance that ran the subscribe handler and only once no other session on that instance still holds the URI. In that case there is no request to answer, so `context.request` and `context.reply` are undefined (`ResourceUnsubscribeContext`). Expiry, and sessions deleted or unsubscribed through another instance, are picked up by a periodic sweep (at most every `min(sessionTtlMs, 60s)`).
+
 ## Handler API Reference
 
 All MCP handlers follow a consistent pattern where the context parameter is always provided as the final parameter:

@@ -43,9 +43,20 @@ export type ResourceSubscribeHandler = (
   context: HandlerContext
 ) => Promise<Record<string, unknown>> | Record<string, unknown>
 
+/**
+ * Context for the unsubscribe handler. Besides explicit `resources/unsubscribe`
+ * requests, the handler also runs when a session ends (DELETE or expiry) and
+ * was the last one on this instance holding the URI; then there is no request
+ * to answer, so `request` and `reply` are absent.
+ */
+export interface ResourceUnsubscribeContext extends Omit<HandlerContext, 'request' | 'reply'> {
+  request?: FastifyRequest
+  reply?: FastifyReply
+}
+
 export type ResourceUnsubscribeHandler = (
   params: { uri: string },
-  context: HandlerContext
+  context: ResourceUnsubscribeContext
 ) => Promise<Record<string, unknown>> | Record<string, unknown>
 
 // Resource handlers container

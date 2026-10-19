@@ -350,6 +350,7 @@ export type {
   ResourceHandlers,
   ResourceSubscribeHandler,
   ResourceUnsubscribeHandler,
+  ResourceUnsubscribeContext,
   TracerLike
 } from './types.ts'
 
