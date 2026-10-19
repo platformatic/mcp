@@ -1256,6 +1256,9 @@ async function handleTasksResult (
   })
 }
 
+/** How many lease checks one tasks/list page runs against the store at once */
+const TASK_LIST_LEASE_CHECK_CONCURRENCY = 8
+
 async function handleTasksList (
   request: JSONRPCRequest,
   dependencies: HandlerDependencies
@@ -1297,8 +1300,17 @@ async function handleTasksList (
     }
     throw err
   }
+  // Same owner-lost check as tasks/get, so a task whose instance died reads
+  // `failed` here too rather than `working` until its ttl. Done here, not in
+  // the store, so every backend gets it and waiters on this instance wake up.
+  const checked = await mapWithConcurrency(
+    page.tasks,
+    TASK_LIST_LEASE_CHECK_CONCURRENCY,
+    task => failIfOwnerLost(task, dependencies)
+  )
   const result: ListTasksResult = {
-    tasks: page.tasks.map(toWireTask),
+    // A task deleted while being checked is simply gone from the page
+    tasks: checked.filter((task): task is TaskRecord => task !== null).map(toWireTask),
     nextCursor: page.nextCursor
   }
   return createResponse(request.id, result)
