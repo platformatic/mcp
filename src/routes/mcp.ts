@@ -1150,6 +1150,21 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
           return
         }
 
+        // Access is only checked when the stream opens, so the stream ends
+        // when the identity that opened it expires. One that has already
+        // expired would be closed at once and reopened in a tight loop.
+        const authContext = await authContextFrom(request)
+        const expiresAt = authContext?.expiresAt instanceof Date ? authContext.expiresAt.getTime() : undefined
+        if (expiresAt !== undefined && Number.isFinite(expiresAt) && expiresAt <= Date.now()) {
+          // Shaped like every other 401 when this plugin runs OAuth, so the
+          // client finds the metadata it needs to re-authorize.
+          if (opts.authorization?.enabled) {
+            reply.header('WWW-Authenticate', generateWWWAuthenticateHeader(opts.authorization, { error: 'invalid_token', error_description: 'The access token expired' }))
+          }
+          reply.code(401).type('application/json').send({ error: 'Unauthorized: the access token expired' })
+          return
+        }
+
         request.log.info({ sessionId }, 'Handling SSE request')
 
         // Find or create the session before taking the reply over, so a store
@@ -1221,9 +1236,9 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         // stream into a polling channel. The client reconnects with Last-Event-ID
         // on GET and we replay whatever it missed, so closing here loses nothing.
         // Access is only checked when the stream opens, so never let it outlive the
-        // token that opened it: close at exp and the client reconnects with a fresh one.
-        const tokenExp = request.tokenPayload?.exp
-        const msUntilTokenExp = typeof tokenExp === 'number' ? Math.max(0, tokenExp * 1000 - Date.now()) : undefined
+        // identity that opened it: close when it expires (the token's exp, or the
+        // resolver's expiresAt) and the client reconnects with a fresh one.
+        const msUntilTokenExp = expiresAt !== undefined && Number.isFinite(expiresAt) ? Math.max(0, expiresAt - Date.now()) : undefined
         let closeAfterMs = opts.sseMaxConnectionMs || undefined
         let closeReason = 'Closing SSE stream to let the client poll; it may resume with Last-Event-ID'
         if (msUntilTokenExp !== undefined && (closeAfterMs === undefined || msUntilTokenExp < closeAfterMs)) {
