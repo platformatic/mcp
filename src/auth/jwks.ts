@@ -45,6 +45,8 @@ export class JwksCache {
 
   /** The PEM public key for `kid` and `alg`, or an error when the set has none. */
   async getPublicKey (kid: string | undefined, alg: string | undefined): Promise<string> {
+    // A fetch already under way may bring the key (a cold start, a rotation).
+    if (this.refreshing) await this.refreshKeepingOld()
     if (Date.now() - this.fetchedAt >= this.ttlMs) {
       await this.refreshKeepingOld()
     }

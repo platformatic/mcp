@@ -1057,7 +1057,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         const repeated = repeatedMirroredHeader(request.raw.rawHeaders)
         const headerCheck = repeated !== undefined
           ? { ok: false as const, message: `Header mismatch: ${repeated} must be sent only once` }
-          : validateStandardHeaders(request.headers, legacyRequest.method, legacyRequest.params)
+          : validateStandardHeaders(request.headers, legacyRequest.method, legacyRequest.params, { requirePresent: false })
         if (!headerCheck.ok) {
           reply.code(400).type('application/json')
           return createError('id' in legacyRequest ? legacyRequest.id : null, HEADER_MISMATCH, headerCheck.message)

@@ -8,6 +8,7 @@ import type { AuthorizationContext } from './types/auth-types.ts'
 import type { MCPPluginOptions } from './types.ts'
 import type { TaskOutcome, TaskStore, TaskWaiters } from './stores/task-store.ts'
 import { JSONRPC_VERSION, INTERNAL_ERROR } from './schema.ts'
+import { identifiesUser } from './principal.ts'
 
 const DEFAULT_TASK_MAX_CONCURRENT = 1000
 const DEFAULT_TASK_MAX_PER_PRINCIPAL = 100
@@ -67,7 +68,7 @@ function registryFor (store: object): TaskRegistry {
  * out all the others.
  */
 export function quotaKeyOf (authContext: AuthorizationContext | undefined): string | undefined {
-  if (authContext?.userId === undefined) return undefined
+  if (!identifiesUser(authContext)) return undefined
   return JSON.stringify([authContext.userId, authContext.authorizationServer ?? null])
 }
 

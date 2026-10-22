@@ -163,19 +163,21 @@ export function expectedNameFor (method: string, params: unknown): string | unde
  *
  * `MCP-Protocol-Version` is checked separately because an unsupported version
  * has its own error code, and the two failures are reported differently.
+ * With `requirePresent: false` (legacy revisions, which define no mirrored
+ * headers) only the headers actually sent are checked.
  */
 export function validateStandardHeaders (
   headers: IncomingHttpHeaders,
   method: string,
-  params: unknown
+  params: unknown,
+  { requirePresent = true }: { requirePresent?: boolean } = {}
 ): HeaderCheck {
   const methodHeader = readMirroredHeader(headers, 'mcp-method', 'Mcp-Method', false)
   if (!methodHeader.ok) return methodHeader
   const mcpMethod = methodHeader.value
   if (mcpMethod === undefined) {
-    return { ok: false, message: 'Missing required Mcp-Method header' }
-  }
-  if (mcpMethod !== method) {
+    if (requirePresent) return { ok: false, message: 'Missing required Mcp-Method header' }
+  } else if (mcpMethod !== method) {
     return {
       ok: false,
       message: `Header mismatch: Mcp-Method header value '${mcpMethod}' does not match body value '${method}'`
@@ -195,7 +197,7 @@ export function validateStandardHeaders (
     // Required for this method regardless of what the body contains — a body
     // that omits `name`/`uri` is malformed, but that is a separate failure and
     // must not excuse the missing header.
-    return { ok: false, message: 'Missing required Mcp-Name header' }
+    return requirePresent ? { ok: false, message: 'Missing required Mcp-Name header' } : { ok: true }
   }
 
   const expectedName = expectedNameFor(method, params)

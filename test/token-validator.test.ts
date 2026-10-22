@@ -907,3 +907,31 @@ describe('round 12: signing keys', () => {
     }
   })
 })
+
+describe('round 13: signing keys', () => {
+  test('tokens arriving while the key set is being fetched wait for it', async (t: TestContext) => {
+    let fetches = 0
+    let keys: unknown[] = [{ ...generateMockJWKSResponse().keys[0], kid: 'old' }]
+    const server = createServer((_req, res) => {
+      fetches++
+      // Slow enough that the other callers arrive while it is in flight.
+      setTimeout(() => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ keys })) }, 100)
+    })
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+    t.after(() => server.close())
+    const { port } = server.address() as { port: number }
+    const cache = new JwksCache(`http://127.0.0.1:${port}/jwks.json`, { minRefreshMs: 50 })
+
+    // A cold start: nothing fetched yet.
+    const cold = await Promise.allSettled(Array.from({ length: 5 }, () => cache.getPublicKey('old', 'RS256')))
+    t.assert.deepStrictEqual(cold.map(result => result.status), Array(5).fill('fulfilled'))
+    t.assert.strictEqual(fetches, 1)
+
+    // A rotation: the first token naming the new key starts the fetch.
+    await new Promise(resolve => setTimeout(resolve, 60))
+    keys = [...keys, { ...generateMockJWKSResponse().keys[0], kid: 'new' }]
+    const rotated = await Promise.allSettled(Array.from({ length: 4 }, () => cache.getPublicKey('new', 'RS256')))
+    t.assert.deepStrictEqual(rotated.map(result => result.status), Array(4).fill('fulfilled'))
+    t.assert.strictEqual(fetches, 2)
+  })
+})

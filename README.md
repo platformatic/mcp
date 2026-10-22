@@ -480,7 +480,8 @@ app.mcpAddTool({
 
 Answers are checked before the handler sees them: each must be a result of the method it
 answered, and an accepted elicitation must match what was asked — content conforming to the
-form's `requestedSchema`, or no content for a URL-mode elicitation. A non-conforming answer is
+form's `requestedSchema`, or no content for a URL-mode elicitation. A form with no required
+fields (a plain confirmation) may be accepted without content, and the handler sees `content: {}`. A non-conforming answer is
 refused with `-32602`, on a retry and on `tasks/update` alike. Content sent with `decline` or
 `cancel` is not checked against the `requestedSchema` (only its shape is), so handlers should
 look at `action` first. Sampling answers must carry well-formed content blocks, `roots/list`
@@ -697,7 +698,7 @@ Both are sent only when the client asked for them, on the response stream of tha
 - `context.log(level, data, logger?)` emits `notifications/message` when the request sets
   `io.modelcontextprotocol/logLevel`, and only at or above that level.
 
-Notifications are held until the outcome is known, or until the handler has run for 200ms.
+Notifications are held until the outcome is known, or for 200ms after the first one is sent.
 A request that never reports, or that fails before then, answers with plain JSON and its
 proper status. Otherwise the response is a `text/event-stream` carrying the notifications and
 then the result. Once streaming has started the status is committed to `200`, so a later
@@ -2274,7 +2275,7 @@ await app.register(mcpPlugin, {
 The hook receives the tool name and a per-request context (`authContext`, `request`, `sessionId`, `operation`), and may be sync or async. It is consulted at both dispatch points, so list and call can never disagree:
 
 - `tools/list` omits every tool the hook denies for that request, calling the hook with `operation: 'list'`. Per-tool checks run concurrently with a fixed cap (8 at a time), so an async hook backed by a database or HTTP service is not flooded with one lookup per registered tool; the listing keeps registration order.
-- `tools/call` on a denied tool returns the same `-32602` (Invalid params) "Tool 'name' not found" protocol error as an unknown tool, calling the hook with `operation: 'call'`. The hook runs even for unknown names, so callers cannot probe for tools they are not allowed to see by response shape. Response timing is not guaranteed to be indistinguishable — it depends on what the hook itself does per name. Task-augmented calls (`task` field) and `app.mcpCallTool()` also use `operation: 'call'`.
+- `tools/call` on a denied tool returns the same `-32602` (Invalid params) protocol error as an unknown tool ("Unknown tool: name" on 2026-07-28, "Tool 'name' not found" on earlier revisions), calling the hook with `operation: 'call'`. The hook runs even for unknown names, so callers cannot probe for tools they are not allowed to see by response shape. Response timing is not guaranteed to be indistinguishable — it depends on what the hook itself does per name. Task-augmented calls (`task` field) and `app.mcpCallTool()` also use `operation: 'call'`.
 
 Visibility and execution policies may intentionally differ — a tool hidden from `tools/list` can still be callable by a client that already knows its name.
 
@@ -2864,7 +2865,7 @@ app.mcpAddTool({
 
 Resource and prompt handlers also receive the same context object as tool handlers, enabling access to HTTP context and authorization information:
 
-When `uriPattern` contains `{name}` placeholders (an RFC 6570 level-1 template), `resources/read` for a concrete URI such as `context://data/42` is routed to it, and the values are available as `context.uriParams` (`{ id: '42' }`). Each placeholder matches a single non-empty segment that does not contain `/`; an exact `uri` registration always takes precedence over a template.
+When `uriPattern` contains `{name}` placeholders (an RFC 6570 level-1 template), `resources/read` for a concrete URI such as `context://data/42` is routed to it, and the values are available as `context.uriParams` (`{ id: '42' }`). Each placeholder matches a single non-empty segment of the URI as sent, and its value is percent-decoded, so `context://files/..%2Fsecret` yields `{ name: '../secret' }`: a decoded value can contain `/` or `..`, and a handler that maps it onto a path must validate it. An exact `uri` registration always takes precedence over a template.
 
 ```typescript
 // Resource handler with context

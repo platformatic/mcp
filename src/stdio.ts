@@ -72,6 +72,12 @@ const LISTEN_FLUSH_MS = 1000
  */
 const REQUEST_DRAIN_MS = 1000
 
+/**
+ * After the drain, how long requests aborted by the shutdown get to be
+ * answered before the app closes.
+ */
+const ABORT_GRACE_MS = 500
+
 /** Why a request was aborted when the client cancelled it: it gets no response. */
 class CancelledByClient extends Error {}
 
@@ -205,17 +211,7 @@ export class StdioTransport {
     }
 
     // Let what was already read finish and be answered, for a while.
-    if (this.processing.size > 0) {
-      const deadline = Date.now() + REQUEST_DRAIN_MS
-      while (this.processing.size > 0 && Date.now() < deadline) {
-        let timer: NodeJS.Timeout | undefined
-        await Promise.race([
-          Promise.allSettled(this.processing),
-          new Promise<void>(resolve => { timer = setTimeout(resolve, deadline - Date.now()) })
-        ])
-        clearTimeout(timer)
-      }
-    }
+    await this.settleProcessing(REQUEST_DRAIN_MS)
 
     // Cancel what is still running, so handlers stop rather than outlive the
     // resources app.close() tears down. Listen streams are left open: closing
@@ -224,6 +220,8 @@ export class StdioTransport {
     for (const cancel of this.inFlight.values()) {
       if (!this.listens.has(cancel)) cancel.abort(new Error('stdio transport closed'))
     }
+    // A handler that honours its signal still answers, so give it a moment.
+    await this.settleProcessing(ABORT_GRACE_MS)
 
     // Close the Fastify app gracefully
     try {
@@ -243,6 +241,19 @@ export class StdioTransport {
       ])
       clearTimeout(timer)
       for (const cancel of this.listens.keys()) cancel.abort(new Error('stdio transport closed'))
+    }
+  }
+
+  /** Wait until every non-listen message has been answered, or `timeoutMs` passes. */
+  private async settleProcessing (timeoutMs: number): Promise<void> {
+    const deadline = Date.now() + timeoutMs
+    while (this.processing.size > 0 && Date.now() < deadline) {
+      let timer: NodeJS.Timeout | undefined
+      await Promise.race([
+        Promise.allSettled(this.processing),
+        new Promise<void>(resolve => { timer = setTimeout(resolve, deadline - Date.now()) })
+      ])
+      clearTimeout(timer)
     }
   }
 
@@ -290,18 +301,22 @@ export class StdioTransport {
       return
     }
 
-    // On stdio there is no response stream to close: the client cancels with
-    // a notification, after which nothing more may be sent for that request.
-    if ((message as { method?: string }).method === 'notifications/cancelled') {
-      const requestId = (message as { params?: { requestId?: unknown } }).params?.requestId
-      if (typeof requestId === 'string' || typeof requestId === 'number') {
-        this.inFlight.get(requestKey(requestId))?.abort(new CancelledByClient('cancelled by the client'))
-      }
-    }
-
+    this.applyCancellation(message)
     const response = await this.processMessage(message)
     if (response) {
       this.sendMessage(response)
+    }
+  }
+
+  /**
+   * On stdio there is no response stream to close: the client cancels with a
+   * notification, after which nothing more may be sent for that request.
+   */
+  private applyCancellation (message: JSONRPCMessage): void {
+    if ((message as { method?: string }).method !== 'notifications/cancelled') return
+    const requestId = (message as { params?: { requestId?: unknown } }).params?.requestId
+    if (typeof requestId === 'string' || typeof requestId === 'number') {
+      this.inFlight.get(requestKey(requestId))?.abort(new CancelledByClient('cancelled by the client'))
     }
   }
 
@@ -316,6 +331,7 @@ export class StdioTransport {
         responses.push(invalidRequest())
         continue
       }
+      this.applyCancellation(message)
       const response = await this.processMessage(message)
       if (response) {
         responses.push(response)
@@ -391,12 +407,21 @@ export class StdioTransport {
       if (String(response.headers['content-type'] ?? '').startsWith('text/event-stream')) {
         // Cancelled before the stream even arrived: the listener below would
         // never fire on an already-aborted signal, so close it now.
-        if (cancel.signal.aborted) {
+        if (cancel.signal.reason instanceof CancelledByClient || (isListen && cancel.signal.aborted)) {
           stream.destroy()
           return null
         }
-        cancel.signal.addEventListener('abort', () => stream.destroy(), { once: true })
-        const forwarded = this.forwardEvents(stream, cancel.signal)
+        // A listen stops on any abort. Any other stream stops only when the
+        // client cancelled it: one stopped by a shutdown still ends with its
+        // response, like a request answered with plain JSON.
+        const stopped = isListen ? cancel : new AbortController()
+        if (!isListen) {
+          cancel.signal.addEventListener('abort', () => {
+            if (cancel.signal.reason instanceof CancelledByClient) stopped.abort(cancel.signal.reason)
+          }, { once: true })
+        }
+        stopped.signal.addEventListener('abort', () => stream.destroy(), { once: true })
+        const forwarded = this.forwardEvents(stream, stopped.signal)
         if (isListen) this.listens.set(cancel, forwarded)
         await forwarded
         return null

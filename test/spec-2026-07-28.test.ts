@@ -5668,3 +5668,123 @@ describe('round 12: stdin close, listen reconnects, answer shapes and mirrored h
     }
   })
 })
+
+describe('round 13: stdio shutdown and batches, partial mirrored headers, empty forms and anonymous tasks', () => {
+  test('a request streaming progress when stdin closes is still answered', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'steps', inputSchema: Type.Object({}) }, async (_args: any, context: any) => {
+        for (let i = 1; i <= 100 && !context.signal.aborted; i++) {
+          await context.sendProgress(i, 100)
+          await new Promise(resolve => setTimeout(resolve, 50))
+        }
+        return { content: [{ type: 'text', text: `aborted ${context.signal.aborted}` }] }
+      })
+    })
+    const { transport, lines, send } = stdioPipe(t, app)
+    const body = modernBody('tools/call', { id: 'p', params: { name: 'steps', arguments: {} } }) as any
+    body.params._meta.progressToken = 7
+    send(body)
+    await until(() => lines.some(line => line.method === 'notifications/progress'))
+    await transport.stop()
+    const answer = lines.find(line => line.id === 'p')
+    t.assert.strictEqual(answer?.result?.content[0].text, 'aborted true', JSON.stringify(lines.slice(-2)))
+  })
+
+  test('a notifications/cancelled sent in a batch cancels the request', async (t: TestContext) => {
+    let aborted = false
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'slow', inputSchema: Type.Object({}) }, async (_args: any, context: any) => {
+        await new Promise<void>(resolve => {
+          const timer = setTimeout(resolve, 1_000)
+          context.signal.addEventListener('abort', () => { aborted = true; clearTimeout(timer); resolve() }, { once: true })
+        })
+        return { content: [{ type: 'text', text: 'finished' }] }
+      })
+    })
+    const { lines, send } = stdioPipe(t, app)
+    send(modernBody('tools/call', { id: 5, params: { name: 'slow', arguments: {} } }))
+    await new Promise(resolve => setTimeout(resolve, 100))
+    send([{ jsonrpc: JSONRPC_VERSION, method: 'notifications/cancelled', params: { requestId: 5 } }])
+    await until(() => aborted)
+    await new Promise(resolve => setTimeout(resolve, 100))
+    t.assert.strictEqual(lines.find(line => line.id === 5), undefined, JSON.stringify(lines))
+  })
+
+  test('a legacy request sending only one mirrored header that agrees with the body is served', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'echo', inputSchema: Type.Object({}) }, async () => ({ content: [{ type: 'text', text: 'ok' }] }))
+    })
+    const init = await app.inject({
+      method: 'POST',
+      url: '/mcp',
+      payload: {
+        jsonrpc: JSONRPC_VERSION,
+        id: 1,
+        method: 'initialize',
+        params: { protocolVersion: LATEST_LEGACY_PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: 'l', version: '1' } }
+      }
+    })
+    const legacyCall = (headers: Record<string, string>) => app.inject({
+      method: 'POST',
+      url: '/mcp',
+      headers: {
+        'mcp-session-id': init.headers['mcp-session-id'] as string,
+        'mcp-protocol-version': LATEST_LEGACY_PROTOCOL_VERSION,
+        ...headers
+      },
+      payload: { jsonrpc: JSONRPC_VERSION, id: 2, method: 'tools/call', params: { name: 'echo', arguments: {} } }
+    })
+    for (const headers of [{ 'mcp-name': 'echo' }, { 'mcp-method': 'tools/call' }] as Record<string, string>[]) {
+      const response = await legacyCall(headers)
+      t.assert.strictEqual(response.statusCode, 200, response.body)
+      t.assert.strictEqual(response.json().result?.content[0].text, 'ok')
+    }
+    const mismatch = await legacyCall({ 'mcp-name': 'other' })
+    t.assert.strictEqual(mismatch.statusCode, 400)
+    t.assert.strictEqual(mismatch.json().error.code, HEADER_MISMATCH)
+  })
+
+  test('a form with no required fields may be accepted without content', async (t: TestContext) => {
+    const seen: unknown[] = []
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'confirm', inputSchema: Type.Object({}) }, async (_args: any, context: any) => {
+        const answer = context.inputResponses?.ok
+        if (!answer) throw new InputRequired({ inputRequests: { ok: elicitForm('Proceed?', { type: 'object', properties: {} } as any) } })
+        seen.push(answer.content)
+        return { content: [{ type: 'text', text: answer.action }] }
+      })
+      app.mcpAddTool({ name: 'ask', inputSchema: Type.Object({}) }, async (_args: any, context: any) => {
+        const answer = context.inputResponses?.n
+        if (!answer) {
+          throw new InputRequired({ inputRequests: { n: elicitForm('Name?', { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] } as any) } })
+        }
+        return { content: [{ type: 'text', text: answer.action }] }
+      })
+    })
+    const capabilities = { elicitation: { form: {} } }
+    const retry = async (name: string, key: string) => {
+      const first = (await call(app, 'tools/call', { params: { name, arguments: {} }, capabilities })).json().result
+      return (await call(app, 'tools/call', {
+        id: 2,
+        capabilities,
+        params: { name, arguments: {}, requestState: first.requestState, inputResponses: { [key]: { action: 'accept' } } }
+      })).json()
+    }
+    const confirmed = await retry('confirm', 'ok')
+    t.assert.strictEqual(confirmed.result?.content[0].text, 'accept', JSON.stringify(confirmed))
+    t.assert.deepStrictEqual(seen, [{}])
+    const missing = await retry('ask', 'n')
+    t.assert.strictEqual(missing.error?.code, INVALID_PARAMS, JSON.stringify(missing))
+  })
+
+  test('callers whose user id is null are not one task owner', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'job', inputSchema: Type.Object({}), execution: { taskSupport: 'optional' } } as any, async () => ({ content: [{ type: 'text', text: 'private' }] }))
+    }, { enableTasks: true, resolveAuthorizationContext: async () => ({ userId: null }) })
+    const capabilities = { extensions: { [TASKS_EXTENSION]: {} } } as any
+    // Unidentified, the caller gets no task (nobody could be told apart from
+    // it later): the call simply runs.
+    const created = await call(app, 'tools/call', { params: { name: 'job', arguments: {} }, capabilities })
+    t.assert.strictEqual(created.json().result?.resultType, 'complete', created.body)
+  })
+})

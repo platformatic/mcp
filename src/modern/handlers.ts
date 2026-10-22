@@ -64,7 +64,7 @@ import { AnswerValidator, normalizeAnswerSchema } from './answer-validator.ts'
 import { collectHeaderParams, validateToolParamHeaders } from './headers.ts'
 import type { TaskRecord } from '../stores/task-store.ts'
 import { TASK_OWNER_LOST, TaskLimitError, isTerminal } from '../stores/task-store.ts'
-import { principalOf } from '../principal.ts'
+import { identifiesUser, principalOf } from '../principal.ts'
 import { validateElicitationRequest, validateElicitationUrl } from '../security.ts'
 import { NO_NOTIFIERS } from './request-stream.ts'
 import { TaskStopped, quotaKeyOf, reserveTask, setLongTimeout, setWaitingForInput } from '../task-registry.ts'
@@ -511,7 +511,8 @@ const answerValidator = new AnswerValidator()
 /**
  * What is wrong with an accepted elicitation's content, given what was asked:
  * a URL-mode elicitation is answered with no content, a form with content
- * matching its `requestedSchema`. A declined or cancelled one is not checked:
+ * matching its `requestedSchema`. An accepted form whose schema `{}` already
+ * satisfies may omit its content, which is filled in as `{}`. A declined or cancelled one is not checked:
  * its content is meaningless, and the spec only says it is typically omitted.
  */
 function invalidElicitationAnswer (
@@ -522,9 +523,15 @@ function invalidElicitationAnswer (
   if (expected.mode === 'url') {
     return value.content === undefined ? undefined : ['content', 'to be omitted for a URL-mode elicitation']
   }
-  if (value.content === undefined) return ['content', 'the submitted data when the action is accept']
   let problem: string | null
   try {
+    if (value.content === undefined) {
+      // A form that asks for nothing required (a plain confirmation) may be
+      // accepted with no content; the handler then sees an empty object.
+      if (answerValidator.validate(expected.schema, {}) !== null) return ['content', 'the submitted data when the action is accept']
+      value.content = {}
+      return undefined
+    }
     problem = answerValidator.validate(expected.schema, value.content)
   } catch {
     // Checked when the question was asked, so only state sealed by an older
@@ -1244,7 +1251,7 @@ async function runAsTask (
   // When the deployment identifies callers, a task is visible only to its
   // creator. One created for an unidentified caller would be unreachable.
   const identifiesCallers = opts.authorization?.enabled === true || opts.resolveAuthorizationContext !== undefined
-  if (identifiesCallers && dependencies.authContext?.userId === undefined) return undefined
+  if (identifiesCallers && !identifiesUser(dependencies.authContext)) return undefined
 
   const createdAt = Date.now()
   const now = new Date(createdAt).toISOString()
