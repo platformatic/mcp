@@ -45,13 +45,19 @@ export class JwksCache {
 
   /** The PEM public key for `kid` and `alg`, or an error when the set has none. */
   async getPublicKey (kid: string | undefined, alg: string | undefined): Promise<string> {
-    // A fetch already under way may bring the key (a cold start, a rotation).
-    if (this.refreshing) await this.refreshKeepingOld()
     if (Date.now() - this.fetchedAt >= this.ttlMs) {
       await this.refreshKeepingOld()
     }
     let jwk = this.find(kid, alg)
-    if (!jwk && Date.now() - this.fetchedAt >= this.minRefreshMs) {
+    // A key the set lacks may be on its way: a fetch already under way (a
+    // cold start, a rotation) is waited for, and a new one is made when the
+    // last was long enough ago, or when no fetch has succeeded yet. A key the
+    // set holds never waits on a fetch, however slow the server is.
+    if (!jwk && this.refreshing) {
+      await this.refreshKeepingOld()
+      jwk = this.find(kid, alg)
+    }
+    if (!jwk && (this.keys.length === 0 || Date.now() - this.fetchedAt >= this.minRefreshMs)) {
       await this.refreshKeepingOld()
       jwk = this.find(kid, alg)
     }

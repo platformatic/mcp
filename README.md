@@ -341,12 +341,13 @@ A modern notification (a message without an `id`) is acknowledged with `202` onc
 well-formed JSON-RPC message; its `_meta` and mirrored headers are not checked, since nothing
 is answered to it. A tool with no handler answers `tools/call` with an `isError` result, as on
 the legacy path, while a resource or prompt with no handler answers `-32603`. The list
-operations return everything in one page and ignore a `cursor`.
+operations return everything in one page, so they issue no cursor, and a 2026-07-28 request
+that sends one gets `-32602` (Invalid params). Legacy requests still ignore it.
 
 ### What 2026-07-28 removed
 
 These are answered with `404` and `-32601` on the modern path, and continue to work
-unchanged for legacy clients:
+unchanged for legacy clients (except `logging/setLevel`, which is not implemented for them):
 
 | Removed | Replacement |
 |---|---|
@@ -696,7 +697,9 @@ Both are sent only when the client asked for them, on the response stream of tha
   request carries `_meta.progressToken`. `progress` must increase; a value that does not is
   dropped.
 - `context.log(level, data, logger?)` emits `notifications/message` when the request sets
-  `io.modelcontextprotocol/logLevel`, and only at or above that level.
+  `io.modelcontextprotocol/logLevel`, and only at or above that level. 2026-07-28 clients are
+  therefore always told the server supports `logging`. Legacy clients never are: this server
+  does not implement `logging/setLevel`, and `context.log` writes nothing on the legacy path.
 
 Notifications are held until the outcome is known, or for 200ms after the first one is sent.
 A request that never reports, or that fails before then, answers with plain JSON and its

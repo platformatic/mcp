@@ -97,6 +97,8 @@ export class StdioTransport {
   private inFlight = new Map<string, AbortController>()
   /** Open `subscriptions/listen` streams, settled once each has been forwarded to the end. */
   private listens = new Map<AbortController, Promise<void>>()
+  /** How to stop forwarding each streamed response that is not a listen. */
+  private streams = new Set<AbortController>()
   /** Every message being processed other than listen streams, which never end on their own. */
   private processing = new Set<Promise<unknown>>()
   // There is no session over stdio, so the transport itself has to remember
@@ -221,7 +223,9 @@ export class StdioTransport {
       if (!this.listens.has(cancel)) cancel.abort(new Error('stdio transport closed'))
     }
     // A handler that honours its signal still answers, so give it a moment.
+    // One that ignores it is not waited for, and its stream writes no more.
     await this.settleProcessing(ABORT_GRACE_MS)
+    for (const stopped of this.streams) stopped.abort(new Error('stdio transport closed'))
 
     // Close the Fastify app gracefully
     try {
@@ -416,6 +420,7 @@ export class StdioTransport {
         // response, like a request answered with plain JSON.
         const stopped = isListen ? cancel : new AbortController()
         if (!isListen) {
+          this.streams.add(stopped)
           cancel.signal.addEventListener('abort', () => {
             if (cancel.signal.reason instanceof CancelledByClient) stopped.abort(cancel.signal.reason)
           }, { once: true })
@@ -423,7 +428,11 @@ export class StdioTransport {
         stopped.signal.addEventListener('abort', () => stream.destroy(), { once: true })
         const forwarded = this.forwardEvents(stream, stopped.signal)
         if (isListen) this.listens.set(cancel, forwarded)
-        await forwarded
+        try {
+          await forwarded
+        } finally {
+          this.streams.delete(stopped)
+        }
         return null
       }
 

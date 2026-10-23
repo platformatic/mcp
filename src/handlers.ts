@@ -282,10 +282,10 @@ async function handleInitialize (
     // Never advertise a capability the agreed revision cannot express, nor a
     // list-change notification a legacy client has no SSE channel to receive.
     // stdio has none either: its client never opens a GET stream.
-    capabilities: withoutUndeliverableNotifications(
+    capabilities: withoutLogging(withoutUndeliverableNotifications(
       capabilitiesForRevision(capabilities, protocolVersion),
       opts.enableSSE === true && !isStdioRequest(dependencies.request)
-    ),
+    )),
     serverInfo,
     instructions: opts.instructions
   }
@@ -327,6 +327,17 @@ function withoutUndeliverableNotifications<T extends Record<string, any>> (capab
     }
   }
   return trimmed as T
+}
+
+/**
+ * Legacy logging is driven by `logging/setLevel`, which this server does not
+ * implement, and `context.log` writes nothing on this path, so a client told
+ * `logging` is supported would only get errors back.
+ */
+function withoutLogging<T extends Record<string, any>> (capabilities: T): T {
+  if (!('logging' in capabilities)) return capabilities
+  const { logging, ...rest } = capabilities
+  return rest as T
 }
 
 /**

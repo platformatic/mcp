@@ -47,6 +47,7 @@ import type { RequestStateSealer } from '../modern/request-state.ts'
 import { DEFAULT_MAX_RESOURCE_SUBSCRIPTIONS, SubscriptionRegistry, invalidFilter, negotiateFilter } from '../modern/subscriptions.ts'
 import type { SubscriptionDeadline } from '../modern/subscriptions.ts'
 import { quotaKeyOf } from '../task-registry.ts'
+import { identifiesUser } from '../principal.ts'
 import type { ClientCapabilities as ModernClientCapabilities, SubscriptionFilter } from '../schema-2026.ts'
 import { isStdioRequest, stdioAuthContext, stdioRequestSignal } from '../stdio-trust.ts'
 import { generateWWWAuthenticateHeader } from '../auth/prehandler.ts'
@@ -536,15 +537,17 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
    * Who a legacy session belongs to: the user the deployment's resolver
    * identifies when there is one, otherwise the verified token's subject at
    * its issuer, and the OAuth client either way. Undefined for anonymous
-   * callers, whose sessions are unbound. A user id that is not a string is
-   * refused rather than leaving the session unbound for anyone to use.
+   * callers, whose sessions are unbound: no user id, `null` or `''`, as tasks
+   * and request state read them too. Any other user id that is not a string
+   * is refused rather than leaving the session unbound for anyone to use.
    */
   async function sessionOwnerOf (request: FastifyRequest): Promise<{ sub: string, iss: string | undefined, client: string | undefined } | undefined> {
     const authContext = opts.resolveAuthorizationContext
       ? await authContextFrom(request)
       : request.tokenPayload ? buildAuthContext(request, request.tokenPayload) : undefined
-    if (authContext?.userId === undefined) return undefined
-    if (typeof authContext.userId !== 'string') {
+    const userId: unknown = authContext?.userId
+    if (userId === undefined || userId === null || userId === '') return undefined
+    if (!identifiesUser(authContext)) {
       throw new Error('The caller\'s user id is not a string, so its session cannot be bound to it')
     }
     const client = typeof authContext.clientId === 'string' ? authContext.clientId : undefined

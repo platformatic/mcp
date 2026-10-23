@@ -67,7 +67,7 @@ import { TASK_OWNER_LOST, TaskLimitError, isTerminal } from '../stores/task-stor
 import { identifiesUser, principalOf } from '../principal.ts'
 import { validateElicitationRequest, validateElicitationUrl } from '../security.ts'
 import { NO_NOTIFIERS } from './request-stream.ts'
-import { TaskStopped, quotaKeyOf, reserveTask, setLongTimeout, setWaitingForInput } from '../task-registry.ts'
+import { TASK_CANCELLED, TaskStopped, quotaKeyOf, reserveTask, setLongTimeout, setWaitingForInput } from '../task-registry.ts'
 
 /** Freshness hints applied to one cacheable operation. */
 export interface CacheHint {
@@ -1252,6 +1252,9 @@ async function runAsTask (
   // creator. One created for an unidentified caller would be unreachable.
   const identifiesCallers = opts.authorization?.enabled === true || opts.resolveAuthorizationContext !== undefined
   if (identifiesCallers && !identifiesUser(dependencies.authContext)) return undefined
+  // The client already went away, so it would never learn the task's id: the
+  // call runs (or not) as a cancelled synchronous one would.
+  if (dependencies.signal?.aborted) return undefined
 
   const createdAt = Date.now()
   const now = new Date(createdAt).toISOString()
@@ -1306,6 +1309,9 @@ async function runAsTask (
     return undefined
   }
   const expiresAt = createdAt + ttl
+  // Gone while the task was being created: nobody can reach it, so the
+  // handler must not start.
+  if (dependencies.signal?.aborted) stop(new TaskStopped(TASK_CANCELLED))
 
   // The lease lets any instance tell a crashed worker from a slow one. Each
   // renewal also reports the task's status, catching a cancellation whose
@@ -1709,9 +1715,12 @@ export function buildServerCapabilities (
   // support is advertised as an extension instead.
   delete (capabilities as Record<string, unknown>).tasks
   // Nothing on this path answers `completion/complete`, so advertising it
-  // would be a promise the server cannot keep. `logging` stays: handlers log
-  // to the request's stream through `context.log`.
+  // would be a promise the server cannot keep.
   delete (capabilities as Record<string, unknown>).completions
+  // Any handler may log to the request's stream through `context.log` when
+  // the request sets a log level, and a server that emits log notifications
+  // must declare `logging`.
+  capabilities.logging ??= {}
 
   if (options.enableTasks) {
     capabilities.extensions = { ...capabilities.extensions, [TASKS_EXTENSION]: {} }
@@ -1719,6 +1728,8 @@ export function buildServerCapabilities (
 
   return capabilities
 }
+
+const LIST_METHODS = new Set(['tools/list', 'resources/list', 'resources/templates/list', 'prompts/list'])
 
 /** Is this the client coming back with answers to an `InputRequiredResult`? */
 function isMrtrRetry (request: JSONRPCRequest): boolean {
@@ -1800,6 +1811,13 @@ export async function dispatchModern (
   // once and never shared.
   const hint = (which: keyof CachingConfig): CacheHint =>
     isMrtrRetry(request) ? UNCACHEABLE : scoped.caching[which]
+
+  // Every list fits on one page, so no cursor is ever issued and any cursor a
+  // client sends is invalid; restarting from the first page instead would
+  // look like more items to a client paging through.
+  if (LIST_METHODS.has(request.method) && (request.params as { cursor?: unknown } | undefined)?.cursor !== undefined) {
+    return createError(request.id, INVALID_PARAMS, 'Invalid cursor')
+  }
 
   try {
     switch (request.method) {

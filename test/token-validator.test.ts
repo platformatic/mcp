@@ -935,3 +935,48 @@ describe('round 13: signing keys', () => {
     t.assert.strictEqual(fetches, 2)
   })
 })
+
+describe('round 14: signing keys', () => {
+  test('a cached key does not wait for a fetch made for an unknown one', async (t: TestContext) => {
+    let fetches = 0
+    const keys = [{ ...generateMockJWKSResponse().keys[0], kid: 'good' }]
+    const server = createServer((_req, res) => {
+      // The first fetch is quick; the server then becomes very slow.
+      const delay = fetches++ === 0 ? 0 : 2_000
+      setTimeout(() => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ keys })) }, delay)
+    })
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+    t.after(() => { server.closeAllConnections(); server.close() })
+    const { port } = server.address() as { port: number }
+    const cache = new JwksCache(`http://127.0.0.1:${port}/jwks.json`, { minRefreshMs: 0 })
+
+    await cache.getPublicKey('good', 'RS256')
+    const unknown = cache.getPublicKey('made-up', 'RS256').catch(() => {})
+    const startedAt = Date.now()
+    await cache.getPublicKey('good', 'RS256')
+    t.assert.ok(Date.now() - startedAt < 500, `took ${Date.now() - startedAt}ms`)
+    await unknown
+  })
+
+  test('a failed first fetch does not refuse every token until the next refresh is allowed', async (t: TestContext) => {
+    let fetches = 0
+    const keys = [{ ...generateMockJWKSResponse().keys[0], kid: 'good' }]
+    const server = createServer((_req, res) => {
+      if (fetches++ === 0) {
+        res.statusCode = 503
+        res.end()
+        return
+      }
+      res.setHeader('content-type', 'application/json')
+      res.end(JSON.stringify({ keys }))
+    })
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+    t.after(() => server.close())
+    const { port } = server.address() as { port: number }
+    const cache = new JwksCache(`http://127.0.0.1:${port}/jwks.json`)
+
+    await t.assert.rejects(cache.getPublicKey('good', 'RS256'))
+    t.assert.match(await cache.getPublicKey('good', 'RS256'), /BEGIN PUBLIC KEY/)
+    t.assert.strictEqual(fetches, 2)
+  })
+})

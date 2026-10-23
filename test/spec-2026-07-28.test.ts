@@ -5,7 +5,7 @@ import Fastify from 'fastify'
 import type { FastifyInstance } from 'fastify'
 import { Type } from '@sinclair/typebox'
 import mcpPlugin, { isStdioRequest } from '../src/index.ts'
-import { createServer } from 'node:net'
+import { connect, createServer } from 'node:net'
 import { createStdioTransport } from '../src/stdio.ts'
 import { MemoryTaskStore } from '../src/stores/memory-task-store.ts'
 import {
@@ -5786,5 +5786,116 @@ describe('round 13: stdio shutdown and batches, partial mirrored headers, empty 
     // it later): the call simply runs.
     const created = await call(app, 'tools/call', { params: { name: 'job', arguments: {} }, capabilities })
     t.assert.strictEqual(created.json().result?.resultType, 'complete', created.body)
+  })
+})
+
+describe('round 14: abandoned tasks, stdio streams after stop, logging and cursors', () => {
+  test('a tools/call whose client left before it could become a task creates none', async (t: TestContext) => {
+    const events: string[] = []
+    const app = Fastify()
+    t.after(() => app.close())
+    // A slow hook (authentication, say) gives the client time to leave first.
+    app.addHook('preHandler', async () => { await new Promise(resolve => setTimeout(resolve, 150)) })
+    await app.register(mcpPlugin, { serverInfo: { name: 's', version: '1' }, capabilities: { tools: {} }, enableTasks: true })
+    app.mcpAddTool({ name: 'deploy', inputSchema: Type.Object({}), execution: { taskSupport: 'optional' } } as any, async (_args: any, context: any) => {
+      events.push(`started aborted=${context.signal.aborted}`)
+      return { content: [] }
+    })
+    await app.listen({ port: 0, host: '127.0.0.1' })
+    const { port } = app.server.address() as { port: number }
+    const params = { name: 'deploy', arguments: {} }
+    const options = { params, capabilities: { extensions: { [TASKS_EXTENSION]: {} } } as any }
+    const payload = JSON.stringify(modernBody('tools/call', options))
+    const headers = Object.entries({ ...modernHeaders('tools/call', options), host: 'x', 'content-length': String(Buffer.byteLength(payload)) })
+      .map(([name, value]) => `${name}: ${value}\r\n`).join('')
+    await new Promise<void>(resolve => {
+      const socket = connect(port, '127.0.0.1', () => {
+        socket.write(`POST /mcp HTTP/1.1\r\n${headers}\r\n${payload}`)
+        setTimeout(() => { socket.destroy(); resolve() }, 30)
+      })
+    })
+    await new Promise(resolve => setTimeout(resolve, 400))
+    // Run as the synchronous call would have been: told it was cancelled.
+    t.assert.deepStrictEqual(events, ['started aborted=true'])
+  })
+
+  test('a stream whose handler ignores the shutdown writes nothing once stop() resolves', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'steps', inputSchema: Type.Object({}) }, async (_args: any, context: any) => {
+        for (let i = 1; i <= 40; i++) {
+          await context.sendProgress(i, 40)
+          await new Promise(resolve => setTimeout(resolve, 100))
+        }
+        return { content: [] }
+      })
+    })
+    const { transport, lines, send } = stdioPipe(t, app)
+    const body = modernBody('tools/call', { id: 'p', params: { name: 'steps', arguments: {} } }) as any
+    body.params._meta.progressToken = 7
+    send(body)
+    await until(() => lines.some(line => line.method === 'notifications/progress'))
+    await transport.stop()
+    const written = lines.length
+    await new Promise(resolve => setTimeout(resolve, 400))
+    t.assert.strictEqual(lines.length, written, JSON.stringify(lines.slice(written)))
+  })
+
+  test('logging is declared to 2026-07-28 clients and not to legacy ones', async (t: TestContext) => {
+    const app = await buildServer(t, undefined, { capabilities: { tools: {}, logging: {} } })
+    const discover = (await call(app, 'server/discover')).json().result
+    t.assert.deepStrictEqual(discover.capabilities.logging, {})
+    const bare = await buildServer(t, undefined, { capabilities: { tools: {} } })
+    t.assert.deepStrictEqual((await call(bare, 'server/discover')).json().result.capabilities.logging, {})
+
+    const init = await app.inject({
+      method: 'POST',
+      url: '/mcp',
+      payload: {
+        jsonrpc: JSONRPC_VERSION,
+        id: 1,
+        method: 'initialize',
+        params: { protocolVersion: LATEST_LEGACY_PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: 'l', version: '1' } }
+      }
+    })
+    t.assert.strictEqual(init.json().result.capabilities.logging, undefined, init.body)
+  })
+
+  test('a cursor sent to a 2026-07-28 list method is invalid', async (t: TestContext) => {
+    const app = await buildServer(t)
+    for (const method of ['tools/list', 'resources/list', 'resources/templates/list', 'prompts/list']) {
+      for (const cursor of ['bogus', 5]) {
+        const response = await call(app, method, { params: { cursor } })
+        t.assert.strictEqual(response.json().error?.code, INVALID_PARAMS, `${method} ${response.body}`)
+      }
+      t.assert.ok((await call(app, method)).json().result, method)
+    }
+  })
+
+  test('a legacy caller whose user id is null or empty gets an unbound session', async (t: TestContext) => {
+    for (const anonymous of [null, '']) {
+      const app = await buildServer(t, undefined, {
+        resolveAuthorizationContext: async (request: any) => ({ userId: request.headers['x-user'] ?? anonymous })
+      })
+      const init = await app.inject({
+        method: 'POST',
+        url: '/mcp',
+        payload: {
+          jsonrpc: JSONRPC_VERSION,
+          id: 1,
+          method: 'initialize',
+          params: { protocolVersion: LATEST_LEGACY_PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: 'l', version: '1' } }
+        }
+      })
+      t.assert.strictEqual(init.statusCode, 200, init.body)
+      // Anonymous sessions are unbound, like those of a resolver that
+      // identifies nobody, rather than bound to an owner named ''.
+      const later = await app.inject({
+        method: 'POST',
+        url: '/mcp',
+        headers: { 'mcp-session-id': init.headers['mcp-session-id'] as string, 'mcp-protocol-version': LATEST_LEGACY_PROTOCOL_VERSION, 'x-user': 'bob' },
+        payload: { jsonrpc: JSONRPC_VERSION, id: 2, method: 'tools/list', params: {} }
+      })
+      t.assert.strictEqual(later.statusCode, 200, `${JSON.stringify(anonymous)} ${later.body}`)
+    }
   })
 })
