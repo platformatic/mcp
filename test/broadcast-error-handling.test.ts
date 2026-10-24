@@ -130,7 +130,8 @@ test('session message does not cause an unhandled rejection when the session sto
     method: 'notifications/message',
     params: { level: 'info', data: 'hello' }
   })
-  t.assert.strictEqual(sent, true)
+  // The message is stored by the sender, so a failing store is reported to the caller
+  t.assert.strictEqual(sent, false)
   await sleep(100)
 
   t.assert.deepStrictEqual(unhandled, [])
@@ -150,7 +151,8 @@ test('session message does not cause an unhandled rejection when the session sto
     method: 'notifications/message',
     params: { level: 'info', data: 'hello' }
   })
-  t.assert.strictEqual(sent, true)
+  // The message is stored by the sender, so a failing store is reported to the caller
+  t.assert.strictEqual(sent, false)
   await sleep(100)
 
   t.assert.deepStrictEqual(unhandled, [])
