@@ -21,6 +21,7 @@ import { createAuthPreHandler } from './auth/prehandler.ts'
 import oauthClientPlugin from './auth/oauth-client.ts'
 import authRoutesPlugin from './routes/auth-routes.ts'
 import { quitWithTimeout } from './redis-quit-with-timeout.ts'
+import { isRedisClient } from './redis-client.ts'
 import { createJsonSchemaValidator } from './validation/json-schema-validator.ts'
 import {
   createMcpClient,
@@ -110,17 +111,27 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
   // Initialize stores and brokers based on configuration
   let sessionStore: SessionStore
   let messageBroker: MessageBroker
-  let redis: Redis | null = null
+  // Only a connection the plugin opened itself is closed on shutdown; a
+  // client passed in by the caller is theirs to manage.
+  let ownedRedis: Redis | null = null
 
   let taskStore: TaskStore | undefined
 
   if (opts.redis) {
     // Redis implementations for horizontal scaling
-    redis = new Redis(opts.redis)
-    // Without an 'error' listener a dropped connection is reported as unhandled; log it and let ioredis reconnect.
-    redis.on('error', (err) => {
-      app.log.error({ err }, 'Redis connection error')
-    })
+    let redis: Redis
+    if (isRedisClient(opts.redis)) {
+      // Error handling on a caller-owned client is left to the caller
+      redis = opts.redis
+    } else {
+      // ioredis accepts either a URL or an options object
+      redis = typeof opts.redis === 'string' ? new Redis(opts.redis) : new Redis(opts.redis)
+      ownedRedis = redis
+      // Without an 'error' listener a dropped connection is reported as unhandled; log it and let ioredis reconnect.
+      redis.on('error', (err) => {
+        app.log.error({ err }, 'Redis connection error')
+      })
+    }
     sessionStore = new RedisSessionStore({ redis, maxMessages: 100, sessionTtlMs: opts.sessionTtlMs })
     messageBroker = new RedisMessageBroker(redis, {
       onCloseTimeout: (closeTimeoutMs) => {
@@ -317,8 +328,8 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     try {
       await messageBroker.close()
     } finally {
-      if (redis) {
-        await quitWithTimeout(redis, REDIS_QUIT_TIMEOUT_MS, () => {
+      if (ownedRedis) {
+        await quitWithTimeout(ownedRedis, REDIS_QUIT_TIMEOUT_MS, () => {
           app.log.warn({ timeoutMs: REDIS_QUIT_TIMEOUT_MS }, 'Redis client quit timed out; forcing disconnect')
         })
       }
