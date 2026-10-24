@@ -172,6 +172,29 @@ test('stdio transport - rejects a numeric id that is not a safe integer', async 
   assert.strictEqual(infinite.error.code, -32600)
 })
 
+test('stdio transport - rejects messages that are not JSON-RPC 2.0', async (t) => {
+  const { sendRaw, stop } = await setupStdio()
+  t.after(stop)
+
+  for (const line of [
+    '{"jsonrpc":"1.0","id":1,"method":"tools/list"}',
+    '{"id":2,"method":"tools/list"}',
+    '{"jsonrpc":"2.0","id":3,"method":5}',
+    '{"jsonrpc":"2.0","method":5}'
+  ]) {
+    const response = await sendRaw(line)
+    assert.strictEqual(response.jsonrpc, '2.0', line)
+    assert.strictEqual(response.id, null, line)
+    assert.strictEqual(response.error.code, -32600, line)
+    assert.strictEqual(response.result, undefined, line)
+  }
+
+  // A valid request still works afterwards
+  const ok = await sendRaw('{"jsonrpc":"2.0","id":4,"method":"ping"}')
+  assert.strictEqual(ok.id, 4)
+  assert.deepStrictEqual(ok.result, {})
+})
+
 test('runStdioServer - resolves only after app.close() completes on input EOF', async () => {
   const app = fastify({ logger: false })
 
