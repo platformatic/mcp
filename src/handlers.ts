@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify'
 import createFastifyError from 'fastify-error'
+import type { TSchema } from '@sinclair/typebox'
 import type {
   JSONRPCMessage,
   JSONRPCRequest,
@@ -19,13 +20,13 @@ import type {
   ReadResourceResult,
   GetPromptResult,
   CreateTaskResult,
-  ListTasksResult,
-  ClientCapabilities
+  ListTasksResult
 } from './schema.ts'
 
 import {
   JSONRPC_VERSION,
   LATEST_PROTOCOL_VERSION,
+  LATEST_LEGACY_PROTOCOL_VERSION,
   SUPPORTED_PROTOCOL_VERSIONS,
   METHOD_NOT_FOUND,
   INTERNAL_ERROR,
@@ -33,14 +34,33 @@ import {
   INVALID_REQUEST,
   RESOURCE_NOT_FOUND
 } from './schema.ts'
-import type { RequestId } from './schema.ts'
+import type { ClientCapabilities, RequestId } from './schema.ts'
+import type { ClientCapabilities as ModernClientCapabilities } from './schema-2026.ts'
 
-import type { MCPTool, MCPResource, MCPPrompt, MCPPluginOptions, ResourceHandlers, McpCallToolOutcome, ToolAccessOperation, MCPToolCallCompleteEvent, TracerLike } from './types.ts'
+import type {
+  MCPTool,
+  MCPResource,
+  MCPPrompt,
+  MCPPluginOptions,
+  ResourceHandlers,
+  HandlerContext,
+  McpCallToolOutcome,
+  ToolAccessOperation,
+  MCPToolCallCompleteEvent,
+  TracerLike
+} from './types.ts'
 import type { SessionStore } from './stores/session-store.ts'
-import type { TaskStore, TaskRecord, TaskOwner, TaskWaiters, TaskLeases } from './stores/task-store.ts'
-import { InvalidTaskCursorError, TaskLimitError, TASK_LIMIT_REACHED, TASK_OWNER_LOST, decodeTaskCursor, isTaskOwner, isTerminal, ownerLostOutcome, toWireTask } from './stores/task-store.ts'
+import type { TaskStore, TaskRecord, TaskWaiters, TaskLeases } from './stores/task-store.ts'
+import { InvalidTaskCursorError, TaskLimitError, TASK_LIMIT_REACHED, TASK_OWNER_LOST, decodeTaskCursor, isTerminal, ownerLostOutcome, toWireTask } from './stores/task-store.ts'
 import type { AuthorizationContext } from './types/auth-types.ts'
+import { principalOf } from './principal.ts'
+import { TASK_CANCELLED, TaskStopped, isRunningHere, quotaKeyOf, reserveTask, setLongTimeout } from './task-registry.ts'
+import type { TaskInputChannel } from './modern/task-inputs.ts'
+import { InputRequired } from './modern/input-required.ts'
+import type { RequestNotifiers } from './modern/request-stream.ts'
+import { isStdioRequest } from './stdio-trust.ts'
 import {
+  atLeast,
   supportsTasks,
   supportsSchemaDialect,
   trimDefinitionToRevision,
@@ -48,9 +68,9 @@ import {
 } from './protocol-version.ts'
 import { validate, CallToolRequestSchema, ReadResourceRequestSchema, GetPromptRequestSchema, isTypeBoxSchema } from './validation/index.ts'
 import type { JsonSchemaValidator } from './validation/json-schema-validator.ts'
+import { createJsonSchemaValidator } from './validation/json-schema-validator.ts'
 import { sanitizeToolParams, assessToolSecurity } from './security.ts'
 import { MCP_ATTR, type SpanAttributeValue } from './telemetry-constants.ts'
-import { isStdioRequest } from './stdio-marker.ts'
 
 // Lazy-loaded telemetry module — only imported when a tracer is configured
 let _telemetry: typeof import('./telemetry.ts') | undefined
@@ -82,9 +102,33 @@ export type HandlerDependencies = {
   sessionId?: string
   /** The revision this client negotiated; responses are shaped to match it */
   protocolVersion?: string
+  /**
+   * Multi round-trip state for the 2026-07-28 path: what the client sent back
+   * in answer to a previous `InputRequiredResult`. Absent on a first attempt
+   * and on the legacy path.
+   */
+  mrtr?: {
+    inputResponses?: Record<string, unknown>
+    /** The payload the handler sealed into `requestState`, already verified. */
+    requestState?: unknown
+  }
+  /** Wakes task executions when `tasks/update` delivers their input. */
+  taskInputs?: TaskInputChannel
+  /**
+   * Report failures as JSON-RPC errors rather than as successful content.
+   * Set on the 2026-07-28 path, where a successful `resources/read` carries
+   * caching hints and an error must never be cached as the resource.
+   */
+  strictErrors?: boolean
+  /** Aborts when the request is cancelled; see `HandlerContext.signal`. */
+  signal?: AbortSignal
+  /** Request-scoped notifications; see `HandlerContext.sendProgress` and `log`. */
+  notifiers?: RequestNotifiers
+  /** What the client declared on this request; see `HandlerContext.clientCapabilities`. */
+  clientCapabilities?: ModernClientCapabilities
 }
 
-type ToolCallDependencies = Pick<HandlerDependencies,
+export type ToolCallDependencies = Pick<HandlerDependencies,
   'app' |
   'opts' |
   'tools' |
@@ -92,7 +136,12 @@ type ToolCallDependencies = Pick<HandlerDependencies,
   'reply' |
   'authContext' |
   'jsonSchemaValidator' |
-  'sessionId'
+  'sessionId' |
+  'mrtr' |
+  'signal' |
+  'protocolVersion' |
+  'notifiers' |
+  'clientCapabilities'
 >
 
 export function createResponse (id: string | number, result: any): JSONRPCResponse {
@@ -129,17 +178,71 @@ export function checkRequestId (message: unknown): JSONRPCError | null {
 }
 
 /**
- * Pick the protocol revision to use for this session.
+ * The context every user handler receives.
  *
- * The spec requires that we echo back the client's requested version when we
- * support it, and otherwise respond with the newest version we do support so
- * the client can decide whether to continue or disconnect.
+ * Built in one place so the multi round-trip fields cannot be plumbed into some
+ * handler kinds and forgotten in others.
+ */
+/** For requests nothing can cancel. */
+const NEVER_ABORTED = new AbortController().signal
+const NO_NOTIFIERS: RequestNotifiers = { sendProgress: () => {}, log: () => {} }
+
+export function handlerContext (
+  dependencies: Pick<HandlerDependencies, 'request' | 'reply' | 'authContext' | 'mrtr' | 'signal' | 'notifiers' | 'protocolVersion' | 'clientCapabilities'>,
+  sessionId: string | undefined
+): HandlerContext {
+  return {
+    sessionId,
+    protocolVersion: dependencies.protocolVersion,
+    clientCapabilities: dependencies.clientCapabilities,
+    request: dependencies.request,
+    reply: dependencies.reply,
+    authContext: dependencies.authContext,
+    inputResponses: dependencies.mrtr?.inputResponses,
+    requestState: dependencies.mrtr?.requestState,
+    signal: dependencies.signal ?? NEVER_ABORTED,
+    sendProgress: (dependencies.notifiers ?? NO_NOTIFIERS).sendProgress,
+    log: (dependencies.notifiers ?? NO_NOTIFIERS).log
+  }
+}
+
+/**
+ * A handler asking for client input is a protocol outcome, not a failure, so it
+ * must escape the catch-alls that turn thrown errors into `isError` results.
+ */
+function rethrowIfInputRequired (error: unknown): void {
+  if (error instanceof InputRequired) throw error
+}
+
+/** The {@link InputRequired} behind each `input-required` tool outcome. */
+const inputRequiredErrors = new WeakMap<McpCallToolOutcome, InputRequired>()
+
+/**
+ * A tool asking for client input reports it as an outcome, so in-process
+ * callers and `onToolCallComplete` see it like any other. The JSON-RPC paths
+ * turn it back into the error the dispatchers handle.
+ */
+function inputRequiredOutcome (error: InputRequired): McpCallToolOutcome {
+  const outcome: McpCallToolOutcome = { ok: false, reason: 'input-required', inputRequests: error.inputRequests ?? {} }
+  inputRequiredErrors.set(outcome, error)
+  return outcome
+}
+
+/**
+ * Pick the protocol revision for a client that arrived via `initialize`.
+ *
+ * We echo back what was asked for when we implement it, and otherwise answer
+ * with the newest revision we support that still has a handshake. Answering
+ * with 2026-07-28 would be nonsense here: a client capable of it would not be
+ * sending `initialize` in the first place.
  */
 export function negotiateProtocolVersion (requested: unknown): string {
-  if (typeof requested === 'string' && (SUPPORTED_PROTOCOL_VERSIONS as readonly string[]).includes(requested)) {
+  if (typeof requested === 'string' &&
+      requested !== LATEST_PROTOCOL_VERSION &&
+      (SUPPORTED_PROTOCOL_VERSIONS as readonly string[]).includes(requested)) {
     return requested
   }
-  return LATEST_PROTOCOL_VERSION
+  return LATEST_LEGACY_PROTOCOL_VERSION
 }
 
 async function handleInitialize (
@@ -176,8 +279,13 @@ async function handleInitialize (
 
   const result: InitializeResult = {
     protocolVersion,
-    // Never advertise a capability the agreed revision cannot express
-    capabilities: capabilitiesForRevision(capabilities, protocolVersion),
+    // Never advertise a capability the agreed revision cannot express, nor a
+    // list-change notification a legacy client has no SSE channel to receive.
+    // stdio has none either: its client never opens a GET stream.
+    capabilities: withoutLogging(withoutUndeliverableNotifications(
+      capabilitiesForRevision(capabilities, protocolVersion),
+      opts.enableSSE === true && !isStdioRequest(dependencies.request)
+    )),
     serverInfo,
     instructions: opts.instructions
   }
@@ -201,6 +309,35 @@ function withSchemaDialect<T> (schema: T, protocolVersion: string | undefined): 
   if (!schema || typeof schema !== 'object') return schema
   if ('$schema' in (schema as Record<string, unknown>)) return schema
   return { $schema: JSON_SCHEMA_DIALECT, ...(schema as Record<string, unknown>) } as T
+}
+
+/**
+ * A legacy client only receives notifications on its SSE stream. Without one,
+ * advertising `listChanged` or resource `subscribe` would promise
+ * notifications that can never arrive.
+ */
+function withoutUndeliverableNotifications<T extends Record<string, any>> (capabilities: T, deliverable: boolean): T {
+  if (deliverable) return capabilities
+  const trimmed: Record<string, any> = { ...capabilities }
+  for (const list of ['tools', 'resources', 'prompts']) {
+    if (trimmed[list]?.listChanged || (list === 'resources' && trimmed[list]?.subscribe)) {
+      const { listChanged, ...rest } = trimmed[list]
+      if (list === 'resources') delete rest.subscribe
+      trimmed[list] = rest
+    }
+  }
+  return trimmed as T
+}
+
+/**
+ * Legacy logging is driven by `logging/setLevel`, which this server does not
+ * implement, and `context.log` writes nothing on this path, so a client told
+ * `logging` is supported would only get errors back.
+ */
+function withoutLogging<T extends Record<string, any>> (capabilities: T): T {
+  if (!('logging' in capabilities)) return capabilities
+  const { logging, ...rest } = capabilities
+  return rest as T
 }
 
 /**
@@ -253,7 +390,7 @@ async function mapWithConcurrency<T, R> (items: T[], limit: number, fn: (item: T
   return results
 }
 
-async function handleToolsList (request: JSONRPCRequest, dependencies: HandlerDependencies): Promise<JSONRPCResponse> {
+export async function handleToolsList (request: JSONRPCRequest, dependencies: HandlerDependencies): Promise<JSONRPCResponse> {
   const { tools, protocolVersion } = dependencies
   // Per-tool checks run concurrently (bounded); order stays registration order
   const registeredTools = Array.from(tools.values())
@@ -265,11 +402,13 @@ async function handleToolsList (request: JSONRPCRequest, dependencies: HandlerDe
   const accessibleTools = registeredTools.filter((_tool, index) => accessResults[index])
   const result: ListToolsResult = {
     tools: accessibleTools.map(t => {
-      const tool = trimDefinitionToRevision(t.definition, protocolVersion)
+      const { inputCapabilities, ...tool } = trimDefinitionToRevision(t.definition, protocolVersion)
       // TypeBox schemas are already JSON Schema compatible
       const serialized: typeof tool = {
         ...tool,
-        inputSchema: withSchemaDialect(tool.inputSchema, protocolVersion)
+        // `inputSchema` is required, and must be an object schema; a tool
+        // registered without one takes an object of anything.
+        inputSchema: withSchemaDialect(tool.inputSchema ?? { type: 'object' }, protocolVersion)
       }
       if (serialized.outputSchema) {
         serialized.outputSchema = withSchemaDialect(serialized.outputSchema, protocolVersion)
@@ -363,7 +502,7 @@ function pickResourceMetadata (definition: Record<string, any>, fields: readonly
   return picked
 }
 
-function handleResourcesList (request: JSONRPCRequest, dependencies: HandlerDependencies): JSONRPCResponse {
+export function handleResourcesList (request: JSONRPCRequest, dependencies: HandlerDependencies): JSONRPCResponse {
   const { resources, protocolVersion } = dependencies
   const result: ListResourcesResult = {
     resources: Array.from(resources.values())
@@ -380,7 +519,7 @@ function handleResourcesList (request: JSONRPCRequest, dependencies: HandlerDepe
   return createResponse(request.id, result)
 }
 
-function handleResourceTemplatesList (request: JSONRPCRequest, dependencies: HandlerDependencies): JSONRPCResponse {
+export function handleResourceTemplatesList (request: JSONRPCRequest, dependencies: HandlerDependencies): JSONRPCResponse {
   const { resources, protocolVersion } = dependencies
   const result: ListResourceTemplatesResult = {
     resourceTemplates: Array.from(resources.values())
@@ -397,7 +536,7 @@ function handleResourceTemplatesList (request: JSONRPCRequest, dependencies: Han
   return createResponse(request.id, result)
 }
 
-function handlePromptsList (request: JSONRPCRequest, dependencies: HandlerDependencies): JSONRPCResponse {
+export function handlePromptsList (request: JSONRPCRequest, dependencies: HandlerDependencies): JSONRPCResponse {
   const { prompts, protocolVersion } = dependencies
   const result: ListPromptsResult = {
     prompts: Array.from(prompts.values()).map(p => {
@@ -463,21 +602,26 @@ async function handleToolsCall (
     return createError(request.id, METHOD_NOT_FOUND, augmentation.error)
   }
   if (augmentation.mode === 'task') {
-    return await runToolCallAsTask(
+    const response = await runToolCallAsTask(
       request,
       ttl,
       // Timed from when the task actually starts executing, not from when it
       // was queued, so `durationMs` reflects work done rather than wait time.
-      () => executeToolCall(request, resolved.tool, params, sessionId, dependencies, { source: 'task', startedAt: performance.now() }),
+      (signal, defer) => executeToolCall(request, resolved.tool, params, sessionId, { ...dependencies, signal }, { source: 'task', startedAt: performance.now(), defer }),
       dependencies
     )
+    // Refused at a limit, the call never ran; it still happened, as on 2026-07-28.
+    if ('error' in response && response.error.code === TASK_LIMIT_REACHED) {
+      await emitToolCallComplete('json-rpc', toolName, params.arguments || {}, { ok: false, reason: 'task-limit', message: response.error.message }, startedAt, dependencies)
+    }
+    return response
   }
 
   return await executeToolCall(request, resolved.tool, params, sessionId, dependencies, { source: 'json-rpc', startedAt })
 }
 
 /** An observability failure must never change the tool response. */
-async function emitToolCallComplete (
+export async function emitToolCallComplete (
   source: MCPToolCallCompleteEvent['source'],
   toolName: string,
   args: Record<string, unknown>,
@@ -524,7 +668,7 @@ type RegisteredToolResolution =
   | { ok: false, reason: 'not-found' }
   | { ok: false, reason: 'access-denied' }
 
-async function resolveRegisteredTool (
+export async function resolveRegisteredTool (
   toolName: string,
   dependencies: ToolCallDependencies
 ): Promise<RegisteredToolResolution> {
@@ -571,6 +715,15 @@ function toolCallOutcomeToJsonRpc (
     // consistent if they ever converge. Mirrors resolveTaskAugmentation's error.
     case 'task-required':
       return createError(id, METHOD_NOT_FOUND, `Tool '${toolName}' requires task-augmented execution`)
+    // The multi round-trip machinery answers this, not a tool result.
+    case 'input-required':
+      throw inputRequiredErrors.get(outcome) ?? new InputRequired({ inputRequests: outcome.inputRequests })
+    // Only ever reported to onToolCallComplete, when a task could not be created.
+    case 'task-limit':
+      return createError(id, INVALID_REQUEST, `Cannot create a task: ${outcome.message}`)
+    // Only ever reported to onToolCallComplete, once a task has ended.
+    case 'task-ended':
+      return createError(id, INTERNAL_ERROR, outcome.message)
     default: {
       const unhandled: never = outcome
       throw new UnhandledToolCallOutcomeError(JSON.stringify(unhandled))
@@ -606,9 +759,15 @@ export async function callRegisteredTool (
 interface ToolCallObservationContext {
   source: MCPToolCallCompleteEvent['source']
   startedAt: number
+  /**
+   * A task's round is not necessarily the end of the call: the event is
+   * handed here instead of being emitted, so the task can emit it once it
+   * ends, with a different outcome if the task ended differently.
+   */
+  defer?: (outcome: McpCallToolOutcome, emit: (override?: McpCallToolOutcome) => Promise<void>) => void
 }
 
-async function executeToolCall (
+export async function executeToolCall (
   request: JSONRPCRequest,
   tool: MCPTool,
   params: { name: string, arguments?: Record<string, unknown> },
@@ -621,11 +780,94 @@ async function executeToolCall (
 
   const callDependencies = { ...dependencies, sessionId }
   const outcome = await executeRegisteredTool(tool, toolName, args, callDependencies)
-  await emitToolCallComplete(observation.source, toolName, args, outcome, observation.startedAt, callDependencies)
+  const emit = (override?: McpCallToolOutcome) =>
+    emitToolCallComplete(observation.source, toolName, args, override ?? outcome, observation.startedAt, callDependencies)
+  if (observation.defer) {
+    observation.defer(outcome, emit)
+  } else {
+    await emit()
+  }
   return toolCallOutcomeToJsonRpc(request.id, toolName, outcome)
 }
 
+/** The revision that introduced `outputSchema` and `structuredContent`. */
+const OUTPUT_SCHEMA_REVISION = '2025-06-18'
+
+/**
+ * Validates tool output. Unlike the input validator it must never change what
+ * it checks: the result goes to the client exactly as the tool produced it.
+ */
+let outputValidator: JsonSchemaValidator | undefined
+export function getOutputValidator (): JsonSchemaValidator {
+  outputValidator ??= createJsonSchemaValidator({
+    coerceTypes: false,
+    useDefaults: false,
+    removeAdditional: false
+  })
+  return outputValidator
+}
+
+/**
+ * Hold a successful result to the tool's `outputSchema`: when one is declared,
+ * the server MUST provide structured content that conforms to it. A result
+ * that does not is the tool's bug, reported as a tool error rather than handed
+ * to a client that may trust the schema. Error results are exempt.
+ */
+function conformToOutputSchema (
+  tool: MCPTool,
+  toolName: string,
+  outcome: McpCallToolOutcome,
+  dependencies: ToolCallDependencies
+): McpCallToolOutcome {
+  const schema = (tool.definition as { outputSchema?: unknown }).outputSchema
+  if (!outcome.ok || schema === undefined || outcome.result.isError) return outcome
+  // Revisions before 2025-06-18 have no `structuredContent`, so a text-only
+  // result is correct there. An in-process call has no revision and is held
+  // to the current rules.
+  const version = dependencies.protocolVersion
+  if (version !== undefined && !atLeast(version, OUTPUT_SCHEMA_REVISION)) return outcome
+
+  const structured = outcome.result.structuredContent
+  let problem: string | null = null
+  if (structured === undefined) {
+    problem = 'missing structuredContent'
+  } else {
+    try {
+      // Validate what the client will receive: a Date or anything with
+      // `toJSON` conforms by its serialized form, not its in-memory one.
+      const wire = JSON.parse(JSON.stringify(structured))
+      if (isTypeBoxSchema(schema)) {
+        const checked = validate(schema as TSchema, wire)
+        if (!checked.success) problem = checked.error.message
+      } else {
+        problem = getOutputValidator().validate(schema as Record<string, unknown>, wire)
+      }
+    } catch (error) {
+      problem = `structured content cannot be validated: ${error instanceof Error ? error.message : String(error)}`
+    }
+  }
+  if (problem === null) return outcome
+
+  dependencies.app.log.error({ tool: toolName, problem }, 'Tool result does not conform to its outputSchema')
+  return {
+    ok: true,
+    result: {
+      content: [{ type: 'text', text: `Tool '${toolName}' returned a result that does not match its output schema` }],
+      isError: true
+    }
+  }
+}
+
 async function executeRegisteredTool (
+  tool: MCPTool,
+  toolName: string,
+  args: Record<string, unknown>,
+  dependencies: ToolCallDependencies
+): Promise<McpCallToolOutcome> {
+  return conformToOutputSchema(tool, toolName, await runRegisteredTool(tool, toolName, args, dependencies), dependencies)
+}
+
+async function runRegisteredTool (
   tool: MCPTool,
   toolName: string,
   args: Record<string, unknown>,
@@ -689,9 +931,10 @@ async function executeRegisteredTool (
 
       // Use validated arguments
       try {
-        const result = await tool.handler(argumentsValidation.data, { sessionId, request: dependencies.request, reply: dependencies.reply, authContext: dependencies.authContext })
+        const result = await tool.handler(argumentsValidation.data, handlerContext(dependencies, sessionId))
         return { ok: true, result }
       } catch (error: any) {
+        if (error instanceof InputRequired) return inputRequiredOutcome(error)
         const result: CallToolResult = {
           content: [{
             type: 'text',
@@ -712,9 +955,10 @@ async function executeRegisteredTool (
         }
       }
       try {
-        const result = await tool.handler(toolArguments, { sessionId, request: dependencies.request, reply: dependencies.reply, authContext: dependencies.authContext })
+        const result = await tool.handler(toolArguments, handlerContext(dependencies, sessionId))
         return { ok: true, result }
       } catch (error: any) {
+        if (error instanceof InputRequired) return inputRequiredOutcome(error)
         const result: CallToolResult = {
           content: [{
             type: 'text',
@@ -728,14 +972,10 @@ async function executeRegisteredTool (
   } else {
     // Unsafe tool without schema - pass arguments as-is
     try {
-      const result = await tool.handler(toolArguments, {
-        sessionId,
-        request: dependencies.request,
-        reply: dependencies.reply,
-        authContext: dependencies.authContext
-      })
+      const result = await tool.handler(toolArguments, handlerContext(dependencies, sessionId))
       return { ok: true, result }
     } catch (error: any) {
+      if (error instanceof InputRequired) return inputRequiredOutcome(error)
       const result: CallToolResult = {
         content: [{
           type: 'text',
@@ -748,7 +988,7 @@ async function executeRegisteredTool (
   }
 }
 
-async function handleResourcesRead (
+export async function handleResourcesRead (
   request: JSONRPCRequest,
   sessionId: string | undefined,
   dependencies: HandlerDependencies
@@ -799,6 +1039,9 @@ async function handleResourcesRead (
   }
 
   if (!resource.handler) {
+    if (dependencies.strictErrors) {
+      return createError(request.id, INTERNAL_ERROR, `Resource '${uri}' has no handler implementation`)
+    }
     const result: ReadResourceResult = {
       contents: [{
         uri,
@@ -824,21 +1067,24 @@ async function handleResourcesRead (
   }
 
   try {
-    const result = await resource.handler(uri, {
-      sessionId,
-      request: dependencies.request,
-      reply: dependencies.reply,
-      authContext: dependencies.authContext,
-      uriParams
-    })
+    const result = await resource.handler(uri, { ...handlerContext(dependencies, sessionId), uriParams })
+    // A resource with no contents does not exist: answering an empty array
+    // for it is not allowed, so report it the way a missing resource is.
+    if (dependencies.strictErrors && Array.isArray(result?.contents) && result.contents.length === 0) {
+      return createError(request.id, INVALID_PARAMS, `Resource '${uri}' not found`)
+    }
     return createResponse(request.id, result)
   } catch (error: any) {
-    dependencies.request.log.error({ err: error, uri }, 'Resource read handler failed')
+    rethrowIfInputRequired(error)
+    dependencies.app.log.error({ err: error, uri }, 'Resource read handler failed')
+    // On 2026-07-28 the handler's error may carry internals: it goes to the
+    // log only. The legacy path keeps reporting its message.
+    if (dependencies.strictErrors) return createError(request.id, INTERNAL_ERROR, 'Resource read failed')
     return createError(request.id, INTERNAL_ERROR, `Resource read failed: ${error?.message || error}`)
   }
 }
 
-async function handlePromptsGet (
+export async function handlePromptsGet (
   request: JSONRPCRequest,
   sessionId: string | undefined,
   dependencies: HandlerDependencies
@@ -862,21 +1108,28 @@ async function handlePromptsGet (
     return createError(request.id, INVALID_PARAMS, `Prompt '${promptName}' not found`)
   }
 
+  // Failures are JSON-RPC errors: -32602 for the client's arguments, -32603
+  // otherwise. On 2026-07-28 a handler's error text stays in the server log;
+  // the legacy path still reports it, and a prompt with no handler there is
+  // still answered with a message.
+  const strict = dependencies.strictErrors === true
+  const asMessage = (text: string): JSONRPCResponse => createResponse(request.id, {
+    messages: [{ role: 'user', content: { type: 'text', text } }]
+  } satisfies GetPromptResult)
+  const failed = (error: any): JSONRPCError => {
+    dependencies.app.log.error({ err: error, prompt: promptName }, 'Prompt handler failed')
+    if (!strict) return createError(request.id, INTERNAL_ERROR, `Prompt execution failed: ${error?.message || error}`)
+    return createError(request.id, INTERNAL_ERROR, 'Internal server error')
+  }
+
   if (!prompt.handler) {
-    const result: GetPromptResult = {
-      messages: [{
-        role: 'user',
-        content: {
-          type: 'text',
-          text: `Prompt '${promptName}' has no handler implementation`
-        }
-      }]
-    }
-    return createResponse(request.id, result)
+    if (!strict) return asMessage(`Prompt '${promptName}' has no handler implementation`)
+    dependencies.app.log.error({ prompt: promptName }, 'Prompt has no handler implementation')
+    return createError(request.id, INTERNAL_ERROR, 'Internal server error')
   }
 
   // Validate prompt arguments against the prompt's argument schema
-  const promptArguments = params.arguments || {}
+  const promptArguments: Record<string, unknown> = params.arguments || {}
   let handlerArguments: Record<string, unknown> = promptArguments
   const { argumentSchema } = prompt.definition
   if (argumentSchema && isTypeBoxSchema(argumentSchema)) {
@@ -886,28 +1139,23 @@ async function handlePromptsGet (
         validation: argumentsValidation.error
       })
     }
-    handlerArguments = argumentsValidation.data
+    handlerArguments = argumentsValidation.data as Record<string, unknown>
   } else {
     // No TypeBox schema: enforce the `required` flags declared in `arguments`
     const missing = (prompt.definition.arguments ?? [])
-      .filter(arg => arg.required && promptArguments[arg.name] === undefined)
-      .map(arg => arg.name)
+      .filter(argument => argument.required && promptArguments[argument.name] === undefined)
+      .map(argument => argument.name)
     if (missing.length > 0) {
       return createError(request.id, INVALID_PARAMS, `Missing required prompt arguments: ${missing.join(', ')}`, { missing })
     }
   }
 
   try {
-    const result = await prompt.handler(promptName, handlerArguments as any, {
-      sessionId,
-      request: dependencies.request,
-      reply: dependencies.reply,
-      authContext: dependencies.authContext
-    })
+    const result = await prompt.handler(promptName, handlerArguments as any, handlerContext(dependencies, sessionId))
     return createResponse(request.id, result)
   } catch (error: any) {
-    dependencies.request.log.error({ err: error, prompt: promptName }, 'Prompt handler failed')
-    return createError(request.id, INTERNAL_ERROR, `Prompt execution failed: ${error?.message || error}`)
+    rethrowIfInputRequired(error)
+    return failed(error)
   }
 }
 
@@ -954,30 +1202,28 @@ function taskTtlBounds (dependencies: HandlerDependencies): { defaultTtl: number
 }
 
 /**
- * The owner a task created by this request belongs to: the token's subject and
- * its normalized issuer, since a subject is only unique within its issuer.
+ * The principal a task belongs to: user, OAuth client and issuer, so another
+ * app acting for the same user cannot read or cancel the task.
  *
- * When the deployment cannot identify requestors both are undefined, and tasks
+ * When the deployment cannot identify requestors it is undefined, and tasks
  * are reachable by anyone holding the (cryptographically random) task id. That
  * limitation is why `tasks/list` is only advertised when auth is in play.
  */
-function taskOwner (dependencies: HandlerDependencies): TaskOwner {
-  return {
-    subject: dependencies.authContext?.userId,
-    issuer: dependencies.authContext ? dependencies.request.tokenIssuer : undefined
-  }
+function taskSubject (dependencies: HandlerDependencies): string | undefined {
+  return principalOf(dependencies.authContext)
 }
 
 /**
  * Whether this deployment can tie a task to a requestor.
  *
  * Mirrors the gate in `index.ts` that decides whether to advertise
- * `tasks.list`. Without authorization every task shares the undefined subject,
+ * `tasks.list`. Without an identity resolver every task shares the undefined
+ * subject,
  * so listing would hand every task's id to any caller — defeating the "random
  * task id is the capability" model that protects `tasks/get|result|cancel`.
  */
 function canIdentifyRequestors (dependencies: HandlerDependencies): boolean {
-  return dependencies.opts.authorization?.enabled === true
+  return dependencies.opts.authorization?.enabled === true || dependencies.opts.resolveAuthorizationContext !== undefined
 }
 
 /**
@@ -987,20 +1233,21 @@ function canIdentifyRequestors (dependencies: HandlerDependencies): boolean {
  */
 function assertTaskAccess (task: TaskRecord | null, dependencies: HandlerDependencies): TaskRecord | null {
   if (!task) return null
+  // 2026-07-28 tasks have a different shape and lifecycle (input rounds
+  // answered through `tasks/update`), which a 2025-11-25 client cannot use.
+  if (task.era === 'modern') return null
 
   if (canIdentifyRequestors(dependencies)) {
-    // Auth on: a task is reachable only by the exact (issuer, subject) pair that
-    // owns it. A token without a `sub` or issuer identifies no one, so an
-    // undefined value must never match an ownerless task via
-    // `undefined === undefined`. Tasks created before issuers were recorded
-    // have no authIssuer and so stay unreachable until their ttl expires.
-    const owner = taskOwner(dependencies)
-    if (owner.subject === undefined || owner.issuer === undefined || !isTaskOwner(task, owner)) return null
+    // Identity resolution on: a task is reachable only by its exact owner. A
+    // context without a `userId` identifies no one, so an undefined subject
+    // must never match another subject-less task via `undefined === undefined`.
+    const subject = taskSubject(dependencies)
+    if (subject === undefined || task.authSubject !== subject) return null
     return task
   }
 
-  // Auth off: no requestor can be identified, so the random task id is the
-  // capability and every (subject-less) task is reachable by whoever holds it.
+  // No identity resolver: the random task id is the capability and every
+  // subject-less task is reachable by whoever holds it.
   return task
 }
 
@@ -1032,8 +1279,10 @@ export function resolveTaskAugmentation (
 function newTaskRecord (
   method: string,
   ttl: number | undefined,
-  owner: TaskOwner,
-  bounds: { defaultTtl: number, maxTtl: number }
+  subject: string | undefined,
+  quotaKey: string | undefined,
+  bounds: { defaultTtl: number, maxTtl: number },
+  leaseMs?: number
 ): TaskRecord {
   const now = new Date().toISOString()
   const requested = ttl ?? bounds.defaultTtl
@@ -1046,8 +1295,12 @@ function newTaskRecord (
     ttl: Math.min(Math.max(requested, MIN_TASK_TTL), bounds.maxTtl),
     pollInterval: DEFAULT_POLL_INTERVAL,
     method,
-    authSubject: owner.subject,
-    authIssuer: owner.issuer
+    authSubject: subject,
+    quotaKey,
+    era: 'legacy',
+    // Leased from the start, so a worker that dies before its first renewal is
+    // still reaped. The store stamps it with its own clock.
+    ...(leaseMs !== undefined ? { leaseExpiresAt: Date.now() + leaseMs } : {})
   }
 }
 
@@ -1087,18 +1340,15 @@ async function handleTasksGet (
  */
 async function failIfOwnerLost (task: TaskRecord, dependencies: HandlerDependencies): Promise<TaskRecord | null> {
   const { taskStore, taskWaiters } = dependencies
-  if (!taskStore?.failExpiredLease || isTerminal(task.status) || typeof task.leaseExpiresAt !== 'number') {
+  if (!taskStore || isTerminal(task.status) || typeof task.leaseExpiresAt !== 'number') {
     return task
   }
 
-  const current = await taskStore.failExpiredLease(task.taskId, {
-    statusMessage: TASK_OWNER_LOST,
-    outcome: ownerLostOutcome()
-  })
-  if (current && isTerminal(current.status)) {
-    taskWaiters?.notify(current)
-  }
-  return current
+  const failed = await taskStore.expireStaleLease(task.taskId, TASK_OWNER_LOST, ownerLostOutcome())
+  if (!failed) return task
+  dependencies.app.log.warn({ taskId: task.taskId }, 'Task failed: the instance running it stopped renewing its lease')
+  taskWaiters?.notify(failed)
+  return failed
 }
 
 /**
@@ -1203,10 +1453,17 @@ async function handleTasksResult (
     const onClose = () => controller.abort()
     res.on('close', onClose)
     if (res.destroyed || res.socket?.destroyed) controller.abort()
+    // On stdio the client cancels with `notifications/cancelled`, which only
+    // the request's own signal reports. A shutdown gives up on tasks running
+    // elsewhere, but one running here is drained, and its outcome is recorded
+    // before the server closes: wait for that instead.
     const { shutdownSignal } = dependencies
-    const signal = shutdownSignal
-      ? AbortSignal.any([controller.signal, shutdownSignal])
-      : controller.signal
+    const local = dependencies.taskStore !== undefined && isRunningHere(dependencies.taskStore, taskId)
+    const signal = AbortSignal.any([
+      controller.signal,
+      ...(shutdownSignal && !local ? [shutdownSignal] : []),
+      ...(dependencies.signal ? [dependencies.signal] : [])
+    ])
     try {
       const settled = await awaitTaskTerminal(taskId, task, dependencies, signal)
       if (!settled) {
@@ -1280,17 +1537,17 @@ async function handleTasksList (
     }
   }
 
-  const owner = taskOwner(dependencies)
-  if (owner.subject === undefined || owner.issuer === undefined) {
-    // Auth is on but this token carries no `sub` (or issuer), so it owns nothing
-    // we can identify. Listing the ownerless tasks would expose every other such
-    // caller's tasks, so return an empty set instead.
+  const subject = taskSubject(dependencies)
+  if (subject === undefined) {
+    // Identity resolution is on but this caller carries no user, so it owns
+    // nothing we can identify. Listing the ownerless tasks would expose every
+    // other such caller's tasks, so return an empty set instead.
     return createResponse(request.id, { tasks: [], nextCursor: undefined } as ListTasksResult)
   }
 
   let page
   try {
-    page = await taskStore.list(owner, { cursor: cursor as string | undefined })
+    page = await taskStore.list(subject, { cursor: cursor as string | undefined, era: 'legacy' })
   } catch (err) {
     if (err instanceof InvalidTaskCursorError) {
       return createError(request.id, INVALID_PARAMS, 'Invalid cursor')
@@ -1331,7 +1588,9 @@ async function handleTasksCancel (
   try {
     cancelled = await taskStore.updateStatus(taskId, 'cancelled', {
       statusMessage: 'The task was cancelled by request.',
-      outcome: createError(request.id, INTERNAL_ERROR, 'Task was cancelled')
+      outcome: createError(request.id, INTERNAL_ERROR, 'Task was cancelled'),
+      inputRequests: null,
+      clearPendingInputResponses: true
     })
   } catch {
     // The task reached a terminal status between our check above and the write
@@ -1345,6 +1604,13 @@ async function handleTasksCancel (
   }
 
   dependencies.taskWaiters?.notify(cancelled)
+  // Stop the worker wherever it runs (it listens for this cancellation), not
+  // only when its next lease renewal finds the task ended.
+  try {
+    await dependencies.taskInputs?.cancel(taskId)
+  } catch (error) {
+    dependencies.app.log.debug({ err: error, taskId }, 'Could not publish task input cancellation')
+  }
   await notifyTaskStatus(cancelled, dependencies)
 
   return createResponse(request.id, toWireTask(cancelled))
@@ -1377,7 +1643,7 @@ async function notifyTaskStatus (task: TaskRecord, dependencies: HandlerDependen
 async function runToolCallAsTask (
   request: JSONRPCRequest,
   ttl: number | undefined,
-  execute: () => Promise<JSONRPCResponse | JSONRPCError>,
+  execute: (signal: AbortSignal, defer: NonNullable<ToolCallObservationContext['defer']>) => Promise<JSONRPCResponse | JSONRPCError>,
   dependencies: HandlerDependencies
 ): Promise<JSONRPCResponse | JSONRPCError> {
   const { taskStore, taskWaiters, taskLeases, app } = dependencies
@@ -1385,30 +1651,84 @@ async function runToolCallAsTask (
     return createError(request.id, METHOD_NOT_FOUND, 'Tasks are not enabled on this server')
   }
 
-  const task = newTaskRecord('tools/call', ttl, taskOwner(dependencies), taskTtlBounds(dependencies))
+  // When the deployment identifies callers a task is visible only to its
+  // creator, so one created for a caller without an identity would be
+  // unreachable, and would escape the per-caller limit too.
+  const subject = taskSubject(dependencies)
+  if (canIdentifyRequestors(dependencies) && subject === undefined) {
+    return createError(request.id, INVALID_REQUEST, 'Cannot create a task: the caller is not identified')
+  }
+
+  const task = newTaskRecord('tools/call', ttl, subject, quotaKeyOf(dependencies.authContext), taskTtlBounds(dependencies), taskLeases?.leaseMs)
+
+  // Legacy tasks share the limits, ttl abort and shutdown drain of the
+  // 2026-07-28 ones, so neither era can starve the other.
+  const reservation = reserveTask(taskStore, task.taskId, quotaKeyOf(dependencies.authContext), dependencies.opts)
+  if (!reservation.ok) {
+    // A limit is the caller's to wait out, as for the store's own cap; only a
+    // shutdown is the server's fault.
+    return reservation.limited
+      ? createError(request.id, TASK_LIMIT_REACHED, reservation.reason)
+      : createError(request.id, INTERNAL_ERROR, `Cannot create a task: ${reservation.reason}`)
+  }
+  // Stoppable from the moment it holds a slot: a shutdown that begins while
+  // the task is still being created must reach it too.
+  const stopController = new AbortController()
+  const stopped = stopController.signal
+  reservation.live.stop = (reason: TaskStopped) => {
+    if (!stopped.aborted) stopController.abort(reason)
+  }
   try {
     await taskStore.create(task)
   } catch (error) {
+    reservation.release()
     if (error instanceof TaskLimitError) {
       return createError(request.id, TASK_LIMIT_REACHED, 'Task limit reached')
     }
     throw error
   }
+  // The lease lets any instance tell a crashed worker from a slow one. A
+  // renewal that finds the task ended (a cancellation whose broker message was
+  // lost) stops the handler too.
   try {
-    await taskLeases?.start(task.taskId)
+    await taskLeases?.start(task.taskId, (status) => {
+      reservation.live.stop(new TaskStopped(status === 'cancelled' ? TASK_CANCELLED : 'Task ended'))
+    })
   } catch (error) {
     // Without a lease the task simply cannot be reaped early; it still runs
     app.log.warn({ err: error, taskId: task.taskId }, 'Failed to take task lease')
   }
+
+  // `tasks/cancel` may arrive on any instance; it reaches the worker here.
+  const stopListening = dependencies.taskInputs?.onCancel(task.taskId, () => {
+    reservation.live.stop(new TaskStopped(TASK_CANCELLED))
+  })
+  // The slot stays held until the handler settles, even past the ttl, so a
+  // caller cannot pile up background work by outliving it.
+  const taskTtl = task.ttl ?? undefined
+  const ttlTimer = taskTtl !== undefined && Number.isFinite(taskTtl)
+    ? setLongTimeout(() => {
+      reservation.live.stop(new TaskStopped('Task expired before it finished'))
+    }, taskTtl)
+    : undefined
 
   // Deliberately not awaited: the point of a task is to return control now.
   const execution = (async () => {
     let outcome: TaskRecord['outcome']
     let status: 'completed' | 'failed' = 'completed'
     let statusMessage: string | undefined
+    // The call's event waits for the task to end, which may not be how the
+    // handler's own result read (it was cancelled while running, say).
+    let handlerOutcome: McpCallToolOutcome | undefined
+    let unreported: ((override?: McpCallToolOutcome) => Promise<void>) | undefined
 
     try {
-      const result = await execute()
+      // Stopped before it ever ran: the handler must not start.
+      if (stopped.aborted) throw stopped.reason
+      const result = await execute(stopped, (handled, emit) => {
+        handlerOutcome = handled
+        unreported = emit
+      })
       outcome = result
       // A tool result carrying isError counts as a failed task
       if ('result' in result && (result.result as CallToolResult)?.isError === true) {
@@ -1423,6 +1743,18 @@ async function runToolCallAsTask (
       statusMessage = `Tool execution failed: ${error?.message || error}`
       outcome = createError(request.id, INTERNAL_ERROR, statusMessage)
     }
+    // A stopped task ends for the reason it was stopped.
+    let ended: McpCallToolOutcome | undefined
+    if (stopped.aborted && stopped.reason instanceof TaskStopped) {
+      status = 'failed'
+      statusMessage = stopped.reason.message
+      outcome = createError(request.id, INTERNAL_ERROR, statusMessage)
+      if (handlerOutcome?.ok || handlerOutcome?.reason === 'input-required') {
+        const endStatus = stopped.reason.message === TASK_CANCELLED ? 'cancelled' : 'failed'
+        ended = { ok: false, reason: 'task-ended', status: endStatus, message: statusMessage }
+      }
+    }
+    await unreported?.(ended)
 
     try {
       const updated = await taskStore.updateStatus(task.taskId, status, { statusMessage, outcome })
@@ -1440,9 +1772,15 @@ async function runToolCallAsTask (
 
   // Nothing awaits `execution`; keep an explicit rejection guard so an
   // unexpected throw can never become an unhandled rejection.
-  execution.catch((error) => {
-    app.log.error({ err: error, taskId: task.taskId }, 'Task execution failed unexpectedly')
-  })
+  execution
+    .catch((error) => {
+      app.log.error({ err: error, taskId: task.taskId }, 'Task execution failed unexpectedly')
+    })
+    .finally(() => {
+      ttlTimer?.clear()
+      stopListening?.()
+      reservation.release()
+    })
 
   const result: CreateTaskResult = { task: toWireTask(task) }
   return createResponse(request.id, result)
@@ -1465,12 +1803,7 @@ async function handleResourcesSubscribe (
   }
 
   try {
-    const result = await resourceHandlers.subscribeHandler(params, {
-      sessionId,
-      request: dependencies.request,
-      reply: dependencies.reply,
-      authContext: dependencies.authContext
-    })
+    const result = await resourceHandlers.subscribeHandler(params, handlerContext(dependencies, sessionId))
     // Remember the subscription so resources/updated broadcasts only reach
     // the sessions that asked for this URI
     if (sessionId && dependencies.sessionStore) {
@@ -1499,12 +1832,7 @@ async function handleResourcesUnsubscribe (
   }
 
   try {
-    const result = await resourceHandlers.unsubscribeHandler(params, {
-      sessionId,
-      request: dependencies.request,
-      reply: dependencies.reply,
-      authContext: dependencies.authContext
-    })
+    const result = await resourceHandlers.unsubscribeHandler(params, handlerContext(dependencies, sessionId))
     if (sessionId && dependencies.sessionStore) {
       await dependencies.sessionStore.removeResourceSubscription(sessionId, params.uri)
     }
@@ -1532,7 +1860,7 @@ function normalizedNetworkProtocolVersion (version: string): string {
   return version.endsWith('.0') ? version.slice(0, -2) : version
 }
 
-async function withMcpServerSpan<T> (
+export async function withMcpServerSpan<T> (
   message: JSONRPCRequest | JSONRPCNotification,
   sessionId: string | undefined,
   dependencies: HandlerDependencies,
@@ -1567,7 +1895,10 @@ async function withMcpServerSpan<T> (
     : dependencies.protocolVersion
   if (protocolVersion) extraAttrs[MCP_ATTR.PROTOCOL_VERSION] = protocolVersion
 
-  if (isStdioRequest(request)) {
+  // The plain transport header is only a hint any HTTP client could send;
+  // trusting it would let a caller drop its address from the span.
+  const isStdio = isStdioRequest(request)
+  if (isStdio) {
     extraAttrs[MCP_ATTR.NETWORK_TRANSPORT] = 'pipe'
   } else {
     const httpVersion = request.raw.httpVersion
@@ -1649,7 +1980,17 @@ export async function handleRequest (
       }
     })
   } catch (error) {
-    return createError(request.id, INTERNAL_ERROR, 'Internal server error', error)
+    // Never serialize the thrown value: an `InputRequired` carries the
+    // handler's private state, and any other error may carry internals.
+    if (error instanceof InputRequired) {
+      return createError(
+        request.id,
+        INTERNAL_ERROR,
+        'This request needs additional client input, which requires protocol version 2026-07-28'
+      )
+    }
+    app.log.error({ err: error, method: request.method }, 'Unhandled error in MCP request')
+    return createError(request.id, INTERNAL_ERROR, 'Internal server error')
   }
 }
 

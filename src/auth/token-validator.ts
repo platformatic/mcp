@@ -1,6 +1,6 @@
-import buildGetJwks from 'get-jwks'
 import { createVerifier } from 'fast-jwt'
 import type { FastifyInstance } from 'fastify'
+import { JwksCache } from './jwks.ts'
 import type { AuthorizationConfig, TokenValidationResult, TokenIntrospectionResponse } from '../types/auth-types.ts'
 
 /**
@@ -31,7 +31,6 @@ export function normalizeIssuer (issuer: string): string {
 }
 
 export class TokenValidator {
-  private getJwks?: any
   private jwtVerifier?: any
   private config: AuthorizationConfig
   private fastify: FastifyInstance
@@ -49,25 +48,12 @@ export class TokenValidator {
     this.allowedIssuers = buildAllowedIssuers(config.authorizationServers)
 
     if (config.tokenValidation.jwksUri) {
-      // Extract domain from JWKS URI
-      const jwksUrl = new URL(config.tokenValidation.jwksUri)
-      const domain = `${jwksUrl.protocol}//${jwksUrl.host}`
-
-      this.getJwks = buildGetJwks({
-        max: 50,
-        ttl: 600000, // 10 minutes
-        jwksPath: jwksUrl.pathname
-      })
+      const jwks = new JwksCache(config.tokenValidation.jwksUri)
 
       this.jwtVerifier = createVerifier({
         key: async (obj: { header?: { kid?: string; alg?: string } } = {}) => {
           const header = obj.header || {}
-          const publicKey = await this.getJwks!.getPublicKey({
-            kid: header.kid,
-            alg: header.alg,
-            domain,
-          })
-          return publicKey
+          return await jwks.getPublicKey(header.kid, header.alg)
         },
 
         algorithms: ['RS256', 'ES256'],
@@ -91,6 +77,12 @@ export class TokenValidator {
       if (this.jwtVerifier) {
         try {
           const payload = await this.jwtVerifier(token)
+
+          // Sessions, tasks and sealed state are bound to the subject, so it
+          // must be a usable identifier, as introspection already requires.
+          if (typeof payload.sub !== 'string' || payload.sub === '') {
+            return { valid: false, error: 'Invalid subject claim' }
+          }
 
           // Validate audience if required
           if (this.config.tokenValidation.validateAudience) {
@@ -259,10 +251,7 @@ export class TokenValidator {
   }
 
   close (): void {
-    // Cleanup if needed
-    if (this.getJwks) {
-      // get-jwks doesn't expose a close method, but the cache will be garbage collected
-    }
+    // Nothing to release: the key cache holds no timers or connections.
   }
 }
 

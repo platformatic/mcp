@@ -16,6 +16,8 @@ import type {
   MCPResource,
   MCPPrompt,
   MCPPluginOptions,
+  AuthorizationContext,
+  AuthorizationContextResolver,
   AllowedOrigins,
   SSESession,
   UnsafeToolHandler,
@@ -35,6 +37,9 @@ import type {
   McpCallToolContext,
   McpCallToolOutcome,
   MCPToolCallCompleteEvent,
+  HandlerContext,
+  ToolDefinitionExtras,
+  TaskUpdateOptions,
 } from '../dist/index.js'
 
 // ─── ToolHandler ─────────────────────────────────────────────────────
@@ -257,6 +262,23 @@ expectNotAssignable<MCPRouteSchemaTransformer>((_schema: FastifySchema) => {
   return undefined
 })
 
+const authorizationContextResolver: AuthorizationContextResolver = async (request) => {
+  expectType<FastifyRequest>(request)
+  return { userId: 'user-1', scopes: ['tools:read'] }
+}
+expectAssignable<MCPPluginOptions>({ resolveAuthorizationContext: authorizationContextResolver })
+
+// A server can advertise its own extensions; server/discover carries them
+expectAssignable<MCPPluginOptions>({ capabilities: { tools: {}, extensions: { 'io.example/ui': {} } } })
+// and a handler can read the client's
+declare const handlerContext: HandlerContext
+expectAssignable<object | undefined>(handlerContext.clientCapabilities?.extensions?.['io.example/ui'])
+expectAssignable<MCPPluginOptions>({ taskMaxRetainedPerPrincipal: 20, toolArgumentLimits: { maxArrayLength: 100 } })
+expectType<Promise<AuthorizationContext | undefined> | AuthorizationContext | undefined>(
+  authorizationContextResolver({} as FastifyRequest)
+)
+expectNotAssignable<AuthorizationContextResolver>(() => 'user-1')
+
 // Full options
 expectAssignable<MCPPluginOptions>({
   serverInfo: { name: 'test', version: '1.0.0' },
@@ -422,6 +444,8 @@ expectAssignable<McpCallToolOutcome>({ ok: false, reason: 'access-denied' })
 expectAssignable<McpCallToolOutcome>({ ok: false, reason: 'invalid-arguments', detail: 'missing input' })
 expectAssignable<McpCallToolOutcome>({ ok: false, reason: 'task-required' })
 expectNotAssignable<McpCallToolOutcome>({ ok: false, reason: 'nope' })
+expectAssignable<McpCallToolOutcome>({ ok: false, reason: 'task-ended', status: 'cancelled', message: 'Task cancelled' })
+expectNotAssignable<McpCallToolOutcome>({ ok: false, reason: 'task-ended', status: 'completed', message: 'done' })
 
 // ─── onToolCallComplete event ───────────────────────────────────────
 
@@ -489,3 +513,15 @@ const app = {} as FastifyInstance
 expectType<boolean>(app.mcpHasTool('search'))
 expectType<readonly string[]>(app.mcpListToolNames())
 expectError(app.mcpListToolNames().push('search'))
+
+// ─── Round-trip and task options ────────────────────────────────────
+
+expectAssignable<MCPPluginOptions>({ requestStateMaxAnswerBytes: 0, taskMaxInputRounds: 32 })
+expectType<AbortSignal>(({} as HandlerContext).signal)
+expectAssignable<ToolDefinitionExtras>({ inputCapabilities: { elicitation: { form: {} } } })
+expectAssignable<TaskUpdateOptions>({ statusMessage: null })
+app.mcpAddTool({
+  name: 'declared',
+  inputSchema: Type.Object({}),
+  inputCapabilities: { sampling: {} }
+}, async () => ({ content: [] }))

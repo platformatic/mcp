@@ -14,18 +14,66 @@ import type {
   Resource,
   Prompt,
   ElicitRequestFormParams,
-  RequestId
+  RequestId,
+  LoggingLevel
 } from './schema.ts'
 import type { Static, TSchema, TObject, TString } from '@sinclair/typebox'
 import type { AuthorizationConfig, AuthorizationContext } from './types/auth-types.ts'
 import type { AllowedOrigins, ToolArgumentLimits } from './security.ts'
+import type { CacheHint } from './modern/handlers.ts'
+import type { ClientCapabilities as ModernClientCapabilities, ServerCapabilities as ModernServerCapabilities, InputRequests } from './schema-2026.ts'
+
+export type { CacheHint }
 
 // Context interface for all handler types
 export interface HandlerContext {
   sessionId?: string
+  /**
+   * The protocol revision this request is served under: the per-request
+   * version on 2026-07-28, the negotiated one on earlier revisions.
+   */
+  protocolVersion?: string
+  /**
+   * What the client declared it supports on this request (2026-07-28), so a
+   * handler can choose, say, URL-mode over form elicitation, or skip asking
+   * at all. Absent on the legacy path.
+   */
+  clientCapabilities?: ModernClientCapabilities
   request: FastifyRequest
   reply: FastifyReply
   authContext?: AuthorizationContext
+  /**
+   * Answers to a previous `InputRequiredResult`, keyed the way the handler
+   * keyed its `inputRequests` (2026-07-28 multi round-trip requests). Absent on
+   * a first attempt, and always absent on the legacy path.
+   */
+  inputResponses?: Record<string, unknown>
+  /**
+   * The value the handler passed as `state` when it threw `InputRequired`,
+   * verified and unsealed. Absent unless the client is retrying.
+   */
+  requestState?: unknown
+  /**
+   * Aborts when the request is cancelled, so the handler can stop work early:
+   * a 2026-07-28 client that disconnects before the response,
+   * `notifications/cancelled` on stdio, or the cancellation of the task the
+   * handler is running in. A legacy HTTP disconnect does not abort it, since
+   * it is not a cancellation on those revisions.
+   */
+  signal: AbortSignal
+  /**
+   * Report progress on this request (`notifications/progress`). Only sent to
+   * a 2026-07-28 client that asked for it with a `progressToken`; `progress`
+   * must increase with each call, and smaller values are dropped. A no-op
+   * otherwise.
+   */
+  sendProgress: (progress: number, total?: number, message?: string) => void
+  /**
+   * Log a message to the client (`notifications/message`). Only sent to a
+   * 2026-07-28 client that set `io.modelcontextprotocol/logLevel`, and only at
+   * or above that level. A no-op otherwise.
+   */
+  log: (level: LoggingLevel, data: unknown, logger?: string) => void
 }
 
 // Context passed to resource read handlers
@@ -72,8 +120,25 @@ export type PromptHandler<TArgsSchema extends TObject = TObject> = (
 ) => Promise<GetPromptResult> | GetPromptResult
 
 // Generic MCP interfaces with TypeBox schema support
+/**
+ * Plugin-only fields of a tool definition. They are never listed to clients.
+ */
+export interface ToolDefinitionExtras {
+  /**
+   * The client capabilities this tool's handler may need when it throws
+   * `InputRequired` (e.g. `{ elicitation: { form: {} } }`). A 2026-07-28
+   * request can only stream progress before the result once the server knows
+   * it will not have to refuse it with `-32021` and a 400, so progress is held
+   * back unless the client declared every capability the tool may need. Left
+   * out, that is every capability an input request can need. A handler that
+   * asks for more than it declared, after progress has streamed, gets an
+   * internal error.
+   */
+  inputCapabilities?: ModernClientCapabilities
+}
+
 export interface MCPTool<TSchema extends TObject = TObject> {
-  definition: Tool & {
+  definition: Tool & ToolDefinitionExtras & {
     inputSchema: TSchema
   }
   handler?: ToolHandler<TSchema>
@@ -98,7 +163,7 @@ declare module 'fastify' {
   interface FastifyInstance {
     // Overloaded methods to support both TypeBox schemas and unsafe usage
     mcpAddTool<TSchema extends TObject>(
-      definition: Omit<Tool, 'inputSchema'> & { inputSchema: TSchema },
+      definition: Omit<Tool, 'inputSchema'> & ToolDefinitionExtras & { inputSchema: TSchema },
       handler?: ToolHandler<TSchema>
     ): void
     mcpAddTool(
@@ -211,6 +276,11 @@ export interface TracerLike {
  */
 export type ToolAccessOperation = 'list' | 'call'
 
+/** Resolve an application-authenticated identity from a Fastify request. */
+export type AuthorizationContextResolver = (
+  request: FastifyRequest
+) => AuthorizationContext | undefined | Promise<AuthorizationContext | undefined>
+
 /** Per-request context handed to the `canAccessTool` hook. */
 export interface ToolAccessContext {
   authContext?: AuthorizationContext
@@ -247,6 +317,24 @@ export type McpCallToolOutcome =
   | { ok: false, reason: 'access-denied' }
   | { ok: false, reason: 'invalid-arguments', detail: string }
   | { ok: false, reason: 'task-required' }
+  /**
+   * A call that would run as a task (in either era) was refused because a task
+   * limit was reached (`taskMaxConcurrent`, `taskMaxPerPrincipal` or the
+   * retention cap).
+   */
+  | { ok: false, reason: 'task-limit', message: string }
+  /**
+   * The handler threw `InputRequired`: it needs the client to answer
+   * `inputRequests` first. In-process there is no client to ask, so the call
+   * cannot complete.
+   */
+  | { ok: false, reason: 'input-required', inputRequests: InputRequests }
+  /**
+   * A 2026-07-28 task ended `failed` or `cancelled` although its last round
+   * returned a result or asked for input: it was cancelled after the handler
+   * returned, ran out of input rounds, or timed out waiting for input.
+   */
+  | { ok: false, reason: 'task-ended', status: 'failed' | 'cancelled', message: string }
 
 interface MCPToolCallCompleteEventBase {
   toolName: string
@@ -284,7 +372,11 @@ export interface MCPClientResponseContext {
 
 export interface MCPPluginOptions {
   serverInfo?: Implementation
-  capabilities?: ServerCapabilities
+  /**
+   * What the server supports. `extensions` is advertised by 2026-07-28's
+   * `server/discover` only; the handshake revisions never see it.
+   */
+  capabilities?: ServerCapabilities & Pick<ModernServerCapabilities, 'extensions'>
   instructions?: string
   enableSSE?: boolean
   /**
@@ -320,19 +412,119 @@ export interface MCPPluginOptions {
    */
   taskMaxTtlMs?: number
   /**
-   * Most tasks one principal (token subject) may keep stored, finished ones
-   * included (default 100). At the cap, the caller's oldest finished task is
-   * evicted; if all of them are still running, the call fails with
-   * "Task limit reached". Without authorization every caller shares one quota.
+   * Most tasks one instance runs in the background at once, for both protocol
+   * eras (default 1000). A task counts until its handler settles, even past
+   * its ttl. Past the limit a task is refused: -32029 on 2025-11-25, -32600
+   * on 2026-07-28 (whose reserved range -32029 falls in).
+   */
+  taskMaxConcurrent?: number
+  /**
+   * Most tasks one caller (a user at an issuer, whichever OAuth client they
+   * come through) may run on an instance at once, for both protocol eras
+   * (default 100). Not applied to callers the deployment cannot identify,
+   * who are bounded by `taskMaxConcurrent` only. Past it, the call is refused
+   * as for `taskMaxConcurrent`.
+   */
+  taskMaxPerPrincipal?: number
+  /**
+   * Most tasks the in-memory task store holds, finished ones included until
+   * their ttl (default 1000). At the cap the oldest finished task is evicted;
+   * if every stored task is still running, new tasks are refused.
+   */
+  taskStoreMaxTasks?: number
+  /**
+   * Most tasks one caller (a user at an issuer, whichever OAuth client they
+   * come through) may keep stored, finished ones included (default 100). At
+   * the cap, the caller's oldest finished task is evicted; if all of them are
+   * still running, the call fails with "Task limit reached". Unlike
+   * `taskMaxPerPrincipal`, which bounds the tasks running on one instance,
+   * this bounds what the store retains across instances.
    */
   taskMaxRetainedPerPrincipal?: number
   /**
-   * Lease on a running task, in milliseconds (default 30000). The instance
-   * executing a task renews it every third of this period; if the instance dies
-   * the lease lapses and the task is reported `failed` instead of staying
-   * `working` until its ttl runs out.
+   * How long a running task's worker lease lasts, for both protocol eras, in
+   * milliseconds (default 15000; renewed every third of it). When an instance
+   * dies, its tasks are reported failed this long after its last renewal
+   * instead of staying `working` until their ttl runs out.
    */
   taskLeaseMs?: number
+  /**
+   * How many times a 2026-07-28 task's handler may throw `InputRequired`
+   * before the task fails (default 32). A round that asks the client nothing
+   * and only carries state waits the task's poll interval before running
+   * again, so it cannot spin.
+   */
+  taskMaxInputRounds?: number
+  /** Most `subscriptions/listen` streams one instance holds open (default 1000). */
+  subscriptionMaxStreams?: number
+  /**
+   * Most `subscriptions/listen` streams one caller (a user at an issuer,
+   * whichever OAuth client they come through) may hold open on an instance
+   * (default 10). Not applied to callers the deployment cannot identify, who
+   * are bounded by `subscriptionMaxStreams` only. Further streams are refused
+   * with HTTP 429.
+   */
+  subscriptionMaxStreamsPerPrincipal?: number
+  /** Most `resourceSubscriptions` URIs one stream may name (default 1000). */
+  subscriptionMaxResourceUris?: number
+  /**
+   * On close, how long to wait for running tasks (both eras) to finish before
+   * aborting them and recording them as failed, in milliseconds (default
+   * 5000). Fastify bounds close hooks by its `pluginTimeout` (10s by default),
+   * so keep this comfortably below it.
+   */
+  taskShutdownTimeoutMs?: number
+  /**
+   * Freshness hints for the operations 2026-07-28 makes cacheable. Every
+   * cacheable result must carry `ttlMs` and `cacheScope`, so anything omitted
+   * here falls back to `{ ttlMs: 0, cacheScope: 'private' }` — immediately
+   * stale and never shared between callers, which is always safe.
+   *
+   * Raise `ttlMs` for lists that rarely change; combined with `listChanged`
+   * notifications the client gets both a cheap steady state and prompt
+   * invalidation. Only mark something `public` when the result genuinely does
+   * not vary per user, since a shared cache may serve it across access tokens.
+   */
+  caching?: {
+    discover?: CacheHint
+    toolsList?: CacheHint
+    promptsList?: CacheHint
+    resourcesList?: CacheHint
+    resourceTemplatesList?: CacheHint
+    resourcesRead?: CacheHint
+  }
+  /**
+   * Secret used to seal the `requestState` blob that carries multi round-trip
+   * context through the client. It must be shared by every instance that can
+   * serve a retry, otherwise a retry landing on another replica is rejected.
+   * Defaults to a per-process random key, which is correct for a single
+   * instance only.
+   *
+   * A list rotates secrets: state is sealed with the first and accepted under
+   * any. Put the new secret first, deploy, and remove the old one once state
+   * sealed with it has expired (`requestStateTtlMs`).
+   */
+  requestStateSecret?: string | string[]
+  /** How long a sealed `requestState` stays valid. Defaults to 5 minutes. */
+  requestStateTtlMs?: number
+  /**
+   * How many bytes of JSON of earlier answers a sealed `requestState` carries
+   * into later rounds. When the answers to carry exceed it the request fails
+   * with -32602 rather than dropping any, so a handler that gathers large
+   * answers stores what it needs in its own state and lists the answers still
+   * worth carrying in `InputRequired`'s `carry`. `0` disables carrying.
+   * Defaults to 64 KiB.
+   */
+  requestStateMaxAnswerBytes?: number
+  /**
+   * Resolve identities established by application-owned authentication hooks.
+   * When present, this resolver is authoritative instead of the built-in OAuth
+   * token payload. It runs once per MCP POST after Fastify preHandlers.
+   *
+   * The application remains responsible for rejecting unauthenticated requests.
+   * Return a context with `userId` to bind request state and tasks to a principal.
+   */
+  resolveAuthorizationContext?: AuthorizationContextResolver
   /**
    * Origins accepted on the MCP endpoints, to prevent DNS rebinding attacks.
    * Omit to disable validation (non-browser deployments), pass `'*'` or `true`

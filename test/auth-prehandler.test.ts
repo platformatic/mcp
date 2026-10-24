@@ -1,7 +1,7 @@
 import { test, describe, beforeEach, afterEach } from 'node:test'
 import type { TestContext } from 'node:test'
 import Fastify from 'fastify'
-import { createAuthPreHandler } from '../src/auth/prehandler.ts'
+import { createAuthPreHandler, generateWWWAuthenticateHeader } from '../src/auth/prehandler.ts'
 import { colonScopeHierarchy } from '../src/index.ts'
 import { TokenValidator } from '../src/auth/token-validator.ts'
 import {
@@ -585,4 +585,15 @@ describe('Authorization PreHandler', () => {
       t.assert.strictEqual(response.statusCode, 403)
     })
   })
+})
+
+test('a challenge cannot be broken out of by the error description', (t: TestContext) => {
+  const header = generateWWWAuthenticateHeader(
+    { enabled: true, authorizationServers: ['https://auth.example.com'], resourceUri: 'https://api.example.com', tokenValidation: {} } as any,
+    { error: 'invalid_token', error_description: 'Token "expired" \\ x' }
+  )
+  t.assert.strictEqual(
+    header,
+    'Bearer realm="MCP Server", resource_metadata="https://api.example.com/.well-known/oauth-protected-resource", error="invalid_token", error_description="Token expired  x"'
+  )
 })

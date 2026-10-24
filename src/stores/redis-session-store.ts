@@ -45,6 +45,9 @@ export class RedisSessionStore implements SessionStore {
     if (metadata.ownerIss !== undefined) {
       sessionData.ownerIss = metadata.ownerIss
     }
+    if (metadata.ownerClient !== undefined) {
+      sessionData.ownerClient = metadata.ownerClient
+    }
 
     // Add authorization context if present
     if (metadata.authorization) {
@@ -144,6 +147,9 @@ export class RedisSessionStore implements SessionStore {
     }
     if (result.ownerIss !== undefined) {
       metadata.ownerIss = result.ownerIss
+    }
+    if (result.ownerClient !== undefined) {
+      metadata.ownerClient = result.ownerClient
     }
 
     // Parse authorization context if present

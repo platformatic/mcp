@@ -166,11 +166,14 @@ describe('tool argument limits', () => {
     t.assert.strictEqual(getInvocations(), 0)
   })
 
-  test('sanitizeToolParams removes control characters from strings in objects inside arrays', (t: TestContext) => {
-    t.assert.deepStrictEqual(
-      sanitizeToolParams({ xs: [{ s: 'a\x00b\x07c', n: 1 }, 'd\x1Fe'] }),
-      { xs: [{ s: 'abc', n: 1 }, 'de'] }
+  test('sanitizeToolParams refuses control characters in strings in objects inside arrays', (t: TestContext) => {
+    // Refused rather than stripped, so the handler never sees a value other
+    // than the one the client sent
+    t.assert.throws(
+      () => sanitizeToolParams({ xs: [{ s: 'a\x00b\x07c', n: 1 }] }),
+      /must not contain control characters/
     )
+    t.assert.throws(() => sanitizeToolParams({ xs: ['d\x1Fe'] }), /must not contain control characters/)
     t.assert.throws(
       () => sanitizeToolParams({ xs: [{ ['k\x00'.repeat(4)]: 1 }] }, { maxStringLength: 5 }),
       /maximum allowed length of 5/
@@ -178,10 +181,10 @@ describe('tool argument limits', () => {
   })
 
   test('sanitizeToolParams recurses into nested arrays', (t: TestContext) => {
-    t.assert.deepStrictEqual(
-      sanitizeToolParams({ xs: [[['a\x00b'], [{ s: 'c\x7Fd' }]], [1, null, true]] }),
-      { xs: [[['ab'], [{ s: 'cd' }]], [1, null, true]] }
-    )
+    const clean = { xs: [[['ab'], [{ s: 'cd' }]], [1, null, true]] }
+    t.assert.strictEqual(sanitizeToolParams(clean), clean)
+    t.assert.throws(() => sanitizeToolParams({ xs: [[['a\x00b']]] }), /must not contain control characters/)
+    t.assert.throws(() => sanitizeToolParams({ xs: [[[{ s: 'c\x7Fd' }]]] }), /must not contain control characters/)
     t.assert.throws(
       () => sanitizeToolParams({ xs: [[['abcdef']]] }, { maxStringLength: 5 }),
       /maximum allowed length of 5/

@@ -84,7 +84,8 @@ describe('Redis connection errors', () => {
 
     const app = Fastify({ logger: { level: 'error', stream } })
     await app.register(mcpPlugin, {
-      redis: { host: '127.0.0.1', port }
+      redis: { host: '127.0.0.1', port },
+      requestStateSecret: 'test-request-state-secret-32-bytes!!'
     })
     await app.ready()
 
