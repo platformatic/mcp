@@ -14,12 +14,13 @@ import type {
   MCPRouteSchemaTransformer
 } from '../types.ts'
 import type { SessionStore, SessionMetadata } from '../stores/session-store.ts'
+import { SessionLimitError, SESSION_LIMIT_REACHED } from '../stores/session-store.ts'
 import { DEFAULT_SESSION_TTL_MS } from '../stores/memory-session-store.ts'
 import type { TaskStore, TaskWaiters, TaskLeases } from '../stores/task-store.ts'
 import type { MessageBroker } from '../brokers/message-broker.ts'
 import type { AuthorizationContext } from '../types/auth-types.ts'
 import type { JsonSchemaValidator } from '../validation/json-schema-validator.ts'
-import { processMessage, checkRequestId } from '../handlers.ts'
+import { processMessage, checkRequestId, createError } from '../handlers.ts'
 import { isStdioRequest } from '../stdio-marker.ts'
 
 const MAX_TIMER_DELAY_MS = 2 ** 31 - 1
@@ -493,6 +494,15 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
           reply.code(202)
         }
       } catch (error) {
+        if (error instanceof SessionLimitError) {
+          // A stable protocol error rather than an opaque 500, so a client that
+          // hit the active-session cap can react (e.g. free a session) instead
+          // of treating it as a transient server failure.
+          const id = Array.isArray(request.body)
+            ? null
+            : (request.body as { id?: string | number | null })?.id ?? null
+          return reply.type('application/json').code(429).send(createError(id, SESSION_LIMIT_REACHED, `Session limit reached (${error.limit})`))
+        }
         app.log.error({ err: error }, 'Error processing MCP message')
         reply.type('application/json').code(500).send({
           jsonrpc: JSONRPC_VERSION,
@@ -542,6 +552,25 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
         request.log.info({ sessionId }, 'Handling SSE request')
 
+        // Resolve (or create) the session before hijacking the reply, so a
+        // failed session creation (e.g. the active-session cap) can still be
+        // answered with a normal HTTP response rather than a hung stream.
+        let session: SessionMetadata
+        let isNewSession = false
+        if (sessionId) {
+          const existingSession = await sessionStore.get(sessionId)
+          if (existingSession) {
+            session = existingSession
+            await sessionStore.touch?.(session.id)
+          } else {
+            session = await createSession(request)
+            isNewSession = true
+          }
+        } else {
+          session = await createSession(request)
+          isNewSession = true
+        }
+
         // We are opting out of Fastify proper
         reply.hijack()
 
@@ -550,19 +579,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         // Set up SSE stream
         raw.setHeader('Content-type', 'text/event-stream')
         raw.setHeader('Cache-Control', 'no-cache')
-
-        let session: SessionMetadata
-        if (sessionId) {
-          const existingSession = await sessionStore.get(sessionId)
-          if (existingSession) {
-            session = existingSession
-            await sessionStore.touch?.(session.id)
-          } else {
-            session = await createSession(request)
-            raw.setHeader('Mcp-Session-Id', session.id)
-          }
-        } else {
-          session = await createSession(request)
+        if (isNewSession) {
           raw.setHeader('Mcp-Session-Id', session.id)
         }
 
@@ -685,6 +702,10 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
           clearInterval(heartbeatInterval)
         })
       } catch (error) {
+        if (error instanceof SessionLimitError) {
+          reply.type('application/json').code(429).send({ error: `Session limit reached (${error.limit})` })
+          return
+        }
         app.log.error({ err: error }, 'Error setting up SSE stream')
         reply.type('application/json').code(500).send({ error: 'Internal server error' })
       }

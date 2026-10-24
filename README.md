@@ -263,6 +263,31 @@ await app.register(mcpPlugin, {
 })
 ```
 
+### Session and subscription limits
+
+By default there is no bound on how many sessions one caller may keep open or on how many
+resources one session may subscribe to. Set `maxSessionsPerPrincipal` and
+`maxResourceSubscriptionsPerSession` to bound retained state; each defaults to `Infinity`.
+
+```typescript
+await app.register(mcpPlugin, {
+  maxSessionsPerPrincipal: 10,        // active sessions per caller
+  maxResourceSubscriptionsPerSession: 50
+})
+```
+
+- **`maxSessionsPerPrincipal`** caps the non-expired sessions a caller may keep active. When
+authorization identifies a caller the cap is keyed by the token's (issuer, subject) pair, so
+each principal gets its own quota; without authorization, or for requests that identify no
+caller, every session shares one anonymous bucket. At the cap a new session is refused with
+`SESSION_LIMIT_REACHED` (`-32035`) — an existing session is never torn down, and sessions
+still expire on their own via `sessionTtlMs`. The Redis store enforces the cap atomically, so
+concurrent session creation across instances cannot overshoot it.
+- **`maxResourceSubscriptionsPerSession`** caps the distinct resource URIs one session may
+subscribe to via `resources/subscribe`. Subscribing to an already-subscribed URI stays
+idempotent; only at the cap does a new URI fail with `SUBSCRIPTION_LIMIT_REACHED` (`-32036`).
+The Redis store enforces the cap atomically, so concurrent subscribes cannot overshoot it.
+
 ## Request Body Errors
 
 Body-parser failures and bodies that are not JSON-RPC messages on `POST /mcp` are answered
@@ -916,8 +941,10 @@ const store: SessionStore = new MemorySessionStore()
 ```
 
 - **`SessionStore`**: the interface the plugin uses to persist SSE session metadata, message history, token-to-session mappings, and per-session resource subscriptions (`addResourceSubscription` / `removeResourceSubscription`, exposed as `resourceSubscriptions` on the metadata). The optional `touch(sessionId)` records activity so the session is not expired while in use.
-- **`MemorySessionStore`**: in-process implementation used automatically when no `redis` option is passed. Takes an optional `maxMessages` history cap (default 100) and `{ sessionTtlMs }` idle expiry (default 1 hour); call `cleanup()` periodically to free expired sessions when using it outside the plugin.
+- **`MemorySessionStore`**: in-process implementation used automatically when no `redis` option is passed. Takes an optional `maxMessages` history cap (default 100) and `{ sessionTtlMs }` idle expiry (default 1 hour); call `cleanup()` periodically to free expired sessions when using it outside the plugin. Both stores also accept `maxSessionsPerPrincipal` and `maxResourceSubscriptionsPerSession` to bound active sessions and per-session resource subscriptions.
 - **`RedisSessionStore`**: distributed implementation used automatically when the `redis` option is passed; sessions and message history live in Redis so any instance can serve any client.
+
+`SessionLimitError` and `SubscriptionLimitError` (with `SESSION_LIMIT_REACHED` and `SUBSCRIPTION_LIMIT_REACHED`) are also exported, so you can catch them when calling a store directly or distinguish those failures from an internal error.
 
 These are the same store classes the plugin instantiates internally based on the `redis` option. Exporting them lets you construct or inspect one directly in tests and scripts.
 

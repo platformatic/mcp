@@ -1,5 +1,6 @@
 import type { JSONRPCMessage } from '../schema.ts'
 import type { SessionStore, SessionMetadata } from './session-store.ts'
+import { SessionLimitError, SubscriptionLimitError, DEFAULT_MAX_SESSIONS_PER_PRINCIPAL, DEFAULT_MAX_RESOURCE_SUBSCRIPTIONS_PER_SESSION, validateStoreLimit } from './session-store.ts'
 import type { AuthorizationContext, TokenRefreshInfo } from '../types/auth-types.ts'
 
 interface MessageHistoryEntry {
@@ -16,6 +17,17 @@ export interface MemorySessionStoreOptions {
    * (default 1 hour, like the Redis store's TTL).
    */
   sessionTtlMs?: number
+  /**
+   * Most non-expired sessions one principal may keep active (default
+   * Infinity). Keyed by the session's (ownerIss, ownerSub) pair; sessions with
+   * no owner share one anonymous bucket.
+   */
+  maxSessionsPerPrincipal?: number
+  /**
+   * Most distinct resource URIs one session may subscribe to (default
+   * Infinity). Duplicate subscriptions are idempotent.
+   */
+  maxResourceSubscriptionsPerSession?: number
 }
 
 export class MemorySessionStore implements SessionStore {
@@ -24,10 +36,40 @@ export class MemorySessionStore implements SessionStore {
   private tokenToSession = new Map<string, string>() // tokenHash -> sessionId
   private maxMessages: number
   readonly sessionTtlMs: number
+  private readonly maxSessionsPerPrincipal: number
+  private readonly maxResourceSubscriptionsPerSession: number
 
   constructor (maxMessages: number = 100, options: MemorySessionStoreOptions = {}) {
     this.maxMessages = maxMessages
     this.sessionTtlMs = options.sessionTtlMs ?? DEFAULT_SESSION_TTL_MS
+    this.maxSessionsPerPrincipal = options.maxSessionsPerPrincipal ?? DEFAULT_MAX_SESSIONS_PER_PRINCIPAL
+    this.maxResourceSubscriptionsPerSession = options.maxResourceSubscriptionsPerSession ?? DEFAULT_MAX_RESOURCE_SUBSCRIPTIONS_PER_SESSION
+    validateStoreLimit('maxSessionsPerPrincipal', this.maxSessionsPerPrincipal)
+    validateStoreLimit('maxResourceSubscriptionsPerSession', this.maxResourceSubscriptionsPerSession)
+  }
+
+  /**
+   * The bucket a session counts against for the per-principal active-session cap.
+   * A session is owned when both the issuer and subject are known; otherwise all
+   * ownerless sessions share one anonymous bucket.
+   */
+  private static ownerKey (metadata: SessionMetadata): string {
+    if (metadata.ownerSub === undefined && metadata.ownerIss === undefined) {
+      return '__anonymous__'
+    }
+    return `${metadata.ownerIss ?? ''}:${metadata.ownerSub ?? ''}`
+  }
+
+  /** Count non-expired sessions in the same owner bucket. */
+  private activeSessionCountFor (metadata: SessionMetadata): number {
+    const key = MemorySessionStore.ownerKey(metadata)
+    let count = 0
+    for (const [otherId, other] of this.sessions) {
+      if (otherId === metadata.id) continue
+      if (this.isExpired(other)) continue
+      if (MemorySessionStore.ownerKey(other) === key) count++
+    }
+    return count
   }
 
   private isExpired (session: SessionMetadata): boolean {
@@ -50,6 +92,10 @@ export class MemorySessionStore implements SessionStore {
   }
 
   async create (metadata: SessionMetadata): Promise<void> {
+    if (this.maxSessionsPerPrincipal !== Infinity &&
+        this.activeSessionCountFor(metadata) >= this.maxSessionsPerPrincipal) {
+      throw new SessionLimitError(this.maxSessionsPerPrincipal)
+    }
     this.sessions.set(metadata.id, { ...metadata })
     this.messageHistory.set(metadata.id, [])
   }
@@ -209,9 +255,15 @@ export class MemorySessionStore implements SessionStore {
     const session = this.live(sessionId)
     if (!session) return
     const subscriptions = session.resourceSubscriptions ??= []
-    if (!subscriptions.includes(uri)) {
-      subscriptions.push(uri)
+    // Duplicate subscriptions stay idempotent: the URI is already present.
+    if (subscriptions.includes(uri)) {
+      return
     }
+    if (this.maxResourceSubscriptionsPerSession !== Infinity &&
+        subscriptions.length >= this.maxResourceSubscriptionsPerSession) {
+      throw new SubscriptionLimitError(this.maxResourceSubscriptionsPerSession)
+    }
+    subscriptions.push(uri)
   }
 
   async removeResourceSubscription (sessionId: string, uri: string): Promise<void> {
