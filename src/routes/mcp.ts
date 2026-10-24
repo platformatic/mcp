@@ -524,6 +524,13 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
       : { onRequest: mcpOnRequest, preHandler: mcpPreHandler, schema }
 
     app.get('/mcp', routeOptions, async (request: FastifyRequest, reply: FastifyReply) => {
+      // Fastify routes HEAD here too. A stream has no meaningful headers-only
+      // form, and opening one would create a session and never answer.
+      if (request.method === 'HEAD') {
+        reply.header('Allow', 'GET, POST, DELETE').code(405).send()
+        return
+      }
+
       if (!supportsSSE(request)) {
         reply.header('Allow', 'GET, POST, DELETE').type('application/json').code(405).send({ error: 'Method Not Allowed: SSE not supported' })
         return
