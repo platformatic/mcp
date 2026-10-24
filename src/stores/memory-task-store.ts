@@ -1,6 +1,7 @@
 import type { TaskStatus } from '../schema.ts'
 import type { TaskStore, TaskRecord, TaskOutcome, TaskListOptions, TaskListPage, TaskOwner } from './task-store.ts'
 import {
+  DEFAULT_TASK_MAX_ANONYMOUS,
   DEFAULT_TASK_MAX_PER_PRINCIPAL,
   TaskLimitError,
   TASK_OWNER_LOST,
@@ -8,6 +9,7 @@ import {
   decodeTaskCursor,
   encodeTaskCursor,
   isAfterTaskCursor,
+  isAnonymousOwner,
   isTaskOwner,
   isTerminal,
   ownerLostOutcome,
@@ -28,13 +30,16 @@ export class MemoryTaskStore implements TaskStore {
   private tasks = new Map<string, TaskRecord>()
   private readonly maxTasks: number
   private readonly maxTasksPerPrincipal: number
+  private readonly maxAnonymousTasks: number
 
-  constructor (options: number | { maxTasks?: number, maxTasksPerPrincipal?: number } = {}) {
+  constructor (options: number | { maxTasks?: number, maxTasksPerPrincipal?: number, maxAnonymousTasks?: number } = {}) {
     const opts = typeof options === 'number' ? { maxTasks: options } : options
     this.maxTasks = opts.maxTasks ?? 1000
     this.maxTasksPerPrincipal = opts.maxTasksPerPrincipal ?? DEFAULT_TASK_MAX_PER_PRINCIPAL
+    this.maxAnonymousTasks = opts.maxAnonymousTasks ?? DEFAULT_TASK_MAX_ANONYMOUS
     validateTaskLimit('maxTasks', this.maxTasks)
     validateTaskLimit('maxTasksPerPrincipal', this.maxTasksPerPrincipal)
+    validateTaskLimit('maxAnonymousTasks', this.maxAnonymousTasks)
   }
 
   async create (task: TaskRecord): Promise<void> {
@@ -42,14 +47,17 @@ export class MemoryTaskStore implements TaskStore {
     // pass the capacity checks and overshoot them.
     const owner = { subject: task.authSubject, issuer: task.authIssuer }
     const ownedBy = (t: TaskRecord) => isTaskOwner(t, owner)
+    // Anonymous callers cannot be told apart, so the per-principal cap would be
+    // one allowance shared by all of them (#320); bound them as a whole instead.
+    const cap = isAnonymousOwner(owner) ? this.maxAnonymousTasks : this.maxTasksPerPrincipal
 
     // Finished tasks count too: otherwise one caller could hold every slot
     // with results it never collects until their ttl runs out.
-    if (this.count(ownedBy) >= this.maxTasksPerPrincipal) {
+    if (this.count(ownedBy) >= cap) {
       this.sweepExpired()
       this.failLapsedLeases(ownedBy)
-      if (this.count(ownedBy) >= this.maxTasksPerPrincipal && !this.evictOldestFinished(ownedBy)) {
-        throw new TaskLimitError(this.maxTasksPerPrincipal)
+      if (this.count(ownedBy) >= cap && !this.evictOldestFinished(ownedBy)) {
+        throw new TaskLimitError(cap)
       }
     }
 
