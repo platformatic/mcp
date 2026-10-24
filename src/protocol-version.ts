@@ -6,6 +6,9 @@
  * lexicographic comparison.
  */
 
+/** The revision that removed JSON-RPC batching */
+export const REVISION_2025_06_18 = '2025-06-18'
+
 /** The revision that introduced tasks, icons, URL elicitation and the JSON Schema dialect */
 export const REVISION_2025_11_25 = '2025-11-25'
 
@@ -16,6 +19,14 @@ export const REVISION_2025_11_25 = '2025-11-25'
 export function atLeast (version: string | undefined, minimum: string): boolean {
   if (!version) return false
   return version >= minimum
+}
+
+/**
+ * JSON-RPC batches. 2025-03-26 spelled them out and 2025-06-18 removed them;
+ * 2024-11-05 is plain JSON-RPC 2.0, which has always allowed them.
+ */
+export function supportsBatching (version: string | undefined): boolean {
+  return !atLeast(version, REVISION_2025_06_18)
 }
 
 /** Task-augmented execution and the `tasks/*` methods (SEP-1686) */
