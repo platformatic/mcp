@@ -6,6 +6,8 @@ import mcpPlugin from '../src/index.ts'
 import { testWithRedis } from './redis-test-utils.ts'
 import { JSONRPC_VERSION, LATEST_PROTOCOL_VERSION, INVALID_PARAMS } from '../src/schema.ts'
 import type { CreateTaskResult, CallToolResult } from '../src/schema.ts'
+import { RedisTaskStore } from '../src/stores/redis-task-store.ts'
+import { createTestAuthConfig, createTestJWT, setupMockAgent, generateMockJWKSResponse } from './auth-test-utils.ts'
 
 async function call (app: any, method: string, params: unknown, id = 1) {
   const response = await app.inject({
@@ -186,6 +188,61 @@ describe('Redis task integration (multi-instance)', () => {
     const task = (await call(b, 'tasks/get', { taskId })).result
     assert.strictEqual(task.status, 'failed')
     assert.match(task.statusMessage, /Task owner lost/)
+  })
+
+  testWithRedis('tasks/list reports a task whose instance died as failed', async (redis, t) => {
+    const restoreMock = setupMockAgent({
+      'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse()
+    })
+    t.after(() => restoreMock())
+
+    const redisOpts = {
+      host: redis.options.host!,
+      port: redis.options.port!,
+      db: redis.options.db!
+    }
+    const taskLeaseMs = 150
+
+    let release!: () => void
+    const hang = new Promise<void>(resolve => { release = resolve })
+    t.after(() => release())
+
+    const app = fastify()
+    t.after(() => app.close())
+    await app.register(mcpPlugin, { enableTasks: true, redis: redisOpts, taskLeaseMs, authorization: createTestAuthConfig() })
+    app.mcpAddTool({
+      name: 'hang',
+      description: 'Runs until released',
+      inputSchema: Type.Object({}),
+      execution: { taskSupport: 'optional' }
+    } as any, async (): Promise<CallToolResult> => {
+      await hang
+      return { content: [{ type: 'text', text: 'late' }] }
+    })
+    await app.ready()
+
+    const token = createTestJWT({ sub: 'user-330' })
+    const authedCall = async (method: string, params: unknown) => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/mcp',
+        headers: { authorization: `Bearer ${token}`, 'mcp-protocol-version': LATEST_PROTOCOL_VERSION },
+        payload: { jsonrpc: JSONRPC_VERSION, id: 1, method, params }
+      })
+      return res.json()
+    }
+
+    const created = await authedCall('tools/call', { name: 'hang', arguments: {}, task: { ttl: 60_000 } })
+    const taskId = (created.result as CreateTaskResult).task.taskId
+
+    // Simulate the owning instance crashing: its renewals stop landing
+    t.mock.method(RedisTaskStore.prototype, 'renewLease', async () => true)
+    await new Promise(resolve => setTimeout(resolve, taskLeaseMs * 4))
+
+    const list = (await authedCall('tasks/list', {})).result
+    assert.deepStrictEqual(list.tasks.map((x: any) => [x.taskId, x.status]), [[taskId, 'failed']])
+    assert.match(list.tasks[0].statusMessage, /Task owner lost/)
+    assert.strictEqual('leaseExpiresAt' in list.tasks[0], false)
   })
 
   testWithRedis('tasks/get fails a task left behind with an expired lease', async (redis, t) => {
