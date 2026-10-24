@@ -542,10 +542,16 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
         request.log.info({ sessionId }, 'Handling SSE request')
 
-        // We are opting out of Fastify proper
+        // We are opting out of Fastify proper. Headers set on the reply by
+        // hooks (CORS, security headers) would be lost with it, so carry them
+        // over to the raw response.
+        const hookHeaders = reply.getHeaders()
         reply.hijack()
 
         const raw = reply.raw
+        for (const [name, value] of Object.entries(hookHeaders)) {
+          if (value !== undefined) raw.setHeader(name, value)
+        }
 
         // Set up SSE stream
         raw.setHeader('Content-type', 'text/event-stream')
@@ -686,7 +692,21 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         })
       } catch (error) {
         app.log.error({ err: error }, 'Error setting up SSE stream')
-        reply.type('application/json').code(500).send({ error: 'Internal server error' })
+        if (!reply.sent) {
+          reply.type('application/json').code(500).send({ error: 'Internal server error' })
+          return
+        }
+        // The reply was hijacked, so Fastify no longer answers for us. The
+        // hook headers are already on the raw response.
+        const raw = reply.raw
+        if (raw.headersSent) {
+          raw.destroy()
+          return
+        }
+        raw.statusCode = 500
+        raw.removeHeader('Cache-Control')
+        raw.setHeader('Content-Type', 'application/json')
+        raw.end(JSON.stringify({ error: 'Internal server error' }))
       }
     })
   }
