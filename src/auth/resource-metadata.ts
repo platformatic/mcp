@@ -17,3 +17,14 @@ export function getResourceMetadataPath (resourceUri: string): string {
 export function getResourceMetadataUrl (resourceUri: string): string {
   return `${new URL(resourceUri).origin}${getResourceMetadataPath(resourceUri)}`
 }
+
+/**
+ * Absolute URL at which the plugin, registered under `prefix`, serves the
+ * metadata for `resourceUri`. Without a prefix this is the RFC 9728 §3.1 URL.
+ * Under a prefix the routes can only live below it, so this is the URL that
+ * actually resolves; advertising the origin-root one would be a 404.
+ */
+export function resolveResourceMetadataUrl (resourceUri: string, prefix: string = ''): string {
+  const normalizedPrefix = prefix.replace(/\/+$/, '')
+  return `${new URL(resourceUri).origin}${normalizedPrefix}${getResourceMetadataPath(resourceUri)}`
+}

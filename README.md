@@ -1837,9 +1837,11 @@ When `oauth2Client` is configured, the plugin registers these legacy server-side
 ### Well-Known Endpoints
 
 These routes are registered only when `authorization.enabled` is true. They are
-all unauthenticated: the bearer-token check skips every path under
-`/.well-known/`. They allow cross-origin `GET` requests (CORS) so browser-based
-clients can discover them.
+all unauthenticated: the bearer-token check skips them by route, so they stay
+public under a route prefix too (it also still skips every other path under
+`/.well-known/` at the origin root). They allow cross-origin `GET` requests
+(CORS) so browser-based clients can discover them. The paths below are relative
+to the prefix the plugin is registered under, if any.
 
 - `GET /.well-known/oauth-protected-resource` - OAuth 2.0 Protected Resource Metadata (RFC 9728). Its `resource` field is `resourceUri`.
 - `GET /.well-known/oauth-protected-resource{path}` - Same metadata, served when `resourceUri` has a path (e.g. `resourceUri: 'https://mcp.example.com/mcp'` is served at `/.well-known/oauth-protected-resource/mcp`). This is the URL advertised in the `resource_metadata` parameter of `WWW-Authenticate` challenges, as required by RFC 9728 §3.1, and its `resource` field equals `resourceUri` exactly.
@@ -1850,6 +1852,58 @@ clients can discover them.
 Authorization server metadata is not served by this plugin. Clients discover it from the authorization servers listed in `authorization_servers` of the protected resource metadata (RFC 8414 / OpenID Connect Discovery on the authorization server itself).
 
 These endpoints send CORS headers for any origin. This applies only to `/.well-known/*`; see [CORS](#cors) for `/mcp`.
+
+#### Under a Route Prefix
+
+A plugin registered under a prefix can only add routes below that prefix, so
+with `prefix: '/api'` the metadata is served at
+`/api/.well-known/oauth-protected-resource{path}`. The `resource_metadata`
+parameter of `WWW-Authenticate` challenges points at that URL, so MCP clients,
+which follow `resource_metadata` when it is present, find the metadata:
+
+```typescript
+await app.register(async (api) => {
+  await api.register(mcpPlugin, {
+    authorization: {
+      enabled: true,
+      authorizationServers: ['https://auth.example.com'],
+      resourceUri: 'https://mcp.example.com/api/mcp',
+      tokenValidation: { jwksUri: 'https://auth.example.com/.well-known/jwks.json' }
+    }
+  })
+}, { prefix: '/api' })
+
+// 401 challenges advertise
+// resource_metadata="https://mcp.example.com/api/.well-known/oauth-protected-resource/api/mcp"
+```
+
+RFC 9728 §3.1 places the metadata at the origin root
+(`/.well-known/oauth-protected-resource/api/mcp` here), which is where clients
+look when a challenge carries no `resource_metadata`. To serve it there too,
+register the exported `wellKnownRoutes` plugin on the root instance and point
+`resourceMetadataUrl` at it:
+
+```typescript
+import mcpPlugin, { wellKnownRoutes, getResourceMetadataUrl } from '@platformatic/mcp'
+import type { AuthorizationConfig } from '@platformatic/mcp'
+
+const authorization: AuthorizationConfig = {
+  enabled: true,
+  authorizationServers: ['https://auth.example.com'],
+  resourceUri: 'https://mcp.example.com/api/mcp',
+  // https://mcp.example.com/.well-known/oauth-protected-resource/api/mcp
+  resourceMetadataUrl: getResourceMetadataUrl('https://mcp.example.com/api/mcp'),
+  tokenValidation: { jwksUri: 'https://auth.example.com/.well-known/jwks.json' }
+}
+
+await app.register(async (api) => {
+  await api.register(mcpPlugin, { authorization })
+}, { prefix: '/api' })
+
+// Serves /.well-known/oauth-protected-resource and
+// /.well-known/oauth-protected-resource/api/mcp at the origin root
+await app.register(wellKnownRoutes, { authConfig: authorization })
+```
 
 ### Security Considerations
 
@@ -2059,6 +2113,7 @@ await app.register(import('@fastify/bearer-auth'), {
   - `enabled`: Enable OAuth 2.1 authorization (default: false)
   - `authorizationServers`: Authorization server URIs. JWTs must carry an `iss` matching one of these (a trailing slash difference is tolerated), plus `sub` and `exp`; introspection responses must carry `sub` and, if they report `iss`, a matching one
   - `resourceUri`: Resource URI. May include a path; the protected resource metadata is then served at `/.well-known/oauth-protected-resource{path}` (RFC 9728 §3.1)
+  - `resourceMetadataUrl`: Absolute URL advertised as `resource_metadata` in `WWW-Authenticate` challenges (optional). Defaults to the URL the plugin serves the metadata at, including the route prefix if any; see [Under a Route Prefix](#under-a-route-prefix)
   - `requiredScopes`: Scopes a token must carry (optional). Tokens missing any of them get a 403 `insufficient_scope` challenge. When set, the scopes are also advertised as `scopes_supported` in the protected resource metadata (every `/.well-known/oauth-protected-resource` route) and as `scope="..."` in the `WWW-Authenticate` header of every 401 challenge
   - `scopeImplies`: `(granted, required) => boolean` deciding whether a granted scope satisfies a required one (default: exact match; see `colonScopeHierarchy`)
   - `tokenValidation`: JWT token validation configuration
