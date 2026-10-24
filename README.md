@@ -349,6 +349,10 @@ app.mcpAddTool({
 })
 ```
 
+Without `enableTasks`, `taskSupport` has no effect: `tools/list` leaves it out, and a
+`tools/call` runs normally whether or not it carries a `task` field, as the spec requires
+when the tasks capability is not declared.
+
 A client opts in per call by adding a `task` field:
 
 ```jsonc
