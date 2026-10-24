@@ -2280,7 +2280,16 @@ app.mcpAddTool({
 
 Resource and prompt handlers also receive the same context object as tool handlers, enabling access to HTTP context and authorization information:
 
-When `uriPattern` contains `{name}` placeholders (an RFC 6570 level-1 template), `resources/read` for a concrete URI such as `context://data/42` is routed to it, and the values are available as `context.uriParams` (`{ id: '42' }`). Each placeholder matches a single non-empty segment that does not contain `/`; an exact `uri` registration always takes precedence over a template.
+When `uriPattern` is an RFC 6570 template, `resources/read` for a concrete URI such as `context://data/42` is routed to it, and the percent-decoded values are available as `context.uriParams` (`{ id: '42' }`). The supported expressions are:
+
+| Expression | Example | Matches |
+|------------|---------|---------|
+| `{name}` | `x://docs/{id}` | a single non-empty segment that does not contain `/` |
+| `{+name}` | `files://{+path}` | a non-empty value that may contain `/` (but not `?` or `#`) |
+| `{/a,b}` | `x://items{/id}` | optional `/value` segments |
+| `{?a,b}`, `{&c}` | `search://docs{?q,limit}{&page}` | optional query parameters in any order; must come last in the template, and unknown or repeated parameters do not match |
+
+Registering a template that uses anything else (the `#`, `.` and `;` operators, `{a,b}` with several variables, or the `*` and `:n` modifiers) throws. An exact `uri` registration always takes precedence over a template; when several templates match, the one with the most literal characters wins (ties go to the first registered), so `x://files/{name}` wins over `x://{a}/{b}` for `x://files/a`. Values such as `{+path}` are not sanitized: validate them (for example against `..` segments) before using them as file paths.
 
 ```typescript
 // Resource handler with context
