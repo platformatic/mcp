@@ -684,7 +684,7 @@ const FileUriSchema = Type.String({
 })
 
 app.mcpAddResource({
-  uriPattern: 'file://documents/*',
+  uriPattern: 'file://documents/{name}',
   name: 'Document Files',
   description: 'Access document files',
   uriSchema: FileUriSchema
@@ -2710,7 +2710,8 @@ This version introduces elicitation support and enhanced security features:
 - Elicitation capability for server-to-client information requests
 - Enhanced input sanitization and validation
 - Automatic security assessment for tool annotations
-- Built-in rate limiting utilities
+- Built-in rate limiting utilities500
+- 
 
 **Breaking Changes:**
 - Protocol version updated to `2025-06-18`
