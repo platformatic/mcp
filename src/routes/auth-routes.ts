@@ -2,7 +2,7 @@ import type { FastifyInstance, FastifyPluginAsync } from 'fastify'
 import fp from 'fastify-plugin'
 import { Type } from '@sinclair/typebox'
 import type { PKCEChallenge } from '../auth/oauth-client.ts'
-import { BEARER_SCHEME } from '../auth/prehandler.ts'
+import { BEARER_SCHEME, SKIP_BEARER_AUTH } from '../auth/prehandler.ts'
 import type { SessionStore } from '../stores/session-store.ts'
 import type { DCRHooks, DCRRequest, DCRResponse } from '../types/auth-types.ts'
 
@@ -105,6 +105,7 @@ const authRoutesPlugin: FastifyPluginAsync<AuthRoutesOptions> = async (fastify: 
 
   // Initiate OAuth authorization flow
   fastify.get('/oauth/authorize', {
+    config: { [SKIP_BEARER_AUTH]: true },
     schema: {
       querystring: AuthorizeQuerystring
     }
@@ -121,8 +122,16 @@ const authRoutesPlugin: FastifyPluginAsync<AuthRoutesOptions> = async (fastify: 
         })
       }
 
-      // Build the callback URL for this server (required for OIDC compliance)
-      const callbackUrl = `${request.protocol}://${request.host}/oauth/callback`
+      // The callback comes from configuration, the same one the client
+      // metadata advertises: a Host header is the caller's to choose.
+      const callbackUrl = fastify.oauthClient.redirectUri
+      if (!callbackUrl) {
+        fastify.log.error('OAuth authorization needs oauth2Client.resourceUri or oauth2Client.redirectUri to build its callback URL')
+        return reply.status(500).send({
+          error: 'server_error',
+          error_description: 'The OAuth callback URL is not configured'
+        })
+      }
 
       // Create authorization request with PKCE and redirect_uri
       const authRequest = await fastify.oauthClient.createAuthorizationRequest({
@@ -162,6 +171,7 @@ const authRoutesPlugin: FastifyPluginAsync<AuthRoutesOptions> = async (fastify: 
 
   // Handle OAuth callback
   fastify.get('/oauth/callback', {
+    config: { [SKIP_BEARER_AUTH]: true },
     schema: {
       querystring: CallbackQuerystring,
       response: {
@@ -344,6 +354,7 @@ const authRoutesPlugin: FastifyPluginAsync<AuthRoutesOptions> = async (fastify: 
   // (Using oauth-client.dynamicClientRegistration here would cause an infinite loop
   // if OIDC discovery points back to this server.)
   fastify.post('/oauth/register', {
+    config: { [SKIP_BEARER_AUTH]: true },
     schema: {
       body: DynamicRegistrationRequest,
       response: {

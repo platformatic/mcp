@@ -8,10 +8,13 @@ const DEFAULT_TTL_MS = 10 * 60 * 1000
  */
 const DEFAULT_MIN_REFRESH_MS = 10_000
 const FETCH_TIMEOUT_MS = 5_000
+/** How often a set that has never been fetched is asked for again. */
+const COLD_RETRY_MS = 1_000
 
 interface Jwk {
   kid?: unknown
   alg?: unknown
+  use?: unknown
   [member: string]: unknown
 }
 
@@ -51,13 +54,16 @@ export class JwksCache {
     let jwk = this.find(kid, alg)
     // A key the set lacks may be on its way: a fetch already under way (a
     // cold start, a rotation) is waited for, and a new one is made when the
-    // last was long enough ago, or when no fetch has succeeded yet. A key the
-    // set holds never waits on a fetch, however slow the server is.
+    // last attempt was long enough ago, whether or not it succeeded, so an
+    // unreachable server is not asked once per token. Until a set has been
+    // fetched at all every token is refused, so that wait is shorter. A key
+    // the set holds never waits on a fetch, however slow the server is.
     if (!jwk && this.refreshing) {
       await this.refreshKeepingOld()
       jwk = this.find(kid, alg)
     }
-    if (!jwk && (this.keys.length === 0 || Date.now() - this.fetchedAt >= this.minRefreshMs)) {
+    const retryAfterMs = this.keys.length === 0 ? Math.min(this.minRefreshMs, COLD_RETRY_MS) : this.minRefreshMs
+    if (!jwk && Date.now() - this.fetchedAt >= retryAfterMs) {
       await this.refreshKeepingOld()
       jwk = this.find(kid, alg)
     }
@@ -71,7 +77,9 @@ export class JwksCache {
   }
 
   private find (kid: string | undefined, alg: string | undefined): Jwk | undefined {
-    return this.keys.find(key => key.kid === kid && (alg === undefined || key.alg === undefined || key.alg === alg))
+    // RFC 7517 §4.2: a key published for encryption does not verify signatures.
+    return this.keys.find(key => key.kid === kid && (key.use === undefined || key.use === 'sig') &&
+      (alg === undefined || key.alg === undefined || key.alg === alg))
   }
 
   /** Fetch the set, sharing one fetch between concurrent callers; a failed fetch keeps the last good set. */

@@ -136,7 +136,8 @@ It accepts both JSON and `text/event-stream` responses; notifications streamed b
 result are returned in `response.notifications`. Pass extra `_meta` (such as a
 `progressToken`) with `callTool(name, args, { meta })`. A result with a `resultType` it does
 not understand is rejected. It does not retry on its own: on `-32022` pick a version from
-`error.data.supported`, and on `-32020` re-run `listTools()` before retrying.
+`error.data.supported`, and on `-32020` re-run `listTools()` before retrying. It talks to the
+endpoint the plugin registered, route prefix included; pass `endpoint` to aim elsewhere.
 
 ```typescript
 import { test } from 'node:test'
@@ -484,8 +485,8 @@ answered, and an accepted elicitation must match what was asked — content conf
 form's `requestedSchema`, or no content for a URL-mode elicitation. A form with no required
 fields (a plain confirmation) may be accepted without content, and the handler sees `content: {}`. A non-conforming answer is
 refused with `-32602`, on a retry and on `tasks/update` alike. Content sent with `decline` or
-`cancel` is not checked against the `requestedSchema` (only its shape is), so handlers should
-look at `action` first. Sampling answers must carry well-formed content blocks, `roots/list`
+`cancel` is not checked against the `requestedSchema`, so it is dropped: the handler sees only
+the `action`. Sampling answers must carry well-formed content blocks, `roots/list`
 answers `file://` URIs, and an answer holding a number JSON cannot carry (`1e400`, which parses
 as `Infinity`) is refused rather than turning into `null` on the next round. An input request holding a non-finite number (`Infinity`, `NaN`), in a
 `requestedSchema` or in sampling parameters, is the handler's error, since JSON would hand the
@@ -1900,6 +1901,13 @@ Starts a Fastify MCP server in stdio mode.
 - `error` - Custom error stream (default: process.stderr)
 - `authContext` - Authorization context every request on this stream runs as (stdio has no
   bearer token, so `resolveAuthorizationContext` is not called)
+- `endpoint` - The MCP endpoint requests go to (default: `/mcp` under the prefix of `app`). Set
+  it when the plugin is registered under a prefix in a child of the instance passed in, for
+  example `endpoint: '/api/mcp'`
+
+stdin is read as plain lines, never in terminal mode, so nothing is echoed to stdout. While
+stdout cannot take more (a client that stops reading), no further requests are read. When stdout
+goes away (`EPIPE`) the server stops as it does when stdin closes, and `runStdioServer` resolves.
 
 #### `createStdioTransport(app, options)`
 
@@ -2062,8 +2070,10 @@ eventSource.onmessage = (event) => {
 By default the plugin adds the bearer-token check as a `preHandler` hook on
 the Fastify instance it is registered on. Because the plugin is not
 encapsulated, that check also covers every route you register yourself on
-that instance. The well-known metadata endpoints and the OAuth flow endpoints
-(`/oauth/authorize`, `/oauth/callback`, `/oauth/register`) are always skipped.
+that instance. The well-known metadata endpoints and the plugin's own OAuth flow
+endpoints (`/oauth/authorize`, `/oauth/callback`, `/oauth/register`, registered when
+`oauth2Client` is configured) are always skipped. Routes of your own under `/oauth/` are
+not: they are protected like any other.
 
 Set `protectedRoutes: 'mcp'` to protect only the MCP endpoints the plugin
 registers (`POST`, `GET` and `DELETE` `/mcp`) and leave your own routes alone:
@@ -2177,6 +2187,10 @@ authorization: {
     
     // Authorization server
     authorizationServer: 'https://auth.example.com',
+
+    // This server: the OAuth callback is https://mcp.example.com/oauth/callback
+    // (or set redirectUri)
+    resourceUri: 'https://mcp.example.com',
     
     // Application configuration
     scopes: ['read', 'write', 'admin'],
@@ -2186,6 +2200,9 @@ authorization: {
   }
 }
 ```
+
+The authorization server's endpoints are discovered from its metadata (RFC 8414 or OpenID
+Connect). Metadata whose `issuer` is not `authorizationServer` is ignored.
 
 ### Session-Based Authorization
 
@@ -2602,14 +2619,24 @@ await app.register(import('@fastify/bearer-auth'), {
   - `requiredScopes`: Scopes a token must carry (optional). Tokens missing any of them get a 403 `insufficient_scope` challenge. When set, the scopes are also advertised as `scopes_supported` in the protected resource metadata (every `/.well-known/oauth-protected-resource` route) and as `scope="..."` in the `WWW-Authenticate` header of every 401 challenge
   - `scopeImplies`: `(granted, required) => boolean` deciding whether a granted scope satisfies a required one (default: exact match; see `colonScopeHierarchy`)
   - `tokenValidation`: JWT token validation configuration
-    - `jwksUri`: JWKS endpoint URL for JWT signature verification
+    - `jwksUri`: JWKS endpoint URL for JWT signature verification. A string is the key set of the
+      first of `authorizationServers`: a token naming another issuer is not checked against it.
+      With several authorization servers, map each issuer to its key set:
+      `{ 'https://a.example.com': 'https://a.example.com/jwks.json', 'https://b.example.com': 'https://b.example.com/jwks.json' }`
+      (two issuers may share one URL). Keys published with `use: "enc"` are ignored
+    - `introspectionEndpoint`: Token introspection endpoint (alternative to JWT). Each call
+      times out after 5 seconds, and a token is active only when the response says
+      `"active": true`
     - `validateAudience`: Enable audience validation
-    - `introspectionEndpoint`: Token introspection endpoint (alternative to JWT)
   - `oauth2Client`: OAuth 2.1 client configuration
     - `clientId`: OAuth client identifier
     - `clientSecret`: OAuth client secret
     - `authorizationServer`: Authorization server URI.
     - `resourceUri`: Resource URI.
+    - `redirectUri`: This server's OAuth callback, sent as `redirect_uri` and advertised in
+      client registration (default: `${resourceUri}/oauth/callback`). It comes from
+      configuration only, never from the request; with neither option set, `/oauth/authorize`
+      answers 500
     - `scopes`: Requested OAuth scopes
     - `dynamicRegistration`: Enable dynamic client registration (default: false)
 - `requestStateSecret`: Secret (at least 32 bytes) that seals multi round-trip

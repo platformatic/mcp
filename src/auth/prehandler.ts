@@ -4,6 +4,9 @@ import { TokenValidator } from './token-validator.ts'
 import { isStdioRequest } from '../stdio-trust.ts'
 import { getResourceMetadataUrl } from './resource-metadata.ts'
 
+/** Route config key marking the plugin's own pre-authorization OAuth routes. */
+export const SKIP_BEARER_AUTH = 'mcpSkipBearerAuth'
+
 export const BEARER_SCHEME = /^bearer +(.*)$/i
 
 export function createAuthPreHandler (
@@ -28,8 +31,11 @@ export function createAuthPreHandler (
       return
     }
 
-    // Skip authorization for OAuth flow endpoints (authorize initiates, callback receives code, register is pre-auth)
-    if (request.url.startsWith('/oauth/authorize') || request.url.startsWith('/oauth/callback') || request.url.startsWith('/oauth/register')) {
+    // Skip authorization for the OAuth flow endpoints this plugin registers
+    // (authorize initiates, callback receives the code, register is pre-auth).
+    // They are marked on the route, so an application route whose URL merely
+    // starts the same way stays protected.
+    if ((request.routeOptions.config as unknown as Record<string, unknown> | undefined)?.[SKIP_BEARER_AUTH] === true) {
       return
     }
 

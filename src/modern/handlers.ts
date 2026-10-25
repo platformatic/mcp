@@ -513,13 +513,18 @@ const answerValidator = new AnswerValidator()
  * a URL-mode elicitation is answered with no content, a form with content
  * matching its `requestedSchema`. An accepted form whose schema `{}` already
  * satisfies may omit its content, which is filled in as `{}`. A declined or cancelled one is not checked:
- * its content is meaningless, and the spec only says it is typically omitted.
+ * its content is meaningless (the spec only says it is typically omitted), so
+ * it is dropped rather than handed on unchecked.
  */
 function invalidElicitationAnswer (
   value: Record<string, unknown>,
   expected: ElicitationExpectation | undefined
 ): [field: string, expected: string] | undefined {
-  if (expected === undefined || value.action !== 'accept') return undefined
+  if (expected === undefined) return undefined
+  if (value.action !== 'accept') {
+    delete value.content
+    return undefined
+  }
   if (expected.mode === 'url') {
     return value.content === undefined ? undefined : ['content', 'to be omitted for a URL-mode elicitation']
   }
@@ -1057,6 +1062,12 @@ async function handleTasksCancel (
       // leaving the owning waiter blocked.
       const current = await dependencies.taskStore!.get(taskId)
       publishCancellation = current?.status === 'cancelled'
+      // Nothing settled it: the write itself failed. Acknowledging would tell
+      // the client a cancellation was recorded that never was.
+      if (current && !isTerminal(current.status)) {
+        dependencies.app.log.error({ err: error, taskId }, 'Could not record task cancellation')
+        return createError(request.id, INTERNAL_ERROR, 'Could not cancel the task; try again')
+      }
     }
   }
   if (publishCancellation) {

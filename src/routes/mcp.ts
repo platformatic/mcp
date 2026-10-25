@@ -54,8 +54,11 @@ import { generateWWWAuthenticateHeader } from '../auth/prehandler.ts'
 import { RequestStream, acceptsMediaType, requestNotifiers } from '../modern/request-stream.ts'
 import type { TaskInputChannel } from '../modern/task-inputs.ts'
 import type { JsonSchemaValidator } from '../validation/json-schema-validator.ts'
+import { resolveRouteUrl } from '../utils/route-url.ts'
 
 const MAX_TIMER_DELAY_MS = 2 ** 31 - 1
+/** How long an ended SSE stream may take to be read to its end before it is dropped. */
+const SSE_END_GRACE_MS = 5_000
 
 interface MCPPubSubRoutesOptions {
   enableSSE: boolean
@@ -99,15 +102,6 @@ function toError (value: unknown): FastifyError {
   const error = new Error('Internal Server Error', { cause: value }) as FastifyError
   error.statusCode = 500
   return error
-}
-
-function resolveRouteUrl (prefix: string | undefined, url: string): string {
-  if (!prefix || prefix === '/') {
-    return url
-  }
-
-  const normalizedPrefix = prefix.endsWith('/') ? prefix.slice(0, -1) : prefix
-  return `${normalizedPrefix}${url}`
 }
 
 function isThenable (value: unknown): value is PromiseLike<unknown> {
@@ -429,6 +423,18 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     return streams ? streams.size > 0 : false
   }
 
+  /**
+   * Write to a legacy SSE stream, or say it can take no more. A stream that
+   * has been ended (its deadline, a shutdown) may stay open while its client
+   * stops reading; writing to it then is an error emitted asynchronously,
+   * which no try/catch here would see.
+   */
+  function writeSSE (stream: FastifyReply, chunk: string): boolean {
+    if (stream.raw.writableEnded || stream.raw.destroyed) return false
+    stream.raw.write(chunk)
+    return true
+  }
+
   async function sendSSEToStreams (sessionId: string, message: JSONRPCMessage, streams: Set<FastifyReply>): Promise<void> {
     const session = await sessionStore.get(sessionId)
     if (!session) return
@@ -445,7 +451,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     const deadStreams = new Set<FastifyReply>()
     for (const stream of streams) {
       try {
-        stream.raw.write(sseEvent)
+        if (!writeSSE(stream, sseEvent)) deadStreams.add(stream)
       } catch (error) {
         app.log.error({ err: error }, 'Failed to write SSE event')
         deadStreams.add(stream)
@@ -474,7 +480,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
       for (const entry of messagesToReplay) {
         const sseEvent = `id: ${entry.eventId}\ndata: ${JSON.stringify(entry.message)}\n\n`
         try {
-          stream.raw.write(sseEvent)
+          if (!writeSSE(stream, sseEvent)) break
         } catch (error) {
           app.log.error({ err: error }, 'Failed to replay SSE event')
           break
@@ -692,9 +698,15 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
    * after `sseMaxConnectionMs`, whichever comes first. Access is only checked
    * when the stream opens, as for the legacy GET stream.
    */
-  function listenDeadline (authContext: AuthorizationContext | undefined): SubscriptionDeadline | undefined {
+  function listenDeadline (authContext: AuthorizationContext | undefined, request: FastifyRequest): SubscriptionDeadline | undefined {
+    // Whichever ends first: what the resolver says, or the bearer token
+    // itself, which a resolver building its own context may not carry over.
     // A resolver typed loosely may hand back something other than a Date.
-    const expiresAt = authContext?.expiresAt instanceof Date ? authContext.expiresAt.getTime() : undefined
+    const resolvedAt = authContext?.expiresAt instanceof Date ? authContext.expiresAt.getTime() : undefined
+    const tokenExp = request.tokenPayload?.exp
+    const tokenAt = typeof tokenExp === 'number' ? tokenExp * 1000 : undefined
+    const known = [resolvedAt, tokenAt].filter((at): at is number => at !== undefined && Number.isFinite(at))
+    const expiresAt = known.length > 0 ? Math.min(...known) : undefined
     const maxAt = opts.sseMaxConnectionMs ? Date.now() + opts.sseMaxConnectionMs : undefined
     if (expiresAt !== undefined && Number.isFinite(expiresAt) && (maxAt === undefined || expiresAt <= maxAt)) {
       return { at: expiresAt, reason: 'The access token that opened this subscription expired' }
@@ -838,7 +850,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
       // Computed before any subscribe handler runs, so nothing can throw
       // between accepting URIs and the stream that releases them.
-      const deadline = listenDeadline(authContext)
+      const deadline = listenDeadline(authContext, request)
       const quotaKey = quotaKeyOf(authContext)
       const reserved = subscriptions.reserve(quotaKey)
       if (typeof reserved === 'string') {
@@ -1203,6 +1215,11 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         reply.hijack()
 
         const raw = reply.raw
+        // A write the client cannot take any more fails asynchronously, and
+        // the stream's 'close' cleans up after it.
+        raw.on('error', (err) => {
+          app.log.debug({ err, sessionId: session.id }, 'SSE stream error')
+        })
 
         // Set up SSE stream
         raw.setHeader('Content-type', 'text/event-stream')
@@ -1275,11 +1292,17 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
               sessionId: session.id,
               afterMs: closeAfterMs
             }, closeReason)
+            // Take it out of the session first, so nothing more is written
+            // to a stream that has been ended.
+            localStreams.get(session.id)?.delete(reply)
             try {
               reply.raw.end()
             } catch {
             // already gone
             }
+            // A client that stops reading never takes the end, and would hold
+            // the connection open for good.
+            setTimeout(() => reply.raw.destroy(), SSE_END_GRACE_MS).unref()
           }
           // setTimeout fires immediately on delays past 2^31-1 ms (~24.8 days), so
           // wait in capped steps until the deadline is reached
@@ -1300,14 +1323,17 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         }
 
         // Send initial heartbeat
-        reply.raw.write(': heartbeat\n\n')
+        writeSSE(reply, ': heartbeat\n\n')
 
         // Keep connection alive with periodic heartbeats. Each heartbeat also
         // counts as session activity, so an open stream keeps its session from
         // expiring even when no messages flow over it.
         const heartbeatInterval = setInterval(() => {
           try {
-            reply.raw.write(': heartbeat\n\n')
+            if (!writeSSE(reply, ': heartbeat\n\n')) {
+              clearInterval(heartbeatInterval)
+              return
+            }
             sessionStore.touch?.(session.id)?.catch((err: unknown) => {
               app.log.warn({ err, sessionId: session.id }, 'Failed to refresh session activity on heartbeat')
             })

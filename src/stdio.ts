@@ -12,6 +12,7 @@ import type {
   JSONRPCNotification
 } from './schema.ts'
 import { checkRequestId } from './handlers.ts'
+import { resolveRouteUrl } from './utils/route-url.ts'
 
 // Local batch types for JSON-RPC 2.0 compatibility
 type JSONRPCBatchRequest = (JSONRPCRequest | JSONRPCNotification)[]
@@ -46,6 +47,12 @@ export interface StdioTransportOptions {
    * work. Without it they are anonymous.
    */
   authContext?: AuthorizationContext
+  /**
+   * The MCP endpoint requests are sent to. Defaults to `/mcp` under the
+   * prefix of the instance passed in; set it when the plugin was registered
+   * under a prefix in a child of that instance.
+   */
+  endpoint?: string
 }
 
 function isJsonRpcObject (value: unknown): value is JSONRPCMessage {
@@ -78,6 +85,12 @@ const REQUEST_DRAIN_MS = 1000
  */
 const ABORT_GRACE_MS = 500
 
+/** What can be asked of an output stream beyond NodeJS.WritableStream. */
+type OutputStream = NodeJS.WritableStream & { destroyed?: boolean, writableEnded?: boolean, writableLength?: number, destroy?: () => void }
+
+/** How long stop() lets stdout take what it has buffered before dropping it. */
+const OUTPUT_FLUSH_MS = 1000
+
 /** Why a request was aborted when the client cancelled it: it gets no response. */
 class CancelledByClient extends Error {}
 
@@ -105,6 +118,11 @@ export class StdioTransport {
   // what a legacy `initialize` agreed on and echo it like an HTTP client would.
   private protocolVersion: string | undefined
   private closePromise: Promise<void> | null = null
+  /** Set once stop() has finished: nothing is written after that. */
+  private closed = false
+  /** Reading is paused until stdout drains. */
+  private throttled = false
+  private readonly endpoint: string
   private onSigint: (() => void) | null = null
   private onSigterm: (() => void) | null = null
 
@@ -120,6 +138,8 @@ export class StdioTransport {
       error: stderr,
       ...transportOpts
     }
+    this.endpoint = transportOpts.endpoint ?? resolveRouteUrl(app.prefix, '/mcp')
+    this.stopped = new Promise(resolve => { this.resolveStopped = resolve })
   }
 
   /**
@@ -128,10 +148,19 @@ export class StdioTransport {
   start (): void {
     this.log('Starting MCP stdio transport...')
 
-    // Create readline interface for line-by-line processing
+    // A client that goes away (EPIPE) is a reason to stop, not to crash.
+    // Errors on stderr are dropped: it is only for logs.
+    this.transportOpts.output?.on('error', (error: Error) => {
+      this.logError('stdout error:', error)
+      this.stop().catch(() => {})
+    })
+    this.transportOpts.error?.on('error', () => {})
+
+    // Create readline interface for line-by-line processing. Never in
+    // terminal mode: that would echo every request to stdout.
     this.readline = createInterface({
       input: this.transportOpts.input!,
-      output: this.transportOpts.output!,
+      terminal: false,
       crlfDelay: Infinity
     })
 
@@ -190,9 +219,14 @@ export class StdioTransport {
     // (readline close, stdin end, signals) all wait for app.close() to finish
     if (!this.closePromise) {
       this.closePromise = this.doStop()
+      this.closePromise.then(this.resolveStopped, this.resolveStopped)
     }
     return this.closePromise
   }
+
+  /** Settles once the transport has stopped, for whatever reason (stdin closed, stdout gone, a signal). */
+  readonly stopped: Promise<void>
+  private resolveStopped!: () => void
 
   private removeSignalListeners (): void {
     if (this.onSigint) {
@@ -246,6 +280,24 @@ export class StdioTransport {
       clearTimeout(timer)
       for (const cancel of this.listens.keys()) cancel.abort(new Error('stdio transport closed'))
     }
+
+    // A handler that ignored its signal must not answer after this resolves.
+    this.closed = true
+    await this.flushOutput()
+  }
+
+  /**
+   * Give stdout a moment to take what it buffered, then drop it, so a client
+   * that stopped reading does not keep the process alive.
+   */
+  private async flushOutput (): Promise<void> {
+    const output = this.transportOpts.output as OutputStream | undefined
+    if (!output || output.destroyed || !(output.writableLength! > 0)) return
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), OUTPUT_FLUSH_MS)
+    await this.drained(controller.signal)
+    clearTimeout(timer)
+    if (output.writableLength! > 0) output.destroy?.()
   }
 
   /** Wait until every non-listen message has been answered, or `timeoutMs` passes. */
@@ -308,8 +360,23 @@ export class StdioTransport {
     this.applyCancellation(message)
     const response = await this.processMessage(message)
     if (response) {
-      this.sendMessage(response)
+      this.sendWithBackpressure(response)
     }
+  }
+
+  /**
+   * Send, and while stdout cannot take more stop reading requests, so a
+   * client that does not read its answers cannot make them pile up.
+   */
+  private sendWithBackpressure (message: JSONRPCMessage | JSONRPCBatchResponse): void {
+    if (this.sendMessage(message) || this.throttled || this.closed) return
+    this.throttled = true
+    this.readline?.pause()
+    this.drained(new AbortController().signal).then(() => {
+      this.throttled = false
+      // Once stopping, readline is closed and must not be resumed.
+      if (!this.closePromise) this.readline?.resume()
+    })
   }
 
   /**
@@ -320,7 +387,14 @@ export class StdioTransport {
     if ((message as { method?: string }).method !== 'notifications/cancelled') return
     const requestId = (message as { params?: { requestId?: unknown } }).params?.requestId
     if (typeof requestId === 'string' || typeof requestId === 'number') {
-      this.inFlight.get(requestKey(requestId))?.abort(new CancelledByClient('cancelled by the client'))
+      const key = requestKey(requestId)
+      const cancel = this.inFlight.get(key)
+      if (cancel) {
+        cancel.abort(new CancelledByClient('cancelled by the client'))
+        // A cancelled request is over for the client, which may reuse its id
+        // at once, whenever the handler actually stops.
+        this.inFlight.delete(key)
+      }
     }
   }
 
@@ -344,7 +418,7 @@ export class StdioTransport {
 
     // Only send response if we have any responses
     if (responses.length > 0) {
-      this.sendMessage(responses)
+      this.sendWithBackpressure(responses)
     }
   }
 
@@ -401,7 +475,7 @@ export class StdioTransport {
       // Use Fastify's inject method to simulate an HTTP request to the /mcp endpoint
       const response = await this.app.inject({
         method: 'POST',
-        url: '/mcp',
+        url: this.endpoint,
         headers,
         payload: message,
         payloadAsStream: true
@@ -550,6 +624,8 @@ export class StdioTransport {
    * full and the caller should wait for it to drain.
    */
   private sendMessage (message: JSONRPCMessage | JSONRPCBatchResponse): boolean {
+    const output = this.transportOpts.output as OutputStream | undefined
+    if (this.closed || output?.destroyed || output?.writableEnded) return true
     try {
       const serialized = JSON.stringify(message)
       this.log('Sending message:', message)
@@ -564,19 +640,26 @@ export class StdioTransport {
     return true
   }
 
+  /** stderr, while it can still be written to; a client may close it. */
+  private writableError (): NodeJS.WritableStream | undefined {
+    const error = this.transportOpts.error as OutputStream | undefined
+    return error && !error.destroyed && !error.writableEnded ? error : undefined
+  }
+
   /**
    * Log debug information to stderr
    */
   private log (message: string, ...args: any[]): void {
-    if (this.transportOpts.debug && this.transportOpts.error) {
+    const errorStream = this.writableError()
+    if (this.transportOpts.debug && errorStream) {
       const timestamp = new Date().toISOString()
-      this.transportOpts.error.write(`[${timestamp}] ${message}`)
+      errorStream.write(`[${timestamp}] ${message}`)
       if (args.length > 0) {
-        this.transportOpts.error.write(' ' + args.map(arg =>
+        errorStream.write(' ' + args.map(arg =>
           typeof arg === 'object' ? JSON.stringify(arg, null, 2) : String(arg)
         ).join(' '))
       }
-      this.transportOpts.error.write('\n')
+      errorStream.write('\n')
     }
   }
 
@@ -584,13 +667,14 @@ export class StdioTransport {
    * Log error information to stderr
    */
   private logError (message: string, error?: any): void {
-    if (this.transportOpts.error) {
+    const errorStream = this.writableError()
+    if (errorStream) {
       const timestamp = new Date().toISOString()
-      this.transportOpts.error.write(`[${timestamp}] ERROR: ${message}`)
+      errorStream.write(`[${timestamp}] ERROR: ${message}`)
       if (error) {
-        this.transportOpts.error.write(' ' + (error instanceof Error ? error.message : String(error)))
+        errorStream.write(' ' + (error instanceof Error ? error.message : String(error)))
       }
-      this.transportOpts.error.write('\n')
+      errorStream.write('\n')
     }
   }
 }
@@ -629,6 +713,8 @@ export async function runStdioServer (
     // Handle graceful shutdown signals
     process.once('SIGINT', shutdown)
     process.once('SIGTERM', shutdown)
+    // The transport may also stop on its own: stdout gone, say.
+    transport.stopped.then(shutdown)
 
     // Handle input close (when parent process closes our stdin)
     const input = transportOpts.input ?? process.stdin

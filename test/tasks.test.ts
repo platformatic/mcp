@@ -1,6 +1,9 @@
 import { test, describe } from 'node:test'
 import type { TestContext } from 'node:test'
 import Fastify from 'fastify'
+import { request } from 'node:http'
+import type { ServerResponse } from 'node:http'
+import { once } from 'node:events'
 import { Type } from '@sinclair/typebox'
 import mcpPlugin from '../src/index.ts'
 import { JSONRPC_VERSION, LATEST_LEGACY_PROTOCOL_VERSION, METHOD_NOT_FOUND, INVALID_PARAMS, INVALID_REQUEST } from '../src/schema.ts'
@@ -1252,5 +1255,63 @@ describe('round 12: shutdown drain', () => {
     const body = await result
     t.assert.strictEqual(body.error?.message, 'The server shut down before this task finished', JSON.stringify(body))
     t.assert.ok(answeredAt <= closedAt, `answered ${answeredAt - closedAt}ms after close`)
+  })
+})
+
+describe('round 15: tasks/result after an abort', () => {
+  test('a client that leaves while tasks/result re-reads the store stops the polling', async (t: TestContext) => {
+    let finish!: () => void
+    const app = Fastify({ logger: false })
+    t.after(() => app.close())
+    await app.register(mcpPlugin, { enableTasks: true, capabilities: { tools: {} } })
+    app.mcpAddTool({ name: 'slow', inputSchema: Type.Object({}), execution: { taskSupport: 'optional' } } as any, async () => {
+      await new Promise<void>(resolve => { finish = resolve })
+      return { content: [] }
+    })
+    let resultResponse: ServerResponse | undefined
+    let answered = false
+    app.addHook('onRequest', async (req, reply) => {
+      if (req.headers['x-test'] === 'result') resultResponse = reply.raw
+    })
+    app.addHook('onSend', async (req) => {
+      if (req.headers['x-test'] === 'result') answered = true
+    })
+    await app.listen({ port: 0, host: '127.0.0.1' })
+    const { port } = app.server.address() as { port: number }
+
+    const created = (await call(app, 'tools/call', { name: 'slow', arguments: {}, task: { ttl: 60_000 } })).result.task
+    const store = MemoryTaskStore.prototype
+    const get = store.get
+    let reads = 0
+    const client = request({
+      port,
+      host: '127.0.0.1',
+      method: 'POST',
+      path: '/mcp',
+      headers: { 'content-type': 'application/json', 'mcp-protocol-version': LATEST_LEGACY_PROTOCOL_VERSION, 'x-test': 'result' }
+    })
+    client.on('error', () => {})
+    t.mock.method(store, 'get', async function (this: MemoryTaskStore, taskId: string) {
+      if (taskId === created.taskId && resultResponse) {
+        reads++
+        // The poll's re-read (the first read is the request's own lookup):
+        // the client leaves while it is in flight.
+        if (reads === 2) {
+          const res = resultResponse
+          client.destroy()
+          if (!res.destroyed) await once(res, 'close')
+        }
+      }
+      return get.call(this, taskId)
+    })
+
+    client.end(JSON.stringify({ jsonrpc: JSONRPC_VERSION, id: 2, method: 'tasks/result', params: { taskId: created.taskId } }))
+
+    // Until it answers, or has plainly started spinning.
+    const settled = () => answered || reads >= 50
+    while (!settled()) await new Promise(resolve => setImmediate(resolve))
+    // It gives up rather than read the store again and again until the task ends.
+    t.assert.ok(reads <= 2, `read the store ${reads} times after the client left`)
+    finish()
   })
 })

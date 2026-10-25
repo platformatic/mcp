@@ -1,7 +1,7 @@
 import { test, describe, beforeEach, afterEach } from 'node:test'
 import type { TestContext } from 'node:test'
 import Fastify from 'fastify'
-import { createAuthPreHandler, generateWWWAuthenticateHeader } from '../src/auth/prehandler.ts'
+import { createAuthPreHandler, generateWWWAuthenticateHeader, SKIP_BEARER_AUTH } from '../src/auth/prehandler.ts'
 import { colonScopeHierarchy } from '../src/index.ts'
 import { TokenValidator } from '../src/auth/token-validator.ts'
 import {
@@ -77,7 +77,7 @@ describe('Authorization PreHandler', () => {
     const preHandler = createAuthPreHandler(config, validator)
 
     app.addHook('preHandler', preHandler)
-    app.get('/oauth/authorize', async () => ({ success: true }))
+    app.get('/oauth/authorize', { config: { [SKIP_BEARER_AUTH]: true } }, async () => ({ success: true }))
 
     await app.ready()
 
@@ -596,4 +596,21 @@ test('a challenge cannot be broken out of by the error description', (t: TestCon
     header,
     'Bearer realm="MCP Server", resource_metadata="https://api.example.com/.well-known/oauth-protected-resource", error="invalid_token", error_description="Token expired  x"'
   )
+})
+
+describe('round 15: routes exempt from bearer authorization', () => {
+  test('an application route under /oauth/ is protected like any other', async (t: TestContext) => {
+    const app = Fastify({ logger: false })
+    t.after(() => app.close())
+    const config = createTestAuthConfig()
+    const validator = new TokenValidator(config, app)
+    app.addHook('preHandler', createAuthPreHandler(config, validator))
+    app.get('/oauth/registered-clients', async () => ({ clients: ['all of them'] }))
+    app.get('/oauth/callbacks/admin', async () => ({ admin: true }))
+    app.get('/oauth/authorize-admin', async () => ({ admin: true }))
+    await app.ready()
+    for (const url of ['/oauth/registered-clients', '/oauth/callbacks/admin', '/oauth/authorize-admin']) {
+      t.assert.strictEqual((await app.inject({ method: 'GET', url })).statusCode, 401, url)
+    }
+  })
 })

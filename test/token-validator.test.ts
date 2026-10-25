@@ -975,8 +975,99 @@ describe('round 14: signing keys', () => {
     const { port } = server.address() as { port: number }
     const cache = new JwksCache(`http://127.0.0.1:${port}/jwks.json`)
 
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() })
     await t.assert.rejects(cache.getPublicKey('good', 'RS256'))
+    // Until a set has been fetched the next attempt waits one second, not minRefreshMs
+    t.mock.timers.tick(1000)
     t.assert.match(await cache.getPublicKey('good', 'RS256'), /BEGIN PUBLIC KEY/)
     t.assert.strictEqual(fetches, 2)
+  })
+})
+
+describe('round 15: issuers, introspection and key sets', () => {
+  const OTHER = 'https://other.example.com'
+
+  test('a key from one authorization server does not vouch for a token naming another', async (t: TestContext) => {
+    const restore = setupMockAgent({ 'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse() })
+    t.after(restore)
+    const app = Fastify({ logger: false })
+    t.after(() => app.close())
+    // One key set, which belongs to the first server.
+    const validator = new TokenValidator(createTestAuthConfig({ authorizationServers: ['https://auth.example.com', OTHER] }), app)
+    t.assert.strictEqual((await validator.validateToken(createTestJWT())).valid, true)
+    t.assert.strictEqual((await validator.validateToken(createTestJWT({ iss: OTHER }))).valid, false)
+  })
+
+  test('each issuer can be given its own key set', async (t: TestContext) => {
+    const restore = setupMockAgent({
+      'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse(),
+      'https://other.example.com/jwks.json': generateMockJWKSResponse()
+    })
+    t.after(restore)
+    const app = Fastify({ logger: false })
+    t.after(() => app.close())
+    const validator = new TokenValidator(createTestAuthConfig({
+      authorizationServers: ['https://auth.example.com', OTHER],
+      tokenValidation: {
+        jwksUri: { 'https://auth.example.com': 'https://auth.example.com/.well-known/jwks.json', [OTHER]: 'https://other.example.com/jwks.json' },
+        validateAudience: true
+      }
+    }), app)
+    const fromOther = await validator.validateToken(createTestJWT({ iss: OTHER }))
+    t.assert.strictEqual(fromOther.valid, true)
+    t.assert.strictEqual(fromOther.issuer, OTHER)
+  })
+
+  test('introspection treats any active value but true as inactive', async (t: TestContext) => {
+    const restore = setupMockAgent({ 'https://auth.example.com/introspect': createIntrospectionResponse('false' as any) })
+    t.after(restore)
+    const app = Fastify({ logger: false })
+    t.after(() => app.close())
+    const validator = new TokenValidator(createTestAuthConfig({
+      tokenValidation: { introspectionEndpoint: 'https://auth.example.com/introspect', validateAudience: true }
+    }), app)
+    const result = await validator.validateToken('opaque-token')
+    t.assert.strictEqual(result.valid, false)
+  })
+
+  test('introspection is bounded by a timeout', async (t: TestContext) => {
+    let signal: AbortSignal | undefined
+    t.mock.method(globalThis, 'fetch', async (_url: unknown, init?: RequestInit) => {
+      signal = init?.signal ?? undefined
+      return new Response(JSON.stringify(createIntrospectionResponse(true)), { headers: { 'content-type': 'application/json' } })
+    })
+    const app = Fastify({ logger: false })
+    t.after(() => app.close())
+    const validator = new TokenValidator(createTestAuthConfig({
+      tokenValidation: { introspectionEndpoint: 'https://auth.example.com/introspect', validateAudience: true }
+    }), app)
+    await validator.validateToken('opaque-token')
+    t.assert.ok(signal instanceof AbortSignal, 'introspection fetch has no abort signal')
+  })
+
+  test('an unreachable key set is not fetched again for every token', async (t: TestContext) => {
+    let fetches = 0
+    const server = createServer((_req, res) => {
+      fetches++
+      res.statusCode = 503
+      res.end()
+    })
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+    t.after(() => server.close())
+    const { port } = server.address() as { port: number }
+    const cache = new JwksCache(`http://127.0.0.1:${port}/jwks.json`)
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() })
+    for (let i = 0; i < 10; i++) await cache.getPublicKey(`kid-${i}`, 'RS256').catch(() => {})
+    t.assert.strictEqual(fetches, 1)
+  })
+
+  test('a key published for encryption does not verify signatures', async (t: TestContext) => {
+    const keys = generateMockJWKSResponse().keys.map((key: Record<string, unknown>) => ({ ...key, use: 'enc' }))
+    const restore = setupMockAgent({ 'https://auth.example.com/.well-known/jwks.json': { keys } })
+    t.after(restore)
+    const app = Fastify({ logger: false })
+    t.after(() => app.close())
+    const validator = new TokenValidator(createTestAuthConfig(), app)
+    t.assert.strictEqual((await validator.validateToken(createTestJWT())).valid, false)
   })
 })

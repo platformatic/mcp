@@ -26,7 +26,8 @@ describe('OAuth Routes', () => {
 
     const config = {
       clientId: 'test-client',
-      authorizationServer: 'https://auth.example.com'
+      authorizationServer: 'https://auth.example.com',
+      redirectUri: 'https://mcp.example.com/oauth/callback'
     }
 
     await fastify.register(oauthClientPlugin, config)
@@ -68,7 +69,8 @@ describe('OAuth Routes', () => {
     const config = {
       clientId: 'test-client',
       clientSecret: 'test-secret',
-      authorizationServer: 'https://auth.example.com'
+      authorizationServer: 'https://auth.example.com',
+      redirectUri: 'https://mcp.example.com/oauth/callback'
     }
 
     await fastify.register(oauthClientPlugin, config)
@@ -108,7 +110,8 @@ describe('OAuth Routes', () => {
 
     const config = {
       clientId: 'test-client',
-      authorizationServer: 'https://auth.example.com'
+      authorizationServer: 'https://auth.example.com',
+      redirectUri: 'https://mcp.example.com/oauth/callback'
     }
 
     await fastify.register(oauthClientPlugin, config)
@@ -134,7 +137,8 @@ describe('OAuth Routes', () => {
 
     const config = {
       clientId: 'test-client',
-      authorizationServer: 'https://auth.example.com'
+      authorizationServer: 'https://auth.example.com',
+      redirectUri: 'https://mcp.example.com/oauth/callback'
     }
 
     await fastify.register(oauthClientPlugin, config)
@@ -160,7 +164,8 @@ describe('OAuth Routes', () => {
 
     const config = {
       clientId: 'test-client',
-      authorizationServer: 'https://auth.example.com'
+      authorizationServer: 'https://auth.example.com',
+      redirectUri: 'https://mcp.example.com/oauth/callback'
     }
 
     await fastify.register(oauthClientPlugin, config)
@@ -197,7 +202,8 @@ describe('OAuth Routes', () => {
     const config = {
       clientId: 'test-client',
       clientSecret: 'test-secret',
-      authorizationServer: 'https://auth.example.com'
+      authorizationServer: 'https://auth.example.com',
+      redirectUri: 'https://mcp.example.com/oauth/callback'
     }
 
     await fastify.register(oauthClientPlugin, config)
@@ -234,7 +240,8 @@ describe('OAuth Routes', () => {
 
     const config = {
       clientId: 'test-client',
-      authorizationServer: 'https://auth.example.com'
+      authorizationServer: 'https://auth.example.com',
+      redirectUri: 'https://mcp.example.com/oauth/callback'
     }
 
     await fastify.register(oauthClientPlugin, config)
@@ -268,7 +275,8 @@ describe('OAuth Routes', () => {
 
     const config = {
       clientId: 'test-client',
-      authorizationServer: 'https://auth.example.com'
+      authorizationServer: 'https://auth.example.com',
+      redirectUri: 'https://mcp.example.com/oauth/callback'
     }
 
     await fastify.register(oauthClientPlugin, config)
@@ -302,7 +310,8 @@ describe('OAuth Routes', () => {
 
     const config = {
       clientId: 'test-client',
-      authorizationServer: 'https://auth.example.com'
+      authorizationServer: 'https://auth.example.com',
+      redirectUri: 'https://mcp.example.com/oauth/callback'
     }
 
     await fastify.register(oauthClientPlugin, config)
@@ -330,7 +339,8 @@ describe('OAuth Routes', () => {
 
     const config = {
       clientId: 'test-client',
-      authorizationServer: 'https://auth.example.com'
+      authorizationServer: 'https://auth.example.com',
+      redirectUri: 'https://mcp.example.com/oauth/callback'
     }
 
     await fastify.register(oauthClientPlugin, config)
@@ -488,7 +498,8 @@ describe('OAuth Routes', () => {
 
     const config = {
       clientId: 'test-client',
-      authorizationServer: 'https://auth.example.com'
+      authorizationServer: 'https://auth.example.com',
+      redirectUri: 'https://mcp.example.com/oauth/callback'
     }
 
     await fastify.register(oauthClientPlugin, config)
@@ -516,7 +527,8 @@ describe('OAuth Routes', () => {
 
     const config = {
       clientId: 'test-client',
-      authorizationServer: 'https://auth.example.com'
+      authorizationServer: 'https://auth.example.com',
+      redirectUri: 'https://mcp.example.com/oauth/callback'
     }
 
     await fastify.register(oauthClientPlugin, config)
@@ -544,7 +556,8 @@ describe('OAuth Routes', () => {
 
     const config = {
       clientId: 'test-client',
-      authorizationServer: 'https://auth.example.com'
+      authorizationServer: 'https://auth.example.com',
+      redirectUri: 'https://mcp.example.com/oauth/callback'
     }
 
     await fastify.register(oauthClientPlugin, config)
@@ -569,7 +582,8 @@ describe('OAuth Routes', () => {
 
     await fastify.register(oauthClientPlugin, {
       clientId: 'test-client',
-      authorizationServer: 'https://auth.example.com'
+      authorizationServer: 'https://auth.example.com',
+      redirectUri: 'https://mcp.example.com/oauth/callback'
     })
 
     let authorizationRequestCreated = false
@@ -620,7 +634,8 @@ describe('OAuth Routes', () => {
     await fastify.register(oauthClientPlugin, {
       clientId: 'test-client',
       clientSecret: 'test-secret',
-      authorizationServer: 'https://auth.example.com'
+      authorizationServer: 'https://auth.example.com',
+      redirectUri: 'https://mcp.example.com/oauth/callback'
     })
 
     const sessionStore = new MemorySessionStore(100)
@@ -666,7 +681,8 @@ describe('OAuth Routes Error Handling', () => {
 
     const config = {
       clientId: 'test-client',
-      authorizationServer: 'https://auth.example.com'
+      authorizationServer: 'https://auth.example.com',
+      redirectUri: 'https://mcp.example.com/oauth/callback'
     }
 
     await fastify.register(oauthClientPlugin, config)
@@ -704,7 +720,8 @@ describe('OAuth Routes Error Handling', () => {
     const config = {
       clientId: 'test-client',
       clientSecret: 'test-secret',
-      authorizationServer: 'https://auth.example.com'
+      authorizationServer: 'https://auth.example.com',
+      redirectUri: 'https://mcp.example.com/oauth/callback'
     }
 
     await fastify.register(oauthClientPlugin, config)
@@ -741,7 +758,8 @@ describe('OAuth Routes Error Handling', () => {
 
     const config = {
       clientId: 'test-client',
-      authorizationServer: 'https://auth.example.com'
+      authorizationServer: 'https://auth.example.com',
+      redirectUri: 'https://mcp.example.com/oauth/callback'
     }
 
     await fastify.register(oauthClientPlugin, config)
@@ -759,5 +777,48 @@ describe('OAuth Routes Error Handling', () => {
     // TypeBox validation should return a validation error
     // Check for either Fastify validation error format or our custom format
     assert.ok(body.statusCode === 400 || body.error || body.message)
+  })
+})
+
+describe('round 15: callback URL, metadata issuer and pre-authorization routes', () => {
+  test('the redirect_uri comes from configuration, never from the Host header', async (t) => {
+    const fastify = Fastify()
+    t.after(() => fastify.close())
+    await fastify.register(oauthClientPlugin, {
+      clientId: 'test-client',
+      authorizationServer: 'https://round15-host.example.com',
+      resourceUri: 'https://mcp.example.com/'
+    })
+    await fastify.register(authRoutesPlugin, { sessionStore: new MemorySessionStore(100) })
+    const response = await fastify.inject({ method: 'GET', url: '/oauth/authorize', headers: { host: 'attacker.example.net' } })
+    assert.strictEqual(response.statusCode, 302)
+    const location = new URL(response.headers.location as string)
+    assert.strictEqual(location.searchParams.get('redirect_uri'), 'https://mcp.example.com/oauth/callback')
+  })
+
+  test('without a configured callback the flow is not started', async (t) => {
+    const fastify = Fastify({ logger: false })
+    t.after(() => fastify.close())
+    await fastify.register(oauthClientPlugin, { clientId: 'test-client', authorizationServer: 'https://round15-none.example.com' })
+    await fastify.register(authRoutesPlugin, { sessionStore: new MemorySessionStore(100) })
+    const response = await fastify.inject({ method: 'GET', url: '/oauth/authorize' })
+    assert.strictEqual(response.statusCode, 500)
+    assert.strictEqual(response.headers.location, undefined)
+  })
+
+  test('authorization server metadata naming another issuer is not used', async (t) => {
+    const server = 'https://round15-issuer.example.com'
+    const pool = mockAgent.get(server)
+    pool.intercept({ path: '/.well-known/oauth-authorization-server', method: 'GET' }).reply(200, {
+      issuer: 'https://attacker.example.net',
+      authorization_endpoint: 'https://attacker.example.net/authorize',
+      token_endpoint: 'https://attacker.example.net/token'
+    })
+    pool.intercept({ path: '/.well-known/openid-configuration', method: 'GET' }).reply(404, {})
+    const fastify = Fastify({ logger: false })
+    t.after(() => fastify.close())
+    await fastify.register(oauthClientPlugin, { clientId: 'test-client', authorizationServer: server, redirectUri: 'https://mcp.example.com/oauth/callback' })
+    const request = await fastify.oauthClient.createAuthorizationRequest()
+    assert.strictEqual(new URL(request.authorizationUrl).origin, server)
   })
 })

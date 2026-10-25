@@ -10,6 +10,7 @@ import type { CreateTaskResult, ListTasksResult, CallToolResult } from '../src/s
 import { createTestAuthConfig, createTestJWT, setupMockAgent, generateMockJWKSResponse } from './auth-test-utils.ts'
 import { testWithRedis } from './redis-test-utils.ts'
 
+const JWKS_URL = 'https://auth.example.com/.well-known/jwks.json'
 const IDP_A = 'https://auth.example.com'
 const IDP_B = 'https://other.example.com'
 
@@ -25,9 +26,14 @@ async function buildApp (t: TestContext, options: { redis?: Redis, auth?: boolea
   })
 
   const { redis } = options
+  const authorization = createTestAuthConfig({
+    authorizationServers: [IDP_A, IDP_B],
+    // Both issuers sign with the same test key, published once.
+    tokenValidation: { jwksUri: { [IDP_A]: JWKS_URL, [IDP_B]: JWKS_URL }, validateAudience: true }
+  })
   await app.register(mcpPlugin, {
     enableTasks: true,
-    ...(options.auth === false ? {} : { authorization: createTestAuthConfig({ authorizationServers: [IDP_A, IDP_B] }) }),
+    ...(options.auth === false ? {} : { authorization }),
     ...(redis ? { redis: { host: redis.options.host!, port: redis.options.port!, db: redis.options.db! }, requestStateSecret: 'task-owner-issuer-test-secret-0123456789' } : {})
   })
   app.mcpAddTool({

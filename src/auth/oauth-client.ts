@@ -8,6 +8,11 @@ export interface OAuthClientConfig {
   clientSecret?: string
   authorizationServer: string
   resourceUri?: string
+  /**
+   * This server's OAuth callback, sent as `redirect_uri`. Defaults to
+   * `${resourceUri}/oauth/callback`; it is never taken from the request.
+   */
+  redirectUri?: string
   scopes?: string[]
   dynamicRegistration?: boolean
   /**
@@ -45,6 +50,8 @@ export interface TokenResponse {
 }
 
 export interface OAuthClientMethods {
+  /** The callback sent as `redirect_uri`, or undefined when neither `redirectUri` nor `resourceUri` is configured. */
+  readonly redirectUri: string | undefined
   generatePKCEChallenge(): PKCEChallenge
   generateState(): string
   createAuthorizationRequest(additionalParams?: Record<string, string>): Promise<AuthorizationRequest>
@@ -113,6 +120,16 @@ export function buildDiscoveryUrls (authorizationServer: string): string[] {
   return [...new Set(urls)]
 }
 
+function withoutTrailingSlash (url: string): string {
+  return url.endsWith('/') ? url.slice(0, -1) : url
+}
+
+/** The callback this server registers and sends as `redirect_uri`, from configuration only. */
+export function oauthCallbackUrl (opts: OAuthClientConfig): string | undefined {
+  if (opts.redirectUri) return opts.redirectUri
+  return opts.resourceUri ? `${withoutTrailingSlash(opts.resourceUri)}/oauth/callback` : undefined
+}
+
 async function discoverOIDCEndpoints (
   authorizationServer: string,
   logger?: FastifyBaseLogger
@@ -131,6 +148,12 @@ async function discoverOIDCEndpoints (
       const response = await fetch(discoveryUrl)
       if (response.ok) {
         const metadata = await response.json() as Record<string, string>
+        // RFC 8414 §3.3: metadata whose issuer is not the server we asked
+        // about must not be used, or its endpoints could point anywhere.
+        if (typeof metadata?.issuer !== 'string' || withoutTrailingSlash(metadata.issuer) !== withoutTrailingSlash(authorizationServer)) {
+          logger?.warn({ discoveryUrl, issuer: metadata?.issuer }, 'OAuth client: metadata issuer does not match the authorization server, ignoring it')
+          continue
+        }
         const endpoints: OIDCEndpoints = {
           authorizationEndpoint: metadata.authorization_endpoint,
           tokenEndpoint: metadata.token_endpoint,
@@ -169,7 +192,7 @@ export function buildClientIdMetadataDocument (opts: OAuthClientConfig, document
     client_id: documentUrl,
     client_name: 'MCP Server',
     client_uri: opts.resourceUri,
-    redirect_uris: [`${opts.resourceUri}/oauth/callback`],
+    redirect_uris: [oauthCallbackUrl(opts)],
     grant_types: ['authorization_code', 'refresh_token'],
     response_types: ['code'],
     token_endpoint_auth_method: 'none',
@@ -215,6 +238,8 @@ const oauthClientPlugin: FastifyPluginAsync<OAuthClientConfig> = async (fastify,
   // but our implementation provides all necessary OAuth client functionality
 
   const oauthClientMethods: OAuthClientMethods = {
+    redirectUri: oauthCallbackUrl(opts),
+
     generatePKCEChallenge (): PKCEChallenge {
       const codeVerifier = randomBytes(32).toString('base64url')
       const codeChallenge = createHash('sha256')
@@ -389,7 +414,7 @@ const oauthClientPlugin: FastifyPluginAsync<OAuthClientConfig> = async (fastify,
         const defaultMetadata = {
           client_name: 'MCP Server',
           client_uri: opts.resourceUri,
-          redirect_uris: [`${opts.resourceUri}/oauth/callback`],
+          redirect_uris: [oauthCallbackUrl(opts)].filter(Boolean),
           grant_types: ['authorization_code', 'refresh_token'],
           response_types: ['code'],
           token_endpoint_auth_method: 'client_secret_post',

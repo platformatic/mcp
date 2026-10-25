@@ -206,6 +206,9 @@ export function handlerContext (
   }
 }
 
+/** Answered (to nobody) when a request is cancelled before its handler started. */
+const CANCELLED_BEFORE_START = 'The request was cancelled before its handler started'
+
 /**
  * A handler asking for client input is a protocol outcome, not a failure, so it
  * must escape the catch-alls that turn thrown errors into `isError` results.
@@ -886,6 +889,12 @@ async function runRegisteredTool (
     return { ok: true, result }
   }
 
+  // The caller may have gone (or cancelled) while the access check ran: a
+  // tool must not start for a request nobody is waiting on any more.
+  if (dependencies.signal?.aborted) {
+    return { ok: true, result: { content: [{ type: 'text', text: CANCELLED_BEFORE_START }], isError: true } }
+  }
+
   // Assess security risks from tool annotations
   const securityAssessment = assessToolSecurity(tool.definition.annotations)
 
@@ -1066,6 +1075,8 @@ export async function handleResourcesRead (
     }
   }
 
+  if (dependencies.signal?.aborted) return createError(request.id, INTERNAL_ERROR, CANCELLED_BEFORE_START)
+
   try {
     const result = await resource.handler(uri, { ...handlerContext(dependencies, sessionId), uriParams })
     // A resource with no contents does not exist: answering an empty array
@@ -1149,6 +1160,8 @@ export async function handlePromptsGet (
       return createError(request.id, INVALID_PARAMS, `Missing required prompt arguments: ${missing.join(', ')}`, { missing })
     }
   }
+
+  if (dependencies.signal?.aborted) return createError(request.id, INTERNAL_ERROR, CANCELLED_BEFORE_START)
 
   try {
     const result = await prompt.handler(promptName, handlerArguments as any, handlerContext(dependencies, sessionId))
@@ -1405,6 +1418,9 @@ async function awaitTaskTerminal (
 
   let task: TaskRecord | null = initial
   while (task && !isTerminal(task.status)) {
+    // Once aborted, both racers settle at once: an abort that landed while
+    // the store was being read would otherwise turn this into a busy loop.
+    signal.throwIfAborted()
     const pollDelay = task.pollInterval ?? DEFAULT_POLL_INTERVAL
     const winner = await Promise.race([
       accelerator,

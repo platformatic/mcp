@@ -25,6 +25,7 @@ import {
 import pubsubDecorators from './decorators/pubsub.ts'
 import metaDecorators from './decorators/meta.ts'
 import routes from './routes/mcp.ts'
+import { resolveRouteUrl } from './utils/route-url.ts'
 import wellKnownRoutes from './routes/well-known.ts'
 import { TokenValidator } from './auth/token-validator.ts'
 import { createAuthPreHandler } from './auth/prehandler.ts'
@@ -122,8 +123,11 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     claimStdioRequest(request)
   })
 
+  // Under a route prefix the endpoint is not /mcp: aim at the route this
+  // registration serves.
+  const mcpEndpoint = resolveRouteUrl(app.prefix, '/mcp')
   app.decorate('mcpClient', (clientOptions?: McpClientOptions) => {
-    return createMcpClient(app, clientOptions)
+    return createMcpClient(app, { ...clientOptions, endpoint: clientOptions?.endpoint ?? mcpEndpoint })
   })
 
   const enableSSE = opts.enableSSE ?? false

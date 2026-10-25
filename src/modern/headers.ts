@@ -129,16 +129,19 @@ function readMirroredHeader (
 /** An integer header value: plain decimal, optionally with a zero fraction. */
 const INTEGER_HEADER_VALUE = /^-?(0|[1-9][0-9]*)(\.0+)?$/
 
-/** Methods for which `Mcp-Name` is REQUIRED, and the body field it mirrors. */
-const NAME_SOURCE: Record<string, 'name' | 'uri'> = {
-  'tools/call': 'name',
-  'prompts/get': 'name',
-  'resources/read': 'uri'
-}
+/**
+ * Methods for which `Mcp-Name` is REQUIRED, and the body field it mirrors. A
+ * Map, so a method named after an Object.prototype member is not one of them.
+ */
+const NAME_SOURCE = new Map<string, 'name' | 'uri'>([
+  ['tools/call', 'name'],
+  ['prompts/get', 'name'],
+  ['resources/read', 'uri']
+])
 
 /** Does this method have to carry `Mcp-Name`, whatever the body looks like? */
 export function requiresName (method: string): boolean {
-  return method in NAME_SOURCE
+  return NAME_SOURCE.has(method)
 }
 
 /**
@@ -151,7 +154,7 @@ export function requiresName (method: string): boolean {
  * header.
  */
 export function expectedNameFor (method: string, params: unknown): string | undefined {
-  const field = NAME_SOURCE[method]
+  const field = NAME_SOURCE.get(method)
   if (!field) return undefined
 
   const value = (params as Record<string, unknown> | undefined)?.[field]

@@ -41,7 +41,9 @@ async function buildApp (t: TestContext, redis?: Redis, options: BuildOptions = 
       resourceUri: 'https://mcp.example.com',
       protectedRoutes: options.protectedRoutes,
       tokenValidation: {
-        jwksUri: 'https://auth.example.com/.well-known/jwks.json',
+        // Every issuer here signs with the same test key, published once.
+        jwksUri: Object.fromEntries((options.authorizationServers ?? ['https://auth.example.com'])
+          .map(issuer => [issuer, 'https://auth.example.com/.well-known/jwks.json'])),
         introspectionEndpoint: options.introspectionEndpoint,
         validateAudience: true
       }

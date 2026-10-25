@@ -6,7 +6,8 @@ import type { FastifyInstance } from 'fastify'
 import { Type } from '@sinclair/typebox'
 import mcpPlugin, { isStdioRequest } from '../src/index.ts'
 import { connect, createServer } from 'node:net'
-import { createStdioTransport } from '../src/stdio.ts'
+import { once } from 'node:events'
+import { createStdioTransport, runStdioServer } from '../src/stdio.ts'
 import { MemoryTaskStore } from '../src/stores/memory-task-store.ts'
 import {
   JSONRPC_VERSION,
@@ -3445,14 +3446,21 @@ describe('round 4: transport, input validation and stdio', () => {
   })
 
   test('a client that disconnects while hooks run cancels the request', async (t: TestContext) => {
-    let sawAbort: boolean | undefined
+    let ran = false
+    let answered = false
+    let hookStarted!: () => void
+    const started = new Promise<void>(resolve => { hookStarted = resolve })
     const app = Fastify()
     t.after(() => app.close())
-    // A slow hook stands in for token validation (a JWKS fetch, say).
-    app.addHook('preHandler', async () => { await new Promise(resolve => setTimeout(resolve, 300)) })
+    // A hook that outlasts the client stands in for token validation (a JWKS fetch, say).
+    app.addHook('preHandler', async (request) => {
+      hookStarted()
+      if (!request.raw.socket.destroyed) await once(request.raw.socket, 'close')
+    })
+    app.addHook('onSend', async () => { answered = true })
     await app.register(mcpPlugin, { serverInfo: { name: 'test-server', version: '1.0.0' } })
-    app.mcpAddTool({ name: 'watch', inputSchema: Type.Object({}) }, async (_args: any, context: any) => {
-      sawAbort = context.signal.aborted
+    app.mcpAddTool({ name: 'watch', inputSchema: Type.Object({}) }, async () => {
+      ran = true
       return { content: [{ type: 'text', text: 'ran' }] }
     })
     const port = await listen(app)
@@ -3462,10 +3470,11 @@ describe('round 4: transport, input validation and stdio', () => {
     const req = request({ port, host: '127.0.0.1', method: 'POST', path: '/mcp', headers: modernHeaders('tools/call', { params }) })
     req.on('error', () => {})
     req.end(JSON.stringify(modernBody('tools/call', { params })))
-    await new Promise(resolve => setTimeout(resolve, 100))
+    await started
     req.destroy()
-    await until(() => sawAbort !== undefined)
-    t.assert.strictEqual(sawAbort, true)
+    await until(() => answered)
+    // Nobody is waiting for it, so the tool never starts.
+    t.assert.strictEqual(ran, false)
   })
 
   test('with telemetry, a malformed modern body is still a 400 -32600', async (t: TestContext) => {
@@ -5792,13 +5801,20 @@ describe('round 13: stdio shutdown and batches, partial mirrored headers, empty 
 describe('round 14: abandoned tasks, stdio streams after stop, logging and cursors', () => {
   test('a tools/call whose client left before it could become a task creates none', async (t: TestContext) => {
     const events: string[] = []
+    let answered = false
+    let hookStarted!: () => void
+    const started = new Promise<void>(resolve => { hookStarted = resolve })
     const app = Fastify()
     t.after(() => app.close())
-    // A slow hook (authentication, say) gives the client time to leave first.
-    app.addHook('preHandler', async () => { await new Promise(resolve => setTimeout(resolve, 150)) })
+    // A hook (authentication, say) the client leaves during.
+    app.addHook('preHandler', async (request) => {
+      hookStarted()
+      if (!request.raw.socket.destroyed) await once(request.raw.socket, 'close')
+    })
+    app.addHook('onSend', async () => { answered = true })
     await app.register(mcpPlugin, { serverInfo: { name: 's', version: '1' }, capabilities: { tools: {} }, enableTasks: true })
-    app.mcpAddTool({ name: 'deploy', inputSchema: Type.Object({}), execution: { taskSupport: 'optional' } } as any, async (_args: any, context: any) => {
-      events.push(`started aborted=${context.signal.aborted}`)
+    app.mcpAddTool({ name: 'deploy', inputSchema: Type.Object({}), execution: { taskSupport: 'optional' } } as any, async () => {
+      events.push('started')
       return { content: [] }
     })
     await app.listen({ port: 0, host: '127.0.0.1' })
@@ -5808,15 +5824,13 @@ describe('round 14: abandoned tasks, stdio streams after stop, logging and curso
     const payload = JSON.stringify(modernBody('tools/call', options))
     const headers = Object.entries({ ...modernHeaders('tools/call', options), host: 'x', 'content-length': String(Buffer.byteLength(payload)) })
       .map(([name, value]) => `${name}: ${value}\r\n`).join('')
-    await new Promise<void>(resolve => {
-      const socket = connect(port, '127.0.0.1', () => {
-        socket.write(`POST /mcp HTTP/1.1\r\n${headers}\r\n${payload}`)
-        setTimeout(() => { socket.destroy(); resolve() }, 30)
-      })
-    })
-    await new Promise(resolve => setTimeout(resolve, 400))
-    // Run as the synchronous call would have been: told it was cancelled.
-    t.assert.deepStrictEqual(events, ['started aborted=true'])
+    const socket = connect(port, '127.0.0.1', () => socket.write(`POST /mcp HTTP/1.1\r\n${headers}\r\n${payload}`))
+    socket.on('error', () => {})
+    await started
+    socket.destroy()
+    await until(() => answered)
+    // Neither a task nor the synchronous call it would have fallen back to.
+    t.assert.deepStrictEqual(events, [])
   })
 
   test('a stream whose handler ignores the shutdown writes nothing once stop() resolves', async (t: TestContext) => {
@@ -5897,5 +5911,187 @@ describe('round 14: abandoned tasks, stdio streams after stop, logging and curso
       })
       t.assert.strictEqual(later.statusCode, 200, `${JSON.stringify(anonymous)} ${later.body}`)
     }
+  })
+})
+
+describe('round 15: inherited method names, cancelled requests, answers and stdio output', () => {
+  test('a method named after an Object.prototype member is an unknown method', async (t: TestContext) => {
+    const app = await buildServer(t)
+    for (const method of ['toString', 'constructor', 'hasOwnProperty', 'valueOf']) {
+      const response = await call(app, method)
+      t.assert.strictEqual(response.statusCode, 404, `${method}: ${response.body}`)
+      t.assert.strictEqual(response.json().error.code, METHOD_NOT_FOUND)
+    }
+  })
+
+  test('a declined elicitation reaches the handler without its content', async (t: TestContext) => {
+    const seen: unknown[] = []
+    const formCapabilities: ClientCapabilities = { elicitation: { form: {} } }
+    const schema = { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] } as const
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'ask', inputSchema: Type.Object({}) }, async (_args: any, context: any) => {
+        const answer = context.inputResponses?.who
+        if (!answer) throw new InputRequired({ inputRequests: { who: elicitForm('Who?', schema as any) } })
+        seen.push(answer)
+        return { content: [] }
+      })
+    })
+    const first = (await call(app, 'tools/call', { params: { name: 'ask', arguments: {} }, capabilities: formCapabilities })).json().result
+    const retry = await call(app, 'tools/call', {
+      id: 2,
+      capabilities: formCapabilities,
+      params: { name: 'ask', arguments: {}, requestState: first.requestState, inputResponses: { who: { action: 'decline', content: { name: 42, extra: 'x' } } } }
+    })
+    t.assert.strictEqual(retry.json().result?.resultType, 'complete')
+    // Never checked against the schema, so never handed on.
+    t.assert.deepStrictEqual(seen, [{ action: 'decline' }])
+  })
+
+  test('tasks/cancel is not acknowledged when the cancellation could not be recorded', async (t: TestContext) => {
+    const tasksCapable: ClientCapabilities = { extensions: { [TASKS_EXTENSION]: {} } }
+    let release!: () => void
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'slow', inputSchema: Type.Object({}), execution: { taskSupport: 'optional' } } as any, async () => {
+        await new Promise<void>(resolve => { release = resolve })
+        return { content: [] }
+      })
+    }, { enableTasks: true })
+    const created = (await call(app, 'tools/call', { params: { name: 'slow', arguments: {} }, capabilities: tasksCapable })).json().result
+    const updateStatus = MemoryTaskStore.prototype.updateStatus
+    t.mock.method(MemoryTaskStore.prototype, 'updateStatus', async function (this: MemoryTaskStore, ...args: Parameters<typeof updateStatus>) {
+      if (args[1] === 'cancelled') throw new Error('store unavailable')
+      return updateStatus.apply(this, args)
+    })
+    const cancelled = await call(app, 'tasks/cancel', { params: { taskId: created.taskId }, capabilities: tasksCapable })
+    t.assert.strictEqual(cancelled.json().error?.code, INTERNAL_ERROR, cancelled.body)
+    const task = (await call(app, 'tasks/get', { params: { taskId: created.taskId }, capabilities: tasksCapable })).json().result
+    t.assert.strictEqual(task.status, 'working')
+    release()
+  })
+
+  test('stdio: an id is free again as soon as its request is cancelled', async (t: TestContext) => {
+    let started = false
+    let release!: () => void
+    const app = await buildServer(t, (app) => {
+      // Ignores its signal, so it is still running when its id is reused.
+      app.mcpAddTool({ name: 'stubborn', inputSchema: Type.Object({}) }, async () => {
+        started = true
+        await new Promise<void>(resolve => { release = resolve })
+        return { content: [] }
+      })
+      app.mcpAddTool({ name: 'quick', inputSchema: Type.Object({}) }, async () => ({ content: [{ type: 'text', text: 'quick' }] }))
+    })
+    const { lines, send } = stdioPipe(t, app)
+    send(modernBody('tools/call', { id: 'a', params: { name: 'stubborn', arguments: {} } }))
+    await until(() => started)
+    send({ jsonrpc: JSONRPC_VERSION, method: 'notifications/cancelled', params: { requestId: 'a' } })
+    send(modernBody('tools/call', { id: 'a', params: { name: 'quick', arguments: {} } }))
+    await until(() => lines.some(line => line.id === 'a'))
+    t.assert.deepStrictEqual(lines.filter(line => line.id === 'a').map(line => line.result?.content?.[0]?.text ?? line.error?.message), ['quick'])
+    release()
+  })
+
+  test('stdio: a handler that ignores the shutdown writes nothing once stop() resolves', async (t: TestContext) => {
+    let started = false
+    let release!: () => void
+    let returned!: Promise<void>
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'stubborn', inputSchema: Type.Object({}) }, async () => {
+        started = true
+        returned = new Promise<void>(resolve => { release = resolve })
+        await returned
+        return { content: [{ type: 'text', text: 'late' }] }
+      })
+    })
+    const { transport, lines, send } = stdioPipe(t, app)
+    send(modernBody('tools/call', { id: 1, params: { name: 'stubborn', arguments: {} } }))
+    await until(() => started)
+    const processing = [...(transport as any).processing]
+    await transport.stop()
+    const written = lines.length
+    release()
+    await Promise.all(processing)
+    await new Promise(resolve => setImmediate(resolve))
+    t.assert.strictEqual(lines.length, written, JSON.stringify(lines.slice(written)))
+  })
+
+  test('stdio: a client that goes away (EPIPE) stops the server instead of crashing it', async (t: TestContext) => {
+    let closed = false
+    const app = await buildServer(t, (app) => {
+      app.addHook('onClose', async () => { closed = true })
+    })
+    const input = new PassThrough()
+    const output = new PassThrough()
+    const error = new PassThrough()
+    const running = runStdioServer(app, { input, output, error })
+    // stderr is only for logs: losing it is not fatal either.
+    error.destroy(Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }))
+    input.write('not json\n')
+    output.destroy(Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }))
+    await running
+    t.assert.strictEqual(closed, true)
+  })
+
+  test('stdio: while stdout cannot take more, no more requests are read', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'big', inputSchema: Type.Object({}) }, async () => ({ content: [{ type: 'text', text: 'x'.repeat(256 * 1024) }] }))
+    })
+    const input = new PassThrough()
+    const output = new PassThrough()
+    const transport = createStdioTransport(app, { input, output, error: new PassThrough() })
+    transport.start()
+    t.after(() => transport.stop())
+    // Nobody reads stdout.
+    input.write(JSON.stringify(modernBody('tools/call', { id: 1, params: { name: 'big', arguments: {} } })) + '\n')
+    await until(() => output.writableLength > 0)
+    t.assert.strictEqual(input.isPaused(), true)
+    // Reading again lets requests in again.
+    output.resume()
+    await until(() => !input.isPaused())
+  })
+
+  test('stdio: requests are never echoed to stdout, even when it is a terminal', async (t: TestContext) => {
+    const app = await buildServer(t)
+    const input = new PassThrough()
+    const output = Object.assign(new PassThrough(), { isTTY: true, columns: 80 })
+    let written = ''
+    output.on('data', (chunk: Buffer) => { written += chunk.toString() })
+    const transport = createStdioTransport(app, { input, output, error: new PassThrough() })
+    transport.start()
+    t.after(() => transport.stop())
+    input.write(JSON.stringify({ jsonrpc: JSONRPC_VERSION, id: 1, method: 'ping' }) + '\n')
+    await until(() => written.includes('"result"'))
+    t.assert.strictEqual(written, JSON.stringify({ jsonrpc: JSONRPC_VERSION, id: 1, result: {} }) + '\n')
+  })
+
+  test('stdio and mcpClient reach the plugin registered under a prefix', async (t: TestContext) => {
+    const app = Fastify()
+    t.after(() => app.close())
+    let scoped!: FastifyInstance
+    await app.register(async (api) => {
+      await api.register(mcpPlugin, { serverInfo: { name: 's', version: '1' } })
+      scoped = api
+    }, { prefix: '/api' })
+    await app.ready()
+
+    const viaScope = stdioPipe(t, scoped)
+    viaScope.send({ jsonrpc: JSONRPC_VERSION, id: 1, method: 'ping' })
+    await until(() => viaScope.lines.length > 0)
+    t.assert.deepStrictEqual(viaScope.lines[0].result, {})
+
+    // The root instance does not know the prefix: it is named.
+    const input = new PassThrough()
+    const output = new PassThrough()
+    const lines: any[] = []
+    output.on('data', (chunk: Buffer) => { for (const line of chunk.toString().split('\n')) if (line) lines.push(JSON.parse(line)) })
+    const transport = createStdioTransport(app, { input, output, error: new PassThrough(), endpoint: '/api/mcp' })
+    transport.start()
+    t.after(() => transport.stop())
+    input.write(JSON.stringify({ jsonrpc: JSONRPC_VERSION, id: 2, method: 'ping' }) + '\n')
+    await until(() => lines.length > 0)
+    t.assert.deepStrictEqual(lines[0].result, {})
+
+    const initialized = await scoped.mcpClient().initialize()
+    t.assert.strictEqual(initialized.statusCode, 200)
   })
 })
