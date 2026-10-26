@@ -68,3 +68,10 @@ export function stdioRequestSignal (request: { raw: IncomingMessage }): AbortSig
 export function stdioAuthContext (request: { raw: IncomingMessage }): AuthorizationContext | undefined {
   return stdioRequests.get(request.raw)?.authContext
 }
+
+/**
+ * The plugin decorates its instance with the signal it aborts as that
+ * instance starts closing, so a stdio transport stops with the app even when
+ * something else closed it.
+ */
+export const MCP_SHUTDOWN_SIGNAL = Symbol.for('platformatic.mcp.shutdownSignal')

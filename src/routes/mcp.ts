@@ -1134,7 +1134,19 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         signal: stdioRequestSignal(request)
       })
       if (response) {
-        return response
+        // Serialized here, once: a result a handler built with a BigInt or a
+        // cycle must still answer its id with a JSON-RPC error.
+        let serialized: string
+        let answered: typeof response = response
+        try {
+          serialized = JSON.stringify(response)
+        } catch (error) {
+          request.log.error({ err: error }, 'MCP response could not be serialized')
+          answered = createError(response.id ?? null, INTERNAL_ERROR, 'Internal server error')
+          serialized = JSON.stringify(answered)
+        }
+        reply.type('application/json; charset=utf-8').serializer(() => serialized)
+        return answered
       } else {
         reply.code(202)
       }

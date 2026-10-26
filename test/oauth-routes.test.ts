@@ -4,7 +4,13 @@ import { MockAgent, setGlobalDispatcher, getGlobalDispatcher } from 'undici'
 import Fastify from 'fastify'
 import oauthClientPlugin from '../src/auth/oauth-client.ts'
 import authRoutesPlugin from '../src/routes/auth-routes.ts'
+import type { TestContext } from 'node:test'
+import type { Redis } from 'ioredis'
+import mcpPlugin from '../src/index.ts'
 import { MemorySessionStore } from '../src/stores/memory-session-store.ts'
+import { MemoryAuthorizationStateStore, RedisAuthorizationStateStore } from '../src/auth/authorization-state-store.ts'
+import { testWithRedis } from './redis-test-utils.ts'
+import type { AuthSession } from '../src/auth/authorization-state-store.ts'
 
 const originalDispatcher = getGlobalDispatcher()
 const mockAgent = new MockAgent()
@@ -31,8 +37,7 @@ describe('OAuth Routes', () => {
     }
 
     await fastify.register(oauthClientPlugin, config)
-    const sessionStore = new MemorySessionStore(100)
-    await fastify.register(authRoutesPlugin, { sessionStore })
+    await fastify.register(authRoutesPlugin)
 
     const response = await fastify.inject({
       method: 'GET',
@@ -74,8 +79,7 @@ describe('OAuth Routes', () => {
     }
 
     await fastify.register(oauthClientPlugin, config)
-    const sessionStore = new MemorySessionStore(100)
-    await fastify.register(authRoutesPlugin, { sessionStore })
+    await fastify.register(authRoutesPlugin)
 
     // First, initiate the flow to get a valid state
     const authResponse = await fastify.inject({
@@ -91,7 +95,8 @@ describe('OAuth Routes', () => {
     // Then handle the callback
     const callbackResponse = await fastify.inject({
       method: 'GET',
-      url: `/oauth/callback?code=test-code&state=${state}`
+      url: `/oauth/callback?code=test-code&state=${state}`,
+      headers: { cookie: `mcp_oauth_state=${state}` }
     })
 
     assert.strictEqual(callbackResponse.statusCode, 200)
@@ -115,8 +120,7 @@ describe('OAuth Routes', () => {
     }
 
     await fastify.register(oauthClientPlugin, config)
-    const sessionStore = new MemorySessionStore(100)
-    await fastify.register(authRoutesPlugin, { sessionStore })
+    await fastify.register(authRoutesPlugin)
 
     const response = await fastify.inject({
       method: 'GET',
@@ -142,8 +146,7 @@ describe('OAuth Routes', () => {
     }
 
     await fastify.register(oauthClientPlugin, config)
-    const sessionStore = new MemorySessionStore(100)
-    await fastify.register(authRoutesPlugin, { sessionStore })
+    await fastify.register(authRoutesPlugin)
 
     const response = await fastify.inject({
       method: 'GET',
@@ -169,12 +172,12 @@ describe('OAuth Routes', () => {
     }
 
     await fastify.register(oauthClientPlugin, config)
-    const sessionStore = new MemorySessionStore(100)
-    await fastify.register(authRoutesPlugin, { sessionStore })
+    await fastify.register(authRoutesPlugin)
 
     const response = await fastify.inject({
       method: 'GET',
-      url: '/oauth/callback?code=test-code&state=invalid-state'
+      url: '/oauth/callback?code=test-code&state=invalid-state',
+      headers: { cookie: 'mcp_oauth_state=invalid-state' }
     })
 
     assert.strictEqual(response.statusCode, 400)
@@ -207,8 +210,7 @@ describe('OAuth Routes', () => {
     }
 
     await fastify.register(oauthClientPlugin, config)
-    const sessionStore = new MemorySessionStore(100)
-    await fastify.register(authRoutesPlugin, { sessionStore })
+    await fastify.register(authRoutesPlugin)
 
     const response = await fastify.inject({
       method: 'POST',
@@ -245,8 +247,7 @@ describe('OAuth Routes', () => {
     }
 
     await fastify.register(oauthClientPlugin, config)
-    const sessionStore = new MemorySessionStore(100)
-    await fastify.register(authRoutesPlugin, { sessionStore })
+    await fastify.register(authRoutesPlugin)
 
     const response = await fastify.inject({
       method: 'POST',
@@ -280,8 +281,7 @@ describe('OAuth Routes', () => {
     }
 
     await fastify.register(oauthClientPlugin, config)
-    const sessionStore = new MemorySessionStore(100)
-    await fastify.register(authRoutesPlugin, { sessionStore })
+    await fastify.register(authRoutesPlugin)
 
     const response = await fastify.inject({
       method: 'POST',
@@ -315,8 +315,7 @@ describe('OAuth Routes', () => {
     }
 
     await fastify.register(oauthClientPlugin, config)
-    const sessionStore = new MemorySessionStore(100)
-    await fastify.register(authRoutesPlugin, { sessionStore })
+    await fastify.register(authRoutesPlugin)
 
     const response = await fastify.inject({
       method: 'GET',
@@ -344,8 +343,7 @@ describe('OAuth Routes', () => {
     }
 
     await fastify.register(oauthClientPlugin, config)
-    const sessionStore = new MemorySessionStore(100)
-    await fastify.register(authRoutesPlugin, { sessionStore })
+    await fastify.register(authRoutesPlugin)
 
     const response = await fastify.inject({
       method: 'GET',
@@ -369,8 +367,7 @@ describe('OAuth Routes', () => {
     }
 
     await fastify.register(oauthClientPlugin, config)
-    const sessionStore = new MemorySessionStore(100)
-    await fastify.register(authRoutesPlugin, { sessionStore })
+    await fastify.register(authRoutesPlugin)
 
     const response = await fastify.inject({
       method: 'POST',
@@ -404,9 +401,7 @@ describe('OAuth Routes', () => {
     }
 
     await fastify.register(oauthClientPlugin, config)
-    const sessionStore = new MemorySessionStore(100)
     await fastify.register(authRoutesPlugin, {
-      sessionStore,
       dcrHooks: {
         upstreamEndpoint: 'https://auth.example.com/oauth2/register'
       }
@@ -452,9 +447,7 @@ describe('OAuth Routes', () => {
     let onResponseCalled = false
 
     await fastify.register(oauthClientPlugin, config)
-    const sessionStore = new MemorySessionStore(100)
     await fastify.register(authRoutesPlugin, {
-      sessionStore,
       dcrHooks: {
         upstreamEndpoint: 'https://auth.example.com/oauth2/register',
         onRequest: async (request, _log) => {
@@ -503,8 +496,7 @@ describe('OAuth Routes', () => {
     }
 
     await fastify.register(oauthClientPlugin, config)
-    const sessionStore = new MemorySessionStore(100)
-    await fastify.register(authRoutesPlugin, { sessionStore })
+    await fastify.register(authRoutesPlugin)
 
     const response = await fastify.inject({
       method: 'POST',
@@ -532,8 +524,7 @@ describe('OAuth Routes', () => {
     }
 
     await fastify.register(oauthClientPlugin, config)
-    const sessionStore = new MemorySessionStore(100)
-    await fastify.register(authRoutesPlugin, { sessionStore })
+    await fastify.register(authRoutesPlugin)
 
     const response = await fastify.inject({
       method: 'POST',
@@ -561,8 +552,7 @@ describe('OAuth Routes', () => {
     }
 
     await fastify.register(oauthClientPlugin, config)
-    const sessionStore = new MemorySessionStore(100)
-    await fastify.register(authRoutesPlugin, { sessionStore })
+    await fastify.register(authRoutesPlugin)
 
     const response = await fastify.inject({
       method: 'POST',
@@ -592,13 +582,13 @@ describe('OAuth Routes', () => {
       throw new Error('must not be called')
     }
 
-    const sessionStore = new MemorySessionStore(100)
+    const stateStore = new MemoryAuthorizationStateStore()
     let sessionCreated = false
-    sessionStore.create = async () => {
+    stateStore.put = async () => {
       sessionCreated = true
     }
 
-    await fastify.register(authRoutesPlugin, { sessionStore })
+    await fastify.register(authRoutesPlugin, { stateStore })
 
     const response = await fastify.inject({
       method: 'GET',
@@ -638,29 +628,24 @@ describe('OAuth Routes', () => {
       redirectUri: 'https://mcp.example.com/oauth/callback'
     })
 
-    const sessionStore = new MemorySessionStore(100)
-    await sessionStore.create({
-      id: 'stale-state',
-      eventId: 0,
-      createdAt: new Date(),
-      lastActivity: new Date(),
-      authSession: {
-        state: 'stale-state',
-        pkce: {
-          codeVerifier: 'verifier',
-          codeChallenge: 'challenge',
-          codeChallengeMethod: 'S256'
-        },
-        originalUrl: 'https://attacker.example/capture',
-        callbackUrl: 'https://mcp.example.com/oauth/callback'
-      }
-    })
+    const stateStore = new MemoryAuthorizationStateStore()
+    await stateStore.put('stale-state', {
+      state: 'stale-state',
+      pkce: {
+        codeVerifier: 'verifier',
+        codeChallenge: 'challenge',
+        codeChallengeMethod: 'S256'
+      },
+      originalUrl: 'https://attacker.example/capture',
+      callbackUrl: 'https://mcp.example.com/oauth/callback'
+    } as AuthSession, 60_000)
 
-    await fastify.register(authRoutesPlugin, { sessionStore })
+    await fastify.register(authRoutesPlugin, { stateStore })
 
     const response = await fastify.inject({
       method: 'GET',
-      url: '/oauth/callback?code=test-code&state=stale-state'
+      url: '/oauth/callback?code=test-code&state=stale-state',
+      headers: { cookie: 'mcp_oauth_state=stale-state' }
     })
 
     assert.strictEqual(response.statusCode, 200)
@@ -668,7 +653,7 @@ describe('OAuth Routes', () => {
     assert.strictEqual(response.headers['cache-control'], 'no-store')
     assert.strictEqual(response.headers.pragma, 'no-cache')
     assert.strictEqual(response.json().access_token, 'callback-access-token')
-    assert.strictEqual(await sessionStore.get('stale-state'), null)
+    assert.strictEqual(await stateStore.take('stale-state'), undefined)
   })
 })
 
@@ -692,8 +677,7 @@ describe('OAuth Routes Error Handling', () => {
       throw new Error('Authorization server unreachable')
     }
 
-    const sessionStore = new MemorySessionStore(100)
-    await fastify.register(authRoutesPlugin, { sessionStore })
+    await fastify.register(authRoutesPlugin)
 
     const response = await fastify.inject({
       method: 'GET',
@@ -725,8 +709,7 @@ describe('OAuth Routes Error Handling', () => {
     }
 
     await fastify.register(oauthClientPlugin, config)
-    const sessionStore = new MemorySessionStore(100)
-    await fastify.register(authRoutesPlugin, { sessionStore })
+    await fastify.register(authRoutesPlugin)
 
     // Initiate flow to get valid state
     const authResponse = await fastify.inject({
@@ -742,7 +725,8 @@ describe('OAuth Routes Error Handling', () => {
     // Handle callback with server error
     const callbackResponse = await fastify.inject({
       method: 'GET',
-      url: `/oauth/callback?code=test-code&state=${state}`
+      url: `/oauth/callback?code=test-code&state=${state}`,
+      headers: { cookie: `mcp_oauth_state=${state}` }
     })
 
     assert.strictEqual(callbackResponse.statusCode, 500)
@@ -763,8 +747,7 @@ describe('OAuth Routes Error Handling', () => {
     }
 
     await fastify.register(oauthClientPlugin, config)
-    const sessionStore = new MemorySessionStore(100)
-    await fastify.register(authRoutesPlugin, { sessionStore })
+    await fastify.register(authRoutesPlugin)
 
     const response = await fastify.inject({
       method: 'POST',
@@ -789,7 +772,7 @@ describe('round 15: callback URL, metadata issuer and pre-authorization routes',
       authorizationServer: 'https://round15-host.example.com',
       resourceUri: 'https://mcp.example.com/'
     })
-    await fastify.register(authRoutesPlugin, { sessionStore: new MemorySessionStore(100) })
+    await fastify.register(authRoutesPlugin)
     const response = await fastify.inject({ method: 'GET', url: '/oauth/authorize', headers: { host: 'attacker.example.net' } })
     assert.strictEqual(response.statusCode, 302)
     const location = new URL(response.headers.location as string)
@@ -800,7 +783,7 @@ describe('round 15: callback URL, metadata issuer and pre-authorization routes',
     const fastify = Fastify({ logger: false })
     t.after(() => fastify.close())
     await fastify.register(oauthClientPlugin, { clientId: 'test-client', authorizationServer: 'https://round15-none.example.com' })
-    await fastify.register(authRoutesPlugin, { sessionStore: new MemorySessionStore(100) })
+    await fastify.register(authRoutesPlugin)
     const response = await fastify.inject({ method: 'GET', url: '/oauth/authorize' })
     assert.strictEqual(response.statusCode, 500)
     assert.strictEqual(response.headers.location, undefined)
@@ -820,5 +803,142 @@ describe('round 15: callback URL, metadata issuer and pre-authorization routes',
     await fastify.register(oauthClientPlugin, { clientId: 'test-client', authorizationServer: server, redirectUri: 'https://mcp.example.com/oauth/callback' })
     const request = await fastify.oauthClient.createAuthorizationRequest()
     assert.strictEqual(new URL(request.authorizationUrl).origin, server)
+  })
+})
+
+describe('round 16: pending authorizations and the default callback', () => {
+  const tokenReply = {
+    access_token: 'round16-access-token',
+    token_type: 'Bearer',
+    expires_in: 3600
+  }
+
+  async function buildRoutes (t: TestContext, server: string, extra: Record<string, unknown> = {}) {
+    const fastify = Fastify({ logger: false })
+    t.after(() => fastify.close())
+    await fastify.register(oauthClientPlugin, {
+      clientId: 'test-client',
+      clientSecret: 'test-secret',
+      authorizationServer: server,
+      redirectUri: 'https://mcp.example.com/oauth/callback',
+      ...extra
+    })
+    await fastify.register(authRoutesPlugin)
+    const authorize = await fastify.inject({ method: 'GET', url: '/oauth/authorize' })
+    const state = new URL(authorize.headers.location as string).searchParams.get('state')!
+    return { fastify, authorize, state }
+  }
+
+  test('authorize sets a cookie scoped to the callback, and the callback needs it', async (t: TestContext) => {
+    const server = 'https://round16-cookie.example.com'
+    mockAgent.get(server).intercept({ path: '/oauth/token', method: 'POST' }).reply(200, tokenReply)
+    const { fastify, authorize, state } = await buildRoutes(t, server)
+
+    const cookie = String(authorize.headers['set-cookie'])
+    assert.match(cookie, new RegExp(`^mcp_oauth_state=${state};`))
+    assert.match(cookie, /Path=\/oauth\/callback/)
+    assert.match(cookie, /HttpOnly/)
+    assert.match(cookie, /SameSite=Lax/)
+    assert.match(cookie, /Secure/)
+
+    // A callback URL opened in a browser that did not start the flow
+    for (const headers of [{}, { cookie: 'mcp_oauth_state=someone-else' }]) {
+      const response = await fastify.inject({ method: 'GET', url: `/oauth/callback?code=c&state=${state}`, headers })
+      assert.strictEqual(response.statusCode, 400)
+      assert.strictEqual(response.json().error, 'invalid_request')
+    }
+
+    // ...and it did not use up the state
+    const response = await fastify.inject({
+      method: 'GET',
+      url: `/oauth/callback?code=c&state=${state}`,
+      headers: { cookie: `other=1; mcp_oauth_state=${state}` }
+    })
+    assert.strictEqual(response.statusCode, 200)
+    assert.strictEqual(response.json().access_token, 'round16-access-token')
+    assert.match(String(response.headers['set-cookie']), /^mcp_oauth_state=; .*Max-Age=0/)
+  })
+
+  test('a state is redeemed once, even by concurrent callbacks', async (t: TestContext) => {
+    const server = 'https://round16-once.example.com'
+    mockAgent.get(server).intercept({ path: '/oauth/token', method: 'POST' }).reply(200, tokenReply).times(2)
+    const { fastify, state } = await buildRoutes(t, server)
+    const callback = () => fastify.inject({
+      method: 'GET',
+      url: `/oauth/callback?code=c&state=${state}`,
+      headers: { cookie: `mcp_oauth_state=${state}` }
+    })
+    const statuses = (await Promise.all([callback(), callback()])).map(r => r.statusCode).sort()
+    assert.deepStrictEqual(statuses, [200, 400])
+  })
+
+  test('starting an authorization creates no MCP session', async (t: TestContext) => {
+    const created = t.mock.method(MemorySessionStore.prototype, 'create')
+    const app = Fastify({ logger: false })
+    t.after(() => app.close())
+    await app.register(mcpPlugin, {
+      authorization: {
+        enabled: true,
+        authorizationServers: ['https://round16-session.example.com'],
+        resourceUri: 'https://mcp.example.com',
+        tokenValidation: { jwksUri: 'https://round16-session.example.com/.well-known/jwks.json' },
+        oauth2Client: {
+          clientId: 'test-client',
+          authorizationServer: 'https://round16-session.example.com',
+          resourceUri: 'https://mcp.example.com'
+        }
+      }
+    })
+    await app.ready()
+    for (let i = 0; i < 3; i++) {
+      assert.strictEqual((await app.inject({ method: 'GET', url: '/oauth/authorize' })).statusCode, 302)
+    }
+    assert.strictEqual(created.mock.callCount(), 0)
+  })
+
+  test('the memory store is bounded and forgets lapsed authorizations', async (t: TestContext) => {
+    t.mock.timers.enable({ apis: ['Date'] })
+    const store = new MemoryAuthorizationStateStore(3)
+    const session = (state: string) => ({ state, pkce: { codeVerifier: 'v', codeChallenge: 'c', codeChallengeMethod: 'S256' } }) as AuthSession
+    for (const state of ['a', 'b', 'c', 'd', 'e']) await store.put(state, session(state), 1000)
+    assert.strictEqual(await store.take('a'), undefined)
+    assert.strictEqual(await store.take('b'), undefined)
+    assert.strictEqual((await store.take('c'))?.state, 'c')
+    assert.strictEqual(await store.take('c'), undefined)
+    t.mock.timers.tick(1001)
+    assert.strictEqual(await store.take('d'), undefined)
+  })
+
+  testWithRedis('the Redis store keeps a state for one redemption', async (redis: Redis, t: TestContext) => {
+    const store = new RedisAuthorizationStateStore(redis)
+    const session = { state: 's1', pkce: { codeVerifier: 'v', codeChallenge: 'c', codeChallengeMethod: 'S256' } } as AuthSession
+    await store.put('s1', session, 60_000)
+    const ttl = await redis.pttl('mcp:oauth:state:s1')
+    t.assert.ok(ttl > 0 && ttl <= 60_000)
+    t.assert.deepStrictEqual(await store.take('s1'), session)
+    t.assert.strictEqual(await store.take('s1'), undefined)
+  })
+
+  test('the default callback is the served route: resource path ignored, route prefix applied', async (t: TestContext) => {
+    for (const { prefix, resourceUri, expected } of [
+      { prefix: '', resourceUri: 'https://mcp.example.com/mcp', expected: 'https://mcp.example.com/oauth/callback' },
+      { prefix: '/api', resourceUri: 'https://mcp.example.com', expected: 'https://mcp.example.com/api/oauth/callback' }
+    ]) {
+      const fastify = Fastify({ logger: false })
+      t.after(() => fastify.close())
+      await fastify.register(async (child) => {
+        await child.register(oauthClientPlugin, { clientId: 'test-client', authorizationServer: 'https://round16-default.example.com', resourceUri })
+        await child.register(authRoutesPlugin)
+      }, { prefix })
+      const authorize = await fastify.inject({ method: 'GET', url: `${prefix}/oauth/authorize` })
+      const redirectUri = new URL(authorize.headers.location as string).searchParams.get('redirect_uri')
+      assert.strictEqual(redirectUri, expected)
+      // ...which is where the callback route answers
+      const state = new URL(authorize.headers.location as string).searchParams.get('state')
+      const callback = await fastify.inject({ method: 'GET', url: `${new URL(redirectUri!).pathname}?state=${state}` })
+      assert.strictEqual(callback.statusCode, 400)
+      assert.match(callback.json().error_description, /Missing required parameters/)
+      assert.match(String(authorize.headers['set-cookie']), new RegExp(`Path=${new URL(expected).pathname}`))
+    }
   })
 })

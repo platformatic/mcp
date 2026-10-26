@@ -947,7 +947,7 @@ async function runRegisteredTool (
         const result: CallToolResult = {
           content: [{
             type: 'text',
-            text: `Tool execution failed: ${error.message || error}`
+            text: `Tool execution failed: ${errorText(error)}`
           }],
           isError: true
         }
@@ -971,7 +971,7 @@ async function runRegisteredTool (
         const result: CallToolResult = {
           content: [{
             type: 'text',
-            text: `Tool execution failed: ${error.message || error}`
+            text: `Tool execution failed: ${errorText(error)}`
           }],
           isError: true
         }
@@ -988,7 +988,7 @@ async function runRegisteredTool (
       const result: CallToolResult = {
         content: [{
           type: 'text',
-          text: `Tool execution failed: ${error.message || error}`
+          text: `Tool execution failed: ${errorText(error)}`
         }],
         isError: true
       }
@@ -1091,7 +1091,7 @@ export async function handleResourcesRead (
     // On 2026-07-28 the handler's error may carry internals: it goes to the
     // log only. The legacy path keeps reporting its message.
     if (dependencies.strictErrors) return createError(request.id, INTERNAL_ERROR, 'Resource read failed')
-    return createError(request.id, INTERNAL_ERROR, `Resource read failed: ${error?.message || error}`)
+    return createError(request.id, INTERNAL_ERROR, `Resource read failed: ${errorText(error)}`)
   }
 }
 
@@ -1129,7 +1129,7 @@ export async function handlePromptsGet (
   } satisfies GetPromptResult)
   const failed = (error: any): JSONRPCError => {
     dependencies.app.log.error({ err: error, prompt: promptName }, 'Prompt handler failed')
-    if (!strict) return createError(request.id, INTERNAL_ERROR, `Prompt execution failed: ${error?.message || error}`)
+    if (!strict) return createError(request.id, INTERNAL_ERROR, `Prompt execution failed: ${errorText(error)}`)
     return createError(request.id, INTERNAL_ERROR, 'Internal server error')
   }
 
@@ -1745,9 +1745,19 @@ async function runToolCallAsTask (
         handlerOutcome = handled
         unreported = emit
       })
-      outcome = result
-      // A tool result carrying isError counts as a failed task
-      if ('result' in result && (result.result as CallToolResult)?.isError === true) {
+      // Stored as it will be read back: a result the store cannot hold (a
+      // BigInt, a cycle) fails the task, as the call would answer -32603.
+      let stored: JSONRPCResponse | JSONRPCError | undefined
+      try {
+        stored = JSON.parse(JSON.stringify(result))
+      } catch (resultError) {
+        app.log.error({ err: resultError, taskId: task.taskId }, 'Task result could not be serialized')
+      }
+      outcome = stored ?? createError(request.id, INTERNAL_ERROR, 'Internal server error')
+      if (!stored) {
+        status = 'failed'
+        statusMessage = 'Internal server error'
+      } else if ('result' in result && (result.result as CallToolResult)?.isError === true) {
         status = 'failed'
         statusMessage = 'Tool execution reported an error'
       } else if ('error' in result) {
@@ -1756,7 +1766,7 @@ async function runToolCallAsTask (
       }
     } catch (error: any) {
       status = 'failed'
-      statusMessage = `Tool execution failed: ${error?.message || error}`
+      statusMessage = `Tool execution failed: ${errorText(error)}`
       outcome = createError(request.id, INTERNAL_ERROR, statusMessage)
     }
     // A stopped task ends for the reason it was stopped.
@@ -1827,7 +1837,7 @@ async function handleResourcesSubscribe (
     }
     return createResponse(request.id, result)
   } catch (error: any) {
-    return createError(request.id, INTERNAL_ERROR, `Subscribe failed: ${error.message || error}`)
+    return createError(request.id, INTERNAL_ERROR, `Subscribe failed: ${errorText(error)}`)
   }
 }
 
@@ -1848,13 +1858,27 @@ async function handleResourcesUnsubscribe (
   }
 
   try {
-    const result = await resourceHandlers.unsubscribeHandler(params, handlerContext(dependencies, sessionId))
-    if (sessionId && dependencies.sessionStore) {
-      await dependencies.sessionStore.removeResourceSubscription(sessionId, params.uri)
+    // Only the session holding the subscription undoes it: without one there
+    // is nothing of this caller's to stop, and the handler would stop a
+    // watcher someone else depends on.
+    const session = sessionId && dependencies.sessionStore ? await dependencies.sessionStore.get(sessionId) : null
+    if (!session?.resourceSubscriptions?.includes(params.uri)) {
+      return createResponse(request.id, {})
     }
+    const result = await resourceHandlers.unsubscribeHandler(params, handlerContext(dependencies, sessionId))
+    await dependencies.sessionStore!.removeResourceSubscription(sessionId!, params.uri)
     return createResponse(request.id, result)
   } catch (error: any) {
-    return createError(request.id, INTERNAL_ERROR, `Unsubscribe failed: ${error.message || error}`)
+    return createError(request.id, INTERNAL_ERROR, `Unsubscribe failed: ${errorText(error)}`)
+  }
+}
+
+/** What a handler threw, as text: it may have thrown anything, null and symbols included. */
+export function errorText (error: unknown): string {
+  try {
+    return String((error as { message?: unknown } | null | undefined)?.message || error)
+  } catch {
+    return 'Unknown error'
   }
 }
 

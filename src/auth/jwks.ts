@@ -48,10 +48,17 @@ export class JwksCache {
 
   /** The PEM public key for `kid` and `alg`, or an error when the set has none. */
   async getPublicKey (kid: string | undefined, alg: string | undefined): Promise<string> {
-    if (Date.now() - this.fetchedAt >= this.ttlMs) {
-      await this.refreshKeepingOld()
-    }
     let jwk = this.find(kid, alg)
+    if (Date.now() - this.fetchedAt >= this.ttlMs) {
+      if (jwk) {
+        // The set is due, but this key is in it: answer now and fetch the
+        // set behind it. A failed fetch keeps the set, so nothing to report.
+        this.refreshKeepingOld().catch(() => {})
+      } else {
+        await this.refreshKeepingOld()
+        jwk = this.find(kid, alg)
+      }
+    }
     // A key the set lacks may be on its way: a fetch already under way (a
     // cold start, a rotation) is waited for, and a new one is made when the
     // last attempt was long enough ago, whether or not it succeeded, so an

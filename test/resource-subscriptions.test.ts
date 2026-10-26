@@ -220,3 +220,43 @@ describe('resources/updated subscriptions with Redis', () => {
     t.assert.strictEqual(await redis.exists('session:missing'), 0)
   })
 })
+
+describe('round 16: legacy resources/unsubscribe', () => {
+  test('only the session holding the subscription runs the unsubscribe handler', async (t: TestContext) => {
+    const app = fastify()
+    t.after(() => app.close())
+    await app.register(mcpPlugin, {
+      serverInfo: { name: 'test', version: '1.0.0' },
+      capabilities: { resources: { subscribe: true } },
+      enableSSE: true
+    })
+    const watched = new Set<string>()
+    const unsubscribedBy: (string | undefined)[] = []
+    app.mcpSetResourceSubscribeHandler(async ({ uri }) => { watched.add(uri); return {} })
+    app.mcpSetResourceUnsubscribeHandler(async ({ uri }, context) => {
+      unsubscribedBy.push(context?.sessionId)
+      watched.delete(uri)
+      return {}
+    })
+
+    const alice = await initSession(app)
+    const bob = await initSession(app)
+    await rpc(app, alice, 'resources/subscribe', 'file:///alice-doc')
+
+    // Another session, and a request with no session at all
+    await rpc(app, bob, 'resources/unsubscribe', 'file:///alice-doc')
+    const sessionless = await app.inject({
+      method: 'POST',
+      url: '/mcp',
+      headers: { 'content-type': 'application/json', accept: 'application/json' },
+      payload: { jsonrpc: '2.0', id: 3, method: 'resources/unsubscribe', params: { uri: 'file:///alice-doc' } }
+    })
+    t.assert.deepStrictEqual(sessionless.json().result, {})
+    t.assert.deepStrictEqual([...watched], ['file:///alice-doc'])
+    t.assert.deepStrictEqual(unsubscribedBy, [])
+
+    await rpc(app, alice, 'resources/unsubscribe', 'file:///alice-doc')
+    t.assert.deepStrictEqual([...watched], [])
+    t.assert.deepStrictEqual(unsubscribedBy, [alice])
+  })
+})

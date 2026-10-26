@@ -14,7 +14,7 @@ import { RedisTaskStore } from './stores/redis-task-store.ts'
 import type { MCPPluginOptions, MCPTool, MCPResource, MCPPrompt, ResourceHandlers } from './types.ts'
 import type { CacheHint, CachingConfig } from './modern/handlers.ts'
 import { drainTasks } from './task-registry.ts'
-import { claimStdioRequest } from './stdio-trust.ts'
+import { claimStdioRequest, MCP_SHUTDOWN_SIGNAL } from './stdio-trust.ts'
 import { RequestStateSealer } from './modern/request-state.ts'
 import { SubscriptionRegistry } from './modern/subscriptions.ts'
 import {
@@ -31,6 +31,7 @@ import { TokenValidator } from './auth/token-validator.ts'
 import { createAuthPreHandler } from './auth/prehandler.ts'
 import oauthClientPlugin from './auth/oauth-client.ts'
 import authRoutesPlugin from './routes/auth-routes.ts'
+import { MemoryAuthorizationStateStore, RedisAuthorizationStateStore } from './auth/authorization-state-store.ts'
 import { quitWithTimeout } from './redis-quit-with-timeout.ts'
 import { createJsonSchemaValidator } from './validation/json-schema-validator.ts'
 import {
@@ -273,6 +274,7 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
   app.addHook('preClose', async () => {
     shutdownController.abort(new Error('Server is shutting down'))
   })
+  app.decorate(MCP_SHUTDOWN_SIGNAL, shutdownController.signal)
 
   // Leases let any instance notice that the one running a task has died.
   const taskLeases = taskStore
@@ -411,7 +413,7 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
   // Register OAuth client routes if OAuth client is configured
   if (opts.authorization?.enabled && opts.authorization?.oauth2Client) {
     await app.register(authRoutesPlugin, {
-      sessionStore,
+      stateStore: redis ? new RedisAuthorizationStateStore(redis) : new MemoryAuthorizationStateStore(),
       dcrHooks: opts.authorization.dcrHooks
     })
   }

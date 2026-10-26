@@ -6095,3 +6095,153 @@ describe('round 15: inherited method names, cancelled requests, answers and stdi
     t.assert.strictEqual(initialized.statusCode, 200)
   })
 })
+
+describe('round 16: thrown values, cache hints, task results and stdio framing', () => {
+  test('a tool that throws null, undefined or a symbol fails as a tool, and is reported', async (t: TestContext) => {
+    const completed: string[] = []
+    const app = await buildServer(t, (app) => {
+      for (const [name, value] of [['null', null], ['undefined', undefined], ['symbol', Symbol('odd')]] as const) {
+        app.mcpAddTool({ name, inputSchema: Type.Object({}) }, async () => { throw value })
+      }
+    }, { onToolCallComplete: (event: { toolName: string }) => { completed.push(event.toolName) } })
+    for (const name of ['null', 'undefined', 'symbol']) {
+      const result = (await call(app, 'tools/call', { params: { name, arguments: {} } })).json().result
+      t.assert.strictEqual(result?.isError, true, name)
+      t.assert.match(result.content[0].text, /^Tool execution failed: /)
+    }
+    t.assert.deepStrictEqual(completed, ['null', 'undefined', 'symbol'])
+  })
+
+  test('a resource handler can tighten the configured cache hint, never loosen it', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddResource({ uriPattern: 'docs://public', name: 'public' }, async (uri: string) => ({ contents: [{ uri, text: 'hello' }] }))
+      app.mcpAddResource({ uriPattern: 'me://profile', name: 'profile' }, async (uri: string) => ({
+        contents: [{ uri, text: 'mine' }], cacheScope: 'private', ttlMs: 0
+      }) as any)
+      app.mcpAddResource({ uriPattern: 'docs://loose', name: 'loose' }, async (uri: string) => ({
+        contents: [{ uri, text: 'x' }], cacheScope: 'public', ttlMs: 999_999
+      }) as any)
+    }, { caching: { resourcesRead: { ttlMs: 60_000, cacheScope: 'public' } } })
+    const hint = async (uri: string) => {
+      const { ttlMs, cacheScope } = (await call(app, 'resources/read', { params: { uri } })).json().result
+      return { ttlMs, cacheScope }
+    }
+    t.assert.deepStrictEqual(await hint('docs://public'), { ttlMs: 60_000, cacheScope: 'public' })
+    t.assert.deepStrictEqual(await hint('me://profile'), { ttlMs: 0, cacheScope: 'private' })
+    t.assert.deepStrictEqual(await hint('docs://loose'), { ttlMs: 60_000, cacheScope: 'public' })
+  })
+
+  test('a task whose result or input request cannot be stored fails with an internal error', async (t: TestContext) => {
+    const tasksCapable: ClientCapabilities = { extensions: { [TASKS_EXTENSION]: {} }, elicitation: { form: {} } }
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'big-number', inputSchema: Type.Object({}), execution: { taskSupport: 'optional' } } as any, async () => ({
+        content: [], structuredContent: { n: 10n }
+      }) as any)
+      app.mcpAddTool({ name: 'big-question', inputSchema: Type.Object({}), execution: { taskSupport: 'optional' } } as any, async () => {
+        throw new InputRequired({ inputRequests: { q: { ...elicitForm('How many?', { type: 'object', properties: {} } as any), extra: 10n } as any } })
+      })
+    }, { enableTasks: true })
+    for (const name of ['big-number', 'big-question']) {
+      const created = (await call(app, 'tools/call', { params: { name, arguments: {} }, capabilities: tasksCapable })).json().result
+      let task: any
+      for (let attempt = 0; attempt < 100; attempt++) {
+        task = (await call(app, 'tasks/get', { params: { taskId: created.taskId }, capabilities: tasksCapable })).json()
+        if (task.result?.status !== 'working') break
+        await new Promise(resolve => setImmediate(resolve))
+      }
+      t.assert.strictEqual(task.result?.status, 'failed', `${name}: ${JSON.stringify(task)}`)
+      t.assert.strictEqual(task.result.error?.code, INTERNAL_ERROR)
+    }
+  })
+
+  test('stdio: messages are split on newlines only', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'echo', inputSchema: Type.Object({ text: Type.String() }) }, async ({ text }: { text: string }) => ({
+        content: [{ type: 'text', text }]
+      }))
+    })
+    const { lines, transport } = stdioPipe(t, app)
+    const input = (transport as any).transportOpts.input as PassThrough
+    const text = 'one\u2028two\u2029three'
+    // U+2028/U+2029 inside a string, a bare \r between tokens, CRLF line ends,
+    // and a message split across writes in the middle of a multi-byte character
+    const first = Buffer.from(JSON.stringify(modernBody('tools/call', { id: 1, params: { name: 'echo', arguments: { text } } })) + '\r\n')
+    const cut = first.indexOf(Buffer.from('\u2028')) + 1
+    input.write(first.subarray(0, cut))
+    input.write(first.subarray(cut))
+    input.write(JSON.stringify(modernBody('tools/call', { id: 2, params: { name: 'echo', arguments: { text: 'cr' } } })).replace('{', '{\r') + '\n')
+    await until(() => lines.length >= 2)
+    t.assert.deepStrictEqual(lines.map(line => [line.id, line.result?.content?.[0]?.text ?? line.error]).sort(), [[1, text], [2, 'cr']])
+  })
+
+  test('stdio: a reply from the client is handed on, and never answered', async (t: TestContext) => {
+    let release!: () => void
+    let started = false
+    const replies: unknown[] = []
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'slow', inputSchema: Type.Object({}) }, async () => {
+        started = true
+        await new Promise<void>(resolve => { release = resolve })
+        return { content: [{ type: 'text', text: 'done' }] }
+      })
+    }, { onClientResponse: (response: unknown) => { replies.push(response) } })
+    const { lines, send } = stdioPipe(t, app)
+    send({ jsonrpc: JSONRPC_VERSION, id: 1, method: 'initialize', params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'c', version: '1' } } })
+    await until(() => lines.length === 1)
+    send({ jsonrpc: JSONRPC_VERSION, id: 5, method: 'tools/call', params: { name: 'slow', arguments: {} } })
+    await until(() => started)
+    // The same id as a request in flight: the server's ids are its own
+    send({ jsonrpc: JSONRPC_VERSION, id: 5, result: { action: 'cancel' } })
+    send({ jsonrpc: JSONRPC_VERSION, id: 6, error: { code: -1, message: 'no' } })
+    await until(() => replies.length === 2)
+    release()
+    await until(() => lines.length === 2)
+    t.assert.deepStrictEqual(lines.slice(1).map(line => [line.id, line.result?.content?.[0]?.text]), [[5, 'done']])
+    t.assert.deepStrictEqual(replies, [
+      { jsonrpc: JSONRPC_VERSION, id: 5, result: { action: 'cancel' } },
+      { jsonrpc: JSONRPC_VERSION, id: 6, error: { code: -1, message: 'no' } }
+    ])
+  })
+
+  test('stdio: errors the transport answers itself also wait for stdout', async (t: TestContext) => {
+    const app = await buildServer(t)
+    const input = new PassThrough()
+    const output = new PassThrough({ highWaterMark: 64 })
+    const transport = createStdioTransport(app, { input, output, error: new PassThrough() })
+    transport.start()
+    t.after(() => transport.stop())
+    // Nobody reads stdout
+    input.write('garbage\n'.repeat(1000))
+    await until(() => input.isPaused())
+    t.assert.strictEqual(input.isPaused(), true)
+    t.assert.ok(output.writableLength < 1000 * 50, `stdout buffered ${output.writableLength} bytes`)
+    output.resume()
+    await until(() => !input.isPaused())
+  })
+
+  test('stdio: the transport stops when the app is closed by someone else', async (t: TestContext) => {
+    const app = await buildServer(t)
+    const input = new PassThrough()
+    const output = new PassThrough()
+    const transport = createStdioTransport(app, { input, output, error: new PassThrough() })
+    transport.start()
+    t.after(() => transport.stop())
+    await app.close()
+    t.assert.notStrictEqual((transport as any).closePromise, null, 'the transport did not start stopping')
+    await transport.stopped
+    t.assert.strictEqual(input.listenerCount('data'), 0)
+  })
+
+  test('stdio: stop() runs the shutdown once', async (t: TestContext) => {
+    const app = await buildServer(t)
+    let closes = 0
+    const close = app.close.bind(app)
+    t.mock.method(app, 'close', () => { closes++; return close() })
+    const input = new PassThrough()
+    const transport = createStdioTransport(app, { input, output: new PassThrough(), error: new PassThrough() })
+    transport.start()
+    // Stopping stops reading stdin, which must not start a second shutdown
+    await transport.stop()
+    t.assert.strictEqual(closes, 1)
+  })
+})

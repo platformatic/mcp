@@ -53,7 +53,8 @@ import {
   handleResourceTemplatesList,
   handlePromptsList,
   handleResourcesRead,
-  handlePromptsGet
+  handlePromptsGet,
+  errorText
 } from '../handlers.ts'
 import type { RequestContext } from './request-meta.ts'
 import { supportsTasksExtension } from './request-meta.ts'
@@ -175,10 +176,14 @@ function withCache<T extends Record<string, unknown>> (
   hint: CacheHint,
   serverInfo: Implementation | undefined
 ): CacheableResult {
+  // A handler's own hint may only tighten the configured one: a shorter
+  // ttlMs, or `private` for a result that depends on the caller.
+  const own = body as { ttlMs?: unknown, cacheScope?: unknown }
+  const ttlMs = typeof own.ttlMs === 'number' && own.ttlMs >= 0 ? Math.min(own.ttlMs, hint.ttlMs) : hint.ttlMs
   return {
     ...complete(body, serverInfo),
-    ttlMs: Math.max(0, hint.ttlMs),
-    cacheScope: hint.cacheScope
+    ttlMs: Math.max(0, ttlMs),
+    cacheScope: own.cacheScope === 'private' ? 'private' : hint.cacheScope
   } as CacheableResult
 }
 
@@ -1402,7 +1407,15 @@ async function runAsTask (
             ),
             dependencies.serverInfo
           )
-          outcome = response
+          // Stored as it will be read back: a result the store cannot hold
+          // (a BigInt, a cycle) fails the task, as the sync call answers -32603.
+          try {
+            outcome = jsonCopy(response) as JSONRPCResponse | JSONRPCError
+          } catch (resultError) {
+            app.log.error({ err: resultError, taskId: record.taskId }, 'Task result could not be serialized')
+            fail('Internal server error')
+            break
+          }
           if ('error' in response) {
             status = 'failed'
             statusMessage = response.error.message
@@ -1417,7 +1430,7 @@ async function runAsTask (
             break
           }
           if (!(error instanceof InputRequired) || !taskInputs) {
-            fail(`Tool execution failed: ${error?.message ?? error}`)
+            fail(`Tool execution failed: ${errorText(error)}`)
             break
           }
           // Nothing to ask the client: the handler only wants to resume with
@@ -1474,7 +1487,15 @@ async function runAsTask (
             break
           }
 
-          const { wire, handlerKeys } = assignWireKeys(withoutLegacyFields(requests) as Record<string, unknown>, usedWireKeys)
+          const { wire: assigned, handlerKeys } = assignWireKeys(withoutLegacyFields(requests) as Record<string, unknown>, usedWireKeys)
+          let wire: Record<string, unknown>
+          try {
+            wire = jsonCopy(assigned) as Record<string, unknown>
+          } catch (requestError) {
+            app.log.error({ err: requestError, taskId: record.taskId }, 'Task input requests could not be serialized')
+            fail('Internal server error')
+            break
+          }
           try {
             const parked = await taskStore!.updateStatus(record.taskId, 'input_required', {
               statusMessage: error.message,

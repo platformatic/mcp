@@ -753,6 +753,18 @@ await app.register(mcpPlugin, {
 > from an authenticated endpoint**. Only use it for results that genuinely do not vary per
 > user, and never rely on it for access control.
 
+A `resources/read` handler can tighten the configured hint for its own result by returning
+`ttlMs` and `cacheScope`: the shorter `ttlMs` wins, and `cacheScope: 'private'` overrides a
+`public` default. A handler cannot loosen the configured hint.
+
+```typescript
+app.mcpAddResource({ uriPattern: 'me://profile', name: 'Profile' }, async (uri, context) => ({
+  contents: [{ uri, text: await profileOf(context.authContext) }],
+  cacheScope: 'private',
+  ttlMs: 0
+}))
+```
+
 ## Origin Validation
 
 Browser clients can be protected against DNS rebinding by allow-listing origins. A rejected
@@ -1905,9 +1917,12 @@ Starts a Fastify MCP server in stdio mode.
   it when the plugin is registered under a prefix in a child of the instance passed in, for
   example `endpoint: '/api/mcp'`
 
-stdin is read as plain lines, never in terminal mode, so nothing is echoed to stdout. While
-stdout cannot take more (a client that stops reading), no further requests are read. When stdout
-goes away (`EPIPE`) the server stops as it does when stdin closes, and `runStdioServer` resolves.
+stdin is read as plain lines, never in terminal mode, so nothing is echoed to stdout. Messages
+are split on `\n` only (a trailing `\r` is dropped), so U+2028 and U+2029 inside a string are
+safe. While stdout cannot take more (a client that stops reading), no further requests are read.
+When stdout goes away (`EPIPE`) the server stops as it does when stdin closes, and
+`runStdioServer` resolves; so it does when the app is closed by something else. A response the
+client sends to a server request is passed to `onClientResponse` and never answered.
 
 #### `createStdioTransport(app, options)`
 
@@ -2101,7 +2116,8 @@ app.get('/health', async () => ({ status: 'ok' }))
 | `'mcp'` | Only the `/mcp` routes require a token. |
 
 If you keep the default and only need to open a few paths, list them in
-`excludedPaths` instead. Each entry is a URL prefix string or a `RegExp`:
+`excludedPaths` instead. Each entry is a path prefix string or a `RegExp`,
+matched against the request path without its query string:
 
 ```typescript
 authorization: {
@@ -2390,6 +2406,12 @@ When `oauth2Client` is configured, the plugin registers these legacy server-side
 - `POST /oauth/logout` - Revoke tokens and end session
 - `POST /oauth/register` - Dynamic client registration (if enabled)
 
+`/oauth/authorize` sets an HttpOnly `mcp_oauth_state` cookie, scoped to the
+callback path, and `/oauth/callback` completes only when it carries the matching
+state: the callback must reach the browser that started the flow. A pending
+authorization expires after 10 minutes and can be redeemed once. With `redis`
+configured it is kept in Redis, so the callback may reach another instance.
+
 ### Well-Known Endpoints
 
 These routes are registered only when `authorization.enabled` is true. They are
@@ -2634,9 +2656,9 @@ await app.register(import('@fastify/bearer-auth'), {
     - `authorizationServer`: Authorization server URI.
     - `resourceUri`: Resource URI.
     - `redirectUri`: This server's OAuth callback, sent as `redirect_uri` and advertised in
-      client registration (default: `${resourceUri}/oauth/callback`). It comes from
-      configuration only, never from the request; with neither option set, `/oauth/authorize`
-      answers 500
+      client registration (default: the `/oauth/callback` route, under the plugin's route
+      prefix, on the origin of `resourceUri`). It comes from configuration only, never from
+      the request; with neither option set, `/oauth/authorize` answers 500
     - `scopes`: Requested OAuth scopes
     - `dynamicRegistration`: Enable dynamic client registration (default: false)
 - `requestStateSecret`: Secret (at least 32 bytes) that seals multi round-trip

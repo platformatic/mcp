@@ -614,3 +614,24 @@ describe('round 15: routes exempt from bearer authorization', () => {
     }
   })
 })
+
+describe('round 16: excluded paths', () => {
+  test('excludedPaths match the path, not the query string', async (t: TestContext) => {
+    const app = Fastify({ logger: false })
+    t.after(() => app.close())
+    const config = createTestAuthConfig({ excludedPaths: ['/public', /\/health$/, /\.(png|css)$/] })
+    const validator = new TokenValidator(config, app)
+    app.addHook('preHandler', createAuthPreHandler(config, validator))
+    app.post('/mcp', async () => ({ secret: true }))
+    app.get('/health', async () => ({ ok: true }))
+    app.get('/public/logo.png', async () => ({ ok: true }))
+    await app.ready()
+
+    for (const url of ['/mcp?x=/health', '/mcp?x.png', '/mcp?/health', '/mcp?/public']) {
+      t.assert.strictEqual((await app.inject({ method: 'POST', url })).statusCode, 401, url)
+    }
+    for (const url of ['/health', '/health?probe=1', '/public/logo.png?v=2']) {
+      t.assert.strictEqual((await app.inject({ method: 'GET', url })).statusCode, 200, url)
+    }
+  })
+})

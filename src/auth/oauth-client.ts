@@ -2,6 +2,7 @@ import type { FastifyPluginAsync, FastifyBaseLogger } from 'fastify'
 import fp from 'fastify-plugin'
 import { createHash, randomBytes } from 'node:crypto'
 import { validateTokenResponse, validateIntrospectionResponse, validateClientRegistrationResponse } from './oauth-schemas.ts'
+import { resolveRouteUrl } from '../utils/route-url.ts'
 
 export interface OAuthClientConfig {
   clientId?: string
@@ -124,10 +125,14 @@ function withoutTrailingSlash (url: string): string {
   return url.endsWith('/') ? url.slice(0, -1) : url
 }
 
-/** The callback this server registers and sends as `redirect_uri`, from configuration only. */
-export function oauthCallbackUrl (opts: OAuthClientConfig): string | undefined {
+/**
+ * The callback this server registers and sends as `redirect_uri`, from
+ * configuration only. By default it is where the callback route is served:
+ * `/oauth/callback` under the route prefix, on the resource's origin.
+ */
+export function oauthCallbackUrl (opts: OAuthClientConfig, prefix?: string): string | undefined {
   if (opts.redirectUri) return opts.redirectUri
-  return opts.resourceUri ? `${withoutTrailingSlash(opts.resourceUri)}/oauth/callback` : undefined
+  return opts.resourceUri ? new URL(resolveRouteUrl(prefix, '/oauth/callback'), opts.resourceUri).href : undefined
 }
 
 async function discoverOIDCEndpoints (
@@ -187,12 +192,12 @@ async function discoverOIDCEndpoints (
  * Build the client metadata document we publish when using CIMD (SEP-991).
  * `client_id` must equal the URL the document is served from.
  */
-export function buildClientIdMetadataDocument (opts: OAuthClientConfig, documentUrl: string): Record<string, unknown> {
+export function buildClientIdMetadataDocument (opts: OAuthClientConfig, documentUrl: string, prefix?: string): Record<string, unknown> {
   return {
     client_id: documentUrl,
     client_name: 'MCP Server',
     client_uri: opts.resourceUri,
-    redirect_uris: [oauthCallbackUrl(opts)],
+    redirect_uris: [oauthCallbackUrl(opts, prefix)],
     grant_types: ['authorization_code', 'refresh_token'],
     response_types: ['code'],
     token_endpoint_auth_method: 'none',
@@ -214,7 +219,7 @@ const oauthClientPlugin: FastifyPluginAsync<OAuthClientConfig> = async (fastify,
     }
 
     const documentUrl = `${opts.resourceUri.replace(/\/$/, '')}${path}`
-    const document = buildClientIdMetadataDocument(opts, documentUrl)
+    const document = buildClientIdMetadataDocument(opts, documentUrl, fastify.prefix)
 
     // The authorization server fetches this document unauthenticated to resolve
     // the client_id. The auth preHandler only exempts /.well-known, so a custom
@@ -238,7 +243,7 @@ const oauthClientPlugin: FastifyPluginAsync<OAuthClientConfig> = async (fastify,
   // but our implementation provides all necessary OAuth client functionality
 
   const oauthClientMethods: OAuthClientMethods = {
-    redirectUri: oauthCallbackUrl(opts),
+    redirectUri: oauthCallbackUrl(opts, fastify.prefix),
 
     generatePKCEChallenge (): PKCEChallenge {
       const codeVerifier = randomBytes(32).toString('base64url')
@@ -414,7 +419,7 @@ const oauthClientPlugin: FastifyPluginAsync<OAuthClientConfig> = async (fastify,
         const defaultMetadata = {
           client_name: 'MCP Server',
           client_uri: opts.resourceUri,
-          redirect_uris: [oauthCallbackUrl(opts)].filter(Boolean),
+          redirect_uris: [oauthCallbackUrl(opts, fastify.prefix)].filter(Boolean),
           grant_types: ['authorization_code', 'refresh_token'],
           response_types: ['code'],
           token_endpoint_auth_method: 'client_secret_post',

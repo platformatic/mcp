@@ -1,7 +1,7 @@
 import { stdin, stdout, stderr } from 'process'
-import { createInterface } from 'readline'
+import { StringDecoder } from 'node:string_decoder'
 import type { FastifyInstance } from 'fastify'
-import { STDIO_REQUEST_HEADER, registerStdioRequest } from './stdio-trust.ts'
+import { MCP_SHUTDOWN_SIGNAL, STDIO_REQUEST_HEADER, registerStdioRequest } from './stdio-trust.ts'
 import type { AuthorizationContext } from './types/auth-types.ts'
 import { MAX_REQUEST_ID_LENGTH, bodyClaimsModern } from './modern/request-meta.ts'
 import type {
@@ -65,6 +65,11 @@ function isJsonRpcResponse (value: unknown): value is JSONRPCResponse | JSONRPCE
   return record.jsonrpc === '2.0' && 'id' in record && ('result' in record || 'error' in record)
 }
 
+/** A reply to a request this server sent: it is processed but never answered. */
+function isClientResponse (message: JSONRPCMessage): boolean {
+  return !('method' in message) && ('result' in message || 'error' in message)
+}
+
 function invalidRequest (): JSONRPCError {
   return { jsonrpc: '2.0', id: null as unknown as string, error: { code: -32600, message: 'Invalid Request' } }
 }
@@ -104,8 +109,12 @@ function requestKey (id: string | number): string {
  */
 export class StdioTransport {
   private app: FastifyInstance
-  private readline: any
   private transportOpts: StdioTransportOptions
+  /** stdin read so far that does not end in a newline yet. */
+  private pendingInput = ''
+  private readonly decoder = new StringDecoder('utf8')
+  private reading = false
+  private inputEnded = false
   /** Requests still being served, by JSON-RPC id, so a client can cancel them. */
   private inFlight = new Map<string, AbortController>()
   /** Open `subscriptions/listen` streams, settled once each has been forwarded to the end. */
@@ -156,38 +165,26 @@ export class StdioTransport {
     })
     this.transportOpts.error?.on('error', () => {})
 
-    // Create readline interface for line-by-line processing. Never in
-    // terminal mode: that would echo every request to stdout.
-    this.readline = createInterface({
-      input: this.transportOpts.input!,
-      terminal: false,
-      crlfDelay: Infinity
-    })
+    // Messages are delimited by newlines and nothing else. readline would
+    // also split on a bare \r and on U+2028/U+2029, which JSON allows inside
+    // strings, and in terminal mode would echo every request to stdout.
+    const input = this.transportOpts.input!
+    input.on('data', this.onInputData)
+    input.on('end', this.onInputEnd)
+    input.on('close', this.onInputEnd)
+    input.on('error', this.onInputError)
+    this.reading = true
 
-    // Handle each line as a JSON-RPC message
-    this.readline.on('line', (line: string) => {
-      // One bad line must never take the server down with an unhandled rejection.
-      this.handleIncomingMessage(line.trim()).catch((error) => {
-        this.logError('Error handling message:', error)
-      })
-    })
-
-    // Handle close/error events
-    this.readline.on('close', () => {
-      this.log('Stdio transport closed')
-      // Trigger graceful shutdown when readline closes
-      this.stop().catch(error => {
-        this.logError('Error during shutdown:', error)
-      })
-    })
-
-    this.readline.on('error', (error: Error) => {
-      this.logError('Readline error:', error)
-      // Trigger graceful shutdown on readline error
-      this.stop().catch(shutdownError => {
-        this.logError('Error during shutdown:', shutdownError)
-      })
-    })
+    // Closed by something other than this transport: stop with it, rather
+    // than answer every request with an error from a closed app.
+    const shutdown = (this.app as unknown as Record<symbol, AbortSignal | undefined>)[MCP_SHUTDOWN_SIGNAL]
+    if (shutdown) {
+      const onShutdown = () => {
+        this.stop().catch(error => this.logError('Error during shutdown:', error))
+      }
+      if (shutdown.aborted) onShutdown()
+      else shutdown.addEventListener('abort', onShutdown, { once: true })
+    }
 
     // Handle process signals for graceful shutdown. Keep references so stop()
     // can remove them; otherwise every transport leaks two listeners.
@@ -216,12 +213,76 @@ export class StdioTransport {
     this.removeSignalListeners()
 
     // Return the same promise to every caller so that concurrent stop() calls
-    // (readline close, stdin end, signals) all wait for app.close() to finish
+    // (stdin end, signals, the app closing) all wait for app.close() to
+    // finish. It is in place before any of the shutdown runs, so a stop()
+    // that the shutdown itself causes joins it.
     if (!this.closePromise) {
-      this.closePromise = this.doStop()
+      this.closePromise = Promise.resolve().then(() => this.doStop())
       this.closePromise.then(this.resolveStopped, this.resolveStopped)
     }
     return this.closePromise
+  }
+
+  private readonly onInputData = (chunk: Buffer | string): void => {
+    this.pendingInput += typeof chunk === 'string' ? chunk : this.decoder.write(chunk)
+    this.readLines()
+  }
+
+  private readonly onInputEnd = (): void => {
+    if (this.inputEnded) return
+    this.inputEnded = true
+    this.pendingInput += this.decoder.end()
+    this.readLines()
+  }
+
+  private readonly onInputError = (error: Error): void => {
+    this.logError('stdin error:', error)
+    this.stopReading()
+    this.stop().catch(shutdownError => this.logError('Error during shutdown:', shutdownError))
+  }
+
+  /**
+   * Handle each complete line. While stdout is full, lines wait here: a
+   * client that does not read its answers cannot make them pile up. Once
+   * stdin has ended, a last line without a newline is still a message.
+   */
+  private readLines (): void {
+    if (!this.reading) return
+    let start = 0
+    let newline = this.pendingInput.indexOf('\n')
+    while (newline !== -1 && !this.throttled) {
+      const end = newline > start && this.pendingInput[newline - 1] === '\r' ? newline - 1 : newline
+      this.handleLine(this.pendingInput.slice(start, end))
+      start = newline + 1
+      newline = this.pendingInput.indexOf('\n', start)
+    }
+    this.pendingInput = this.pendingInput.slice(start)
+    if (this.throttled || !this.inputEnded) return
+    const last = this.pendingInput
+    this.pendingInput = ''
+    if (last) this.handleLine(last)
+    this.log('Stdio transport closed')
+    this.stopReading()
+    this.stop().catch(error => this.logError('Error during shutdown:', error))
+  }
+
+  private handleLine (line: string): void {
+    // One bad line must never take the server down with an unhandled rejection.
+    this.handleIncomingMessage(line.trim()).catch((error) => {
+      this.logError('Error handling message:', error)
+    })
+  }
+
+  /** Stop reading stdin for good, and let go of it so the process can exit. */
+  private stopReading (): void {
+    if (!this.reading) return
+    this.reading = false
+    const input = this.transportOpts.input!
+    input.removeListener('data', this.onInputData)
+    input.removeListener('end', this.onInputEnd)
+    input.removeListener('close', this.onInputEnd)
+    input.removeListener('error', this.onInputError)
+    input.pause()
   }
 
   /** Settles once the transport has stopped, for whatever reason (stdin closed, stdout gone, a signal). */
@@ -242,9 +303,7 @@ export class StdioTransport {
   private async doStop (): Promise<void> {
     this.log('Stopping stdio transport...')
 
-    if (this.readline) {
-      this.readline.close()
-    }
+    this.stopReading()
 
     // Let what was already read finish and be answered, for a while.
     await this.settleProcessing(REQUEST_DRAIN_MS)
@@ -325,7 +384,7 @@ export class StdioTransport {
     } catch (error) {
       // JSON-RPC answers unparseable input with a parse error and a null id.
       this.logError('Could not parse message:', error)
-      this.sendMessage({
+      this.sendWithBackpressure({
         jsonrpc: '2.0',
         id: null as unknown as string,
         error: { code: -32700, message: 'Parse error' }
@@ -338,7 +397,7 @@ export class StdioTransport {
     // (or, for the legacy revisions, a non-empty array) is an invalid request.
     const parsed: unknown = message
     if (!isJsonRpcObject(parsed) && !(Array.isArray(parsed) && parsed.length > 0)) {
-      this.sendMessage(invalidRequest())
+      this.sendWithBackpressure(invalidRequest())
       return
     }
 
@@ -346,7 +405,7 @@ export class StdioTransport {
       // 2026-07-28 carries exactly one message per line; only the legacy
       // revisions that predate the batch removal may still send arrays.
       if ((message as unknown[]).some(entry => bodyClaimsModern(entry))) {
-        this.sendMessage({
+        this.sendWithBackpressure({
           jsonrpc: '2.0',
           id: null as unknown as string,
           error: { code: -32600, message: 'Batch requests are not supported' }
@@ -371,11 +430,13 @@ export class StdioTransport {
   private sendWithBackpressure (message: JSONRPCMessage | JSONRPCBatchResponse): void {
     if (this.sendMessage(message) || this.throttled || this.closed) return
     this.throttled = true
-    this.readline?.pause()
+    if (this.reading) this.transportOpts.input!.pause()
     this.drained(new AbortController().signal).then(() => {
       this.throttled = false
-      // Once stopping, readline is closed and must not be resumed.
-      if (!this.closePromise) this.readline?.resume()
+      // Once stopped reading, stdin is not resumed.
+      if (!this.reading) return
+      this.transportOpts.input!.resume()
+      this.readLines()
     })
   }
 
@@ -443,6 +504,13 @@ export class StdioTransport {
     // Check before inject re-serializes the message: an id such as 1e400
     // parses to Infinity, which JSON.stringify would turn into null, and an
     // unsafe integer would come back as a different id.
+    // A client's reply to a server request is handed on, but it is not a
+    // request: its id is the server's own, and JSON-RPC never answers it.
+    if (isClientResponse(message)) {
+      await this.forwardClientResponse(message)
+      return null
+    }
+
     const idError = checkRequestId(message)
     if (idError) return idError
 
@@ -567,6 +635,24 @@ export class StdioTransport {
       registration.release()
       this.listens.delete(cancel)
       if (key !== undefined && this.inFlight.get(key) === cancel) this.inFlight.delete(key)
+    }
+  }
+
+  private async forwardClientResponse (message: JSONRPCMessage): Promise<void> {
+    const registration = registerStdioRequest(new AbortController().signal, this.transportOpts.authContext)
+    try {
+      const headers: Record<string, string> = {
+        'content-type': 'application/json',
+        accept: 'application/json, text/event-stream',
+        'x-platformatic-mcp-transport': 'stdio',
+        [STDIO_REQUEST_HEADER]: registration.token
+      }
+      if (this.protocolVersion) headers['mcp-protocol-version'] = this.protocolVersion
+      await this.app.inject({ method: 'POST', url: this.endpoint, headers, payload: message })
+    } catch (error) {
+      this.logError('Error processing a client response:', error)
+    } finally {
+      registration.release()
     }
   }
 

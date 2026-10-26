@@ -1071,3 +1071,48 @@ describe('round 15: issuers, introspection and key sets', () => {
     t.assert.strictEqual((await validator.validateToken(createTestJWT())).valid, false)
   })
 })
+
+describe('round 16: key set refresh', () => {
+  test('a key already held is served while the due set is fetched behind it', async (t: TestContext) => {
+    const key = generateMockJWKSResponse().keys[0]
+    let fetches = 0
+    let release: (() => void) | undefined
+    const refetched = Promise.withResolvers<void>()
+    const server = createServer((_req, res) => {
+      fetches++
+      const send = () => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ keys: [{ ...key, kid: fetches === 1 ? 'k' : 'rotated' }] })) }
+      // Every fetch after the first hangs until the test lets it go
+      if (fetches === 1) return send()
+      release = send
+      refetched.resolve()
+    })
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+    t.after(() => server.close())
+    const { port } = server.address() as { port: number }
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() })
+    const cache = new JwksCache(`http://127.0.0.1:${port}/jwks.json`, { ttlMs: 1000 })
+
+    await cache.getPublicKey('k', 'RS256')
+    t.mock.timers.tick(1001)
+    let served = 0
+    const serving = Promise.all(Array.from({ length: 5 }, () => cache.getPublicKey('k', 'RS256').then(() => { served++ })))
+    await refetched.promise
+    t.assert.strictEqual(fetches, 2)
+    try {
+      // Answered while the fetch is still hanging
+      t.assert.strictEqual(served, 5)
+    } finally {
+      release!()
+      await serving
+    }
+
+    // Once the new set is in, a key it dropped is gone
+    await t.assert.rejects(async () => {
+      for (;;) {
+        await cache.getPublicKey('k', 'RS256')
+        await new Promise(resolve => setImmediate(resolve))
+      }
+    }, /No matching signing key/)
+    t.assert.ok(await cache.getPublicKey('rotated', 'RS256'))
+  })
+})

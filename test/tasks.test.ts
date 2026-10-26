@@ -6,12 +6,14 @@ import type { ServerResponse } from 'node:http'
 import { once } from 'node:events'
 import { Type } from '@sinclair/typebox'
 import mcpPlugin from '../src/index.ts'
-import { JSONRPC_VERSION, LATEST_LEGACY_PROTOCOL_VERSION, METHOD_NOT_FOUND, INVALID_PARAMS, INVALID_REQUEST } from '../src/schema.ts'
+import type { Redis } from 'ioredis'
+import { JSONRPC_VERSION, LATEST_LEGACY_PROTOCOL_VERSION, METHOD_NOT_FOUND, INVALID_PARAMS, INVALID_REQUEST, INTERNAL_ERROR } from '../src/schema.ts'
 import type { Task, CreateTaskResult, ListTasksResult, CallToolResult } from '../src/schema.ts'
 import { MemoryTaskStore } from '../src/stores/memory-task-store.ts'
 import { canTransition, isTerminal, taskHasExpired, toWireTask, InvalidTaskCursorError, DEFAULT_TASK_PAGE_SIZE, TaskLimitError, TASK_LIMIT_REACHED, TaskLeases, TASK_OWNER_LOST, TaskWaiters } from '../src/stores/task-store.ts'
 import type { TaskRecord } from '../src/stores/task-store.ts'
 import { resolveTaskAugmentation, RELATED_TASK_META_KEY } from '../src/handlers.ts'
+import { testWithRedis } from './redis-test-utils.ts'
 
 const ISS = 'https://auth.example.com'
 /** A principal as `principalOf` builds it: user, OAuth client and issuer. */
@@ -1314,4 +1316,47 @@ describe('round 15: tasks/result after an abort', () => {
     t.assert.ok(reads <= 2, `read the store ${reads} times after the client left`)
     finish()
   })
+})
+
+describe('round 16: legacy results that cannot be serialized', () => {
+  async function buildBigNumberApp (t: TestContext, redis?: Redis) {
+    const app = Fastify({ logger: false })
+    t.after(() => app.close())
+    await app.register(mcpPlugin, {
+      enableTasks: true,
+      capabilities: { tools: {} },
+      ...(redis ? { redis: { host: redis.options.host!, port: redis.options.port!, db: redis.options.db! }, requestStateSecret: 'round16-legacy-unserializable-secret' } : {})
+    })
+    app.mcpAddTool({ name: 'big-number', inputSchema: Type.Object({}), execution: { taskSupport: 'optional' } } as any, async () => ({
+      content: [], structuredContent: { n: 10n }
+    }) as any)
+    await app.ready()
+    return app
+  }
+
+  test('a call answers its id with an internal error', async (t: TestContext) => {
+    const app = await buildBigNumberApp(t)
+    const response = await app.inject({
+      method: 'POST',
+      url: '/mcp',
+      headers: { 'mcp-protocol-version': LATEST_LEGACY_PROTOCOL_VERSION },
+      payload: { jsonrpc: JSONRPC_VERSION, id: 7, method: 'tools/call', params: { name: 'big-number', arguments: {} } }
+    })
+    t.assert.strictEqual(response.statusCode, 200)
+    t.assert.deepStrictEqual(response.json(), { jsonrpc: JSONRPC_VERSION, id: 7, error: { code: INTERNAL_ERROR, message: 'Internal server error' } })
+  })
+
+  for (const backend of ['memory', 'redis'] as const) {
+    const run = async (t: TestContext, redis?: Redis) => {
+      const app = await buildBigNumberApp(t, redis)
+      const created = (await call(app, 'tools/call', { name: 'big-number', arguments: {}, task: { ttl: 60_000 } })).result.task
+      const task = await waitForTerminal(app, created.taskId)
+      t.assert.strictEqual(task.status, 'failed')
+      t.assert.strictEqual(task.statusMessage, 'Internal server error')
+      const result = await call(app, 'tasks/result', { taskId: created.taskId })
+      t.assert.deepStrictEqual(result.error, { code: INTERNAL_ERROR, message: 'Internal server error' })
+    }
+    if (backend === 'memory') test('memory: a task fails with an internal error', (t: TestContext) => run(t))
+    else testWithRedis('redis: a task fails with an internal error', (redis: Redis, t: TestContext) => run(t, redis))
+  }
 })

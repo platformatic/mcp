@@ -7,6 +7,11 @@ import { getResourceMetadataUrl } from './resource-metadata.ts'
 /** Route config key marking the plugin's own pre-authorization OAuth routes. */
 export const SKIP_BEARER_AUTH = 'mcpSkipBearerAuth'
 
+function requestPath (url: string): string {
+  const query = url.indexOf('?')
+  return query === -1 ? url : url.slice(0, query)
+}
+
 export const BEARER_SCHEME = /^bearer +(.*)$/i
 
 export function createAuthPreHandler (
@@ -39,9 +44,11 @@ export function createAuthPreHandler (
       return
     }
 
-    // Skip authorization for custom excluded paths
+    // Skip authorization for custom excluded paths. They match the path only:
+    // the query string is the caller's to choose.
+    const pathname = requestPath(request.url)
     if (config.excludedPaths?.some(path =>
-      typeof path === 'string' ? request.url.startsWith(path) : path.test(request.url)
+      typeof path === 'string' ? pathname.startsWith(path) : path.test(pathname)
     )) {
       return
     }
