@@ -179,7 +179,11 @@ function withCache<T extends Record<string, unknown>> (
   // A handler's own hint may only tighten the configured one: a shorter
   // ttlMs, or `private` for a result that depends on the caller.
   const own = body as { ttlMs?: unknown, cacheScope?: unknown }
-  const ttlMs = typeof own.ttlMs === 'number' && own.ttlMs >= 0 ? Math.min(own.ttlMs, hint.ttlMs) : hint.ttlMs
+  // ttlMs is a whole number of milliseconds, and a negative one means
+  // stale, as clients read it (caching: "treat it as 0").
+  const ttlMs = typeof own.ttlMs === 'number' && Number.isFinite(own.ttlMs)
+    ? Math.min(Math.max(0, Math.floor(own.ttlMs)), hint.ttlMs)
+    : hint.ttlMs
   return {
     ...complete(body, serverInfo),
     ttlMs: Math.max(0, ttlMs),
@@ -364,6 +368,9 @@ function invalidInputRequests (inputRequests: Record<string, unknown>): string |
     // Assigning this key changes an object's prototype instead of adding it,
     // so the request would silently vanish from what the client receives.
     if (key === '__proto__') return 'uses the reserved key \'__proto__\''
+    // A lone surrogate cannot be encoded, and every store and client would
+    // read the key differently.
+    if (!key.isWellFormed()) return 'has a key that is not well-formed Unicode'
     const method = (entry as { method?: unknown })?.method
     if (!requiredCapabilityFor(entry as { method?: string })) {
       return `input request '${key}' has unsupported method '${method}'`
@@ -423,10 +430,22 @@ function invalidElicitation (params: unknown): string | undefined {
   return undefined
 }
 
-function hasNonFiniteNumber (value: unknown, depth = 0): boolean {
-  if (typeof value === 'number') return !Number.isFinite(value)
-  if (!value || typeof value !== 'object' || depth > 64) return false
-  return Object.values(value).some(entry => hasNonFiniteNumber(entry, depth + 1))
+function hasNonFiniteNumber (value: unknown): boolean {
+  // Walked without recursion, at any depth: a client's answer can nest
+  // deeper than the stack. A handler's input request may hold cycles or
+  // shared objects, so each object is visited once.
+  const pending: unknown[] = [value]
+  const visited = new Set<object>()
+  while (pending.length > 0) {
+    const entry = pending.pop()
+    if (typeof entry === 'number') {
+      if (!Number.isFinite(entry)) return true
+    } else if (entry && typeof entry === 'object' && !visited.has(entry)) {
+      visited.add(entry)
+      for (const child of Object.values(entry)) pending.push(child)
+    }
+  }
+  return false
 }
 
 /** The `items` of a multi-select enum: string values, listed or titled. */
@@ -1503,7 +1522,17 @@ async function runAsTask (
               incrementInputRequestRound: true
             })
             if (parked) taskWaiters?.notify(parked)
-
+          } catch (parkError) {
+            // Not a wait that ran out: the round could not be recorded at all.
+            if (stopped.aborted) {
+              fail(stopMessage())
+            } else {
+              app.log.error({ err: parkError, taskId: record.taskId }, 'Task input round could not be recorded')
+              fail('Internal server error')
+            }
+            break
+          }
+          try {
             setWaitingForInput(taskStore!, live, true)
             let responses: Record<string, unknown>
             try {
@@ -1560,6 +1589,8 @@ async function runAsTask (
       ttlTimer.clear()
       stopListening?.()
       taskInputs?.forget(record.taskId)
+      // The task is over: its slot is free before the call's event runs.
+      reservation.release()
     }
     await settled?.(recorded)
   })()

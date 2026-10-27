@@ -59,6 +59,8 @@ import { resolveRouteUrl } from '../utils/route-url.ts'
 const MAX_TIMER_DELAY_MS = 2 ** 31 - 1
 /** How long an ended SSE stream may take to be read to its end before it is dropped. */
 const SSE_END_GRACE_MS = 5_000
+/** What opening a listen stream yields when its client left during the subscribe handlers. */
+const LISTEN_ABANDONED = Symbol('listen abandoned')
 
 interface MCPPubSubRoutesOptions {
   enableSSE: boolean
@@ -626,8 +628,9 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     request: FastifyRequest,
     reply: FastifyReply,
     authContext: AuthorizationContext | undefined,
-    context: RequestContext
-  ): Promise<(() => void) | undefined> {
+    context: RequestContext,
+    signal: AbortSignal
+  ): Promise<(() => void) | undefined | typeof LISTEN_ABANDONED> {
     if (!filter.resourceSubscriptions) return undefined
     const { subscribeHandler } = resourceHandlers
     // Without a handler nothing can check access, and update notifications
@@ -639,10 +642,11 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
       return undefined
     }
 
-    const handlerContextFor = () => handlerContext({
+    const handlerContextFor = (handlerSignal?: AbortSignal) => handlerContext({
       request,
       reply,
       authContext,
+      signal: handlerSignal,
       protocolVersion: context.protocolVersion,
       clientCapabilities: context.clientCapabilities
     }, undefined)
@@ -670,10 +674,26 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
       listenUriStopping.set(uri, stopped)
     }
 
-    const outcomes = await Promise.allSettled(uris.map(async uri => {
+    const settling = Promise.allSettled(uris.map(async uri => {
       await listenUriStopping.get(uri)
-      return await subscribeHandler({ uri }, handlerContextFor())
+      return await subscribeHandler({ uri }, handlerContextFor(signal))
     }))
+    // A client gone while the handlers run gives its stream slot back at
+    // once; the watchers the handlers still start are stopped as they do.
+    const abandoned = new Promise<typeof LISTEN_ABANDONED>(resolve => {
+      if (signal.aborted) resolve(LISTEN_ABANDONED)
+      signal.addEventListener('abort', () => resolve(LISTEN_ABANDONED), { once: true })
+    })
+    const outcomes = await Promise.race([settling, abandoned])
+    if (outcomes === LISTEN_ABANDONED) {
+      if (unsubscribeHandler) {
+        settling.then(late => uris.forEach((uri, index) => {
+          if (late[index].status === 'fulfilled') listenUriWatched.add(uri)
+          release(uri)
+        })).catch(() => {})
+      }
+      return LISTEN_ABANDONED
+    }
     const accepted = uris.filter((_uri, index) => outcomes[index].status === 'fulfilled')
     const refused = uris.length - accepted.length
     if (refused > 0) request.log.info({ refused }, 'Resource subscriptions refused by the subscribe handler')
@@ -858,10 +878,21 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         return createError(message.id, INVALID_REQUEST, reserved)
       }
 
+      // The client leaving, cancelling or the server shutting down while the
+      // subscribe handlers run cancels them.
+      const opening = new AbortController()
+      const onClose = () => opening.abort(new Error('client disconnected'))
+      reply.raw.once('close', onClose)
+      const openingSignal = AbortSignal.any([opening.signal, ...(listenCancel ? [listenCancel] : []), ...(shutdownSignal ? [shutdownSignal] : [])])
       let opened: boolean
       try {
         const filter = negotiateFilter(requested as SubscriptionFilter, capabilities)
-        const onEnd = await authorizeResourceSubscriptions(filter, request, reply, authContext, context)
+        const onEnd = await authorizeResourceSubscriptions(filter, request, reply, authContext, context, openingSignal)
+        reply.raw.off('close', onClose)
+        if (onEnd === LISTEN_ABANDONED) {
+          reply.code(204)
+          return undefined
+        }
         // The filter can be large and is the client's to choose: log its shape.
         request.log.info({
           subscriptionId: message.id,

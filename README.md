@@ -755,7 +755,8 @@ await app.register(mcpPlugin, {
 
 A `resources/read` handler can tighten the configured hint for its own result by returning
 `ttlMs` and `cacheScope`: the shorter `ttlMs` wins, and `cacheScope: 'private'` overrides a
-`public` default. A handler cannot loosen the configured hint.
+`public` default. A handler cannot loosen the configured hint. Its `ttlMs` is rounded down
+to whole milliseconds, and a negative one counts as `0`.
 
 ```typescript
 app.mcpAddResource({ uriPattern: 'me://profile', name: 'Profile' }, async (uri, context) => ({
@@ -1919,10 +1920,15 @@ Starts a Fastify MCP server in stdio mode.
 
 stdin is read as plain lines, never in terminal mode, so nothing is echoed to stdout. Messages
 are split on `\n` only (a trailing `\r` is dropped), so U+2028 and U+2029 inside a string are
-safe. While stdout cannot take more (a client that stops reading), no further requests are read.
+safe. A line longer than four times the app's `bodyLimit` (and at least 1 MiB) is dropped as it arrives and answered
+with `Request too large` (id `null`); a shorter one past the limit is refused with its own id.
+While stdout cannot take more (a client that stops reading), no further requests are read; once
+the transport has stopped, output the client never read is dropped so the process can exit.
 When stdout goes away (`EPIPE`) the server stops as it does when stdin closes, and
-`runStdioServer` resolves; so it does when the app is closed by something else. A response the
-client sends to a server request is passed to `onClientResponse` and never answered.
+`runStdioServer` resolves; so it does when the app is closed by something else, including when
+the plugin is registered in a child of the instance passed in. A response the client sends to a
+server request is passed to `onClientResponse` and never answered. Only a notification named
+`notifications/cancelled` cancels a request; a request by that name is just an unknown method.
 
 #### `createStdioTransport(app, options)`
 
@@ -2112,12 +2118,13 @@ app.get('/health', async () => ({ status: 'ok' }))
 
 | Value | Behaviour |
 |-------|-----------|
-| `'all'` (default) | Every route of the app requires a token, except the well-known and OAuth endpoints. |
+| `'all'` (default) | Every route of the app requires a token, except the discovery and OAuth endpoints the plugin registers. An application route of your own under `/.well-known/` still requires one. |
 | `'mcp'` | Only the `/mcp` routes require a token. |
 
 If you keep the default and only need to open a few paths, list them in
 `excludedPaths` instead. Each entry is a path prefix string or a `RegExp`,
-matched against the request path without its query string:
+matched against the path the router matched: decoded, and without the query
+string or fragment:
 
 ```typescript
 authorization: {
@@ -2406,17 +2413,19 @@ When `oauth2Client` is configured, the plugin registers these legacy server-side
 - `POST /oauth/logout` - Revoke tokens and end session
 - `POST /oauth/register` - Dynamic client registration (if enabled)
 
-`/oauth/authorize` sets an HttpOnly `mcp_oauth_state` cookie, scoped to the
-callback path, and `/oauth/callback` completes only when it carries the matching
-state: the callback must reach the browser that started the flow. A pending
-authorization expires after 10 minutes and can be redeemed once. With `redis`
-configured it is kept in Redis, so the callback may reach another instance.
+The server keeps nothing between `/oauth/authorize` and `/oauth/callback`. The
+pending authorization, PKCE verifier included, travels in an encrypted HttpOnly
+`mcp_oauth_state_<state>` cookie scoped to the callback path, one per
+authorization, so flows started in several tabs complete independently. The
+callback completes only in the browser that started the flow, within 10
+minutes, and clears the cookie. The cookie is sealed with `requestStateSecret`:
+set it when another instance may serve the callback.
 
 ### Well-Known Endpoints
 
 These routes are registered only when `authorization.enabled` is true. They are
-all unauthenticated: the bearer-token check skips every path under
-`/.well-known/`. They allow cross-origin `GET` requests (CORS) so browser-based
+all unauthenticated: the bearer-token check skips these routes, and answers a
+`/.well-known/` URL that matches no route with 404. They allow cross-origin `GET` requests (CORS) so browser-based
 clients can discover them.
 
 - `GET /.well-known/oauth-protected-resource` - OAuth 2.0 Protected Resource Metadata (RFC 9728). Its `resource` field is `resourceUri`.
@@ -2645,7 +2654,10 @@ await app.register(import('@fastify/bearer-auth'), {
       first of `authorizationServers`: a token naming another issuer is not checked against it.
       With several authorization servers, map each issuer to its key set:
       `{ 'https://a.example.com': 'https://a.example.com/jwks.json', 'https://b.example.com': 'https://b.example.com/jwks.json' }`
-      (two issuers may share one URL). Keys published with `use: "enc"` are ignored
+      (two issuers may share one URL). Keys published with `use: "enc"` are ignored. A key
+      set is fetched again every 10 minutes; for 10 more minutes the keys in hand keep
+      answering while the new set is fetched in the background. After that a token waits
+      for the fetch, and is refused while the key set cannot be fetched
     - `introspectionEndpoint`: Token introspection endpoint (alternative to JWT). Each call
       times out after 5 seconds, and a token is active only when the response says
       `"active": true`
@@ -2662,7 +2674,8 @@ await app.register(import('@fastify/bearer-auth'), {
     - `scopes`: Requested OAuth scopes
     - `dynamicRegistration`: Enable dynamic client registration (default: false)
 - `requestStateSecret`: Secret (at least 32 bytes) that seals multi round-trip
-  `requestState`. Set it when `redis` is configured, since any instance may serve a retry
+  `requestState` and the pending-authorization cookie of the OAuth routes. Set it when
+  `redis` is configured, since any instance may serve a retry or a callback
   (the plugin warns at startup otherwise). An array rotates secrets: the first seals, any
   verifies. Rotate in three deploys so no retry fails mid-rollout: `[old, new]` (every
   instance accepts the new one), then `[new, old]` (instances seal with it), then `[new]`
@@ -2697,7 +2710,12 @@ await app.register(import('@fastify/bearer-auth'), {
   - `port`: Redis server port
   - `db`: Redis database number
   - `password`: Redis authentication password
-  - Any other ioredis [`RedisOptions`](https://github.com/redis/ioredis/blob/main/lib/redis/RedisOptions.ts) (`tls`, `retryStrategy`, `sentinels`, ...); the object is passed to the ioredis constructor as-is
+  - `channelPrefix`: First level of every pub/sub topic (default: `db<db>`, after ioredis
+    `keyPrefix` when set). Redis pub/sub ignores the database number, so this is what keeps
+    two deployments on one Redis server from hearing each other's notifications. Every
+    instance of one deployment needs the same prefix; an instance running an earlier
+    version of this plugin publishes without one, so upgrade all instances together
+  - Any other ioredis [`RedisOptions`](https://github.com/redis/ioredis/blob/main/lib/redis/RedisOptions.ts) (`tls`, `retryStrategy`, `sentinels`, ...); everything but `channelPrefix` is passed to the ioredis constructor as-is
 
 ### Decorators
 
@@ -3214,7 +3232,7 @@ await app.register(mcpPlugin, {
 
 - **Always use authentication:** Set `requirepass` in Redis config
 - **Enable TLS encryption:** Especially for remote Redis instances
-- **Use dedicated Redis database:** Isolate MCP data with `db` parameter
+- **Use dedicated Redis database:** Isolate MCP data with `db` parameter; pub/sub topics are kept apart by `channelPrefix`, which defaults to one per `db`
 - **Implement network security:** Use VPCs, security groups, firewalls
 - **Regular updates:** Keep Redis version up-to-date
 - **Monitor access:** Log and monitor Redis access patterns

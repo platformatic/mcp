@@ -1154,7 +1154,7 @@ export async function handlePromptsGet (
   } else {
     // No TypeBox schema: enforce the `required` flags declared in `arguments`
     const missing = (prompt.definition.arguments ?? [])
-      .filter(argument => argument.required && promptArguments[argument.name] === undefined)
+      .filter(argument => argument.required && (!Object.hasOwn(promptArguments, argument.name) || promptArguments[argument.name] === undefined))
       .map(argument => argument.name)
     if (missing.length > 0) {
       return createError(request.id, INVALID_PARAMS, `Missing required prompt arguments: ${missing.join(', ')}`, { missing })
@@ -1770,18 +1770,18 @@ async function runToolCallAsTask (
       outcome = createError(request.id, INTERNAL_ERROR, statusMessage)
     }
     // A stopped task ends for the reason it was stopped.
-    let ended: McpCallToolOutcome | undefined
     if (stopped.aborted && stopped.reason instanceof TaskStopped) {
       status = 'failed'
       statusMessage = stopped.reason.message
       outcome = createError(request.id, INTERNAL_ERROR, statusMessage)
-      if (handlerOutcome?.ok || handlerOutcome?.reason === 'input-required') {
-        const endStatus = stopped.reason.message === TASK_CANCELLED ? 'cancelled' : 'failed'
-        ended = { ok: false, reason: 'task-ended', status: endStatus, message: statusMessage }
-      }
     }
-    await unreported?.(ended)
 
+    // Recorded before the call's event runs: however long that takes, the
+    // result is already readable, and a cancellation or shutdown meanwhile
+    // finds the task over. A cancellation recorded first wins over ours.
+    let recordedStatus: 'completed' | 'failed' | 'cancelled' =
+      stopped.aborted && stopped.reason instanceof TaskStopped && stopped.reason.message === TASK_CANCELLED ? 'cancelled' : status
+    let recordedMessage = statusMessage
     try {
       const updated = await taskStore.updateStatus(task.taskId, status, { statusMessage, outcome })
       if (updated) {
@@ -1791,9 +1791,28 @@ async function runToolCallAsTask (
     } catch (error) {
       // The task was cancelled or expired while the tool was still running
       app.log.debug({ err: error, taskId: task.taskId }, 'Could not record task outcome')
+      try {
+        const current = await taskStore.get(task.taskId)
+        if (current && (current.status === 'cancelled' || current.status === 'failed' || current.status === 'completed')) {
+          recordedStatus = current.status
+          // A stop this worker saw says why in its own words
+          if (!(stopped.reason instanceof TaskStopped)) recordedMessage = current.statusMessage
+        }
+      } catch {}
     } finally {
       taskLeases?.stop(task.taskId)
+      ttlTimer?.clear()
+      stopListening?.()
+      reservation.release()
     }
+
+    // The event reports how the task ended, which may not be how the
+    // handler's own result read (it was cancelled while running, say).
+    const ended: McpCallToolOutcome | undefined = recordedStatus !== 'completed' &&
+      (handlerOutcome?.ok || handlerOutcome?.reason === 'input-required')
+      ? { ok: false, reason: 'task-ended', status: recordedStatus, message: recordedMessage ?? recordedStatus }
+      : undefined
+    await unreported?.(ended)
   })()
 
   // Nothing awaits `execution`; keep an explicit rejection guard so an
@@ -1824,17 +1843,21 @@ async function handleResourcesSubscribe (
   }
 
   const params = request.params as { uri: string }
-  if (!params?.uri) {
+  if (typeof params?.uri !== 'string' || params.uri === '') {
     return createError(request.id, INVALID_PARAMS, 'Missing required parameter: uri')
+  }
+
+  // Updates reach a subscriber through its session; without one there is
+  // nowhere to deliver them, and nothing that could later undo the watch.
+  if (!sessionId || !dependencies.sessionStore) {
+    return createError(request.id, METHOD_NOT_FOUND, 'Resource subscriptions need a session')
   }
 
   try {
     const result = await resourceHandlers.subscribeHandler(params, handlerContext(dependencies, sessionId))
     // Remember the subscription so resources/updated broadcasts only reach
     // the sessions that asked for this URI
-    if (sessionId && dependencies.sessionStore) {
-      await dependencies.sessionStore.addResourceSubscription(sessionId, params.uri)
-    }
+    await dependencies.sessionStore.addResourceSubscription(sessionId, params.uri)
     return createResponse(request.id, result)
   } catch (error: any) {
     return createError(request.id, INTERNAL_ERROR, `Subscribe failed: ${errorText(error)}`)
@@ -1853,7 +1876,7 @@ async function handleResourcesUnsubscribe (
   }
 
   const params = request.params as { uri: string }
-  if (!params?.uri) {
+  if (typeof params?.uri !== 'string' || params.uri === '') {
     return createError(request.id, INVALID_PARAMS, 'Missing required parameter: uri')
   }
 

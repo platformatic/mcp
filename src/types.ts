@@ -593,10 +593,17 @@ export interface MCPPluginOptions {
    */
   validateJsonSchemaInputs?: Options
   /**
-   * Redis connection options, passed as-is to the ioredis constructor.
+   * Redis connection options, passed to the ioredis constructor.
    * Providing this option switches sessions, messaging and tasks to the Redis backends.
    */
-  redis?: RedisOptions
+  redis?: RedisOptions & {
+    /**
+     * Prefix of every pub/sub topic. Redis pub/sub ignores the database
+     * number, so deployments sharing one Redis server need different ones.
+     * Default: `db<db>`, plus ioredis `keyPrefix` when set.
+     */
+    channelPrefix?: string
+  }
   authorization?: AuthorizationConfig
   /**
    * Optional OpenTelemetry instrumentation.

@@ -14,7 +14,7 @@ import { RedisTaskStore } from './stores/redis-task-store.ts'
 import type { MCPPluginOptions, MCPTool, MCPResource, MCPPrompt, ResourceHandlers } from './types.ts'
 import type { CacheHint, CachingConfig } from './modern/handlers.ts'
 import { drainTasks } from './task-registry.ts'
-import { claimStdioRequest, MCP_SHUTDOWN_SIGNAL } from './stdio-trust.ts'
+import { claimStdioRequest, registerShutdownSignal } from './stdio-trust.ts'
 import { RequestStateSealer } from './modern/request-state.ts'
 import { SubscriptionRegistry } from './modern/subscriptions.ts'
 import {
@@ -31,7 +31,6 @@ import { TokenValidator } from './auth/token-validator.ts'
 import { createAuthPreHandler } from './auth/prehandler.ts'
 import oauthClientPlugin from './auth/oauth-client.ts'
 import authRoutesPlugin from './routes/auth-routes.ts'
-import { MemoryAuthorizationStateStore, RedisAuthorizationStateStore } from './auth/authorization-state-store.ts'
 import { quitWithTimeout } from './redis-quit-with-timeout.ts'
 import { createJsonSchemaValidator } from './validation/json-schema-validator.ts'
 import {
@@ -229,13 +228,18 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
 
   if (opts.redis) {
     // Redis implementations for horizontal scaling
-    redis = new Redis(opts.redis)
+    const { channelPrefix, ...redisOptions } = opts.redis
+    if (channelPrefix !== undefined && (typeof channelPrefix !== 'string' || /[+#]/.test(channelPrefix))) {
+      throw new Error('redis.channelPrefix must be a string without the topic wildcards + and #')
+    }
+    redis = new Redis(redisOptions)
     // Without an 'error' listener a dropped connection is reported as unhandled; log it and let ioredis reconnect.
     redis.on('error', (err) => {
       app.log.error({ err }, 'Redis connection error')
     })
     sessionStore = new RedisSessionStore({ redis, maxMessages: 100, sessionTtlMs: opts.sessionTtlMs })
     messageBroker = new RedisMessageBroker(redis, {
+      channelPrefix: channelPrefix ?? `${redisOptions.keyPrefix ?? ''}db${redisOptions.db ?? 0}`,
       onCloseTimeout: (closeTimeoutMs) => {
         app.log.warn({ closeTimeoutMs }, 'Redis message broker close timed out; forcing disconnect')
       },
@@ -274,7 +278,7 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
   app.addHook('preClose', async () => {
     shutdownController.abort(new Error('Server is shutting down'))
   })
-  app.decorate(MCP_SHUTDOWN_SIGNAL, shutdownController.signal)
+  registerShutdownSignal(app.server, shutdownController.signal)
 
   // Leases let any instance notice that the one running a task has died.
   const taskLeases = taskStore
@@ -413,7 +417,7 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
   // Register OAuth client routes if OAuth client is configured
   if (opts.authorization?.enabled && opts.authorization?.oauth2Client) {
     await app.register(authRoutesPlugin, {
-      stateStore: redis ? new RedisAuthorizationStateStore(redis) : new MemoryAuthorizationStateStore(),
+      stateSecret: opts.requestStateSecret,
       dcrHooks: opts.authorization.dcrHooks
     })
   }

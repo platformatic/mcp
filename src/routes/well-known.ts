@@ -2,6 +2,7 @@ import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify'
 import fp from 'fastify-plugin'
 import type { AuthorizationConfig, ProtectedResourceMetadata } from '../types/auth-types.ts'
 import { getResourceMetadataPath, PROTECTED_RESOURCE_METADATA_PATH } from '../auth/resource-metadata.ts'
+import { SKIP_BEARER_AUTH } from '../auth/prehandler.ts'
 
 interface WellKnownRoutesOptions {
   authConfig?: AuthorizationConfig
@@ -36,6 +37,11 @@ const wellKnownRoutesPlugin = fp(async function (fastify: FastifyInstance, opts:
 })
 
 async function wellKnownRoutes (app: FastifyInstance, authConfig: AuthorizationConfig & { enabled: true }) {
+  // Discovery is public: every route here is exempt from the bearer check
+  app.addHook('onRoute', (route) => {
+    route.config = { ...route.config, [SKIP_BEARER_AUTH]: true }
+  })
+
   // Discovery endpoints are public, so allow cross-origin requests from any origin
   app.addHook('onRequest', async (request, reply) => {
     const origin = request.headers.origin

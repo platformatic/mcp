@@ -155,14 +155,17 @@ export function acceptsMediaType (accept: string | undefined, mediaType: string)
 
 /** Make log data serializable: errors, bigints and cycles would otherwise throw or vanish. */
 function toJsonSafe (data: unknown): unknown {
-  const seen = new WeakSet<object>()
+  // The objects on the path to the value being serialized: only one of them
+  // seen again is a cycle; an object shared between siblings is not.
+  const ancestors: object[] = []
   try {
-    return JSON.parse(JSON.stringify(data, (_key, value: unknown) => {
+    return JSON.parse(JSON.stringify(data, function (this: object, _key, value: unknown) {
+      while (ancestors.length > 0 && ancestors[ancestors.length - 1] !== this) ancestors.pop()
       if (typeof value === 'bigint') return value.toString()
-      if (value instanceof Error) return { name: value.name, message: value.message }
+      if (value instanceof Error) value = { name: value.name, message: value.message }
       if (typeof value === 'object' && value !== null) {
-        if (seen.has(value)) return '[Circular]'
-        seen.add(value)
+        if (ancestors.includes(value)) return '[Circular]'
+        ancestors.push(value)
       }
       return value
     }) ?? 'null')

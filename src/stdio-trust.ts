@@ -70,8 +70,19 @@ export function stdioAuthContext (request: { raw: IncomingMessage }): Authorizat
 }
 
 /**
- * The plugin decorates its instance with the signal it aborts as that
- * instance starts closing, so a stdio transport stops with the app even when
- * something else closed it.
+ * The signals each plugin registration aborts as its app starts closing,
+ * kept by HTTP server: every instance of one app shares it, so a stdio
+ * transport given the root stops with an app whose plugin was registered in
+ * a child (under a prefix, say), however the app was closed.
  */
-export const MCP_SHUTDOWN_SIGNAL = Symbol.for('platformatic.mcp.shutdownSignal')
+const shutdownSignals = new WeakMap<object, AbortSignal[]>()
+
+export function registerShutdownSignal (server: object, signal: AbortSignal): void {
+  const signals = shutdownSignals.get(server)
+  if (signals) signals.push(signal)
+  else shutdownSignals.set(server, [signal])
+}
+
+export function shutdownSignalsOf (server: object): AbortSignal[] {
+  return shutdownSignals.get(server) ?? []
+}

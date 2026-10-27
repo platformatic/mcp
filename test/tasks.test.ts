@@ -1360,3 +1360,44 @@ describe('round 16: legacy results that cannot be serialized', () => {
     else testWithRedis('redis: a task fails with an internal error', (redis: Redis, t: TestContext) => run(t, redis))
   }
 })
+
+describe('round 17: a task is over before its call event runs', () => {
+  test('legacy: the result is recorded and the slot freed while onToolCallComplete still runs', async (t: TestContext) => {
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    let entered!: () => void
+    const hookRunning = new Promise<void>(resolve => { entered = resolve })
+    const outcomes: unknown[] = []
+    const app = Fastify({ logger: false })
+    t.after(() => app.close())
+    // Registered after the app's close, so it runs first
+    t.after(() => release())
+    await app.register(mcpPlugin, {
+      enableTasks: true,
+      capabilities: { tools: {} },
+      taskMaxConcurrent: 1,
+      // Only the first call's event waits
+      onToolCallComplete: async (event: { outcome: unknown }) => {
+        outcomes.push(event.outcome)
+        if (outcomes.length > 1) return
+        entered()
+        await gate
+      }
+    })
+    app.mcpAddTool({ name: 'quick', inputSchema: Type.Object({}), execution: { taskSupport: 'optional' } } as any, async () => ({
+      content: [{ type: 'text', text: 'the result' }]
+    }))
+    await app.ready()
+
+    const created = (await call(app, 'tools/call', { name: 'quick', arguments: {}, task: { ttl: 60_000 } })).result.task
+    await hookRunning
+    t.assert.strictEqual((await call(app, 'tasks/get', { taskId: created.taskId })).result.status, 'completed')
+    // Too late to cancel: the finished result stays
+    await call(app, 'tasks/cancel', { taskId: created.taskId })
+    t.assert.strictEqual((await call(app, 'tasks/result', { taskId: created.taskId })).result.content[0].text, 'the result')
+    // ...and the one running slot is free again
+    const next = await call(app, 'tools/call', { name: 'quick', arguments: {}, task: { ttl: 60_000 } }, 2)
+    t.assert.ok(next.result?.task, JSON.stringify(next))
+    t.assert.strictEqual((outcomes[0] as { ok: boolean }).ok, true)
+  })
+})

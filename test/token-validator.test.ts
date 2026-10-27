@@ -1116,3 +1116,70 @@ describe('round 16: key set refresh', () => {
     t.assert.ok(await cache.getPublicKey('rotated', 'RS256'))
   })
 })
+
+describe('round 17: how long a key set is trusted', () => {
+  async function until (check: () => boolean): Promise<void> {
+    for (let attempt = 0; attempt < 1000 && !check(); attempt++) await new Promise(resolve => setImmediate(resolve))
+  }
+
+  test('a set that cannot be refreshed is used for one more ttl, then refused', async (t: TestContext) => {
+    const key = generateMockJWKSResponse().keys[0]
+    let fetches = 0
+    const server = createServer((_req, res) => {
+      fetches++
+      if (fetches > 1) {
+        res.statusCode = 503
+        return res.end()
+      }
+      res.setHeader('content-type', 'application/json')
+      res.end(JSON.stringify({ keys: [{ ...key, kid: 'k' }] }))
+    })
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+    t.after(() => server.close())
+    const { port } = server.address() as { port: number }
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() })
+    const cache = new JwksCache(`http://127.0.0.1:${port}/jwks.json`, { ttlMs: 1000 })
+
+    await cache.getPublicKey('k', 'RS256')
+    t.mock.timers.tick(1500)
+    t.assert.ok(await cache.getPublicKey('k', 'RS256'))
+    // Let the background refresh fail
+    await until(() => fetches >= 2)
+    t.assert.ok(await cache.getPublicKey('k', 'RS256'))
+
+    t.mock.timers.tick(1000)
+    await t.assert.rejects(cache.getPublicKey('k', 'RS256'), /could not be refreshed/)
+  })
+
+  test('past the grace period a held key waits for the fetch, which can remove it', async (t: TestContext) => {
+    const key = generateMockJWKSResponse().keys[0]
+    let fetches = 0
+    let release: (() => void) | undefined
+    const refetched = Promise.withResolvers<void>()
+    const server = createServer((_req, res) => {
+      fetches++
+      const send = () => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ keys: [{ ...key, kid: fetches === 1 ? 'k' : 'rotated' }] })) }
+      if (fetches === 1) return send()
+      release = send
+      refetched.resolve()
+    })
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+    t.after(() => server.close())
+    const { port } = server.address() as { port: number }
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() })
+    const cache = new JwksCache(`http://127.0.0.1:${port}/jwks.json`, { ttlMs: 1000 })
+
+    await cache.getPublicKey('k', 'RS256')
+    t.mock.timers.tick(2001)
+    let settled = false
+    const lookup = cache.getPublicKey('k', 'RS256').finally(() => { settled = true })
+    lookup.catch(() => {})
+    await refetched.promise
+    try {
+      t.assert.strictEqual(settled, false)
+    } finally {
+      release!()
+    }
+    await t.assert.rejects(lookup, /No matching signing key/)
+  })
+})

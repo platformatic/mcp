@@ -5,12 +5,10 @@ import Fastify from 'fastify'
 import oauthClientPlugin from '../src/auth/oauth-client.ts'
 import authRoutesPlugin from '../src/routes/auth-routes.ts'
 import type { TestContext } from 'node:test'
-import type { Redis } from 'ioredis'
 import mcpPlugin from '../src/index.ts'
 import { MemorySessionStore } from '../src/stores/memory-session-store.ts'
-import { MemoryAuthorizationStateStore, RedisAuthorizationStateStore } from '../src/auth/authorization-state-store.ts'
-import { testWithRedis } from './redis-test-utils.ts'
-import type { AuthSession } from '../src/auth/authorization-state-store.ts'
+import { AuthorizationStateSealer } from '../src/auth/authorization-state.ts'
+import type { AuthSession } from '../src/auth/authorization-state.ts'
 
 const originalDispatcher = getGlobalDispatcher()
 const mockAgent = new MockAgent()
@@ -22,6 +20,11 @@ after(async () => {
   await mockAgent.close()
   setGlobalDispatcher(originalDispatcher)
 })
+
+/** The `name=value` pair of the state cookie an /oauth/authorize response set. */
+function stateCookieOf (response: { headers: Record<string, unknown> }): string {
+  return String(response.headers['set-cookie']).split(';')[0]
+}
 
 describe('OAuth Routes', () => {
   test('should initiate OAuth authorization flow', async (t) => {
@@ -96,7 +99,7 @@ describe('OAuth Routes', () => {
     const callbackResponse = await fastify.inject({
       method: 'GET',
       url: `/oauth/callback?code=test-code&state=${state}`,
-      headers: { cookie: `mcp_oauth_state=${state}` }
+      headers: { cookie: stateCookieOf(authResponse) }
     })
 
     assert.strictEqual(callbackResponse.statusCode, 200)
@@ -177,7 +180,7 @@ describe('OAuth Routes', () => {
     const response = await fastify.inject({
       method: 'GET',
       url: '/oauth/callback?code=test-code&state=invalid-state',
-      headers: { cookie: 'mcp_oauth_state=invalid-state' }
+      headers: { cookie: 'mcp_oauth_state_invalid-state=not-a-sealed-value' }
     })
 
     assert.strictEqual(response.statusCode, 400)
@@ -582,13 +585,7 @@ describe('OAuth Routes', () => {
       throw new Error('must not be called')
     }
 
-    const stateStore = new MemoryAuthorizationStateStore()
-    let sessionCreated = false
-    stateStore.put = async () => {
-      sessionCreated = true
-    }
-
-    await fastify.register(authRoutesPlugin, { stateStore })
+    await fastify.register(authRoutesPlugin)
 
     const response = await fastify.inject({
       method: 'GET',
@@ -601,7 +598,7 @@ describe('OAuth Routes', () => {
       error_description: 'redirect_uri is not supported'
     })
     assert.strictEqual(authorizationRequestCreated, false)
-    assert.strictEqual(sessionCreated, false)
+    assert.strictEqual(response.headers['set-cookie'], undefined)
   })
 
   test('should not redirect tokens for a session created before the fix', async (t) => {
@@ -628,8 +625,8 @@ describe('OAuth Routes', () => {
       redirectUri: 'https://mcp.example.com/oauth/callback'
     })
 
-    const stateStore = new MemoryAuthorizationStateStore()
-    await stateStore.put('stale-state', {
+    const stateSecret = 'a'.repeat(32)
+    const sealed = new AuthorizationStateSealer(stateSecret).seal({
       state: 'stale-state',
       pkce: {
         codeVerifier: 'verifier',
@@ -640,12 +637,12 @@ describe('OAuth Routes', () => {
       callbackUrl: 'https://mcp.example.com/oauth/callback'
     } as AuthSession, 60_000)
 
-    await fastify.register(authRoutesPlugin, { stateStore })
+    await fastify.register(authRoutesPlugin, { stateSecret })
 
     const response = await fastify.inject({
       method: 'GET',
       url: '/oauth/callback?code=test-code&state=stale-state',
-      headers: { cookie: 'mcp_oauth_state=stale-state' }
+      headers: { cookie: `mcp_oauth_state_stale-state=${sealed}` }
     })
 
     assert.strictEqual(response.statusCode, 200)
@@ -653,7 +650,6 @@ describe('OAuth Routes', () => {
     assert.strictEqual(response.headers['cache-control'], 'no-store')
     assert.strictEqual(response.headers.pragma, 'no-cache')
     assert.strictEqual(response.json().access_token, 'callback-access-token')
-    assert.strictEqual(await stateStore.take('stale-state'), undefined)
   })
 })
 
@@ -726,7 +722,7 @@ describe('OAuth Routes Error Handling', () => {
     const callbackResponse = await fastify.inject({
       method: 'GET',
       url: `/oauth/callback?code=test-code&state=${state}`,
-      headers: { cookie: `mcp_oauth_state=${state}` }
+      headers: { cookie: stateCookieOf(authResponse) }
     })
 
     assert.strictEqual(callbackResponse.statusCode, 500)
@@ -835,41 +831,29 @@ describe('round 16: pending authorizations and the default callback', () => {
     const { fastify, authorize, state } = await buildRoutes(t, server)
 
     const cookie = String(authorize.headers['set-cookie'])
-    assert.match(cookie, new RegExp(`^mcp_oauth_state=${state};`))
+    assert.match(cookie, new RegExp(`^mcp_oauth_state_${state}=[A-Za-z0-9_-]+;`))
     assert.match(cookie, /Path=\/oauth\/callback/)
     assert.match(cookie, /HttpOnly/)
     assert.match(cookie, /SameSite=Lax/)
     assert.match(cookie, /Secure/)
+    // The PKCE verifier travels sealed, not readable
+    assert.doesNotMatch(cookie, /codeVerifier/)
 
     // A callback URL opened in a browser that did not start the flow
-    for (const headers of [{}, { cookie: 'mcp_oauth_state=someone-else' }]) {
+    for (const headers of [{}, { cookie: `mcp_oauth_state_${state}=forged` }]) {
       const response = await fastify.inject({ method: 'GET', url: `/oauth/callback?code=c&state=${state}`, headers })
       assert.strictEqual(response.statusCode, 400)
       assert.strictEqual(response.json().error, 'invalid_request')
     }
 
-    // ...and it did not use up the state
     const response = await fastify.inject({
       method: 'GET',
       url: `/oauth/callback?code=c&state=${state}`,
-      headers: { cookie: `other=1; mcp_oauth_state=${state}` }
+      headers: { cookie: `other=1; ${stateCookieOf(authorize)}` }
     })
     assert.strictEqual(response.statusCode, 200)
     assert.strictEqual(response.json().access_token, 'round16-access-token')
-    assert.match(String(response.headers['set-cookie']), /^mcp_oauth_state=; .*Max-Age=0/)
-  })
-
-  test('a state is redeemed once, even by concurrent callbacks', async (t: TestContext) => {
-    const server = 'https://round16-once.example.com'
-    mockAgent.get(server).intercept({ path: '/oauth/token', method: 'POST' }).reply(200, tokenReply).times(2)
-    const { fastify, state } = await buildRoutes(t, server)
-    const callback = () => fastify.inject({
-      method: 'GET',
-      url: `/oauth/callback?code=c&state=${state}`,
-      headers: { cookie: `mcp_oauth_state=${state}` }
-    })
-    const statuses = (await Promise.all([callback(), callback()])).map(r => r.statusCode).sort()
-    assert.deepStrictEqual(statuses, [200, 400])
+    assert.match(String(response.headers['set-cookie']), new RegExp(`^mcp_oauth_state_${state}=; .*Max-Age=0`))
   })
 
   test('starting an authorization creates no MCP session', async (t: TestContext) => {
@@ -896,29 +880,6 @@ describe('round 16: pending authorizations and the default callback', () => {
     assert.strictEqual(created.mock.callCount(), 0)
   })
 
-  test('the memory store is bounded and forgets lapsed authorizations', async (t: TestContext) => {
-    t.mock.timers.enable({ apis: ['Date'] })
-    const store = new MemoryAuthorizationStateStore(3)
-    const session = (state: string) => ({ state, pkce: { codeVerifier: 'v', codeChallenge: 'c', codeChallengeMethod: 'S256' } }) as AuthSession
-    for (const state of ['a', 'b', 'c', 'd', 'e']) await store.put(state, session(state), 1000)
-    assert.strictEqual(await store.take('a'), undefined)
-    assert.strictEqual(await store.take('b'), undefined)
-    assert.strictEqual((await store.take('c'))?.state, 'c')
-    assert.strictEqual(await store.take('c'), undefined)
-    t.mock.timers.tick(1001)
-    assert.strictEqual(await store.take('d'), undefined)
-  })
-
-  testWithRedis('the Redis store keeps a state for one redemption', async (redis: Redis, t: TestContext) => {
-    const store = new RedisAuthorizationStateStore(redis)
-    const session = { state: 's1', pkce: { codeVerifier: 'v', codeChallenge: 'c', codeChallengeMethod: 'S256' } } as AuthSession
-    await store.put('s1', session, 60_000)
-    const ttl = await redis.pttl('mcp:oauth:state:s1')
-    t.assert.ok(ttl > 0 && ttl <= 60_000)
-    t.assert.deepStrictEqual(await store.take('s1'), session)
-    t.assert.strictEqual(await store.take('s1'), undefined)
-  })
-
   test('the default callback is the served route: resource path ignored, route prefix applied', async (t: TestContext) => {
     for (const { prefix, resourceUri, expected } of [
       { prefix: '', resourceUri: 'https://mcp.example.com/mcp', expected: 'https://mcp.example.com/oauth/callback' },
@@ -940,5 +901,85 @@ describe('round 16: pending authorizations and the default callback', () => {
       assert.match(callback.json().error_description, /Missing required parameters/)
       assert.match(String(authorize.headers['set-cookie']), new RegExp(`Path=${new URL(expected).pathname}`))
     }
+  })
+})
+
+describe('round 17: pending authorizations live in their cookie', () => {
+  const tokenReply = {
+    access_token: 'round17-access-token',
+    token_type: 'Bearer',
+    expires_in: 3600
+  }
+
+  async function buildRoutes (t: TestContext, server: string, stateSecret?: string) {
+    const fastify = Fastify({ logger: false })
+    t.after(() => fastify.close())
+    await fastify.register(oauthClientPlugin, {
+      clientId: 'test-client',
+      authorizationServer: server,
+      redirectUri: 'https://mcp.example.com/oauth/callback'
+    })
+    await fastify.register(authRoutesPlugin, { stateSecret })
+    return fastify
+  }
+
+  async function authorize (fastify: Awaited<ReturnType<typeof buildRoutes>>) {
+    const response = await fastify.inject({ method: 'GET', url: '/oauth/authorize' })
+    return { cookie: stateCookieOf(response), state: new URL(response.headers.location as string).searchParams.get('state')! }
+  }
+
+  test('two authorizations started in one browser both complete', async (t: TestContext) => {
+    const server = 'https://round17-tabs.example.com'
+    mockAgent.get(server).intercept({ path: '/oauth/token', method: 'POST' }).reply(200, tokenReply).times(2)
+    const fastify = await buildRoutes(t, server)
+    const first = await authorize(fastify)
+    const second = await authorize(fastify)
+    // The browser holds both cookies and sends both to the callback path
+    const jar = `${first.cookie}; ${second.cookie}`
+    for (const { state } of [first, second]) {
+      const response = await fastify.inject({ method: 'GET', url: `/oauth/callback?code=c&state=${state}`, headers: { cookie: jar } })
+      assert.strictEqual(response.statusCode, 200)
+    }
+  })
+
+  test('anonymous authorizations cannot push out a pending one', async (t: TestContext) => {
+    const server = 'https://round17-flood.example.com'
+    mockAgent.get(server).intercept({ path: '/oauth/token', method: 'POST' }).reply(200, tokenReply)
+    const fastify = await buildRoutes(t, server)
+    const victim = await authorize(fastify)
+    for (let i = 0; i < 10_000; i++) {
+      await fastify.inject({ method: 'GET', url: '/oauth/authorize' })
+    }
+    const response = await fastify.inject({ method: 'GET', url: `/oauth/callback?code=c&state=${victim.state}`, headers: { cookie: victim.cookie } })
+    assert.strictEqual(response.statusCode, 200)
+  })
+
+  test('a cookie opens only for its own state, before it expires, under the same secret', async (t: TestContext) => {
+    t.mock.timers.enable({ apis: ['Date'] })
+    const server = 'https://round17-seal.example.com'
+    mockAgent.get(server).intercept({ path: '/oauth/token', method: 'POST' }).reply(200, tokenReply)
+    const secret = 'b'.repeat(32)
+    const issuer = await buildRoutes(t, server, secret)
+    const other = await buildRoutes(t, server, secret)
+    const stranger = await buildRoutes(t, server, 'c'.repeat(32))
+
+    const pending = await authorize(issuer)
+    const value = pending.cookie.split('=')[1]
+    const otherState = 'A'.repeat(22)
+    const replayed = await issuer.inject({
+      method: 'GET',
+      url: `/oauth/callback?code=c&state=${otherState}`,
+      headers: { cookie: `mcp_oauth_state_${otherState}=${value}` }
+    })
+    assert.strictEqual(replayed.statusCode, 400)
+
+    const callback = (app: typeof issuer, { state, cookie } = pending) => app.inject({ method: 'GET', url: `/oauth/callback?code=c&state=${state}`, headers: { cookie } })
+    assert.strictEqual((await callback(stranger)).statusCode, 400)
+    // Another instance with the same secret finishes the flow
+    assert.strictEqual((await callback(other)).statusCode, 200)
+
+    const late = await authorize(issuer)
+    t.mock.timers.tick(10 * 60 * 1000 + 1)
+    assert.strictEqual((await callback(other, late)).statusCode, 400)
   })
 })

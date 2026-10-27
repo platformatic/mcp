@@ -2,14 +2,18 @@ import type { FastifyInstance, FastifyPluginAsync } from 'fastify'
 import fp from 'fastify-plugin'
 import { Type } from '@sinclair/typebox'
 import { BEARER_SCHEME, SKIP_BEARER_AUTH } from '../auth/prehandler.ts'
-import { AUTHORIZATION_STATE_TTL_MS, MemoryAuthorizationStateStore } from '../auth/authorization-state-store.ts'
-import type { AuthSession, AuthorizationStateStore } from '../auth/authorization-state-store.ts'
+import { AUTHORIZATION_STATE_TTL_MS, AuthorizationStateSealer } from '../auth/authorization-state.ts'
+import type { AuthSession } from '../auth/authorization-state.ts'
 import type { DCRHooks, DCRRequest, DCRResponse } from '../types/auth-types.ts'
 
-export type { AuthSession } from '../auth/authorization-state-store.ts'
+export type { AuthSession } from '../auth/authorization-state.ts'
 
-/** Cookie tying a pending authorization to the browser that started it. */
-export const AUTHORIZATION_STATE_COOKIE = 'mcp_oauth_state'
+/**
+ * Prefix of the cookie carrying a pending authorization to its callback.
+ * Each authorization gets its own, named after its state, so flows started
+ * in two tabs do not overwrite each other.
+ */
+export const AUTHORIZATION_STATE_COOKIE = 'mcp_oauth_state_'
 
 export interface AuthorizationCallbackQuery {
   code?: string
@@ -23,8 +27,12 @@ export interface TokenRefreshBody {
 }
 
 export interface AuthRoutesOptions {
-  /** Where pending authorization requests wait for their callback (default: in memory). */
-  stateStore?: AuthorizationStateStore
+  /**
+   * Secret sealing pending authorizations into their cookie (default: a
+   * per-process random one). Every instance that can serve the callback
+   * needs the same one; a list rotates it, sealing with the first.
+   */
+  stateSecret?: string | Buffer | ReadonlyArray<string | Buffer>
   /** DCR hooks for custom request/response processing */
   dcrHooks?: DCRHooks
 }
@@ -99,10 +107,10 @@ const LogoutResponse = Type.Object({
   logout_status: Type.String()
 })
 
-function stateCookie (callbackUrl: string | undefined, value: string, ttlMs: number): string {
+function stateCookie (callbackUrl: string | undefined, state: string, value: string, ttlMs: number): string {
   const url = callbackUrl ? new URL(callbackUrl) : undefined
   const attributes = [
-    `${AUTHORIZATION_STATE_COOKIE}=${encodeURIComponent(value)}`,
+    `${AUTHORIZATION_STATE_COOKIE}${state}=${value}`,
     `Path=${url?.pathname ?? '/'}`,
     `Max-Age=${Math.floor(ttlMs / 1000)}`,
     'HttpOnly',
@@ -118,17 +126,13 @@ function readCookie (header: string | undefined, name: string): string | undefin
   for (const part of header.split(';')) {
     const separator = part.indexOf('=')
     if (separator === -1 || part.slice(0, separator).trim() !== name) continue
-    try {
-      return decodeURIComponent(part.slice(separator + 1).trim())
-    } catch {
-      return undefined
-    }
+    return part.slice(separator + 1).trim()
   }
   return undefined
 }
 
 const authRoutesPlugin: FastifyPluginAsync<AuthRoutesOptions> = async (fastify: FastifyInstance, opts) => {
-  const stateStore = opts.stateStore ?? new MemoryAuthorizationStateStore()
+  const sealer = new AuthorizationStateSealer(opts.stateSecret)
 
   // Initiate OAuth authorization flow
   fastify.get('/oauth/authorize', {
@@ -172,12 +176,12 @@ const authRoutesPlugin: FastifyPluginAsync<AuthRoutesOptions> = async (fastify: 
         resourceUri: resource,
         callbackUrl // Store for token exchange (must match)
       }
-      await stateStore.put(authRequest.state, sessionData, AUTHORIZATION_STATE_TTL_MS)
-
-      // The callback only completes in the browser that started the flow
-      // (RFC 9700 Section 4.7.1): a callback URL from someone else's login
-      // carries a state this browser never received.
-      reply.header('Set-Cookie', stateCookie(callbackUrl, authRequest.state, AUTHORIZATION_STATE_TTL_MS))
+      // The pending authorization travels in a cookie, so the callback only
+      // completes in the browser that started the flow (RFC 9700 Section
+      // 4.7.1): a callback URL from someone else's login carries a state this
+      // browser holds no cookie for.
+      const sealed = sealer.seal(sessionData, AUTHORIZATION_STATE_TTL_MS)
+      reply.header('Set-Cookie', stateCookie(callbackUrl, authRequest.state, sealed, AUTHORIZATION_STATE_TTL_MS))
       return reply.redirect(authRequest.authorizationUrl)
     } catch (error) {
       fastify.log.error({ error }, 'Failed to initiate OAuth authorization')
@@ -226,22 +230,23 @@ const authRoutesPlugin: FastifyPluginAsync<AuthRoutesOptions> = async (fastify: 
         })
       }
 
-      if (readCookie(request.headers.cookie, AUTHORIZATION_STATE_COOKIE) !== state) {
+      const cookie = readCookie(request.headers.cookie, AUTHORIZATION_STATE_COOKIE + state)
+      if (cookie === undefined) {
         return reply.status(400).send({
           error: 'invalid_request',
           error_description: 'This authorization was not started from this browser'
         })
       }
 
-      // Read and removed in one step: a state is redeemed once
-      const sessionData = await stateStore.take(state)
+      const sessionData = sealer.open(cookie, state)
       if (!sessionData) {
         return reply.status(400).send({
           error: 'invalid_request',
           error_description: 'Invalid or expired state parameter'
         })
       }
-      reply.header('Set-Cookie', stateCookie(sessionData.callbackUrl, '', 0))
+      // The authorization server redeems a code once; the cookie goes too
+      reply.header('Set-Cookie', stateCookie(sessionData.callbackUrl, state, '', 0))
 
       // Exchange authorization code for tokens (include redirect_uri for OIDC compliance)
       const tokens = await fastify.oauthClient.exchangeCodeForToken(

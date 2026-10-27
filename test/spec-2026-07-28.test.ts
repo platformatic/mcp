@@ -1,5 +1,5 @@
 import { test, describe } from 'node:test'
-import { PassThrough } from 'node:stream'
+import { PassThrough, Writable } from 'node:stream'
 import type { TestContext } from 'node:test'
 import Fastify from 'fastify'
 import type { FastifyInstance } from 'fastify'
@@ -6243,5 +6243,244 @@ describe('round 16: thrown values, cache hints, task results and stdio framing',
     // Stopping stops reading stdin, which must not start a second shutdown
     await transport.stop()
     t.assert.strictEqual(closes, 1)
+  })
+})
+
+describe('round 17: listen openings, hints, answers, stdio lines and parked tasks', () => {
+  test('a listen whose client leaves while subscribe handlers run tells them, and frees its slot', async (t: TestContext) => {
+    const aborted: boolean[] = []
+    const entered: (() => void)[] = []
+    const app = await buildServer(t, (app) => {
+      app.mcpSetResourceSubscribeHandler(async (_params, context) => {
+        const index = aborted.push(false) - 1
+        context.signal.addEventListener('abort', () => { aborted[index] = true })
+        entered.shift()?.()
+        await new Promise(() => {})
+        return {}
+      })
+    }, { capabilities: { resources: { subscribe: true } }, subscriptionMaxStreams: 2 })
+    await app.listen({ port: 0, host: '127.0.0.1' })
+    const url = `http://127.0.0.1:${(app.server.address() as { port: number }).port}/mcp`
+    const listen = (id: number, notifications: Record<string, unknown>, signal: AbortSignal) => fetch(url, {
+      method: 'POST',
+      signal,
+      headers: modernHeaders('subscriptions/listen'),
+      body: JSON.stringify(modernBody('subscriptions/listen', { id, params: { notifications } }))
+    })
+
+    for (const id of [1, 2]) {
+      const started = new Promise<void>(resolve => entered.push(resolve))
+      const client = new AbortController()
+      const response = listen(id, { resourceSubscriptions: ['file:///a'] }, client.signal).catch(() => undefined)
+      await started
+      client.abort()
+      await response
+    }
+    await until(() => aborted.every(Boolean))
+    t.assert.deepStrictEqual(aborted, [true, true])
+
+    const third = new AbortController()
+    t.after(() => third.abort())
+    const response = await listen(3, { toolsListChanged: true }, third.signal)
+    t.assert.strictEqual(response.status, 200)
+  })
+
+  test('log data keeps an object it holds twice; only a real cycle is replaced', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'report', inputSchema: Type.Object({}) }, async (_args: unknown, context: any) => {
+        const range = { from: 1, to: 2 }
+        const loop: Record<string, unknown> = { name: 'loop' }
+        loop.self = loop
+        context.log('info', { requested: range, served: range, list: [range, range], loop })
+        return { content: [{ type: 'text', text: 'ok' }] }
+      })
+    }, { capabilities: { tools: {}, logging: {} } })
+    const body = modernBody('tools/call', { params: { name: 'report', arguments: {} } }) as any
+    body.params._meta[META_LOG_LEVEL] = 'debug'
+    const response = await app.inject({ method: 'POST', url: '/mcp', headers: modernHeaders('tools/call', { params: { name: 'report' } }), payload: body })
+    const logged = response.body.split('\n').filter(line => line.startsWith('data: '))
+      .map(line => JSON.parse(line.slice(6))).find(message => message.method === 'notifications/message')
+    const range = { from: 1, to: 2 }
+    t.assert.deepStrictEqual(logged.params.data, { requested: range, served: range, list: [range, range], loop: { name: 'loop', self: '[Circular]' } })
+  })
+
+  test('a handler\'s own ttlMs is a whole number, and a negative one is stale', async (t: TestContext) => {
+    const app = await buildServer(t, (app) => {
+      for (const [name, ttlMs] of [['fraction', 1500.7], ['negative', -1], ['text', '0']] as const) {
+        app.mcpAddResource({ uriPattern: `r://${name}`, name }, async (uri: string) => ({ contents: [{ uri, text: name }], ttlMs }) as any)
+      }
+    }, { caching: { resourcesRead: { ttlMs: 60_000, cacheScope: 'public' } } })
+    const ttl = async (uri: string) => (await call(app, 'resources/read', { params: { uri } })).json().result.ttlMs
+    t.assert.strictEqual(await ttl('r://fraction'), 1500)
+    t.assert.strictEqual(await ttl('r://negative'), 0)
+    t.assert.strictEqual(await ttl('r://text'), 60_000)
+  })
+
+  test('an answer holding a number JSON cannot carry is refused at any depth', async (t: TestContext) => {
+    let seen: unknown = 'not called'
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'sample', inputSchema: Type.Object({}) }, async (_args: unknown, context: any) => {
+        const answer = context.inputResponses?.q
+        if (!answer) {
+          throw new InputRequired({ inputRequests: { q: requestSampling({ messages: [{ role: 'user', content: { type: 'text', text: 'hi' } }], maxTokens: 10 }) } })
+        }
+        seen = answer
+        return { content: [{ type: 'text', text: 'ok' }] }
+      })
+    })
+    const capabilities: ClientCapabilities = { sampling: {} }
+    const first = (await call(app, 'tools/call', { params: { name: 'sample', arguments: {} }, capabilities })).json().result
+    let input = '1e400'
+    for (let i = 0; i < 70; i++) input = `{"a":${input}}`
+    const body = JSON.stringify(modernBody('tools/call', {
+      id: 2,
+      params: { name: 'sample', arguments: {}, requestState: first.requestState, inputResponses: { q: { role: 'assistant', model: 'm', content: { type: 'tool_use', id: 'x', name: 'n', input: '@@' } } } },
+      capabilities
+    })).replace('"@@"', input)
+    const response = await app.inject({ method: 'POST', url: '/mcp', headers: modernHeaders('tools/call', { params: { name: 'sample' } }), payload: body })
+    t.assert.strictEqual(response.json().error?.code, INVALID_PARAMS)
+    t.assert.strictEqual(seen, 'not called')
+  })
+
+  test('stdio: a line longer than any request is dropped as it arrives, and reading goes on', async (t: TestContext) => {
+    const app = await buildServer(t)
+    const { lines, transport, send } = stdioPipe(t, app)
+    const input = (transport as any).transportOpts.input as PassThrough
+    const chunk = 'x'.repeat(64 * 1024)
+    input.write('{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"pad":"')
+    for (let i = 0; i < 80; i++) input.write(chunk)
+    input.write('"}}\n')
+    send(modernBody('tools/list', { id: 2 }))
+    await until(() => lines.length >= 2)
+    t.assert.deepStrictEqual(lines[0], { jsonrpc: '2.0', id: null, error: { code: INVALID_REQUEST, message: 'Request too large' } })
+    t.assert.strictEqual(lines[1].id, 2)
+    t.assert.ok(lines[1].result)
+    // Nothing of the long line is held on to
+    t.assert.strictEqual((transport as any).partialLength, 0)
+  })
+
+  test('stdio: a request named notifications/cancelled does not cancel anything', async (t: TestContext) => {
+    let release!: () => void
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'slow', inputSchema: Type.Object({}) }, async () => {
+        await new Promise<void>(resolve => { release = resolve })
+        return { content: [{ type: 'text', text: 'done' }] }
+      })
+    })
+    const { lines, send } = stdioPipe(t, app)
+    send(modernBody('tools/call', { id: 12, params: { name: 'slow', arguments: {} } }))
+    await until(() => release !== undefined)
+    send({ jsonrpc: JSONRPC_VERSION, id: 13, method: 'notifications/cancelled', params: { requestId: 12 } })
+    await until(() => lines.some(line => line.id === 13))
+    release()
+    await until(() => lines.some(line => line.id === 12))
+    t.assert.strictEqual(lines.find(line => line.id === 12)?.result?.content?.[0]?.text, 'done')
+  })
+
+  test('stdio: an output that ignores destroy() is let go of when it cannot be flushed', async (t: TestContext) => {
+    const app = await buildServer(t)
+    let handleClosed = false
+    // Like process.stdout on a pipe the client never reads: writes never
+    // complete, and destroy() does nothing
+    const output = new Writable({ highWaterMark: 1, write () {} }) as Writable & { _handle?: unknown }
+    output.destroy = () => output
+    output._handle = { close: () => { handleClosed = true } }
+    const input = new PassThrough()
+    const transport = createStdioTransport(app, { input, output, error: new PassThrough() })
+    transport.start()
+    input.write(JSON.stringify(modernBody('tools/list', { id: 1 })) + '\n')
+    input.end()
+    await transport.stopped
+    t.assert.strictEqual(handleClosed, true)
+  })
+
+  test('stdio: the transport stops with an app whose plugin sits in a prefixed child', async (t: TestContext) => {
+    const app = Fastify()
+    await app.register(async (child) => {
+      await child.register(mcpPlugin, { serverInfo: { name: 'test-server', version: '1' }, capabilities: { tools: {} } })
+    }, { prefix: '/api' })
+    await app.ready()
+    const transport = createStdioTransport(app, { input: new PassThrough(), output: new PassThrough(), error: new PassThrough(), endpoint: '/api/mcp' })
+    transport.start()
+    t.after(() => transport.stop())
+    await app.close()
+    t.assert.notStrictEqual((transport as any).closePromise, null, 'the transport did not start stopping')
+  })
+
+  test('a required prompt argument named like an Object.prototype member must be given', async (t: TestContext) => {
+    let ran = false
+    const app = await buildServer(t, (app) => {
+      app.mcpAddPrompt({
+        name: 'proto',
+        arguments: [{ name: 'constructor', required: true }, { name: 'topic', required: true }]
+      }, async () => {
+        ran = true
+        return { messages: [] }
+      })
+    })
+    for (const args of [{}, { topic: 'x' }]) {
+      const error = (await call(app, 'prompts/get', { params: { name: 'proto', arguments: args } })).json().error
+      t.assert.strictEqual(error?.code, INVALID_PARAMS)
+      t.assert.ok(error.data.missing.includes('constructor'), JSON.stringify(error))
+    }
+    t.assert.strictEqual(ran, false)
+  })
+
+  test('a finished task gives its slot back before onToolCallComplete returns', async (t: TestContext) => {
+    const tasksCapable: ClientCapabilities = { extensions: { [TASKS_EXTENSION]: {} } }
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    let entered!: () => void
+    const hookRunning = new Promise<void>(resolve => { entered = resolve })
+    const app = await buildServer(t, (app) => {
+      app.mcpAddTool({ name: 'quick', inputSchema: Type.Object({}), execution: { taskSupport: 'optional' } } as any, async () => ({
+        content: [{ type: 'text', text: 'done' }]
+      }))
+    }, {
+      enableTasks: true,
+      taskMaxConcurrent: 1,
+      // Only the first call's event waits
+      onToolCallComplete: async () => {
+        if (entered === undefined) return
+        const enter = entered
+        entered = undefined as unknown as () => void
+        enter()
+        await gate
+      }
+    })
+    // Registered after the app's close, so it runs first
+    t.after(() => release())
+    const first = (await call(app, 'tools/call', { params: { name: 'quick', arguments: {} }, capabilities: tasksCapable })).json().result
+    t.assert.strictEqual(first.resultType, 'task')
+    await hookRunning
+    const second = (await call(app, 'tools/call', { id: 2, params: { name: 'quick', arguments: {} }, capabilities: tasksCapable })).json()
+    t.assert.strictEqual(second.result?.resultType, 'task', JSON.stringify(second))
+  })
+
+  test('a task round that cannot be recorded fails as such, not as a timeout; ill-formed keys are refused', async (t: TestContext) => {
+    const tasksCapable: ClientCapabilities = { extensions: { [TASKS_EXTENSION]: {} }, elicitation: { form: {} } }
+    const updateStatus = MemoryTaskStore.prototype.updateStatus
+    t.mock.method(MemoryTaskStore.prototype, 'updateStatus', async function (this: MemoryTaskStore, ...args: Parameters<MemoryTaskStore['updateStatus']>) {
+      if (args[1] === 'input_required' && (args[2] as any)?.inputRequests?.broken) throw new Error('store unavailable')
+      return await updateStatus.apply(this, args)
+    })
+    const app = await buildServer(t, (app) => {
+      for (const key of ['broken', 'k\ud800']) {
+        app.mcpAddTool({ name: key === 'broken' ? 'broken' : 'surrogate', inputSchema: Type.Object({}), execution: { taskSupport: 'optional' } } as any, async () => {
+          throw new InputRequired({ inputRequests: { [key]: elicitForm('Which?', { type: 'object', properties: {} } as any) } })
+        })
+      }
+    }, { enableTasks: true })
+    for (const name of ['broken', 'surrogate']) {
+      const created = (await call(app, 'tools/call', { params: { name, arguments: {} }, capabilities: tasksCapable })).json().result
+      let task: any
+      for (let attempt = 0; attempt < 100; attempt++) {
+        task = (await call(app, 'tasks/get', { params: { taskId: created.taskId }, capabilities: tasksCapable })).json().result
+        if (task?.status !== 'working') break
+        await new Promise(resolve => setImmediate(resolve))
+      }
+      t.assert.strictEqual(task?.status, 'failed', `${name}: ${JSON.stringify(task)}`)
+      t.assert.strictEqual(task.error?.message, 'Internal server error', name)
+    }
   })
 })

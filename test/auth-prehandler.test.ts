@@ -50,13 +50,14 @@ describe('Authorization PreHandler', () => {
     validator.close()
   })
 
-  test('should skip authorization for well-known endpoints', async (t: TestContext) => {
+  test('should skip authorization for well-known endpoints marked on the route', async (t: TestContext) => {
     const config = createTestAuthConfig()
     const validator = new TokenValidator(config, app)
     const preHandler = createAuthPreHandler(config, validator)
 
     app.addHook('preHandler', preHandler)
-    app.get('/.well-known/test', async () => ({ success: true }))
+    app.get('/.well-known/test', { config: { [SKIP_BEARER_AUTH]: true } }, async () => ({ success: true }))
+    app.get('/.well-known/app-owned', async () => ({ success: true }))
 
     await app.ready()
 
@@ -67,6 +68,11 @@ describe('Authorization PreHandler', () => {
 
     t.assert.strictEqual(response.statusCode, 200)
     t.assert.deepStrictEqual(response.json(), { success: true })
+
+    // An application route under /.well-known/ is protected like any other,
+    // and a discovery URL nothing serves answers 404
+    t.assert.strictEqual((await app.inject({ method: 'GET', url: '/.well-known/app-owned' })).statusCode, 401)
+    t.assert.strictEqual((await app.inject({ method: 'GET', url: '/.well-known/missing' })).statusCode, 404)
 
     validator.close()
   })
@@ -444,7 +450,7 @@ describe('Authorization PreHandler', () => {
     app.addHook('preHandler', preHandler)
     app.get('/protected1', async () => ({ endpoint: 'protected1' }))
     app.get('/protected2', async () => ({ endpoint: 'protected2' }))
-    app.get('/.well-known/public', async () => ({ endpoint: 'public' }))
+    app.get('/.well-known/public', { config: { [SKIP_BEARER_AUTH]: true } }, async () => ({ endpoint: 'public' }))
 
     await app.ready()
 
@@ -632,6 +638,55 @@ describe('round 16: excluded paths', () => {
     }
     for (const url of ['/health', '/health?probe=1', '/public/logo.png?v=2']) {
       t.assert.strictEqual((await app.inject({ method: 'GET', url })).statusCode, 200, url)
+    }
+  })
+})
+
+describe('round 17: exemptions follow the router', () => {
+  async function rawPost (port: number, target: string): Promise<number> {
+    const { connect } = await import('node:net')
+    return new Promise((resolve, reject) => {
+      const socket = connect(port, '127.0.0.1')
+      let data = ''
+      socket.on('data', chunk => { data += chunk })
+      socket.on('error', reject)
+      socket.on('end', () => resolve(Number(data.split(' ')[1])))
+      socket.write(`POST ${target} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}`)
+    })
+  }
+
+  test('excludedPaths see the routed path: no fragment, no absolute-form origin', async (t: TestContext) => {
+    const app = Fastify({ logger: false })
+    t.after(() => app.close())
+    const config = createTestAuthConfig({ excludedPaths: [/\/health$/, '/public'] })
+    const validator = new TokenValidator(config, app)
+    app.addHook('preHandler', createAuthPreHandler(config, validator))
+    app.post('/mcp', async () => ({ secret: true }))
+    app.post('/health', async () => ({ ok: true }))
+    app.post('/public/*', async () => ({ ok: true }))
+    await app.listen({ port: 0, host: '127.0.0.1' })
+    const port = (app.server.address() as { port: number }).port
+
+    for (const target of ['/mcp#/health', 'http://x/mcp#/health', 'http://x/mcp?/public', '/mcp#/public']) {
+      t.assert.strictEqual(await rawPost(port, target), 401, target)
+    }
+    for (const target of ['/health#', 'http://x/health', '/he%61lth', '/public/a#b']) {
+      t.assert.strictEqual(await rawPost(port, target), 200, target)
+    }
+  })
+
+  test('only the plugin\'s own discovery routes are exempt, not URLs that look like them', async (t: TestContext) => {
+    const app = Fastify({ logger: false })
+    t.after(() => app.close())
+    const config = createTestAuthConfig()
+    const validator = new TokenValidator(config, app)
+    app.addHook('preHandler', createAuthPreHandler(config, validator))
+    app.get('/:collection/:id', async () => ({ secret: true }))
+    app.get('/mcp/:tool', async () => ({ secret: true }))
+    await app.ready()
+
+    for (const url of ['/.well-known/42', '/mcp/.well-known', '/mcp/.well-known-admin']) {
+      t.assert.strictEqual((await app.inject({ method: 'GET', url })).statusCode, 401, url)
     }
   })
 })

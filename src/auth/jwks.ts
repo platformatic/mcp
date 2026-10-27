@@ -38,6 +38,8 @@ export class JwksCache {
   private keys: Jwk[] = []
   private readonly pems = new Map<Jwk, string>()
   private fetchedAt = -Infinity
+  /** When the set in hand was fetched; `fetchedAt` also counts failed attempts. */
+  private loadedAt = -Infinity
   private refreshing: Promise<void> | undefined
 
   constructor (url: string, options: JwksCacheOptions = {}) {
@@ -49,8 +51,13 @@ export class JwksCache {
   /** The PEM public key for `kid` and `alg`, or an error when the set has none. */
   async getPublicKey (kid: string | undefined, alg: string | undefined): Promise<string> {
     let jwk = this.find(kid, alg)
-    if (Date.now() - this.fetchedAt >= this.ttlMs) {
-      if (jwk) {
+    const now = Date.now()
+    // A set is trusted for one ttl, and for one more while it is refreshed.
+    // Past that a key removed upstream would still verify, so the set must be
+    // fetched first, and tokens are refused while it cannot be.
+    const outdated = now - this.loadedAt >= 2 * this.ttlMs
+    if (now - this.fetchedAt >= this.ttlMs || (outdated && now - this.fetchedAt >= COLD_RETRY_MS)) {
+      if (jwk && !outdated) {
         // The set is due, but this key is in it: answer now and fetch the
         // set behind it. A failed fetch keeps the set, so nothing to report.
         this.refreshKeepingOld().catch(() => {})
@@ -75,6 +82,7 @@ export class JwksCache {
       jwk = this.find(kid, alg)
     }
     if (!jwk) throw new Error('No matching signing key')
+    if (Date.now() - this.loadedAt >= 2 * this.ttlMs) throw new Error('The signing key set could not be refreshed')
     let pem = this.pems.get(jwk)
     if (pem === undefined) {
       pem = createPublicKey({ key: jwk as any, format: 'jwk' }).export({ type: 'spki', format: 'pem' }).toString()
@@ -108,5 +116,6 @@ export class JwksCache {
     if (!Array.isArray(body?.keys) || body.keys.length === 0) throw new Error('JWKS response has no keys')
     this.keys = body.keys.filter((key): key is Jwk => typeof key === 'object' && key !== null && !Array.isArray(key))
     this.pems.clear()
+    this.loadedAt = Date.now()
   }
 }

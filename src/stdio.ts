@@ -1,7 +1,7 @@
 import { stdin, stdout, stderr } from 'process'
 import { StringDecoder } from 'node:string_decoder'
 import type { FastifyInstance } from 'fastify'
-import { MCP_SHUTDOWN_SIGNAL, STDIO_REQUEST_HEADER, registerStdioRequest } from './stdio-trust.ts'
+import { STDIO_REQUEST_HEADER, registerStdioRequest, shutdownSignalsOf } from './stdio-trust.ts'
 import type { AuthorizationContext } from './types/auth-types.ts'
 import { MAX_REQUEST_ID_LENGTH, bodyClaimsModern } from './modern/request-meta.ts'
 import type {
@@ -93,6 +93,9 @@ const ABORT_GRACE_MS = 500
 /** What can be asked of an output stream beyond NodeJS.WritableStream. */
 type OutputStream = NodeJS.WritableStream & { destroyed?: boolean, writableEnded?: boolean, writableLength?: number, destroy?: () => void }
 
+/** Stands for a line that was too long to read. */
+const TOO_LARGE = Symbol('too large')
+
 /** How long stop() lets stdout take what it has buffered before dropping it. */
 const OUTPUT_FLUSH_MS = 1000
 
@@ -110,8 +113,13 @@ function requestKey (id: string | number): string {
 export class StdioTransport {
   private app: FastifyInstance
   private transportOpts: StdioTransportOptions
-  /** stdin read so far that does not end in a newline yet. */
-  private pendingInput = ''
+  /** The start of a line whose newline has not been read yet, in pieces. */
+  private partialLine: string[] = []
+  private partialLength = 0
+  /** A line longer than any request can be is skipped until its newline. */
+  private skippingLine = false
+  /** Complete lines read but not handled yet, while stdout is full. */
+  private pendingLines: (string | typeof TOO_LARGE)[] = []
   private readonly decoder = new StringDecoder('utf8')
   private reading = false
   private inputEnded = false
@@ -177,8 +185,9 @@ export class StdioTransport {
 
     // Closed by something other than this transport: stop with it, rather
     // than answer every request with an error from a closed app.
-    const shutdown = (this.app as unknown as Record<symbol, AbortSignal | undefined>)[MCP_SHUTDOWN_SIGNAL]
-    if (shutdown) {
+    const signals = shutdownSignalsOf(this.app.server)
+    if (signals.length > 0) {
+      const shutdown = AbortSignal.any(signals)
       const onShutdown = () => {
         this.stop().catch(error => this.logError('Error during shutdown:', error))
       }
@@ -224,15 +233,67 @@ export class StdioTransport {
   }
 
   private readonly onInputData = (chunk: Buffer | string): void => {
-    this.pendingInput += typeof chunk === 'string' ? chunk : this.decoder.write(chunk)
+    this.takeInput(typeof chunk === 'string' ? chunk : this.decoder.write(chunk))
     this.readLines()
   }
 
   private readonly onInputEnd = (): void => {
     if (this.inputEnded) return
     this.inputEnded = true
-    this.pendingInput += this.decoder.end()
+    this.takeInput(this.decoder.end())
     this.readLines()
+  }
+
+  /**
+   * Split what was read into lines. Only the new text is searched for a
+   * newline, and a partial line is kept in pieces, so a long line costs
+   * linear time; past the longest request the app accepts it is dropped.
+   */
+  private takeInput (text: string): void {
+    let start = 0
+    let newline = text.indexOf('\n')
+    while (newline !== -1) {
+      this.endLine(text.slice(start, newline))
+      start = newline + 1
+      newline = text.indexOf('\n', start)
+    }
+    this.addToLine(text.slice(start))
+  }
+
+  private addToLine (piece: string): void {
+    if (this.skippingLine || piece === '') return
+    this.partialLength += piece.length
+    if (this.partialLength > this.maxLineLength) {
+      this.skippingLine = true
+      this.partialLine = []
+      this.partialLength = 0
+      return
+    }
+    this.partialLine.push(piece)
+  }
+
+  private endLine (piece: string): void {
+    this.addToLine(piece)
+    if (this.skippingLine) {
+      this.skippingLine = false
+      this.pendingLines.push(TOO_LARGE)
+      return
+    }
+    let line = this.partialLine.join('')
+    if (line.endsWith('\r')) line = line.slice(0, -1)
+    this.partialLine = []
+    this.partialLength = 0
+    this.pendingLines.push(line)
+  }
+
+  /**
+   * How long a line may grow before it is dropped unread. A line past the
+   * app's `bodyLimit` (bytes, so at most as many UTF-16 units) is refused
+   * anyway, but one within a few times that is still parsed, so the error
+   * carries its id and the client is not left waiting.
+   */
+  private get maxLineLength (): number {
+    return Math.max(4 * (this.app.initialConfig.bodyLimit ?? 1024 * 1024), 1024 * 1024)
   }
 
   private readonly onInputError = (error: Error): void => {
@@ -248,25 +309,28 @@ export class StdioTransport {
    */
   private readLines (): void {
     if (!this.reading) return
-    let start = 0
-    let newline = this.pendingInput.indexOf('\n')
-    while (newline !== -1 && !this.throttled) {
-      const end = newline > start && this.pendingInput[newline - 1] === '\r' ? newline - 1 : newline
-      this.handleLine(this.pendingInput.slice(start, end))
-      start = newline + 1
-      newline = this.pendingInput.indexOf('\n', start)
+    while (this.pendingLines.length > 0 && !this.throttled) {
+      this.handleLine(this.pendingLines.shift()!)
     }
-    this.pendingInput = this.pendingInput.slice(start)
     if (this.throttled || !this.inputEnded) return
-    const last = this.pendingInput
-    this.pendingInput = ''
-    if (last) this.handleLine(last)
+    if (this.skippingLine || this.partialLength > 0) this.endLine('')
+    const rest = this.pendingLines
+    this.pendingLines = []
+    for (const line of rest) this.handleLine(line)
     this.log('Stdio transport closed')
     this.stopReading()
     this.stop().catch(error => this.logError('Error during shutdown:', error))
   }
 
-  private handleLine (line: string): void {
+  private handleLine (line: string | typeof TOO_LARGE): void {
+    if (line === TOO_LARGE) {
+      this.sendWithBackpressure({
+        jsonrpc: '2.0',
+        id: null as unknown as string,
+        error: { code: -32600, message: 'Request too large' }
+      })
+      return
+    }
     // One bad line must never take the server down with an unhandled rejection.
     this.handleIncomingMessage(line.trim()).catch((error) => {
       this.logError('Error handling message:', error)
@@ -356,7 +420,11 @@ export class StdioTransport {
     const timer = setTimeout(() => controller.abort(), OUTPUT_FLUSH_MS)
     await this.drained(controller.signal)
     clearTimeout(timer)
-    if (output.writableLength! > 0) output.destroy?.()
+    if (!(output.writableLength! > 0)) return
+    output.destroy?.()
+    // process.stdout ignores destroy(), and the write a client never reads
+    // would keep the process alive: let go of the pipe itself.
+    if (!output.destroyed) (output as { _handle?: { close?: () => void } })._handle?.close?.()
   }
 
   /** Wait until every non-listen message has been answered, or `timeoutMs` passes. */
@@ -445,7 +513,9 @@ export class StdioTransport {
    * notification, after which nothing more may be sent for that request.
    */
   private applyCancellation (message: JSONRPCMessage): void {
-    if ((message as { method?: string }).method !== 'notifications/cancelled') return
+    // Only a notification cancels: a request by that name is answered as an
+    // unknown method, and must not also cancel what it names.
+    if ((message as { method?: string }).method !== 'notifications/cancelled' || 'id' in message) return
     const requestId = (message as { params?: { requestId?: unknown } }).params?.requestId
     if (typeof requestId === 'string' || typeof requestId === 'number') {
       const key = requestKey(requestId)

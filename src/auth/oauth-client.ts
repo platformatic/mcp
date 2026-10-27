@@ -3,6 +3,7 @@ import fp from 'fastify-plugin'
 import { createHash, randomBytes } from 'node:crypto'
 import { validateTokenResponse, validateIntrospectionResponse, validateClientRegistrationResponse } from './oauth-schemas.ts'
 import { resolveRouteUrl } from '../utils/route-url.ts'
+import { SKIP_BEARER_AUTH } from './prehandler.ts'
 
 export interface OAuthClientConfig {
   clientId?: string
@@ -222,14 +223,8 @@ const oauthClientPlugin: FastifyPluginAsync<OAuthClientConfig> = async (fastify,
     const document = buildClientIdMetadataDocument(opts, documentUrl, fastify.prefix)
 
     // The authorization server fetches this document unauthenticated to resolve
-    // the client_id. The auth preHandler only exempts /.well-known, so a custom
-    // path outside it would sit behind bearer auth and be unreachable (401).
-    if (!path.startsWith('/.well-known/')) {
-      fastify.log.warn({ path },
-        'clientIdMetadataDocument path is outside /.well-known; add it to authorization.excludedPaths or the authorization server will get 401 when fetching it')
-    }
-
-    fastify.get(path, async (_request, reply) => {
+    // the client_id, so the route is exempt from the bearer check.
+    fastify.get(path, { config: { [SKIP_BEARER_AUTH]: true } }, async (_request, reply) => {
       return reply.type('application/json').send(document)
     })
 
