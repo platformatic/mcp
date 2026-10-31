@@ -2,7 +2,7 @@ import type { FastifyInstance, FastifyPluginAsync } from 'fastify'
 import fp from 'fastify-plugin'
 import { Type } from '@sinclair/typebox'
 import type { PKCEChallenge } from '../auth/oauth-client.ts'
-import { BEARER_SCHEME } from '../auth/prehandler.ts'
+import { BEARER_SCHEME, kPublicRoute } from '../auth/prehandler.ts'
 import type { SessionStore } from '../stores/session-store.ts'
 import type { DCRHooks, DCRRequest, DCRResponse } from '../types/auth-types.ts'
 
@@ -100,11 +100,16 @@ const LogoutResponse = Type.Object({
   logout_status: Type.String()
 })
 
+// authorize starts the flow, callback receives the code and register is
+// pre-authentication, so the bearer-token check skips them whatever the prefix
+const publicRoute = { [kPublicRoute]: true }
+
 const authRoutesPlugin: FastifyPluginAsync<AuthRoutesOptions> = async (fastify: FastifyInstance, opts) => {
   const { sessionStore } = opts
 
   // Initiate OAuth authorization flow
   fastify.get('/oauth/authorize', {
+    config: publicRoute,
     schema: {
       querystring: AuthorizeQuerystring
     }
@@ -162,6 +167,7 @@ const authRoutesPlugin: FastifyPluginAsync<AuthRoutesOptions> = async (fastify: 
 
   // Handle OAuth callback
   fastify.get('/oauth/callback', {
+    config: publicRoute,
     schema: {
       querystring: CallbackQuerystring,
       response: {
@@ -344,6 +350,7 @@ const authRoutesPlugin: FastifyPluginAsync<AuthRoutesOptions> = async (fastify: 
   // (Using oauth-client.dynamicClientRegistration here would cause an infinite loop
   // if OIDC discovery points back to this server.)
   fastify.post('/oauth/register', {
+    config: publicRoute,
     schema: {
       body: DynamicRegistrationRequest,
       response: {
