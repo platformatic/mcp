@@ -51,6 +51,7 @@ import type { JsonSchemaValidator } from './validation/json-schema-validator.ts'
 import { sanitizeToolParams, assessToolSecurity } from './security.ts'
 import { MCP_ATTR, type SpanAttributeValue } from './telemetry-constants.ts'
 import { isStdioRequest } from './stdio-marker.ts'
+import { isTemplateUri, compileUriTemplate, matchUriTemplate } from './uri-template.ts'
 
 // Lazy-loaded telemetry module — only imported when a tracer is configured
 let _telemetry: typeof import('./telemetry.ts') | undefined
@@ -279,73 +280,6 @@ async function handleToolsList (request: JSONRPCRequest, dependencies: HandlerDe
     nextCursor: undefined
   }
   return createResponse(request.id, result)
-}
-
-const URI_TEMPLATE_REGEX = /\{[^}]+\}/
-
-function isTemplateUri (uri: string): boolean {
-  return URI_TEMPLATE_REGEX.test(uri)
-}
-
-interface CompiledUriTemplate {
-  regex: RegExp
-  names: string[]
-}
-
-const compiledUriTemplates = new Map<string, CompiledUriTemplate | null>()
-
-/**
- * Compile an RFC 6570 level-1 template (`{name}` placeholders only) into an
- * anchored regex. Each placeholder matches one non-empty, slash-bounded
- * segment; everything else must match literally. Templates using operators
- * (`{+x}`, `{?x}`, ...) are not supported and never match.
- */
-function compileUriTemplate (template: string): CompiledUriTemplate | null {
-  let compiled = compiledUriTemplates.get(template)
-  if (compiled !== undefined) return compiled
-
-  const names: string[] = []
-  let source = '^'
-  let lastIndex = 0
-  let supported = true
-  for (const match of template.matchAll(/\{([^}]*)\}/g)) {
-    const name = match[1]
-    if (!/^[A-Za-z0-9_]+$/.test(name)) {
-      supported = false
-      break
-    }
-    source += escapeRegExp(template.slice(lastIndex, match.index)) + '([^/]+)'
-    names.push(name)
-    lastIndex = match.index + match[0].length
-  }
-  source += escapeRegExp(template.slice(lastIndex)) + '$'
-
-  compiled = supported ? { regex: new RegExp(source), names } : null
-  compiledUriTemplates.set(template, compiled)
-  return compiled
-}
-
-function escapeRegExp (value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-}
-
-function matchUriTemplate (template: string, uri: string): Record<string, string> | null {
-  const compiled = compileUriTemplate(template)
-  if (!compiled) return null
-
-  const match = compiled.regex.exec(uri)
-  if (!match) return null
-
-  const params: Record<string, string> = {}
-  compiled.names.forEach((name, i) => {
-    const raw = match[i + 1]
-    try {
-      params[name] = decodeURIComponent(raw)
-    } catch {
-      params[name] = raw
-    }
-  })
-  return params
 }
 
 // Fields shared by the spec Resource and ResourceTemplate shapes. Anything else
@@ -779,16 +713,20 @@ async function handleResourcesRead (
     }
   }
 
-  // Otherwise look for a registered template the concrete URI expands from
+  // Otherwise look for a registered template the concrete URI expands from,
+  // preferring the one with the most literal characters (ties: registration order)
   let uriParams: Record<string, string> | undefined
   if (!resource) {
+    let bestLiteralLength = -1
     for (const candidate of resources.values()) {
       if (!isTemplateUri(candidate.definition.uri)) continue
-      const params = matchUriTemplate(candidate.definition.uri, uri)
+      const compiled = compileUriTemplate(candidate.definition.uri)
+      if (compiled.literalLength <= bestLiteralLength) continue
+      const params = matchUriTemplate(compiled, uri)
       if (params) {
         resource = candidate
         uriParams = params
-        break
+        bestLiteralLength = compiled.literalLength
       }
     }
   }
