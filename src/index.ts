@@ -63,6 +63,24 @@ declare module 'fastify' {
   }
 }
 
+const TOOL_ARGUMENT_LIMIT_FIELDS = ['maxStringLength', 'maxObjectProperties', 'maxArrayLength', 'maxDepth'] as const
+
+// The limits are compared with `>`, so NaN (e.g. Number(process.env.X) with X
+// unset) would make every comparison false and silently remove the limit
+function validateToolArgumentLimits (limits: unknown): void {
+  if (limits === undefined) return
+  if (limits === null || typeof limits !== 'object' || Array.isArray(limits)) {
+    throw new TypeError('toolArgumentLimits must be an object')
+  }
+  for (const field of TOOL_ARGUMENT_LIMIT_FIELDS) {
+    const value = (limits as Record<string, unknown>)[field]
+    if (value === undefined || value === Infinity) continue
+    if (!Number.isInteger(value) || (value as number) < 1) {
+      throw new TypeError(`toolArgumentLimits.${field} must be a positive integer or Infinity`)
+    }
+  }
+}
+
 const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOptions) {
   // A single string would make the allow-list check a substring match, so fail loudly
   const allowedOrigins: unknown = opts.allowedOrigins
@@ -102,6 +120,7 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     // Checked before any Redis connection is opened, so a bad value cannot leak one
     validateTaskLimit('taskMaxRetainedPerPrincipal', opts.taskMaxRetainedPerPrincipal)
   }
+  validateToolArgumentLimits(opts.toolArgumentLimits)
   const tools = new Map<string, MCPTool>()
   const resources = new Map<string, MCPResource>()
   const prompts = new Map<string, MCPPrompt>()
