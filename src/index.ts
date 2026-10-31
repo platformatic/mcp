@@ -2,6 +2,7 @@ import type { FastifyInstance, preHandlerHookHandler } from 'fastify'
 import fp from 'fastify-plugin'
 import { Redis } from 'ioredis'
 import type { SessionStore } from './stores/session-store.ts'
+import { validateStoreLimit } from './stores/session-store.ts'
 import type { MessageBroker } from './brokers/message-broker.ts'
 import { MemorySessionStore } from './stores/memory-session-store.ts'
 import { MemoryMessageBroker } from './brokers/memory-message-broker.ts'
@@ -98,6 +99,17 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
   if (opts.sessionTtlMs !== undefined && !(Number.isFinite(opts.sessionTtlMs) && opts.sessionTtlMs > 0)) {
     throw new Error('sessionTtlMs must be a positive number of milliseconds')
   }
+  const validateSessionLimit = (name: string, value: unknown): void => {
+    // Validation happens here (before a Redis connection is opened) and inside
+    // the stores, so a bad value cannot leak a connection.
+    validateStoreLimit(name, value)
+  }
+  if (opts.maxSessionsPerPrincipal !== undefined) {
+    validateSessionLimit('maxSessionsPerPrincipal', opts.maxSessionsPerPrincipal)
+  }
+  if (opts.maxResourceSubscriptionsPerSession !== undefined) {
+    validateSessionLimit('maxResourceSubscriptionsPerSession', opts.maxResourceSubscriptionsPerSession)
+  }
   if (opts.taskMaxRetainedPerPrincipal !== undefined) {
     // Checked before any Redis connection is opened, so a bad value cannot leak one
     validateTaskLimit('taskMaxRetainedPerPrincipal', opts.taskMaxRetainedPerPrincipal)
@@ -121,7 +133,13 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     redis.on('error', (err) => {
       app.log.error({ err }, 'Redis connection error')
     })
-    sessionStore = new RedisSessionStore({ redis, maxMessages: 100, sessionTtlMs: opts.sessionTtlMs })
+    sessionStore = new RedisSessionStore({
+      redis,
+      maxMessages: 100,
+      sessionTtlMs: opts.sessionTtlMs,
+      maxSessionsPerPrincipal: opts.maxSessionsPerPrincipal,
+      maxResourceSubscriptionsPerSession: opts.maxResourceSubscriptionsPerSession
+    })
     messageBroker = new RedisMessageBroker(redis, {
       onCloseTimeout: (closeTimeoutMs) => {
         app.log.warn({ closeTimeoutMs }, 'Redis message broker close timed out; forcing disconnect')
@@ -139,7 +157,11 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     }
   } else {
     // Memory implementations for single-instance deployment
-    sessionStore = new MemorySessionStore(100, { sessionTtlMs: opts.sessionTtlMs })
+    sessionStore = new MemorySessionStore(100, {
+      sessionTtlMs: opts.sessionTtlMs,
+      maxSessionsPerPrincipal: opts.maxSessionsPerPrincipal,
+      maxResourceSubscriptionsPerSession: opts.maxResourceSubscriptionsPerSession
+    })
     messageBroker = new MemoryMessageBroker()
     if (enableTasks) {
       taskStore = new MemoryTaskStore({ maxTasksPerPrincipal: opts.taskMaxRetainedPerPrincipal })
@@ -462,8 +484,18 @@ export { RedisTaskStore } from './stores/redis-task-store.ts'
 
 // Session storage, for callers that want to supply or inspect a backend
 export type { SessionStore, SessionMetadata } from './stores/session-store.ts'
-export { MemorySessionStore } from './stores/memory-session-store.ts'
+export {
+  MemorySessionStore
+} from './stores/memory-session-store.ts'
 export { RedisSessionStore } from './stores/redis-session-store.ts'
+export {
+  SessionLimitError,
+  SubscriptionLimitError,
+  SESSION_LIMIT_REACHED,
+  SUBSCRIPTION_LIMIT_REACHED,
+  DEFAULT_MAX_SESSIONS_PER_PRINCIPAL,
+  DEFAULT_MAX_RESOURCE_SUBSCRIPTIONS_PER_SESSION
+} from './stores/session-store.ts'
 
 // In-process MCP client, for exercising a registered server via app.inject()
 export { createMcpClient } from './client.ts'
