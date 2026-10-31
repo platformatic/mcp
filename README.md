@@ -1778,7 +1778,7 @@ Duration semantics also differ by source: `'json-rpc'` and `'in-process'` durati
 
 ## Customizing MCP Route Schemas
 
-Use `transformRouteSchema` to customize Fastify/OpenAPI schema metadata on MCP transport routes without replacing handlers or route definitions.
+Use `transformRouteSchema` to customize Fastify/OpenAPI schema metadata on the routes the plugin registers without replacing handlers or route definitions.
 
 ```typescript
 import Fastify from 'fastify'
@@ -1799,28 +1799,55 @@ await app.register(mcpPlugin, {
 })
 ```
 
-Route IDs are stable and map to MCP transport routes:
+Route IDs are stable and map to the routes registered by the plugin:
 
 | Route ID | Method | Purpose |
 |---|---|---|
 | `mcp.post` | `POST` | MCP JSON-RPC messages |
-| `mcp.get` | `GET` | MCP streaming/SSE connection |
+| `mcp.get` | `GET` | MCP streaming/SSE connection (answers 405 when `enableSSE` is off) |
 | `mcp.delete` | `DELETE` | MCP session termination |
+| `wellKnown.protectedResourceMetadata` | `GET` | `/.well-known/oauth-protected-resource*` (authorization enabled; one call per path) |
+| `wellKnown.resourceHealth` | `GET` | `/.well-known/mcp-resource-health` (authorization enabled) |
+| `wellKnown.preflight` | `OPTIONS` | CORS preflight for `/.well-known/*` (authorization enabled) |
+| `oauth.clientIdMetadataDocument` | `GET` | Client ID Metadata Document (`oauth2Client.clientIdMetadataDocument`) |
+| `oauth.authorize`, `oauth.callback`, `oauth.status` | `GET` | OAuth client routes (`oauth2Client` configured) |
+| `oauth.refresh`, `oauth.validate`, `oauth.register`, `oauth.logout` | `POST` | OAuth client routes (`oauth2Client` configured) |
 
 Behavior notes:
 
-- The callback runs once per registered MCP transport route during startup.
+- The callback runs once per route registered by the plugin during startup.
 - The plugin passes the original route schema object to the callback.
 - Spread the incoming schema when you want to preserve existing fields.
 - The callback is synchronous and must return a schema object.
-- Returned metadata applies only to Fastify/OpenAPI schema fields.
-- OAuth and well-known routes are not customized by this option in this version.
+- The MCP transport routes start from an empty schema. The well-known and OAuth routes pass their `querystring`, `body` and `response` schemas, which Fastify uses for validation and serialization, so spread them instead of replacing them.
 
 Security notes:
 
 - OpenAPI schema metadata does not enforce authentication or authorization.
 - For example, `security: [{ oauth2: ['tools:read'] }]` documents expectations but does not install auth checks.
 - Enforcement still depends on your configured auth hooks, token validation, and tool access controls.
+
+### Hiding MCP routes from OpenAPI / Swagger
+
+If you generate an OpenAPI document with [`@fastify/swagger`](https://github.com/fastify/fastify-swagger) (for example to build a typed client with `openapi-fetch`), you may not want the MCP endpoints in it. Mark every plugin route with `hide: true`:
+
+```typescript
+import Fastify from 'fastify'
+import swagger from '@fastify/swagger'
+import mcpPlugin from '@platformatic/mcp'
+
+const app = Fastify()
+
+await app.register(swagger, { openapi: { info: { title: 'My API', version: '1.0.0' } } })
+await app.register(mcpPlugin, {
+  transformRouteSchema: (schema) => ({ ...schema, hide: true })
+})
+
+await app.ready()
+app.swagger() // no /mcp, /.well-known/* or /oauth/* paths
+```
+
+To hide them with a tag instead, return `{ ...schema, tags: ['X-HIDDEN'] }`; `X-HIDDEN` is `@fastify/swagger`'s default `hiddenTag`. To hide only some routes, check `routeId` before setting `hide`.
 
 ### OAuth Routes
 
