@@ -2442,6 +2442,8 @@ The plugin automatically sanitizes tool parameters to prevent common attacks:
 - **Array length limits:** Unlimited by default
 - **Control character removal:** Strips null bytes and control characters
 - **Circular reference detection:** Prevents infinite loops
+- **Prototype pollution protection:** Special key names (`__proto__`, `constructor`, `prototype`) are copied as plain own data properties, so untrusted input cannot change the prototype of the sanitized arguments
+- **Key collision detection:** If stripping control characters maps two input keys onto the same output key, the request is refused instead of silently dropping one of the values
 
 The limits are configurable with the `toolArgumentLimits` option. Pass `Infinity` to disable one;
 Fastify's `bodyLimit` still caps the total request size. Arguments over a limit are refused with an
