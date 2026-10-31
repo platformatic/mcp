@@ -7,6 +7,7 @@ import mcpPlugin from '../src/index.ts'
 import { MemorySessionStore } from '../src/stores/memory-session-store.ts'
 import { RedisSessionStore } from '../src/stores/redis-session-store.ts'
 import { testWithRedis } from './redis-test-utils.ts'
+import { Redis } from 'ioredis'
 
 async function createApp (t: TestContext, redis?: { host: string, port: number, db: number }): Promise<FastifyInstance> {
   const app = fastify()
@@ -16,7 +17,8 @@ async function createApp (t: TestContext, redis?: { host: string, port: number, 
     serverInfo: { name: 'test', version: '1.0.0' },
     capabilities: { resources: { subscribe: true } },
     enableSSE: true,
-    redis
+    redis,
+    ...(redis ? { requestStateSecret: 'test-request-state-secret-32-bytes!!' } : {})
   })
 
   app.mcpSetResourceSubscribeHandler(async () => ({}))
@@ -217,5 +219,112 @@ describe('resources/updated subscriptions with Redis', () => {
     // Must not recreate a missing session
     await store.addResourceSubscription('missing', 'file:///a.txt')
     t.assert.strictEqual(await redis.exists('session:missing'), 0)
+  })
+})
+
+describe('round 16: legacy resources/unsubscribe', () => {
+  test('only the session holding the subscription runs the unsubscribe handler', async (t: TestContext) => {
+    const app = fastify()
+    t.after(() => app.close())
+    await app.register(mcpPlugin, {
+      serverInfo: { name: 'test', version: '1.0.0' },
+      capabilities: { resources: { subscribe: true } },
+      enableSSE: true
+    })
+    const watched = new Set<string>()
+    const unsubscribedBy: (string | undefined)[] = []
+    app.mcpSetResourceSubscribeHandler(async ({ uri }) => { watched.add(uri); return {} })
+    app.mcpSetResourceUnsubscribeHandler(async ({ uri }, context) => {
+      unsubscribedBy.push(context?.sessionId)
+      watched.delete(uri)
+      return {}
+    })
+
+    const alice = await initSession(app)
+    const bob = await initSession(app)
+    await rpc(app, alice, 'resources/subscribe', 'file:///alice-doc')
+
+    // Another session, and a request with no session at all
+    await rpc(app, bob, 'resources/unsubscribe', 'file:///alice-doc')
+    const sessionless = await app.inject({
+      method: 'POST',
+      url: '/mcp',
+      headers: { 'content-type': 'application/json', accept: 'application/json' },
+      payload: { jsonrpc: '2.0', id: 3, method: 'resources/unsubscribe', params: { uri: 'file:///alice-doc' } }
+    })
+    t.assert.deepStrictEqual(sessionless.json().result, {})
+    t.assert.deepStrictEqual([...watched], ['file:///alice-doc'])
+    t.assert.deepStrictEqual(unsubscribedBy, [])
+
+    await rpc(app, alice, 'resources/unsubscribe', 'file:///alice-doc')
+    t.assert.deepStrictEqual([...watched], [])
+    t.assert.deepStrictEqual(unsubscribedBy, [alice])
+  })
+})
+
+describe('round 17: legacy subscriptions', () => {
+  test('without a session a subscription is refused, so no watcher is left running', async (t: TestContext) => {
+    const app = fastify()
+    t.after(() => app.close())
+    await app.register(mcpPlugin, {
+      serverInfo: { name: 'test', version: '1.0.0' },
+      capabilities: { resources: { subscribe: true } }
+    })
+    const watched = new Set<string>()
+    app.mcpSetResourceSubscribeHandler(async ({ uri }) => { watched.add(uri); return {} })
+    app.mcpSetResourceUnsubscribeHandler(async ({ uri }) => { watched.delete(uri); return {} })
+
+    const send = (id: number, method: string) => app.inject({
+      method: 'POST',
+      url: '/mcp',
+      headers: { 'content-type': 'application/json', accept: 'application/json' },
+      payload: { jsonrpc: '2.0', id, method, params: { uri: 'file:///a' } }
+    })
+    t.assert.strictEqual((await send(1, 'resources/subscribe')).json().error?.code, -32601)
+    await send(2, 'resources/unsubscribe')
+    t.assert.deepStrictEqual([...watched], [])
+  })
+
+  test('a uri that is not a string is refused before the handler sees it', async (t: TestContext) => {
+    const app = await createApp(t)
+    const seen: unknown[] = []
+    app.mcpSetResourceSubscribeHandler(async ({ uri }) => {
+      seen.push(uri)
+      if (uri === 'file:///secret') throw new Error('Forbidden')
+      return {}
+    })
+    app.mcpSetResourceUnsubscribeHandler(async ({ uri }) => { seen.push(uri); return {} })
+    const sessionId = await initSession(app)
+    for (const method of ['resources/subscribe', 'resources/unsubscribe']) {
+      for (const uri of [['file:///secret'], { toString: 'file:///secret' }, 42, '']) {
+        const response = await app.inject({
+          method: 'POST',
+          url: '/mcp',
+          headers: { 'content-type': 'application/json', accept: 'application/json', 'mcp-session-id': sessionId },
+          payload: { jsonrpc: '2.0', id: 2, method, params: { uri } }
+        })
+        t.assert.strictEqual(response.json().error?.code, -32602, `${method} ${JSON.stringify(uri)}`)
+      }
+    }
+    t.assert.deepStrictEqual(seen, [])
+  })
+
+  testWithRedis('deployments on other Redis databases do not hear each other', async (redis, t) => {
+    const config = { host: redis.options.host!, port: redis.options.port!, db: redis.options.db! }
+    const other = new Redis({ ...config, db: config.db + 10 })
+    t.after(async () => { await other.flushdb(); other.disconnect() })
+    await other.flushdb()
+    const tenantA = await createApp(t, { ...config, db: config.db + 10 })
+    const tenantB = await createApp(t, config)
+    await tenantA.ready()
+
+    const sessionId = await initSession(tenantB)
+    await rpc(tenantB, sessionId, 'resources/subscribe', 'file:///config.json')
+    const stream = await openStream(t, tenantB, sessionId)
+    await tenantA.mcpBroadcastNotification(resourceUpdated('file:///config.json#tenant-a'))
+    await tenantA.mcpBroadcastNotification({ jsonrpc: '2.0', method: 'notifications/tools/list_changed', params: { from: 'tenant-a' } })
+    await tenantB.mcpBroadcastNotification(resourceUpdated('file:///config.json'))
+    const seen = await readUntil(stream, '"uri":"file:///config.json"')
+    t.assert.doesNotMatch(seen, /tenant-a/)
   })
 })

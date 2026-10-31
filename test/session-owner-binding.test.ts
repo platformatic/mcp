@@ -5,7 +5,7 @@ import type { Redis } from 'ioredis'
 import mcpPlugin from '../src/index.ts'
 import { MemorySessionStore } from '../src/stores/memory-session-store.ts'
 import { RedisSessionStore } from '../src/stores/redis-session-store.ts'
-import { JSONRPC_VERSION, LATEST_PROTOCOL_VERSION } from '../src/schema.ts'
+import { JSONRPC_VERSION, LATEST_LEGACY_PROTOCOL_VERSION } from '../src/schema.ts'
 import { createTestJWT, setupMockAgent, generateMockJWKSResponse } from './auth-test-utils.ts'
 import { testWithRedis } from './redis-test-utils.ts'
 
@@ -41,13 +41,15 @@ async function buildApp (t: TestContext, redis?: Redis, options: BuildOptions = 
       resourceUri: 'https://mcp.example.com',
       protectedRoutes: options.protectedRoutes,
       tokenValidation: {
-        jwksUri: 'https://auth.example.com/.well-known/jwks.json',
+        // Every issuer here signs with the same test key, published once.
+        jwksUri: Object.fromEntries((options.authorizationServers ?? ['https://auth.example.com'])
+          .map(issuer => [issuer, 'https://auth.example.com/.well-known/jwks.json'])),
         introspectionEndpoint: options.introspectionEndpoint,
         validateAudience: true
       }
     },
     ...(redis
-      ? { redis: { host: redis.options.host!, port: redis.options.port!, db: redis.options.db! } }
+      ? { redis: { host: redis.options.host!, port: redis.options.port!, db: redis.options.db! }, requestStateSecret: 'session-owner-binding-test-secret-0123456789' }
       : {})
   })
 
@@ -73,7 +75,7 @@ async function initialize (app: Awaited<ReturnType<typeof buildApp>>, token: str
       id: 1,
       method: 'initialize',
       params: {
-        protocolVersion: LATEST_PROTOCOL_VERSION,
+        protocolVersion: LATEST_LEGACY_PROTOCOL_VERSION,
         capabilities: {},
         clientInfo: { name: 'test', version: '1.0.0' }
       }
@@ -93,7 +95,7 @@ function callWhoami (app: Awaited<ReturnType<typeof buildApp>>, token: string, s
     headers: {
       authorization: `Bearer ${token}`,
       'mcp-session-id': sessionId,
-      'mcp-protocol-version': LATEST_PROTOCOL_VERSION
+      'mcp-protocol-version': LATEST_LEGACY_PROTOCOL_VERSION
     },
     payload: {
       jsonrpc: JSONRPC_VERSION,
@@ -281,7 +283,7 @@ describe('Session owner binding', () => {
         id: 1,
         method: 'initialize',
         params: {
-          protocolVersion: LATEST_PROTOCOL_VERSION,
+          protocolVersion: LATEST_LEGACY_PROTOCOL_VERSION,
           capabilities: {},
           clientInfo: { name: 'test', version: '1.0.0' }
         }
@@ -293,10 +295,49 @@ describe('Session owner binding', () => {
     const ping = await app.inject({
       method: 'POST',
       url: '/mcp',
-      headers: { 'mcp-session-id': sessionId, 'mcp-protocol-version': LATEST_PROTOCOL_VERSION },
+      headers: { 'mcp-session-id': sessionId, 'mcp-protocol-version': LATEST_LEGACY_PROTOCOL_VERSION },
       payload: { jsonrpc: JSONRPC_VERSION, id: 2, method: 'ping' }
     })
     t.assert.strictEqual(ping.statusCode, 200)
+  })
+
+  test('with resolveAuthorizationContext, a session belongs to the resolved user', async (t: TestContext) => {
+    const app = Fastify({ logger: false })
+    t.after(() => app.close())
+    await app.register(mcpPlugin, {
+      capabilities: { tools: {} },
+      enableSSE: true,
+      resolveAuthorizationContext: async (request) => {
+        const user = request.headers['x-user']
+        return typeof user === 'string' ? { userId: user, authorizationServer: 'https://app.example.com' } : undefined
+      }
+    })
+    await app.ready()
+    const headers = (user: string, sessionId?: string) => ({
+      'x-user': user,
+      'mcp-protocol-version': LATEST_LEGACY_PROTOCOL_VERSION,
+      ...(sessionId ? { 'mcp-session-id': sessionId } : {})
+    })
+
+    const init = await app.inject({
+      method: 'POST',
+      url: '/mcp',
+      headers: headers('alice'),
+      payload: { jsonrpc: JSONRPC_VERSION, id: 1, method: 'initialize', params: { protocolVersion: LATEST_LEGACY_PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: 'c', version: '1' } } }
+    })
+    const sessionId = init.headers['mcp-session-id'] as string
+    t.assert.ok(sessionId)
+
+    const bobStream = await app.inject({ method: 'GET', url: '/mcp', payloadAsStream: true, headers: { ...headers('bob', sessionId), accept: 'text/event-stream' } })
+    bobStream.stream().destroy()
+    t.assert.strictEqual(bobStream.statusCode, 404)
+    const bobPost = await app.inject({ method: 'POST', url: '/mcp', headers: headers('bob', sessionId), payload: { jsonrpc: JSONRPC_VERSION, id: 2, method: 'ping' } })
+    t.assert.strictEqual(bobPost.statusCode, 404)
+    const bobDelete = await app.inject({ method: 'DELETE', url: '/mcp', headers: headers('bob', sessionId) })
+    t.assert.strictEqual(bobDelete.statusCode, 404)
+
+    const alicePost = await app.inject({ method: 'POST', url: '/mcp', headers: headers('alice', sessionId), payload: { jsonrpc: JSONRPC_VERSION, id: 3, method: 'ping' } })
+    t.assert.strictEqual(alicePost.statusCode, 200)
   })
 
   test('memory session store keeps the owner', async (t: TestContext) => {
@@ -314,5 +355,42 @@ describe('Session owner binding', () => {
     t.assert.strictEqual((await store.get('s1'))?.ownerIss, 'https://auth.example.com')
     t.assert.strictEqual((await store.get('s2'))?.ownerSub, undefined)
     t.assert.strictEqual((await store.get('s2'))?.ownerIss, undefined)
+  })
+})
+
+describe('round 12: session owners include the OAuth client and a string subject', () => {
+  const trusted = { sub: 'alice', client_id: 'trusted-app' }
+  const other = { sub: 'alice', client_id: 'other-app' }
+
+  test('another app acting for the same user cannot use the session', async (t: TestContext) => {
+    await assertHijackRejected(t, undefined, undefined, trusted, other)
+  })
+
+  testWithRedis('another app acting for the same user cannot use the session (redis)', async (redis, t: TestContext) => {
+    await assertHijackRejected(t, redis, undefined, trusted, other)
+  })
+
+  test('the same app keeps using its session', async (t: TestContext) => {
+    const app = await buildApp(t)
+    const sessionId = await initialize(app, createTestJWT(trusted))
+    const response = await callWhoami(app, createTestJWT(trusted), sessionId)
+    t.assert.strictEqual(response.statusCode, 200, response.body)
+  })
+
+  test('a token whose sub is not a string opens no session', async (t: TestContext) => {
+    const app = await buildApp(t)
+    const response = await app.inject({
+      method: 'POST',
+      url: '/mcp',
+      headers: { authorization: `Bearer ${createTestJWT({ sub: 12345 } as any)}` },
+      payload: {
+        jsonrpc: JSONRPC_VERSION,
+        id: 1,
+        method: 'initialize',
+        params: { protocolVersion: LATEST_LEGACY_PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: 'test', version: '1.0.0' } }
+      }
+    })
+    t.assert.strictEqual(response.statusCode, 401, response.body)
+    t.assert.strictEqual(response.headers['mcp-session-id'], undefined)
   })
 })

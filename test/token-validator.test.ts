@@ -1,7 +1,9 @@
 import { test, describe, beforeEach, afterEach } from 'node:test'
 import type { TestContext } from 'node:test'
 import Fastify from 'fastify'
+import { createServer } from 'node:http'
 import { TokenValidator } from '../src/auth/token-validator.ts'
+import { JwksCache } from '../src/auth/jwks.ts'
 import {
   createTestAuthConfig,
   createTestJWT,
@@ -842,5 +844,342 @@ describe('TokenValidator', () => {
       t.assert.strictEqual(result.error, 'Missing subject claim')
       validator.close()
     })
+  })
+})
+
+describe('round 12: signing keys', () => {
+  test('tokens naming unknown signing keys do not each fetch the key set', async (t: TestContext) => {
+    let fetches = 0
+    const jwks = JSON.stringify(generateMockJWKSResponse())
+    const server = createServer((_req, res) => { fetches++; res.setHeader('content-type', 'application/json'); res.end(jwks) })
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+    t.after(() => server.close())
+    const { port } = server.address() as { port: number }
+    const app = Fastify({ logger: false })
+    t.after(() => app.close())
+    const validator = new TokenValidator(createTestAuthConfig({
+      tokenValidation: { jwksUri: `http://127.0.0.1:${port}/jwks.json`, validateAudience: true }
+    }), app)
+    t.after(() => validator.close())
+
+    t.assert.strictEqual((await validator.validateToken(createTestJWT({ kid: 'forged-0' } as any))).valid, false)
+    t.assert.strictEqual(fetches, 1)
+    for (let i = 1; i <= 10; i++) {
+      t.assert.strictEqual((await validator.validateToken(createTestJWT({ kid: `forged-${i % 2}` } as any))).valid, false)
+    }
+    t.assert.strictEqual(fetches, 1)
+
+    // The real key came with that one fetch, so forged tokens never lock it out.
+    const real = await validator.validateToken(createTestJWT())
+    t.assert.strictEqual(real.valid, true, real.error)
+    t.assert.strictEqual(fetches, 1)
+  })
+
+  test('a key rotated in is picked up by the next refresh a token may cause', async (t: TestContext) => {
+    let fetches = 0
+    let keys: unknown[] = [{ ...generateMockJWKSResponse().keys[0], kid: 'old' }]
+    const server = createServer((_req, res) => { fetches++; res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ keys })) })
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+    t.after(() => server.close())
+    const { port } = server.address() as { port: number }
+    const cache = new JwksCache(`http://127.0.0.1:${port}/jwks.json`, { minRefreshMs: 100 })
+
+    t.assert.match(await cache.getPublicKey('old', 'RS256'), /BEGIN PUBLIC KEY/)
+    keys = [...keys, { ...generateMockJWKSResponse().keys[0], kid: 'new' }]
+    await t.assert.rejects(cache.getPublicKey('new', 'RS256'), /No matching signing key/)
+    t.assert.strictEqual(fetches, 1)
+    await new Promise(resolve => setTimeout(resolve, 120))
+    t.assert.match(await cache.getPublicKey('new', 'RS256'), /BEGIN PUBLIC KEY/)
+    t.assert.strictEqual(fetches, 2)
+  })
+
+  test('a JWT whose sub is not a non-empty string is refused', async (t: TestContext) => {
+    const restore = setupMockAgent({ 'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse() })
+    t.after(restore)
+    const app = Fastify({ logger: false })
+    t.after(() => app.close())
+    const validator = new TokenValidator(createTestAuthConfig(), app)
+    t.after(() => validator.close())
+    for (const sub of [12345, '', { id: 'alice' }]) {
+      const result = await validator.validateToken(createTestJWT({ sub } as any))
+      t.assert.strictEqual(result.valid, false, JSON.stringify(sub))
+      t.assert.strictEqual(result.error, 'Invalid subject claim')
+    }
+  })
+})
+
+describe('round 13: signing keys', () => {
+  test('tokens arriving while the key set is being fetched wait for it', async (t: TestContext) => {
+    let fetches = 0
+    let keys: unknown[] = [{ ...generateMockJWKSResponse().keys[0], kid: 'old' }]
+    const server = createServer((_req, res) => {
+      fetches++
+      // Slow enough that the other callers arrive while it is in flight.
+      setTimeout(() => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ keys })) }, 100)
+    })
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+    t.after(() => server.close())
+    const { port } = server.address() as { port: number }
+    const cache = new JwksCache(`http://127.0.0.1:${port}/jwks.json`, { minRefreshMs: 50 })
+
+    // A cold start: nothing fetched yet.
+    const cold = await Promise.allSettled(Array.from({ length: 5 }, () => cache.getPublicKey('old', 'RS256')))
+    t.assert.deepStrictEqual(cold.map(result => result.status), Array(5).fill('fulfilled'))
+    t.assert.strictEqual(fetches, 1)
+
+    // A rotation: the first token naming the new key starts the fetch.
+    await new Promise(resolve => setTimeout(resolve, 60))
+    keys = [...keys, { ...generateMockJWKSResponse().keys[0], kid: 'new' }]
+    const rotated = await Promise.allSettled(Array.from({ length: 4 }, () => cache.getPublicKey('new', 'RS256')))
+    t.assert.deepStrictEqual(rotated.map(result => result.status), Array(4).fill('fulfilled'))
+    t.assert.strictEqual(fetches, 2)
+  })
+})
+
+describe('round 14: signing keys', () => {
+  test('a cached key does not wait for a fetch made for an unknown one', async (t: TestContext) => {
+    let fetches = 0
+    const keys = [{ ...generateMockJWKSResponse().keys[0], kid: 'good' }]
+    const server = createServer((_req, res) => {
+      // The first fetch is quick; the server then becomes very slow.
+      const delay = fetches++ === 0 ? 0 : 2_000
+      setTimeout(() => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ keys })) }, delay)
+    })
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+    t.after(() => { server.closeAllConnections(); server.close() })
+    const { port } = server.address() as { port: number }
+    const cache = new JwksCache(`http://127.0.0.1:${port}/jwks.json`, { minRefreshMs: 0 })
+
+    await cache.getPublicKey('good', 'RS256')
+    const unknown = cache.getPublicKey('made-up', 'RS256').catch(() => {})
+    const startedAt = Date.now()
+    await cache.getPublicKey('good', 'RS256')
+    t.assert.ok(Date.now() - startedAt < 500, `took ${Date.now() - startedAt}ms`)
+    await unknown
+  })
+
+  test('a failed first fetch does not refuse every token until the next refresh is allowed', async (t: TestContext) => {
+    let fetches = 0
+    const keys = [{ ...generateMockJWKSResponse().keys[0], kid: 'good' }]
+    const server = createServer((_req, res) => {
+      if (fetches++ === 0) {
+        res.statusCode = 503
+        res.end()
+        return
+      }
+      res.setHeader('content-type', 'application/json')
+      res.end(JSON.stringify({ keys }))
+    })
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+    t.after(() => server.close())
+    const { port } = server.address() as { port: number }
+    const cache = new JwksCache(`http://127.0.0.1:${port}/jwks.json`)
+
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() })
+    await t.assert.rejects(cache.getPublicKey('good', 'RS256'))
+    // Until a set has been fetched the next attempt waits one second, not minRefreshMs
+    t.mock.timers.tick(1000)
+    t.assert.match(await cache.getPublicKey('good', 'RS256'), /BEGIN PUBLIC KEY/)
+    t.assert.strictEqual(fetches, 2)
+  })
+})
+
+describe('round 15: issuers, introspection and key sets', () => {
+  const OTHER = 'https://other.example.com'
+
+  test('a key from one authorization server does not vouch for a token naming another', async (t: TestContext) => {
+    const restore = setupMockAgent({ 'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse() })
+    t.after(restore)
+    const app = Fastify({ logger: false })
+    t.after(() => app.close())
+    // One key set, which belongs to the first server.
+    const validator = new TokenValidator(createTestAuthConfig({ authorizationServers: ['https://auth.example.com', OTHER] }), app)
+    t.assert.strictEqual((await validator.validateToken(createTestJWT())).valid, true)
+    t.assert.strictEqual((await validator.validateToken(createTestJWT({ iss: OTHER }))).valid, false)
+  })
+
+  test('each issuer can be given its own key set', async (t: TestContext) => {
+    const restore = setupMockAgent({
+      'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse(),
+      'https://other.example.com/jwks.json': generateMockJWKSResponse()
+    })
+    t.after(restore)
+    const app = Fastify({ logger: false })
+    t.after(() => app.close())
+    const validator = new TokenValidator(createTestAuthConfig({
+      authorizationServers: ['https://auth.example.com', OTHER],
+      tokenValidation: {
+        jwksUri: { 'https://auth.example.com': 'https://auth.example.com/.well-known/jwks.json', [OTHER]: 'https://other.example.com/jwks.json' },
+        validateAudience: true
+      }
+    }), app)
+    const fromOther = await validator.validateToken(createTestJWT({ iss: OTHER }))
+    t.assert.strictEqual(fromOther.valid, true)
+    t.assert.strictEqual(fromOther.issuer, OTHER)
+  })
+
+  test('introspection treats any active value but true as inactive', async (t: TestContext) => {
+    const restore = setupMockAgent({ 'https://auth.example.com/introspect': createIntrospectionResponse('false' as any) })
+    t.after(restore)
+    const app = Fastify({ logger: false })
+    t.after(() => app.close())
+    const validator = new TokenValidator(createTestAuthConfig({
+      tokenValidation: { introspectionEndpoint: 'https://auth.example.com/introspect', validateAudience: true }
+    }), app)
+    const result = await validator.validateToken('opaque-token')
+    t.assert.strictEqual(result.valid, false)
+  })
+
+  test('introspection is bounded by a timeout', async (t: TestContext) => {
+    let signal: AbortSignal | undefined
+    t.mock.method(globalThis, 'fetch', async (_url: unknown, init?: RequestInit) => {
+      signal = init?.signal ?? undefined
+      return new Response(JSON.stringify(createIntrospectionResponse(true)), { headers: { 'content-type': 'application/json' } })
+    })
+    const app = Fastify({ logger: false })
+    t.after(() => app.close())
+    const validator = new TokenValidator(createTestAuthConfig({
+      tokenValidation: { introspectionEndpoint: 'https://auth.example.com/introspect', validateAudience: true }
+    }), app)
+    await validator.validateToken('opaque-token')
+    t.assert.ok(signal instanceof AbortSignal, 'introspection fetch has no abort signal')
+  })
+
+  test('an unreachable key set is not fetched again for every token', async (t: TestContext) => {
+    let fetches = 0
+    const server = createServer((_req, res) => {
+      fetches++
+      res.statusCode = 503
+      res.end()
+    })
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+    t.after(() => server.close())
+    const { port } = server.address() as { port: number }
+    const cache = new JwksCache(`http://127.0.0.1:${port}/jwks.json`)
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() })
+    for (let i = 0; i < 10; i++) await cache.getPublicKey(`kid-${i}`, 'RS256').catch(() => {})
+    t.assert.strictEqual(fetches, 1)
+  })
+
+  test('a key published for encryption does not verify signatures', async (t: TestContext) => {
+    const keys = generateMockJWKSResponse().keys.map((key: Record<string, unknown>) => ({ ...key, use: 'enc' }))
+    const restore = setupMockAgent({ 'https://auth.example.com/.well-known/jwks.json': { keys } })
+    t.after(restore)
+    const app = Fastify({ logger: false })
+    t.after(() => app.close())
+    const validator = new TokenValidator(createTestAuthConfig(), app)
+    t.assert.strictEqual((await validator.validateToken(createTestJWT())).valid, false)
+  })
+})
+
+describe('round 16: key set refresh', () => {
+  test('a key already held is served while the due set is fetched behind it', async (t: TestContext) => {
+    const key = generateMockJWKSResponse().keys[0]
+    let fetches = 0
+    let release: (() => void) | undefined
+    const refetched = Promise.withResolvers<void>()
+    const server = createServer((_req, res) => {
+      fetches++
+      const send = () => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ keys: [{ ...key, kid: fetches === 1 ? 'k' : 'rotated' }] })) }
+      // Every fetch after the first hangs until the test lets it go
+      if (fetches === 1) return send()
+      release = send
+      refetched.resolve()
+    })
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+    t.after(() => server.close())
+    const { port } = server.address() as { port: number }
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() })
+    const cache = new JwksCache(`http://127.0.0.1:${port}/jwks.json`, { ttlMs: 1000 })
+
+    await cache.getPublicKey('k', 'RS256')
+    t.mock.timers.tick(1001)
+    let served = 0
+    const serving = Promise.all(Array.from({ length: 5 }, () => cache.getPublicKey('k', 'RS256').then(() => { served++ })))
+    await refetched.promise
+    t.assert.strictEqual(fetches, 2)
+    try {
+      // Answered while the fetch is still hanging
+      t.assert.strictEqual(served, 5)
+    } finally {
+      release!()
+      await serving
+    }
+
+    // Once the new set is in, a key it dropped is gone
+    await t.assert.rejects(async () => {
+      for (;;) {
+        await cache.getPublicKey('k', 'RS256')
+        await new Promise(resolve => setImmediate(resolve))
+      }
+    }, /No matching signing key/)
+    t.assert.ok(await cache.getPublicKey('rotated', 'RS256'))
+  })
+})
+
+describe('round 17: how long a key set is trusted', () => {
+  async function until (check: () => boolean): Promise<void> {
+    for (let attempt = 0; attempt < 1000 && !check(); attempt++) await new Promise(resolve => setImmediate(resolve))
+  }
+
+  test('a set that cannot be refreshed is used for one more ttl, then refused', async (t: TestContext) => {
+    const key = generateMockJWKSResponse().keys[0]
+    let fetches = 0
+    const server = createServer((_req, res) => {
+      fetches++
+      if (fetches > 1) {
+        res.statusCode = 503
+        return res.end()
+      }
+      res.setHeader('content-type', 'application/json')
+      res.end(JSON.stringify({ keys: [{ ...key, kid: 'k' }] }))
+    })
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+    t.after(() => server.close())
+    const { port } = server.address() as { port: number }
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() })
+    const cache = new JwksCache(`http://127.0.0.1:${port}/jwks.json`, { ttlMs: 1000 })
+
+    await cache.getPublicKey('k', 'RS256')
+    t.mock.timers.tick(1500)
+    t.assert.ok(await cache.getPublicKey('k', 'RS256'))
+    // Let the background refresh fail
+    await until(() => fetches >= 2)
+    t.assert.ok(await cache.getPublicKey('k', 'RS256'))
+
+    t.mock.timers.tick(1000)
+    await t.assert.rejects(cache.getPublicKey('k', 'RS256'), /could not be refreshed/)
+  })
+
+  test('past the grace period a held key waits for the fetch, which can remove it', async (t: TestContext) => {
+    const key = generateMockJWKSResponse().keys[0]
+    let fetches = 0
+    let release: (() => void) | undefined
+    const refetched = Promise.withResolvers<void>()
+    const server = createServer((_req, res) => {
+      fetches++
+      const send = () => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ keys: [{ ...key, kid: fetches === 1 ? 'k' : 'rotated' }] })) }
+      if (fetches === 1) return send()
+      release = send
+      refetched.resolve()
+    })
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+    t.after(() => server.close())
+    const { port } = server.address() as { port: number }
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() })
+    const cache = new JwksCache(`http://127.0.0.1:${port}/jwks.json`, { ttlMs: 1000 })
+
+    await cache.getPublicKey('k', 'RS256')
+    t.mock.timers.tick(2001)
+    let settled = false
+    const lookup = cache.getPublicKey('k', 'RS256').finally(() => { settled = true })
+    lookup.catch(() => {})
+    await refetched.promise
+    try {
+      t.assert.strictEqual(settled, false)
+    } finally {
+      release!()
+    }
+    await t.assert.rejects(lookup, /No matching signing key/)
   })
 })

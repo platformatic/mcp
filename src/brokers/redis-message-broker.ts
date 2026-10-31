@@ -4,6 +4,7 @@ import type { JSONRPCMessage } from '../schema.ts'
 import type { MessageBroker } from './message-broker.ts'
 
 const DEFAULT_CLOSE_TIMEOUT_MS = 2000
+const SUBSCRIBE_READY_TIMEOUT_MS = 500
 
 interface RedisConnLike {
   disconnect (): unknown
@@ -31,6 +32,12 @@ interface RedisMQEmitter extends ReturnType<typeof MQEmitterRedis> {
 }
 
 export interface RedisMessageBrokerOptions {
+  /**
+   * Prepended, as a first topic level, to every topic. Redis pub/sub
+   * channels ignore the database number, so without one two deployments on
+   * one server receive each other's messages.
+   */
+  channelPrefix?: string
   /** Bound on how long close() waits for a graceful shutdown, in ms (default 2000). */
   closeTimeoutMs?: number
   /** Called with closeTimeoutMs when close() falls back to a forced disconnect after it elapses. */
@@ -44,6 +51,7 @@ export class RedisMessageBroker implements MessageBroker {
   private readonly closeTimeoutMs: number
   private readonly onCloseTimeout?: (closeTimeoutMs: number) => void
   private closePromise: Promise<void> | null = null
+  private readonly channelPrefix: string
 
   /**
    * @param redis Redis connection duplicated (all ioredis options: host, port, auth, db, tls, …) for the MQEmitter pub/sub connections.
@@ -60,6 +68,7 @@ export class RedisMessageBroker implements MessageBroker {
       pubConn: redis.duplicate()
     })
     this.closeTimeoutMs = options.closeTimeoutMs ?? DEFAULT_CLOSE_TIMEOUT_MS
+    this.channelPrefix = options.channelPrefix ? `${options.channelPrefix}/` : ''
     this.onCloseTimeout = options.onCloseTimeout
     // mqemitter-redis re-emits pub/sub connection errors on `state`; without a listener a Redis
     // restart would crash the process with an unhandled 'error' event. ioredis reconnects on its own.
@@ -77,7 +86,7 @@ export class RedisMessageBroker implements MessageBroker {
 
   async publish (topic: string, message: JSONRPCMessage): Promise<void> {
     return new Promise((resolve, reject) => {
-      this.emitter.emit({ topic, message }, (err) => {
+      this.emitter.emit({ topic: this.channelPrefix + topic, message }, (err) => {
         if (err) {
           reject(err)
         } else {
@@ -89,17 +98,29 @@ export class RedisMessageBroker implements MessageBroker {
 
   async subscribe (topic: string, handler: (message: JSONRPCMessage) => void): Promise<void> {
     return new Promise((resolve) => {
-      this.emitter.on(topic, (packet, cb) => {
+      let settled = false
+      const finish = () => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        resolve()
+      }
+      // A real Redis subscription normally confirms immediately. Bound the
+      // readiness wait so a partially responsive Redis endpoint cannot hang
+      // plugin registration forever.
+      const timer = setTimeout(finish, SUBSCRIBE_READY_TIMEOUT_MS)
+      timer.unref()
+
+      this.emitter.on(this.channelPrefix + topic, (packet, cb) => {
         handler(packet.message)
         cb()
-      })
-      resolve()
+      }, finish)
     })
   }
 
   async unsubscribe (topic: string): Promise<void> {
     return new Promise((resolve) => {
-      this.emitter.removeAllListeners?.(topic)
+      this.emitter.removeAllListeners?.(this.channelPrefix + topic)
       resolve()
     })
   }

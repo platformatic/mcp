@@ -1,0 +1,937 @@
+import { test, describe } from 'node:test'
+import type { TestContext } from 'node:test'
+import { EventEmitter } from 'node:events'
+import { setTimeout as delay } from 'node:timers/promises'
+import {
+  encodeHeaderValue,
+  decodeHeaderValue,
+  expectedNameFor,
+  collectHeaderParams,
+  validateStandardHeaders,
+  validateToolParamHeaders
+} from '../src/modern/headers.ts'
+import { RequestStateSealer, digestRequest } from '../src/modern/request-state.ts'
+import { SubscriptionRegistry, invalidFilter, negotiateFilter, matchesFilter } from '../src/modern/subscriptions.ts'
+import { TaskInputChannel } from '../src/modern/task-inputs.ts'
+import { parseRequestContext, bodyClaimsModern, isModernRequest } from '../src/modern/request-meta.ts'
+import { isModernRevision } from '../src/protocol-version.ts'
+import {
+  META_PROTOCOL_VERSION,
+  META_CLIENT_CAPABILITIES,
+  META_CLIENT_INFO
+} from '../src/schema-2026.ts'
+import { JSONRPC_VERSION } from '../src/schema.ts'
+import { AnswerValidator, normalizeAnswerSchema } from '../src/modern/answer-validator.ts'
+import { RequestStream } from '../src/modern/request-stream.ts'
+
+describe('header value encoding', () => {
+  test('plain ASCII values ride literally', (t: TestContext) => {
+    t.assert.strictEqual(encodeHeaderValue('us-west1'), 'us-west1')
+    t.assert.strictEqual(decodeHeaderValue('us-west1'), 'us-west1')
+  })
+
+  test('non-ASCII, padded and control values use the Base64 sentinel', (t: TestContext) => {
+    for (const value of ['Hello, 世界', ' padded ', 'line1\nline2']) {
+      const encoded = encodeHeaderValue(value)
+      t.assert.ok(encoded.startsWith('=?base64?'), `${value} should be encoded`)
+      t.assert.ok(encoded.endsWith('?='))
+      t.assert.strictEqual(decodeHeaderValue(encoded), value)
+    }
+  })
+
+  test('a literal that looks like the sentinel is encoded to stay unambiguous', (t: TestContext) => {
+    const literal = '=?base64?literal?='
+    const encoded = encodeHeaderValue(literal)
+    t.assert.notStrictEqual(encoded, literal)
+    t.assert.strictEqual(decodeHeaderValue(encoded), literal)
+  })
+
+  test('a leading byte-order mark survives decoding', (t: TestContext) => {
+    // Dropping it would make a header naming "\uFEFFdelete_all" match a body
+    // naming "delete_all", while a gateway routes on the former.
+    const withBom = Buffer.from('\uFEFFdelete_all', 'utf8').toString('base64')
+    t.assert.strictEqual(decodeHeaderValue(`=?base64?${withBom}?=`), '\uFEFFdelete_all')
+    t.assert.strictEqual(decodeHeaderValue(encodeHeaderValue('\uFEFFx')), '\uFEFFx')
+  })
+
+  test('invalid Base64 inside the sentinel is rejected rather than guessed at', (t: TestContext) => {
+    t.assert.strictEqual(decodeHeaderValue('=?base64?not!valid!?='), null)
+  })
+
+  test('a value that only looks like the sentinel, or pads where none belongs, is rejected', (t: TestContext) => {
+    for (const raw of ['=?base64?=', '=?base64?=?=', '=?base64?====?=', '=?base64?SGk==?=']) {
+      t.assert.strictEqual(decodeHeaderValue(raw), null, raw)
+    }
+    t.assert.strictEqual(decodeHeaderValue('=?base64?SGk=?='), 'Hi')
+    t.assert.strictEqual(decodeHeaderValue('=?base64?SGk?='), 'Hi')
+    t.assert.strictEqual(decodeHeaderValue('=?base64??='), '')
+  })
+
+  test('malformed UTF-8 inside the sentinel is rejected', (t: TestContext) => {
+    t.assert.strictEqual(decodeHeaderValue('=?base64?/w==?='), null)
+  })
+})
+
+describe('standard header validation', () => {
+  test('Mcp-Name mirrors name for tools and prompts, uri for resources', (t: TestContext) => {
+    t.assert.strictEqual(expectedNameFor('tools/call', { name: 'x' }), 'x')
+    t.assert.strictEqual(expectedNameFor('prompts/get', { name: 'p' }), 'p')
+    t.assert.strictEqual(expectedNameFor('resources/read', { uri: 'file:///a' }), 'file:///a')
+    t.assert.strictEqual(expectedNameFor('tools/list', {}), undefined)
+  })
+
+  test('a method with no name source does not require the header', (t: TestContext) => {
+    const check = validateStandardHeaders({ 'mcp-method': 'tools/list' }, 'tools/list', {})
+    t.assert.strictEqual(check.ok, true)
+  })
+
+  test('header names are matched case-insensitively but values are not', (t: TestContext) => {
+    // Node lower-cases incoming header names, so the map is already normalised;
+    // the value comparison must stay exact.
+    const check = validateStandardHeaders(
+      { 'mcp-method': 'Tools/Call', 'mcp-name': 'x' },
+      'tools/call',
+      { name: 'x' }
+    )
+    t.assert.strictEqual(check.ok, false)
+  })
+})
+
+describe('x-mcp-header annotations', () => {
+  test('nested properties reachable through `properties` are collected', (t: TestContext) => {
+    const result = collectHeaderParams({
+      type: 'object',
+      properties: {
+        outer: {
+          type: 'object',
+          properties: {
+            region: { type: 'string', 'x-mcp-header': 'Region' }
+          }
+        }
+      }
+    })
+
+    t.assert.strictEqual(result.ok, true)
+    t.assert.deepStrictEqual(result.ok && [...result.params.entries()], [['region', ['outer', 'region']]])
+  })
+
+  test('a duplicate annotation is rejected', (t: TestContext) => {
+    const result = collectHeaderParams({
+      type: 'object',
+      properties: {
+        a: { type: 'string', 'x-mcp-header': 'Region' },
+        b: { type: 'string', 'x-mcp-header': 'region' }
+      }
+    })
+    t.assert.strictEqual(result.ok, false)
+  })
+
+  test('number-typed parameters may not be annotated', (t: TestContext) => {
+    const result = collectHeaderParams({
+      type: 'object',
+      properties: { amount: { type: 'number', 'x-mcp-header': 'Amount' } }
+    })
+    t.assert.strictEqual(result.ok, false)
+  })
+
+  for (const [keyword, value] of [
+    ['items', { type: 'string', 'x-mcp-header': 'Item' }],
+    ['allOf', [{ type: 'string', 'x-mcp-header': 'All' }]],
+    ['oneOf', [{ type: 'string', 'x-mcp-header': 'One' }]],
+    ['anyOf', [{ type: 'string', 'x-mcp-header': 'Any' }]],
+    ['not', { type: 'string', 'x-mcp-header': 'Not' }],
+    ['if', { type: 'string', 'x-mcp-header': 'If' }],
+    ['then', { type: 'string', 'x-mcp-header': 'Then' }],
+    ['else', { type: 'string', 'x-mcp-header': 'Else' }]
+  ] as const) {
+    test(`an annotation under ${keyword} invalidates the schema`, (t: TestContext) => {
+      const result = collectHeaderParams({ type: 'object', [keyword]: value })
+      t.assert.strictEqual(result.ok, false)
+    })
+  }
+
+  test('instance data containing an x-mcp-header key is not treated as a schema annotation', (t: TestContext) => {
+    const result = collectHeaderParams({
+      type: 'object',
+      examples: [{ 'x-mcp-header': 'ordinary instance data' }],
+      properties: { value: { type: 'string', 'x-mcp-header': 'Value' } }
+    })
+    t.assert.strictEqual(result.ok, true)
+  })
+
+  test('an annotation in a referenced definition is invalid', (t: TestContext) => {
+    const result = collectHeaderParams({
+      type: 'object',
+      $ref: '#/$defs/value',
+      $defs: {
+        value: {
+          type: 'object',
+          properties: { tenant: { type: 'string', 'x-mcp-header': 'Tenant' } }
+        }
+      }
+    })
+    t.assert.strictEqual(result.ok, false)
+  })
+
+  test('cyclic schemas are rejected without overflowing the stack', (t: TestContext) => {
+    const schema: Record<string, unknown> = { type: 'object' }
+    schema.properties = { self: schema }
+    const result = collectHeaderParams(schema)
+    t.assert.strictEqual(result.ok, false)
+  })
+
+  test('integers compare numerically after enforcing safe bounds', (t: TestContext) => {
+    const schema = {
+      type: 'object',
+      properties: { count: { type: 'integer', 'x-mcp-header': 'Count' } }
+    }
+
+    t.assert.strictEqual(
+      validateToolParamHeaders({ 'mcp-param-count': '42' }, schema, { count: 42 }).ok,
+      true
+    )
+    t.assert.strictEqual(
+      validateToolParamHeaders({ 'mcp-param-count': '42.0' }, schema, { count: 42 }).ok,
+      true
+    )
+    t.assert.strictEqual(
+      validateToolParamHeaders({ 'mcp-param-count': '43' }, schema, { count: 42 }).ok,
+      false
+    )
+    t.assert.strictEqual(
+      validateToolParamHeaders({ 'mcp-param-count': String(Number.MAX_SAFE_INTEGER) }, schema, { count: Number.MAX_SAFE_INTEGER }).ok,
+      true
+    )
+    t.assert.strictEqual(
+      validateToolParamHeaders({ 'mcp-param-count': String(Number.MIN_SAFE_INTEGER) }, schema, { count: Number.MIN_SAFE_INTEGER }).ok,
+      true
+    )
+    t.assert.strictEqual(
+      validateToolParamHeaders({ 'mcp-param-count': '9007199254740993' }, schema, { count: Number('9007199254740993') }).ok,
+      false
+    )
+    t.assert.strictEqual(
+      validateToolParamHeaders({ 'mcp-param-count': '-9007199254740992' }, schema, { count: -9007199254740992 }).ok,
+      false
+    )
+  })
+
+  test('an absent parameter must carry no header, and vice versa', (t: TestContext) => {
+    const schema = {
+      type: 'object',
+      properties: { region: { type: 'string', 'x-mcp-header': 'Region' } }
+    }
+
+    t.assert.strictEqual(validateToolParamHeaders({}, schema, {}).ok, true)
+    t.assert.strictEqual(validateToolParamHeaders({}, schema, { region: 'x' }).ok, false)
+    t.assert.strictEqual(validateToolParamHeaders({ 'mcp-param-region': 'x' }, schema, {}).ok, false)
+    t.assert.strictEqual(validateToolParamHeaders({}, schema, { region: null }).ok, true)
+  })
+})
+
+describe('request state sealing', () => {
+  const base = { method: 'tools/call', params: { name: 'greet', arguments: { a: 1 } } }
+
+  test('a sealed state round-trips its payload', (t: TestContext) => {
+    const sealer = new RequestStateSealer({ secret: 'shared'.padEnd(32, '-') })
+    const state = sealer.seal({ ...base, payload: { step: 2 } })
+
+    const opened = sealer.open(state, base)
+    t.assert.strictEqual(opened.ok, true)
+    t.assert.deepStrictEqual(opened.ok && opened.claims.payload, { step: 2 })
+  })
+
+  test('an empty or short configured secret is refused, not replaced', (t: TestContext) => {
+    // An unset environment variable expanded to '' must not silently become a
+    // per-process key that no other instance can verify.
+    t.assert.throws(() => new RequestStateSealer({ secret: '' }), /at least 32 bytes/)
+    t.assert.throws(() => new RequestStateSealer({ secret: 'a' }), /at least 32 bytes/)
+    t.assert.doesNotThrow(() => new RequestStateSealer({ secret: 'x'.repeat(32) }))
+    t.assert.doesNotThrow(() => new RequestStateSealer())
+  })
+
+  test('the sealed state records which input keys were asked for', (t: TestContext) => {
+    const sealer = new RequestStateSealer()
+    const state = sealer.seal({ ...base, inputs: { a: 'elicitation/create', b: 'roots/list' } })
+    const opened = sealer.open(state, base)
+    t.assert.ok(opened.ok)
+    if (opened.ok) t.assert.deepStrictEqual(opened.claims.inputs, { a: 'elicitation/create', b: 'roots/list' })
+  })
+
+  test('state from another server sharing the secret is refused', (t: TestContext) => {
+    const secret = 'shared'.padEnd(32, '-')
+    const state = new RequestStateSealer({ secret, audience: 'server-a' }).seal(base)
+    const opened = new RequestStateSealer({ secret, audience: 'server-b' }).open(state, base)
+    t.assert.deepStrictEqual(opened, { ok: false, reason: 'request state was issued by a different server' })
+  })
+
+  test('deeply nested parameters fail verification instead of overflowing', (t: TestContext) => {
+    const sealer = new RequestStateSealer()
+    const state = sealer.seal(base)
+    let nested: Record<string, unknown> = {}
+    const params = { name: 'x', arguments: nested }
+    for (let depth = 0; depth < 10_000; depth++) {
+      const next = {}
+      nested.n = next
+      nested = next
+    }
+    const opened = sealer.open(state, { ...base, params })
+    t.assert.strictEqual(opened.ok, false)
+  })
+
+  test('a different secret cannot open it', (t: TestContext) => {
+    const state = new RequestStateSealer({ secret: 'one'.padEnd(32, '-') }).seal(base)
+    const opened = new RequestStateSealer({ secret: 'two'.padEnd(32, '-') }).open(state, base)
+
+    t.assert.strictEqual(opened.ok, false)
+    t.assert.match(opened.ok === false ? opened.reason : '', /integrity/)
+  })
+
+  test('an expired state is refused', (t: TestContext) => {
+    const sealer = new RequestStateSealer({ secret: 's'.padEnd(32, '-'), ttlMs: 1000 })
+    const state = sealer.seal(base)
+
+    const opened = sealer.open(state, { ...base, now: Date.now() + 5000 })
+    t.assert.strictEqual(opened.ok, false)
+    t.assert.match(opened.ok === false ? opened.reason : '', /expired/)
+  })
+
+  test('state is bound to the principal it was issued to', (t: TestContext) => {
+    const sealer = new RequestStateSealer({ secret: 's'.padEnd(32, '-') })
+    const state = sealer.seal({ ...base, principal: 'alice' })
+
+    t.assert.strictEqual(sealer.open(state, { ...base, principal: 'bob' }).ok, false)
+    t.assert.strictEqual(sealer.open(state, { ...base, principal: 'alice' }).ok, true)
+  })
+
+  test('state is bound to the request that produced it', (t: TestContext) => {
+    const sealer = new RequestStateSealer({ secret: 's'.padEnd(32, '-') })
+    const state = sealer.seal(base)
+
+    const other = { method: 'tools/call', params: { name: 'greet', arguments: { a: 2 } } }
+    t.assert.strictEqual(sealer.open(state, other).ok, false)
+  })
+
+  test('the digest ignores key order but not values', (t: TestContext) => {
+    t.assert.strictEqual(
+      digestRequest('tools/call', { a: 1, b: 2 }),
+      digestRequest('tools/call', { b: 2, a: 1 })
+    )
+    t.assert.notStrictEqual(
+      digestRequest('tools/call', { a: 1 }),
+      digestRequest('tools/call', { a: 2 })
+    )
+  })
+
+  test('the digest ignores the fields that legitimately differ on a retry', (t: TestContext) => {
+    const first = { name: 'greet', _meta: { x: 1 } }
+    const retry = { name: 'greet', _meta: { x: 2 }, inputResponses: { a: {} }, requestState: 'blob' }
+    t.assert.strictEqual(digestRequest('tools/call', first), digestRequest('tools/call', retry))
+  })
+})
+
+describe('subscription filters', () => {
+  const capabilities = {
+    tools: { listChanged: true },
+    resources: { listChanged: true, subscribe: true },
+    prompts: { listChanged: true }
+  }
+
+  test('the acknowledged filter drops what the server cannot honour', (t: TestContext) => {
+    const agreed = negotiateFilter(
+      { toolsListChanged: true, promptsListChanged: true },
+      { tools: { listChanged: true } }
+    )
+    t.assert.deepStrictEqual(agreed, { toolsListChanged: true })
+  })
+
+  test('a capability without listChanged or subscribe agrees to nothing', (t: TestContext) => {
+    const agreed = negotiateFilter(
+      { toolsListChanged: true, resourcesListChanged: true, resourceSubscriptions: ['file:///a'] },
+      { tools: {}, resources: {} }
+    )
+    t.assert.deepStrictEqual(agreed, {})
+  })
+
+  test('a malformed filter is rejected', (t: TestContext) => {
+    t.assert.strictEqual(invalidFilter({ toolsListChanged: true, resourceSubscriptions: ['file:///a'] }), undefined)
+    t.assert.match(invalidFilter('all') ?? '', /expected a subscription filter/)
+    t.assert.match(invalidFilter({ toolsListChanged: 'yes' }) ?? '', /toolsListChanged/)
+    t.assert.match(invalidFilter({ resourceSubscriptions: 'file:///a' }) ?? '', /array of strings/)
+    t.assert.match(invalidFilter({ resourceSubscriptions: [1, { x: 1 }] }) ?? '', /array of strings/)
+  })
+
+  test('duplicate resource subscriptions are collapsed', (t: TestContext) => {
+    const agreed = negotiateFilter(
+      { resourceSubscriptions: ['file:///a', 'file:///a', 'file:///b'] },
+      capabilities
+    )
+    t.assert.deepStrictEqual(agreed.resourceSubscriptions, ['file:///a', 'file:///b'])
+  })
+
+  test('resource updates only match subscribed URIs', (t: TestContext) => {
+    const filter = { resourceSubscriptions: ['file:///a'] }
+    const updated = (uri: string) => ({
+      jsonrpc: JSONRPC_VERSION,
+      method: 'notifications/resources/updated',
+      params: { uri }
+    }) as any
+
+    t.assert.strictEqual(matchesFilter(updated('file:///a'), filter), true)
+    t.assert.strictEqual(matchesFilter(updated('file:///b'), filter), false)
+  })
+
+  test('request-scoped notifications never ride the listen stream', (t: TestContext) => {
+    const progress = { jsonrpc: JSONRPC_VERSION, method: 'notifications/progress', params: {} } as any
+    const message = { jsonrpc: JSONRPC_VERSION, method: 'notifications/message', params: {} } as any
+
+    const everything = {
+      toolsListChanged: true,
+      promptsListChanged: true,
+      resourcesListChanged: true,
+      resourceSubscriptions: ['file:///a']
+    }
+    t.assert.strictEqual(matchesFilter(progress, everything), false)
+    t.assert.strictEqual(matchesFilter(message, everything), false)
+  })
+})
+
+describe('task input channel lifecycle', () => {
+  test('a retention beyond the timer range does not spin the expiry timer', async (t: TestContext) => {
+    const channel = new TaskInputChannel(30 * 24 * 60 * 60 * 1000)
+    t.after(() => channel.close())
+    let armed = 0
+    const original = globalThis.setTimeout
+    t.mock.method(globalThis, 'setTimeout', (callback: () => void, ms?: number) => {
+      armed++
+      return original(callback, ms)
+    })
+    channel.abort('task-1')
+    channel.markConsumed('task-1', 'delivery-1')
+    await new Promise<void>(resolve => { original(resolve, 200) })
+    t.assert.ok(armed < 5, `armed ${armed} timers in 200ms`)
+  })
+
+  test('cancellation rejects a parked waiter immediately', async (t: TestContext) => {
+    const channel = new TaskInputChannel()
+    const waiting = channel.wait('task-1')
+    t.assert.strictEqual(channel.waiterCount, 1)
+
+    channel.abort('task-1', 'task cancelled')
+    await t.assert.rejects(waiting, /task cancelled/)
+    t.assert.strictEqual(channel.waiterCount, 0)
+    channel.close()
+  })
+
+  test('queued input is not acknowledged before broker delivery is accepted', async (t: TestContext) => {
+    const channel = new TaskInputChannel(1000, 10)
+    let acceptPublication: () => void = () => {}
+    const accepted = new Promise<void>((resolve) => { acceptPublication = resolve })
+    channel.setPublisher(async (taskId, responses, deliveryId) => {
+      channel.deliver(taskId, responses, deliveryId)
+      await accepted
+    })
+
+    const waiting = channel.wait('task-1')
+    let publicationSettled = false
+    const publication = channel.publish('task-1', { confirmation: 'yes' }, 'delivery-1')
+      .then(() => { publicationSettled = true })
+
+    t.assert.deepStrictEqual(await waiting, { confirmation: 'yes' })
+    await delay(0)
+    t.assert.strictEqual(publicationSettled, false)
+
+    acceptPublication()
+    await publication
+    t.assert.strictEqual(publicationSettled, true)
+    channel.close()
+  })
+
+  test('broker publication acceptance is treated as delivery confirmation', async (t: TestContext) => {
+    const channel = new TaskInputChannel(1000, 10)
+    channel.setPublisher(async () => {})
+
+    await channel.publish('task-1', { confirmation: 'yes' }, 'delivery-1')
+    t.assert.strictEqual(channel.pendingSize, 0)
+    channel.close()
+  })
+
+  test('input-blocked cancellation waits for broker acceptance', async (t: TestContext) => {
+    const channel = new TaskInputChannel(1000, 10)
+    let acceptPublication: () => void = () => {}
+    const accepted = new Promise<void>((resolve) => { acceptPublication = resolve })
+    channel.setCancellationPublisher(async (taskId) => {
+      channel.abort(taskId, 'task cancelled')
+      await accepted
+    })
+
+    const waiting = channel.wait('task-1')
+    let cancellationSettled = false
+    const cancellation = channel.cancel('task-1').then(() => { cancellationSettled = true })
+    await t.assert.rejects(waiting, /cancelled/)
+    await delay(0)
+    t.assert.strictEqual(cancellationSettled, false)
+
+    acceptPublication()
+    await cancellation
+    t.assert.strictEqual(cancellationSettled, true)
+    channel.close()
+  })
+
+  test('cancellation arriving before wait leaves a tombstone', async (t: TestContext) => {
+    const channel = new TaskInputChannel()
+    channel.abort('task-1', 'task cancelled')
+    await t.assert.rejects(channel.wait('task-1'), /cancelled/)
+    channel.close()
+  })
+
+  test('a retried broker delivery is deduplicated after resolving its waiter', async (t: TestContext) => {
+    const channel = new TaskInputChannel()
+    const waiting = channel.wait('task-1')
+    channel.deliver('task-1', { confirmation: 'yes' }, 'delivery-1')
+    t.assert.deepStrictEqual(await waiting, { confirmation: 'yes' })
+
+    // An ambiguous publish error may make the durable outbox retry a message
+    // that was already delivered. It must not be held for the next input round.
+    channel.deliver('task-1', { confirmation: 'yes' }, 'delivery-1')
+    t.assert.strictEqual(channel.pendingSize, 0)
+    channel.close()
+  })
+
+  test('a burst of unmatched answers expires autonomously and remains bounded', async (t: TestContext) => {
+    const channel = new TaskInputChannel(20, 32)
+    for (let index = 0; index < 1000; index++) {
+      channel.claim(`task-${index}`)
+      channel.deliver(`task-${index}`, { value: index }, `delivery-${index}`)
+    }
+
+    t.assert.strictEqual(channel.pendingSize, 32)
+    await delay(60)
+    t.assert.strictEqual(channel.pendingSize, 0)
+    channel.close()
+  })
+
+  test('answers for tasks another instance runs are not buffered here', async (t: TestContext) => {
+    const channel = new TaskInputChannel()
+    channel.deliver('elsewhere', { value: 'x'.repeat(1024) }, 'delivery-1')
+    t.assert.strictEqual(channel.pendingSize, 0)
+
+    // An early answer for a task this instance runs is still kept for its worker.
+    channel.claim('here')
+    channel.deliver('here', { value: 1 }, 'delivery-2')
+    t.assert.deepStrictEqual(await channel.wait('here'), { value: 1 })
+    channel.close()
+  })
+})
+
+describe('subscription backpressure', () => {
+  class FakeResponse extends EventEmitter {
+    writes: string[] = []
+    ended = false
+    writable = false
+    destroyed = false
+    closed = false
+    writableEnded = false
+    writableFinished = false
+    finishOnEnd = true
+
+    setHeader (): void {}
+    writeHead (): void {}
+
+    write (frame: string): boolean {
+      this.writes.push(frame)
+      return this.writable
+    }
+
+    end (frame?: string): void {
+      if (frame) this.writes.push(frame)
+      this.ended = true
+      this.writableEnded = true
+      if (this.finishOnEnd) {
+        this.writableFinished = true
+        this.closed = true
+        this.emit('close')
+      }
+    }
+
+    destroy (): void {
+      this.destroyed = true
+      this.closed = true
+      this.emit('close')
+    }
+  }
+
+  const logger = {
+    debug: () => {},
+    warn: () => {}
+  } as any
+
+  function replyFor (raw: FakeResponse): any {
+    return { raw, hijack: () => {}, getHeaders: () => ({}) }
+  }
+
+  const changed = {
+    jsonrpc: JSONRPC_VERSION,
+    method: 'notifications/tools/list_changed'
+  } as any
+
+  test('queued frames flush only after drain', (t: TestContext) => {
+    const raw = new FakeResponse()
+    const registry = new SubscriptionRegistry(logger, 10_000)
+    registry.open(replyFor(raw), 1, { toolsListChanged: true })
+
+    // The acknowledgement filled the writable buffer. The notification must be
+    // queued rather than written again until the stream emits drain.
+    registry.deliver(changed)
+    t.assert.strictEqual(raw.writes.length, 1)
+
+    raw.writable = true
+    raw.emit('drain')
+    t.assert.strictEqual(raw.writes.length, 2)
+    registry.closeAll()
+  })
+
+  test('a graceful shutdown sends the notifications still queued before the completion', (t: TestContext) => {
+    const raw = new FakeResponse()
+    const registry = new SubscriptionRegistry(logger, 10_000)
+    registry.open(replyFor(raw), 1, { toolsListChanged: true })
+
+    // Backpressured: the notification waits in the queue.
+    registry.deliver(changed)
+    t.assert.strictEqual(raw.writes.length, 1)
+
+    registry.closeAll()
+    const final = raw.writes[1].split('\n\n').filter(Boolean).map(frame => JSON.parse(frame.slice('data: '.length)))
+    t.assert.deepStrictEqual(final.map(message => message.method ?? 'response'), [
+      'notifications/tools/list_changed',
+      'notifications/cancelled',
+      'response'
+    ])
+  })
+
+  test('a stream ending at its deadline sends the notifications still queued before the completion', async (t: TestContext) => {
+    const raw = new FakeResponse()
+    const registry = new SubscriptionRegistry({ ...logger, info: () => {} }, 10_000)
+    registry.open(replyFor(raw), 1, { toolsListChanged: true }, undefined, undefined, undefined, { at: Date.now() + 20, reason: 'Subscription reached its maximum duration' })
+
+    // Backpressured: the notification waits in the queue.
+    registry.deliver(changed)
+    t.assert.strictEqual(raw.writes.length, 1)
+    await delay(60)
+
+    const final = raw.writes[1].split('\n\n').filter(Boolean).map(frame => JSON.parse(frame.slice('data: '.length)))
+    t.assert.deepStrictEqual(final.map(message => message.method ?? 'response'), [
+      'notifications/tools/list_changed',
+      'notifications/cancelled',
+      'response'
+    ])
+  })
+
+  test('the end hook runs once, however the stream ends', (t: TestContext) => {
+    for (const end of ['shutdown', 'client'] as const) {
+      const raw = new FakeResponse()
+      const registry = new SubscriptionRegistry(logger, 10_000)
+      let ended = 0
+      registry.open(replyFor(raw), 1, { toolsListChanged: true }, undefined, undefined, () => { ended++ })
+      if (end === 'shutdown') registry.closeAll()
+      else raw.destroy()
+      raw.destroy()
+      t.assert.strictEqual(ended, 1, end)
+    }
+
+    // A stream that could not open still releases what was acquired for it.
+    const closed = new FakeResponse()
+    closed.destroyed = true
+    let ended = 0
+    new SubscriptionRegistry(logger).open(replyFor(closed), 1, {}, undefined, undefined, () => { ended++ })
+    t.assert.strictEqual(ended, 1)
+  })
+
+  test('graceful completion is appended even while the stream is backpressured', (t: TestContext) => {
+    const raw = new FakeResponse()
+    const registry = new SubscriptionRegistry(logger, 10_000)
+    registry.open(replyFor(raw), 1, { toolsListChanged: true })
+
+    registry.closeAll()
+    t.assert.strictEqual(raw.ended, true)
+    t.assert.strictEqual(raw.writes.length, 2)
+    t.assert.match(raw.writes[1], /"resultType":"complete"/)
+  })
+
+  test('an already-closed response is not registered', (t: TestContext) => {
+    const registry = new SubscriptionRegistry(logger)
+    const raw = new FakeResponse()
+    raw.destroyed = true
+    t.assert.strictEqual(registry.open(replyFor(raw), 1, { toolsListChanged: true }), false)
+    t.assert.strictEqual(registry.size, 0)
+  })
+
+  test('a closing registry refuses new subscriptions', (t: TestContext) => {
+    const registry = new SubscriptionRegistry(logger)
+    registry.closeAll()
+    const raw = new FakeResponse()
+    t.assert.strictEqual(registry.open(replyFor(raw), 1, { toolsListChanged: true }), false)
+    t.assert.strictEqual(registry.size, 0)
+  })
+
+  test('a shutdown stream that cannot drain is forcibly destroyed', async (t: TestContext) => {
+    const raw = new FakeResponse()
+    raw.finishOnEnd = false
+    const registry = new SubscriptionRegistry(logger, 10_000, 20)
+    registry.open(replyFor(raw), 1, { toolsListChanged: true })
+
+    registry.closeAll()
+    await delay(60)
+    t.assert.strictEqual(raw.destroyed, true)
+  })
+
+  test('a slow subscription is closed when its bounded queue is exceeded', (t: TestContext) => {
+    const raw = new FakeResponse()
+    const registry = new SubscriptionRegistry(logger, 1)
+    registry.open(replyFor(raw), 1, { toolsListChanged: true })
+
+    registry.deliver(changed)
+    t.assert.strictEqual(raw.ended, true)
+    t.assert.strictEqual(registry.size, 0)
+    // The acknowledgement, then the cancellation, never the notification that
+    // overflowed the queue. A notification was lost, so there is no graceful
+    // empty response: the client must resynchronize.
+    t.assert.strictEqual(raw.writes.length, 2)
+    const teardown = raw.writes[1].split('\n\n').filter(Boolean).map(frame => JSON.parse(frame.slice('data: '.length)))
+    t.assert.strictEqual(teardown.length, 1)
+    t.assert.strictEqual(teardown[0].method, 'notifications/cancelled')
+    t.assert.strictEqual(teardown[0].params.requestId, 1)
+  })
+})
+
+describe('request metadata parsing', () => {
+  function meta (overrides: Record<string, unknown> = {}) {
+    return {
+      _meta: {
+        [META_PROTOCOL_VERSION]: '2026-07-28',
+        [META_CLIENT_CAPABILITIES]: {},
+        ...overrides
+      }
+    }
+  }
+
+  test('a well-formed request parses', (t: TestContext) => {
+    const parsed = parseRequestContext(meta({ [META_CLIENT_INFO]: { name: 'c', version: '1' } }))
+    t.assert.strictEqual(parsed.ok, true)
+    t.assert.strictEqual(parsed.ok && parsed.context.protocolVersion, '2026-07-28')
+    t.assert.strictEqual(parsed.ok && parsed.context.clientInfo?.name, 'c')
+  })
+
+  test('capabilities are required even when empty', (t: TestContext) => {
+    const parsed = parseRequestContext({ _meta: { [META_PROTOCOL_VERSION]: '2026-07-28' } })
+    t.assert.strictEqual(parsed.ok, false)
+  })
+
+  test('an unknown log level is rejected rather than ignored', (t: TestContext) => {
+    const parsed = parseRequestContext(meta({ 'io.modelcontextprotocol/logLevel': 'chatty' }))
+    t.assert.strictEqual(parsed.ok, false)
+  })
+
+  test('bodyClaimsModern keys off the protocol version, not the method', (t: TestContext) => {
+    t.assert.strictEqual(bodyClaimsModern({ method: 'tools/list', params: meta() }), true)
+    t.assert.strictEqual(bodyClaimsModern({ method: 'tools/list', params: {} }), false)
+    t.assert.strictEqual(bodyClaimsModern({ method: 'initialize' }), false)
+    t.assert.strictEqual(bodyClaimsModern(undefined), false)
+  })
+
+  test('a modern version header alone commits the request to the modern path', (t: TestContext) => {
+    const modern = ['2026-07-28']
+    const legacyBody = { method: 'tools/call', params: { name: 'x' } }
+
+    // This is the bypass: modern headers a gateway may route on, with a body
+    // that omits `_meta` to dodge header/body validation.
+    t.assert.strictEqual(
+      isModernRequest({ 'mcp-protocol-version': '2026-07-28' }, legacyBody, modern),
+      true
+    )
+    t.assert.strictEqual(
+      isModernRequest({ 'mcp-protocol-version': '2025-11-25' }, legacyBody, modern),
+      false
+    )
+    t.assert.strictEqual(isModernRequest({}, legacyBody, modern), false)
+    // An array-valued header must not slip past either.
+    t.assert.strictEqual(
+      isModernRequest({ 'mcp-protocol-version': ['2026-07-28'] }, legacyBody, modern),
+      true
+    )
+  })
+})
+
+describe('revision era', () => {
+  test('2026-07-28 and later are modern; earlier revisions are not', (t: TestContext) => {
+    t.assert.strictEqual(isModernRevision('2026-07-28'), true)
+    t.assert.strictEqual(isModernRevision('2027-01-01'), true)
+    t.assert.strictEqual(isModernRevision('2025-11-25'), false)
+    t.assert.strictEqual(isModernRevision(undefined), false)
+  })
+})
+
+describe('answer validator', () => {
+  test('ignores annotations, $schema and $id, but keeps property names and enum values', (t: TestContext) => {
+    const normalized = normalizeAnswerSchema({
+      $schema: 'http://json-schema.org/draft-07/schema#',
+      $id: 'urn:x',
+      title: 'T',
+      type: 'object',
+      properties: { title: { type: 'string', description: 'd', default: 'x' }, pick: { enum: [{ title: 'kept' }] } }
+    })
+    t.assert.deepStrictEqual(normalized, {
+      type: 'object',
+      properties: { title: { type: 'string' }, pick: { enum: [{ title: 'kept' }] } }
+    })
+  })
+
+  test('keeps a bounded number of compiled schemas', (t: TestContext) => {
+    const validator = new AnswerValidator()
+    for (let i = 0; i < 400; i++) {
+      t.assert.strictEqual(validator.validate({ type: 'object', properties: { [`p${i}`]: { type: 'string' } } }, {}), null)
+    }
+    t.assert.strictEqual(validator.size, 256)
+    // An evicted schema still validates: it is compiled again.
+    t.assert.match(validator.validate({ type: 'object', properties: { p0: { type: 'string' } } }, { p0: 1 }) ?? '', /must be string/)
+  })
+
+  test('schemas that differ only in wording share one compiled validator', (t: TestContext) => {
+    const validator = new AnswerValidator()
+    for (let i = 0; i < 50; i++) {
+      validator.validate(normalizeAnswerSchema({ type: 'object', properties: { a: { type: 'string', description: `Rename to ${i}?` } } }) as object, {})
+    }
+    t.assert.strictEqual(validator.size, 1)
+  })
+})
+
+describe('request stream back-pressure', () => {
+  function fakeReply () {
+    const raw = new EventEmitter() as any
+    raw.destroyed = false
+    raw.writableEnded = false
+    raw.writableLength = 0
+    raw.written = [] as string[]
+    raw.accepting = true
+    raw.write = (frame: string) => { raw.written.push(frame); return raw.accepting }
+    raw.end = () => { raw.writableEnded = true }
+    raw.setHeader = () => {}
+    raw.writeHead = () => {}
+    return { raw, getHeaders: () => ({}), hijack: () => {} } as any
+  }
+
+  test('drops notifications while the reader is not draining, even when writableLength stays 0', async (t: TestContext) => {
+    const reply = fakeReply()
+    const stream = new RequestStream(reply)
+    const notification = (n: number) => ({ jsonrpc: JSONRPC_VERSION, method: 'notifications/progress', params: { progressToken: 'p', progress: n } }) as any
+    stream.notify(notification(1))
+    await delay(250) // the stream opens and writes the held frame
+    t.assert.strictEqual(reply.raw.written.length, 1)
+
+    reply.raw.accepting = false
+    stream.notify(notification(2)) // written, and reports back-pressure
+    stream.notify(notification(3)) // dropped
+    stream.notify(notification(4)) // dropped
+    t.assert.strictEqual(reply.raw.written.length, 2)
+
+    reply.raw.accepting = true
+    reply.raw.emit('drain')
+    stream.notify(notification(5))
+    t.assert.strictEqual(reply.raw.written.length, 3)
+    t.assert.match(reply.raw.written[2], /"progress":5/)
+  })
+})
+
+describe('round 9 units', () => {
+  test('names in name-keyed keywords survive answer-schema normalization', (t: TestContext) => {
+    const schema = normalizeAnswerSchema({
+      type: 'object',
+      properties: { title: { type: 'string', title: 'Title' }, ok: { type: 'boolean' } },
+      dependentRequired: { title: ['ok'] },
+      patternProperties: { description: { type: 'string', description: 'dropped' } }
+    }) as Record<string, any>
+    t.assert.deepStrictEqual(schema.dependentRequired, { title: ['ok'] })
+    t.assert.deepStrictEqual(schema.patternProperties, { description: { type: 'string' } })
+    t.assert.deepStrictEqual(schema.properties.title, { type: 'string' })
+    t.assert.match(new AnswerValidator().validate(schema, { title: 'x' }) ?? '', /ok/)
+  })
+
+  test('the string formats elicitation defines are checked, others are not', (t: TestContext) => {
+    const validator = new AnswerValidator()
+    const schema = {
+      type: 'object',
+      properties: {
+        email: { type: 'string', format: 'email' },
+        site: { type: 'string', format: 'uri' },
+        day: { type: 'string', format: 'date' },
+        at: { type: 'string', format: 'date-time' },
+        id: { type: 'string', format: 'uuid' }
+      }
+    }
+    for (const [field, bad] of [['email', 'not an email'], ['site', 'no scheme'], ['day', 'yesterday'], ['at', '2026-01-02']]) {
+      t.assert.match(validator.validate(schema, { [field]: bad }) ?? '', /format/, field)
+    }
+    t.assert.strictEqual(validator.validate(schema, {
+      email: 'a@example.com', site: 'https://example.com', day: '2026-01-02', at: '2026-01-02T03:04:05Z', id: 'not a uuid'
+    }), null)
+  })
+
+  test('request state sealed with any listed secret verifies; new state uses the first', (t: TestContext) => {
+    const oldSecret = 'o'.repeat(32)
+    const newSecret = 'n'.repeat(32)
+    const request = { method: 'tools/call', params: { name: 'x', arguments: {} } }
+    const before = new RequestStateSealer({ secret: oldSecret })
+    const during = new RequestStateSealer({ secret: [newSecret, oldSecret] })
+    const after = new RequestStateSealer({ secret: newSecret })
+
+    const sealedBefore = before.seal({ ...request, payload: 1 })
+    t.assert.strictEqual(during.open(sealedBefore, request).ok, true)
+    const sealedDuring = during.seal({ ...request, payload: 2 })
+    t.assert.strictEqual(after.open(sealedDuring, request).ok, true)
+    t.assert.strictEqual(before.open(sealedDuring, request).ok, false)
+
+    t.assert.throws(() => new RequestStateSealer({ secret: [] }), /at least one/)
+    t.assert.throws(() => new RequestStateSealer({ secret: [newSecret, 'short'] }), /at least 32 bytes/)
+  })
+
+  test('a precomputed request digest is what sealing and opening compare', (t: TestContext) => {
+    const sealer = new RequestStateSealer()
+    const received = { method: 'tools/call', params: { name: 'x', arguments: { who: ' bob ' } } }
+    const requestDigest = digestRequest(received.method, received.params)
+    // The handler trimmed the argument before asking.
+    const sealed = sealer.seal({ method: 'tools/call', params: { name: 'x', arguments: { who: 'bob' } }, requestDigest, payload: 1 })
+    t.assert.strictEqual(sealer.open(sealed, { ...received, requestDigest }).ok, true)
+    t.assert.strictEqual(sealer.open(sealed, { method: 'tools/call', params: { name: 'x', arguments: { who: 'bob' } } }).ok, false)
+  })
+
+  test('x-mcp-header accepts literal unions, enums and typed alternatives of one primitive', (t: TestContext) => {
+    const accepted = [
+      { anyOf: [{ const: 'us', type: 'string' }, { const: 'eu', type: 'string' }] },
+      { anyOf: [{ const: 'us' }, { const: 'eu' }, { type: 'null' }] },
+      { enum: [1, 2, 3] },
+      { type: 'string', anyOf: [{ pattern: '^us-' }, { pattern: '^eu-' }] },
+      { type: ['boolean', 'null'] }
+    ]
+    for (const schema of accepted) {
+      const collected = collectHeaderParams({ type: 'object', properties: { p: { ...schema, 'x-mcp-header': 'P' } } })
+      t.assert.strictEqual(collected.ok, true, JSON.stringify(schema))
+    }
+    const refused = [
+      { anyOf: [{ type: 'string' }, { type: 'integer' }] },
+      { enum: ['a', 1] },
+      { enum: [1.5] },
+      { type: 'number' },
+      { type: 'object' }
+    ]
+    for (const schema of refused) {
+      const collected = collectHeaderParams({ type: 'object', properties: { p: { ...schema, 'x-mcp-header': 'P' } } })
+      t.assert.strictEqual(collected.ok, false, JSON.stringify(schema))
+    }
+  })
+
+  test('an initialize without modern _meta is legacy whatever its version header says', (t: TestContext) => {
+    const initialize = { jsonrpc: JSONRPC_VERSION, id: 1, method: 'initialize', params: { protocolVersion: '2025-11-25' } }
+    t.assert.strictEqual(isModernRequest({ 'mcp-protocol-version': '2026-07-28' }, initialize, ['2026-07-28']), false)
+    t.assert.strictEqual(isModernRequest({ 'mcp-protocol-version': '2026-07-28' }, { ...initialize, method: 'tools/list' }, ['2026-07-28']), true)
+  })
+})

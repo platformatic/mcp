@@ -5,11 +5,12 @@ import type { Redis } from 'ioredis'
 import { Type } from '@sinclair/typebox'
 import mcpPlugin from '../src/index.ts'
 import { MemoryTaskStore } from '../src/stores/memory-task-store.ts'
-import { JSONRPC_VERSION, LATEST_PROTOCOL_VERSION, INVALID_PARAMS } from '../src/schema.ts'
+import { JSONRPC_VERSION, LATEST_LEGACY_PROTOCOL_VERSION, INVALID_PARAMS } from '../src/schema.ts'
 import type { CreateTaskResult, ListTasksResult, CallToolResult } from '../src/schema.ts'
 import { createTestAuthConfig, createTestJWT, setupMockAgent, generateMockJWKSResponse } from './auth-test-utils.ts'
 import { testWithRedis } from './redis-test-utils.ts'
 
+const JWKS_URL = 'https://auth.example.com/.well-known/jwks.json'
 const IDP_A = 'https://auth.example.com'
 const IDP_B = 'https://other.example.com'
 
@@ -25,10 +26,15 @@ async function buildApp (t: TestContext, options: { redis?: Redis, auth?: boolea
   })
 
   const { redis } = options
+  const authorization = createTestAuthConfig({
+    authorizationServers: [IDP_A, IDP_B],
+    // Both issuers sign with the same test key, published once.
+    tokenValidation: { jwksUri: { [IDP_A]: JWKS_URL, [IDP_B]: JWKS_URL }, validateAudience: true }
+  })
   await app.register(mcpPlugin, {
     enableTasks: true,
-    ...(options.auth === false ? {} : { authorization: createTestAuthConfig({ authorizationServers: [IDP_A, IDP_B] }) }),
-    ...(redis ? { redis: { host: redis.options.host!, port: redis.options.port!, db: redis.options.db! } } : {})
+    ...(options.auth === false ? {} : { authorization }),
+    ...(redis ? { redis: { host: redis.options.host!, port: redis.options.port!, db: redis.options.db! }, requestStateSecret: 'task-owner-issuer-test-secret-0123456789' } : {})
   })
   app.mcpAddTool({
     name: 'slow',
@@ -47,7 +53,7 @@ async function buildApp (t: TestContext, options: { redis?: Redis, auth?: boolea
       url: '/mcp',
       headers: {
         ...(token ? { authorization: `Bearer ${token}` } : {}),
-        'mcp-protocol-version': LATEST_PROTOCOL_VERSION
+        'mcp-protocol-version': LATEST_LEGACY_PROTOCOL_VERSION
       },
       payload: { jsonrpc: JSONRPC_VERSION, id: 1, method, params }
     })
@@ -118,7 +124,8 @@ describe('Task ownership is bound to issuer and subject', () => {
     const originalGet = MemoryTaskStore.prototype.get
     t.mock.method(MemoryTaskStore.prototype, 'get', async function (this: MemoryTaskStore, id: string) {
       const task = await originalGet.call(this, id)
-      if (task) delete task.authIssuer
+      // Records then carried the bare subject
+      if (task) task.authSubject = 'alice'
       return task
     })
 
@@ -134,13 +141,13 @@ describe('Task ownership is bound to issuer and subject', () => {
     const taskId = await createTask(alice)
 
     // Rewrite the stored record as a pre-upgrade instance would have written it
-    const key = `mcp:task:${taskId}`
+    const key = `mcp:task:v3:${taskId}`
     const stored = JSON.parse((await redis.get(key))!)
-    t.assert.strictEqual(stored.authIssuer, IDP_A)
-    delete stored.authIssuer
+    t.assert.strictEqual(stored.authSubject, JSON.stringify(['alice', null, IDP_A]))
+    stored.authSubject = 'alice'
     await redis.set(key, JSON.stringify(stored), 'KEEPTTL')
     // ...and indexed under the old subject-only key
-    await redis.zadd('mcp:tasks:owner:alice', Date.now(), taskId)
+    await redis.zadd('mcp:tasks:v3:owner:alice', Date.now(), taskId)
 
     for (const method of ['tasks/get', 'tasks/result', 'tasks/cancel']) {
       const body = await call(alice, method, { taskId })

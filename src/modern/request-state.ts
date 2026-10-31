@@ -1,0 +1,316 @@
+/**
+ * `requestState` sealing for multi round-trip requests.
+ *
+ * Under MRTR the server keeps no state between the interim result and the
+ * client's retry — the state travels through the client instead. That makes it
+ * attacker-controlled input, so the spec requires integrity protection and
+ * replay bounds whenever the state influences authorization or business logic.
+ *
+ * We seal with HMAC-SHA256 over the payload and bind three things into it:
+ * the authenticated principal, an expiry, and a digest of the originating
+ * request. State presented by a different principal, after it lapses, or on a
+ * different request is refused.
+ */
+
+import { createHmac, randomBytes, timingSafeEqual, createHash } from 'node:crypto'
+
+export interface RequestStateClaims {
+  /** Authenticated subject the state was issued to, if any. */
+  principal?: string
+  /** Method the state was issued for, e.g. `tools/call`. */
+  method: string
+  /** Digest of the salient request parameters. */
+  requestDigest: string
+  /** Epoch milliseconds after which the state is refused. */
+  expiresAt: number
+  /** The server the state was issued by, so servers sharing a secret cannot accept each other's. */
+  audience?: string
+  /** Whatever the server needs to resume, opaque to us. */
+  payload: unknown
+  /**
+   * The `inputRequests` the server asked for: each key and the method it
+   * asked with. Only those keys are handed to the handler on the retry, and
+   * each answer must have the shape of a result to that method.
+   */
+  inputs?: Record<string, string>
+  /**
+   * What each elicitation the server asked for accepts: a form's
+   * `requestedSchema`, or nothing for a URL-mode elicitation, so the answer
+   * can be checked on the retry.
+   */
+  elicitations?: Record<string, ElicitationExpectation>
+  /**
+   * Answers the client gave in earlier rounds, keyed as the handler asked for
+   * them, so a handler that asks in several steps sees every answer on the
+   * retry, as it would in a task.
+   */
+  answers?: Record<string, unknown>
+}
+
+/** What an elicitation's answer must look like when the user accepts. */
+export type ElicitationExpectation = { mode: 'url' } | { mode: 'form', schema: Record<string, unknown> }
+
+/** Sealing was refused because the deployment identifies callers and this one is not. */
+export class PrincipalRequiredError extends Error {}
+
+export type VerifyResult =
+  | { ok: true, claims: RequestStateClaims }
+  | { ok: false, reason: string }
+
+const DEFAULT_TTL_MS = 5 * 60 * 1000
+
+/** How many bytes of earlier answers a sealed state carries by default. */
+export const DEFAULT_MAX_CARRIED_ANSWER_BYTES = 64 * 1024
+
+/** HMAC-SHA256 keys shorter than its output weaken it. */
+export const MIN_SECRET_BYTES = 32
+
+/**
+ * Prefixed to everything signed, so a signature over request state can never
+ * be confused with one the same secret makes over anything else.
+ */
+const SIGNATURE_DOMAIN = '@platformatic/mcp:requestState:v1\0'
+
+/**
+ * Digest the parameters that identify a request, so state minted for one call
+ * cannot be replayed onto another. `inputResponses` and `requestState` are
+ * excluded because they legitimately differ between the original and the retry.
+ */
+export function digestRequest (method: string, params: unknown): string {
+  const record = { ...(params as Record<string, unknown> | undefined) }
+  delete record._meta
+  delete record.inputResponses
+  delete record.requestState
+  // The server treats absent arguments as empty ones, and clients commonly
+  // normalize one into the other between the first call and the retry.
+  if ((method === 'tools/call' || method === 'prompts/get') && record.arguments === undefined) {
+    record.arguments = {}
+  }
+
+  return createHash('sha256')
+    .update(method)
+    .update('\0')
+    .update(stableStringify(record))
+    .digest('base64url')
+}
+
+/** Deeper than any legitimate request; bounds the digest's recursion. */
+const MAX_DIGEST_DEPTH = 64
+
+export class RequestTooDeepError extends Error {
+  constructor () {
+    super(`request parameters are nested more than ${MAX_DIGEST_DEPTH} levels deep`)
+  }
+}
+
+/** Deterministic JSON so key order cannot change the digest. */
+function stableStringify (value: unknown, depth: number = 0): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null'
+  if (depth >= MAX_DIGEST_DEPTH) throw new RequestTooDeepError()
+  if (Array.isArray(value)) return `[${value.map(item => stableStringify(item, depth + 1)).join(',')}]`
+  const entries = Object.entries(value as Record<string, unknown>)
+    .filter(([, v]) => v !== undefined)
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([k, v]) => `${JSON.stringify(k)}:${stableStringify(v, depth + 1)}`)
+  return `{${entries.join(',')}}`
+}
+
+/** Thrown when the answers a retry must carry exceed `requestStateMaxAnswerBytes`. */
+export class AnswersTooLargeError extends Error {
+  constructor (bytes: number, maxBytes: number) {
+    super(`the answers to carry take ${bytes} bytes of JSON, more than requestStateMaxAnswerBytes (${maxBytes})`)
+  }
+}
+
+/**
+ * The answers to carry. The client echoes the state back on every retry, so
+ * they are bounded by `maxBytes` of JSON. Past it sealing fails rather than
+ * dropping some: a handler that silently lost an earlier answer would ask for
+ * it again, possibly forever. `0` carries none at all.
+ */
+function withinBudget (answers: Record<string, unknown> | undefined, maxBytes: number): { answers?: Record<string, unknown> } {
+  if (answers === undefined || maxBytes === 0 || Object.keys(answers).length === 0) return {}
+  const bytes = Buffer.byteLength(JSON.stringify(answers))
+  if (bytes > maxBytes) throw new AnswersTooLargeError(bytes, maxBytes)
+  return { answers }
+}
+
+/**
+ * Seals and opens `requestState` blobs.
+ *
+ * A caller that does not supply a secret gets a process-random one, which is
+ * correct for a single instance but means state minted by one replica will not
+ * verify on another. Deployments that load-balance MRTR retries across
+ * instances must configure a shared secret.
+ */
+export class RequestStateSealer {
+  /** The first seals; any of them verifies, so a secret can be rotated. */
+  #secrets: Buffer[]
+  #ttlMs: number
+
+  #requirePrincipal: boolean
+  #audience?: string
+  #maxAnswerBytes: number
+
+  constructor (options: {
+    /**
+     * A list rotates secrets: state is sealed with the first and accepted
+     * under any, so add the new secret in front, deploy, and drop the old one
+     * once state sealed with it has expired.
+     */
+    secret?: string | Buffer | ReadonlyArray<string | Buffer>
+    ttlMs?: number
+    requirePrincipal?: boolean
+    audience?: string
+    maxAnswerBytes?: number
+  } = {}) {
+    this.#audience = options.audience
+    this.#maxAnswerBytes = options.maxAnswerBytes ?? DEFAULT_MAX_CARRIED_ANSWER_BYTES
+    if (options.secret === undefined) {
+      this.#secrets = [randomBytes(MIN_SECRET_BYTES)]
+    } else {
+      const configured = Array.isArray(options.secret) ? options.secret : [options.secret as string | Buffer]
+      if (configured.length === 0) {
+        throw new Error('requestStateSecret must name at least one secret')
+      }
+      // A configured but empty secret (say, an unset environment variable
+      // expanded to '') must not silently fall back to a per-process key:
+      // retries would then fail on every other instance.
+      this.#secrets = configured.map(entry => {
+        if (typeof entry !== 'string' && !Buffer.isBuffer(entry)) {
+          throw new TypeError('requestStateSecret must be a string, a Buffer or an array of them')
+        }
+        const secret = Buffer.isBuffer(entry) ? entry : Buffer.from(entry, 'utf8')
+        if (secret.length < MIN_SECRET_BYTES) {
+          throw new Error(`requestStateSecret must be at least ${MIN_SECRET_BYTES} bytes`)
+        }
+        return secret
+      })
+    }
+    this.#ttlMs = options.ttlMs ?? DEFAULT_TTL_MS
+    this.#requirePrincipal = options.requirePrincipal ?? false
+  }
+
+  /** Mint a sealed state string to hand back in an `InputRequiredResult`. */
+  seal (input: {
+    principal?: string
+    method: string
+    params: unknown
+    /**
+     * The digest of the request as the client sent it, taken before any
+     * handler ran; computed from `params` when absent.
+     */
+    requestDigest?: string
+    payload?: unknown
+    inputs?: Record<string, string>
+    elicitations?: Record<string, ElicitationExpectation>
+    answers?: Record<string, unknown>
+    ttlMs?: number
+  }): string {
+    if (this.#requirePrincipal && input.principal === undefined) {
+      // Binding to "nobody" would let any other unidentified caller replay the
+      // state. When the deployment can identify callers, refusing is the only
+      // safe answer; this mirrors how tasks refuse a subject-less token.
+      throw new PrincipalRequiredError('Cannot seal request state without an authenticated principal')
+    }
+
+    const claims: RequestStateClaims = {
+      principal: input.principal,
+      method: input.method,
+      requestDigest: input.requestDigest ?? digestRequest(input.method, input.params),
+      expiresAt: Date.now() + (input.ttlMs ?? this.#ttlMs),
+      ...(this.#audience !== undefined ? { audience: this.#audience } : {}),
+      // Omitted, not null, when the handler saved nothing, so the retry sees
+      // `requestState` exactly as the first attempt did.
+      payload: input.payload,
+      ...(input.inputs ? { inputs: input.inputs } : {}),
+      ...(input.elicitations && Object.keys(input.elicitations).length > 0 ? { elicitations: input.elicitations } : {}),
+      ...withinBudget(input.answers, this.#maxAnswerBytes)
+    }
+
+    const body = Buffer.from(JSON.stringify(claims), 'utf8').toString('base64url')
+    return `${body}.${this.#sign(body)}`
+  }
+
+  /**
+   * Open a state string presented on a retry, refusing anything that fails
+   * integrity, has lapsed, belongs to another principal, or was minted for a
+   * different request.
+   */
+  open (state: string, expected: {
+    principal?: string
+    method: string
+    params: unknown
+    /** As for `seal`: computed from `params` when absent. */
+    requestDigest?: string
+    now?: number
+  }): VerifyResult {
+    const separator = state.lastIndexOf('.')
+    if (separator <= 0) {
+      return { ok: false, reason: 'malformed request state' }
+    }
+
+    const body = state.slice(0, separator)
+    const signature = state.slice(separator + 1)
+
+    if (!this.#verify(body, signature)) {
+      return { ok: false, reason: 'request state failed integrity check' }
+    }
+
+    let claims: RequestStateClaims
+    try {
+      claims = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'))
+    } catch {
+      return { ok: false, reason: 'malformed request state' }
+    }
+
+    const now = expected.now ?? Date.now()
+    if (typeof claims.expiresAt !== 'number' || now > claims.expiresAt) {
+      return { ok: false, reason: 'request state has expired' }
+    }
+
+    if (this.#requirePrincipal && expected.principal === undefined) {
+      return { ok: false, reason: 'request state requires an authenticated principal' }
+    }
+
+    if (claims.audience !== this.#audience) {
+      return { ok: false, reason: 'request state was issued by a different server' }
+    }
+
+    if (claims.principal !== expected.principal) {
+      return { ok: false, reason: 'request state was issued to a different principal' }
+    }
+
+    if (claims.method !== expected.method) {
+      return { ok: false, reason: 'request state was issued for a different method' }
+    }
+
+    let digest: string
+    try {
+      digest = expected.requestDigest ?? digestRequest(expected.method, expected.params)
+    } catch (error) {
+      if (error instanceof RequestTooDeepError) return { ok: false, reason: error.message }
+      throw error
+    }
+    if (claims.requestDigest !== digest) {
+      return { ok: false, reason: 'request state was issued for a different request' }
+    }
+
+    return { ok: true, claims }
+  }
+
+  #sign (body: string, secret: Buffer = this.#secrets[0]): string {
+    return createHmac('sha256', secret).update(SIGNATURE_DOMAIN).update(body).digest('base64url')
+  }
+
+  #verify (body: string, signature: string): boolean {
+    const actual = Buffer.from(signature, 'utf8')
+    let valid = false
+    // Every secret is tried, so the time taken does not tell which matched.
+    for (const secret of this.#secrets) {
+      const expected = Buffer.from(this.#sign(body, secret), 'utf8')
+      if (expected.length === actual.length && timingSafeEqual(expected, actual)) valid = true
+    }
+    return valid
+  }
+}

@@ -1,6 +1,6 @@
 # Fastify MCP Server
 
-A Fastify plugin that implements the Model Context Protocol (MCP) server using JSON-RPC 2.0. This plugin enables Fastify applications to expose tools, resources, and prompts following the MCP 2025-06-18 specification with full elicitation support.
+A Fastify plugin that implements the Model Context Protocol (MCP) server using JSON-RPC 2.0. This plugin enables Fastify applications to expose tools, resources, and prompts following the MCP **2026-07-28** specification, while continuing to serve clients that speak the earlier handshake-based revisions on the same endpoint.
 
 ## Installation
 
@@ -18,8 +18,10 @@ npm install @sinclair/typebox
 
 ## Features
 
-- **Complete MCP 2025-11-25 Support**: Implements the current Model Context Protocol revision, negotiating down to `2025-06-18`, `2025-03-26` and `2024-11-05` for older clients
-- **Tasks (experimental)**: Task-augmented tool calls with polling, deferred result retrieval and cancellation
+- **MCP 2026-07-28 Support**: Stateless per-request protocol with `server/discover`, multi round-trip requests, `subscriptions/listen`, cacheable results and header-based routing
+- **Dual-era**: The same endpoint serves 2026-07-28 statelessly *and* answers `initialize` for `2025-11-25`, `2025-06-18`, `2025-03-26` and `2024-11-05` clients
+- **Multi Round-Trip Requests**: Handlers ask for elicitation, sampling or roots by throwing `InputRequired`; state travels through the client, integrity-protected
+- **Tasks Extension**: `io.modelcontextprotocol/tasks` with `tasks/get` polling, `tasks/update` and `tasks/cancel`
 - **Elicitation Support**: Server-to-client information requests in both form and URL mode, with schema validation
 - **Icons**: Optional icon metadata on tools, resources, resource templates and prompts
 - **TypeBox Validation**: Type-safe schema validation with automatic TypeScript inference
@@ -128,7 +130,14 @@ await app.listen({ port: 3000 })
 
 The plugin decorates the Fastify instance with `mcpClient()`, a client that talks to the
 server through `app.inject()` — no port binding, so it's equally useful for tests or for
-driving the server from other in-process code:
+driving the server from other in-process code.
+
+It accepts both JSON and `text/event-stream` responses; notifications streamed before the
+result are returned in `response.notifications`. Pass extra `_meta` (such as a
+`progressToken`) with `callTool(name, args, { meta })`. A result with a `resultType` it does
+not understand is rejected. It does not retry on its own: on `-32022` pick a version from
+`error.data.supported`, and on `-32020` re-run `listTools()` before retrying. It talks to the
+endpoint the plugin registered, route prefix included; pass `endpoint` to aim elsewhere.
 
 ```typescript
 import { test } from 'node:test'
@@ -178,15 +187,52 @@ test('calls an MCP tool', async (t) => {
 })
 ```
 
+The client defaults to `LATEST_LEGACY_PROTOCOL_VERSION`, so existing code keeps the
+handshake and session lifecycle shown above. To use the stateless revision, select it
+explicitly and call methods without `initialize()`:
+
+```typescript
+import { LATEST_PROTOCOL_VERSION } from '@platformatic/mcp'
+
+const modern = app.mcpClient({
+  protocolVersion: LATEST_PROTOCOL_VERSION,
+  clientInfo: { name: 'my-client', version: '1.0.0' },
+  clientCapabilities: {}
+})
+
+const discovery = await modern.discover()
+const tools = await modern.listTools()
+const result = await modern.callTool('echo', { message: 'hello' })
+```
+
+In modern mode the client adds the required per-request `_meta`, `Mcp-Method`, encoded
+`Mcp-Name`, and protocol-version headers. Calling `listTools()` also caches tool schemas so a
+later `callTool()` can mirror `x-mcp-header` arguments into encoded `Mcp-Param-*` headers.
+For a direct call before listing, pass those headers through `callTool(..., { headers })`.
+It does not create or send a session; `initialize()` rejects because that method was removed
+in `2026-07-28`.
+
+When a call returns `resultType: 'input_required'`, retry it with the returned state and the
+client's answers:
+
+```typescript
+await modern.callTool('interactive-tool', args, {
+  requestState: response.body.result.requestState,
+  inputResponses: {
+    confirmation: { action: 'accept', content: { confirmed: true } }
+  }
+})
+```
+
 The client:
 
 - Uses `app.inject()` only (no port binding).
 - Manages sequential JSON-RPC request IDs per client instance.
-- `initialize()` performs the complete MCP lifecycle handshake (`initialize` plus `notifications/initialized`).
-- `initialize()` rejects when `notifications/initialized` is not accepted with an empty `202` or `204` response.
-- Commits `mcp-session-id` and negotiated protocol version only after the full initialization handshake succeeds.
+- In legacy mode, `initialize()` performs the complete lifecycle handshake (`initialize` plus `notifications/initialized`).
+- Rejects a legacy initialization when `notifications/initialized` is not accepted with an empty `202` or `204` response.
+- Commits `mcp-session-id` and negotiated protocol version only after the full legacy handshake succeeds.
 - Forwards headers passed to `initialize()` to both lifecycle requests, except MCP-managed `mcp-session-id` and `mcp-protocol-version` on `notifications/initialized`.
-- Captures committed `mcp-session-id` from successful initialization and sends it automatically on later requests.
+- Captures committed `mcp-session-id` from successful legacy initialization and sends it automatically on later requests.
 - Lets you pass custom headers (including authorization) globally or per request.
 
 Responses are a discriminated union — narrow with `'result' in response.body` or
@@ -195,21 +241,131 @@ instead of returning.
 
 Note: no OAuth/JWT credentials are generated for you.
 
-## Protocol Version Negotiation
+## Protocol Versions
 
-The server answers `initialize` with the client's requested revision when it is one it
-supports, and otherwise offers the newest one it has:
+This plugin is a **dual-era** server, in the spec's terminology. The `2026-07-28` revision
+removed the `initialize` handshake, protocol-level sessions, and SSE resumability; rather
+than drop the clients that still need them, the same `/mcp` endpoint serves both:
 
 ```typescript
-import { LATEST_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS } from '@platformatic/mcp'
+import {
+  LATEST_PROTOCOL_VERSION,
+  LATEST_LEGACY_PROTOCOL_VERSION,
+  SUPPORTED_PROTOCOL_VERSIONS
+} from '@platformatic/mcp'
 
-LATEST_PROTOCOL_VERSION      // '2025-11-25'
-SUPPORTED_PROTOCOL_VERSIONS  // ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05']
+LATEST_PROTOCOL_VERSION         // '2026-07-28'
+LATEST_LEGACY_PROTOCOL_VERSION  // '2025-11-25' — newest revision reachable via initialize
+SUPPORTED_PROTOCOL_VERSIONS     // ['2026-07-28', '2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05']
 ```
 
-On the HTTP transport, requests after `initialize` must carry the agreed revision in the
-`MCP-Protocol-Version` header. An unsupported value is answered with `400`; an absent header
-is treated as `2025-03-26`, which predates the header.
+A request is served as **modern** when its `params._meta` carries
+`io.modelcontextprotocol/protocolVersion` or its `MCP-Protocol-Version` header names a modern
+revision. A request with neither takes the legacy path, so the two eras can interleave freely
+on one server. Header-based detection ensures modern routing headers can never bypass their
+required header/body validation. A legacy request that sends `Mcp-Method` or `Mcp-Name` anyway
+(an `initialize` from a dual-era client, say) must also match its body, or it is answered with
+`-32020` and HTTP 400.
+
+### Modern requests (2026-07-28)
+
+There is no negotiation step. Every request states what it speaks and what the client can do:
+
+```jsonc
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "get_weather",
+    "arguments": { "location": "Seattle" },
+    "_meta": {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientInfo": { "name": "ExampleClient", "version": "1.0.0" },
+      "io.modelcontextprotocol/clientCapabilities": {}
+    }
+  }
+}
+```
+
+sent with these headers, which the server checks against the body:
+
+```http
+MCP-Protocol-Version: 2026-07-28
+Mcp-Method: tools/call
+Mcp-Name: get_weather
+```
+
+`protocolVersion` and `clientCapabilities` are required — a request missing either is
+answered with `-32602` and HTTP 400. An `initialize` without that `_meta` always takes the
+legacy handshake, whatever supported `MCP-Protocol-Version` header it carries (an
+unsupported one is answered with HTTP 400).
+
+A tool parameter annotated with `x-mcp-header` is mirrored into an `Mcp-Param-*` header and
+must be a string, integer or boolean: a plain `type`, a nullable one, an `enum`/`const` of one of
+those, or a union of such literals (TypeBox's `Type.Union` of `Type.Literal`s). `mcpAddTool`
+throws for an annotation the transport cannot mirror, or one not reachable through `properties`
+alone, since 2026-07-28 clients could never call that tool. Every result comes back with `resultType`, the server's
+identity in `_meta`, and caching hints where the revision defines them.
+
+The status codes matter, because a dual-era *client* uses them to work out which kind of
+server it reached:
+
+| Condition | HTTP | JSON-RPC error |
+|---|---|---|
+| Headers disagree with the body (the version included), or a required one is missing | `400` | `-32020` `HeaderMismatch` |
+| Client did not declare a capability the request needs | `400` | `-32021` `MissingRequiredClientCapability` |
+| Version unknown or unsupported | `400` | `-32022` `UnsupportedProtocolVersion` |
+| Method not implemented, or removed in this revision | `404` | `-32601` `Method not found` |
+| Unknown tool, missing resource, failed handler | `200` | `-32602` / `-32603` |
+
+`server/discover` reports everything a client might want up front, and is the probe a
+dual-era client uses on stdio:
+
+```bash
+curl -X POST http://localhost:3000/mcp \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -H 'MCP-Protocol-Version: 2026-07-28' \
+  -H 'Mcp-Method: server/discover' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{
+        "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities":{}}}}'
+```
+
+`supportedVersions` (and `data.supported` on `-32022`) lists every revision the server speaks,
+legacy ones included, as the specification's own example does. Only `2026-07-28` can be sent
+per request in `_meta`; the legacy revisions are reached through `initialize`, so a client that
+gets `-32022` for a legacy version should start a handshake rather than retry with `_meta`.
+
+A modern notification (a message without an `id`) is acknowledged with `202` once it is a
+well-formed JSON-RPC message; its `_meta` and mirrored headers are not checked, since nothing
+is answered to it. A tool with no handler answers `tools/call` with an `isError` result, as on
+the legacy path, while a resource or prompt with no handler answers `-32603`. The list
+operations return everything in one page, so they issue no cursor, and a 2026-07-28 request
+that sends one gets `-32602` (Invalid params). Legacy requests still ignore it.
+
+### What 2026-07-28 removed
+
+These are answered with `404` and `-32601` on the modern path, and continue to work
+unchanged for legacy clients (except `logging/setLevel`, which is not implemented for them):
+
+| Removed | Replacement |
+|---|---|
+| `initialize` / `notifications/initialized` | per-request `_meta` |
+| `Mcp-Session-Id`, HTTP `GET` and `DELETE` | nothing — the protocol is stateless |
+| `ping` | none; use transport-level health checks |
+| `logging/setLevel` | `io.modelcontextprotocol/logLevel` in a request's `_meta` |
+| `resources/subscribe` / `resources/unsubscribe` | `subscriptions/listen` |
+| Server-initiated requests on SSE streams | [multi round-trip requests](#multi-round-trip-requests-2026-07-28) |
+| `Last-Event-ID` resumability | re-issue the request with a new id |
+| `tasks/result`, `tasks/list` | `tasks/get` polling |
+
+### Legacy requests (2025-11-25 and earlier)
+
+The handshake path is unchanged. The server answers `initialize` with the client's requested
+revision when it supports it, and otherwise with `2025-11-25` — never with `2026-07-28`,
+which a client sending `initialize` by definition cannot speak.
 
 **Responses are shaped to the revision the client negotiated.** A client on an older revision
 never sees a field or method that revision does not define:
@@ -282,6 +438,334 @@ A JSON-RPC response posted by the client is answered with `202` and handed to
 The body-parser error handler is scoped to the `POST /mcp` route. Any other error on that route, and every
 error on your other routes, still goes to your own (or Fastify's default) error handler.
 
+## Multi Round-Trip Requests (2026-07-28)
+
+A stateless server cannot hold a request open while it asks the user something. Instead it
+ends the request with an interim result, and the client comes back with the answers on a new
+one. Handlers express this by throwing `InputRequired`:
+
+```typescript
+import mcpPlugin, { InputRequired, elicitForm, type ElicitResult } from '@platformatic/mcp'
+
+app.mcpAddTool({
+  name: 'create-issue',
+  inputSchema: Type.Object({ title: Type.String() })
+}, async (args, context) => {
+  // Each answer is the result of the method it asked with: an elicitation
+  // answer is an `ElicitResult`, a sampling answer a `CreateMessageResult`.
+  const answer = context.inputResponses?.repo as ElicitResult | undefined
+
+  if (!answer) {
+    throw new InputRequired({
+      inputRequests: {
+        repo: elicitForm('Which repository?', {
+          type: 'object',
+          properties: { name: { type: 'string' } },
+          required: ['name']
+        })
+      },
+      // Anything the handler needs to resume. It is signed, not encrypted: the
+      // client cannot change it, but can read it, so keep secrets out of it.
+      state: { title: args.title }
+    })
+  }
+
+  // On the retry, `requestState` is the value above, verified and unsealed.
+  const { title } = context.requestState as { title: string }
+  // The user may decline or cancel: only an accepted answer carries content.
+  if (answer.action !== 'accept') {
+    return { content: [{ type: 'text', text: 'Cancelled' }], isError: true }
+  }
+  return { content: [{ type: 'text', text: `Created "${title}" in ${answer.content?.name}` }] }
+})
+```
+
+Answers are checked before the handler sees them: each must be a result of the method it
+answered, and an accepted elicitation must match what was asked — content conforming to the
+form's `requestedSchema`, or no content for a URL-mode elicitation. A form with no required
+fields (a plain confirmation) may be accepted without content, and the handler sees `content: {}`. A non-conforming answer is
+refused with `-32602`, on a retry and on `tasks/update` alike. Content sent with `decline` or
+`cancel` is not checked against the `requestedSchema`, so it is dropped: the handler sees only
+the `action`. Sampling answers must carry well-formed content blocks, `roots/list`
+answers `file://` URIs, and an answer holding a number JSON cannot carry (`1e400`, which parses
+as `Infinity`) is refused rather than turning into `null` on the next round. An input request holding a non-finite number (`Infinity`, `NaN`), in a
+`requestedSchema` or in sampling parameters, is the handler's error, since JSON would hand the
+client `null` in its place.
+
+An accepted answer may carry properties the form did not ask for, unless its `requestedSchema`
+sets `additionalProperties: false`. Pick the fields you asked for rather than spreading
+`content` into a record, or a client could set ones you never offered (`isAdmin`, say).
+
+`requestState` is signed, not encrypted. Besides the handler's `state`, a client that decodes it
+can read the caller's identity (`userId`, OAuth client id and issuer), the answers being carried
+and the forms asked. None of that is more than the client already knows, but do not forward
+`requestState` to a third party, and keep secrets out of `state`.
+
+A handler may ask in several steps. Each retry hands it the answers given so far, not just
+the latest round's, so the second step still sees the first answer, as it would when running
+as a task. A key asked again is replaced by its new answer. The client echoes those answers
+back on every retry, so they are bounded by `requestStateMaxAnswerBytes` (64 KiB of JSON by
+default; `0` turns carrying off). Answers are never dropped silently: when a handler asks again
+after gathering more than that, the request fails with `-32602` (and the server logs a warning),
+since a handler that lost an earlier answer would only ask for it again. A handler that gathers
+large answers, such as a sampled draft, should keep what it needs in its own `state` and say
+which answers are still worth carrying with `carry`:
+
+```typescript
+// The draft is summarised into state; only the confirmation is asked next.
+throw new InputRequired({
+  inputRequests: { confirm: elicitForm('Publish this summary?', confirmSchema) },
+  state: { summary: summarise(draft) },
+  carry: [] // carry no earlier answers
+})
+```
+
+An accepted form answer is validated against the `requestedSchema` exactly as written, every
+keyword included (`pattern` too, so keep patterns simple). Annotations (`title`,
+`description`, `default`, `examples`) and `$schema` / `$id` are ignored, so a draft-07 schema
+works. The formats elicitation defines (`email`, `uri`, `date`, `date-time`) are checked; any
+other `format` is accepted as is. A schema that cannot be compiled fails the request with `-32603` when the handler asks,
+rather than leaving its answers unchecked.
+
+`elicitForm`, `elicitUrl`, `requestSampling` and `requestRoots` build the entries. The
+dispatcher refuses to send a request the client did not declare support for, answering
+`-32021` instead — so a handler cannot accidentally elicit from a client that cannot elicit.
+
+### requestState security
+
+`requestState` passes through the client, so it is attacker-controlled by definition. The
+plugin seals it with HMAC-SHA256 and binds it to the authenticated principal, an expiry, and
+a digest of the originating request. State that is tampered with, expired, presented by
+another principal, or replayed onto a different call is refused with `-32602`.
+
+```typescript
+await app.register(mcpPlugin, {
+  // Required when more than one instance can serve a retry — the default is a
+  // per-process random key, so a retry landing on another replica would be refused.
+  requestStateSecret: process.env.MCP_REQUEST_STATE_SECRET,
+  requestStateTtlMs: 5 * 60 * 1000, // default
+  requestStateMaxAnswerBytes: 64 * 1024 // default
+})
+```
+
+> Replay is *bounded*, not eliminated. If a given `requestState` must be consumed at most
+> once, enforce that in your own handler.
+
+Applications that authenticate in their own Fastify hooks can expose that identity to MCP
+without enabling the built-in OAuth plugin:
+
+```typescript
+app.addHook('preHandler', async (request, reply) => {
+  request.user = await authenticateRequest(request, reply)
+})
+
+await app.register(mcpPlugin, {
+  resolveAuthorizationContext: (request) => request.user
+    ? { userId: request.user.id, scopes: request.user.scopes }
+    : undefined
+})
+```
+
+The resolver runs once per MCP request after Fastify preHandlers (POST, and the legacy SSE
+GET and DELETE, which check who owns the session) and is authoritative when configured. It
+only maps an already-authenticated request; it does **not** reject anonymous requests for you,
+so it must not throw for one. Return a stable string `userId` so legacy sessions, `requestState`, modern and legacy tasks, tool
+access hooks, and handler contexts all use the same principal. If the resolver returns no
+`userId`, principal-bound request state is refused and the caller owns no tasks.
+
+The resolver is not called for requests from the stdio transport, which carry no HTTP
+credentials (see [stdio](#stdio-transport)). An authentication hook of your own should let them
+through; `isStdioRequest(request)` tells them apart in hooks added after the plugin is
+registered:
+
+```typescript
+import { isStdioRequest } from '@platformatic/mcp'
+
+app.addHook('preHandler', async (request, reply) => {
+  if (isStdioRequest(request)) return
+  request.user = await authenticateRequest(request, reply)
+})
+```
+
+## Subscriptions (2026-07-28)
+
+`subscriptions/listen` replaces both the standalone `GET` stream and `resources/subscribe`.
+The client names what it wants and the response *is* the stream:
+
+```jsonc
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "subscriptions/listen",
+  "params": {
+    "notifications": {
+      "toolsListChanged": true,
+      "resourceSubscriptions": ["file:///project/config.json"]
+    },
+    "_meta": { /* ... */ }
+  }
+}
+```
+
+The server acknowledges with `notifications/subscriptions/acknowledged`, reporting the subset
+it agreed to honour — an opt-in for something the server has no capability for is dropped.
+Every message on the stream carries `io.modelcontextprotocol/subscriptionId`, and
+`app.mcpBroadcastNotification()` feeds both these streams and legacy SSE sessions.
+
+A notification type is only acknowledged when the server's capabilities say it is emitted:
+`listChanged` for the list types, `resources.subscribe` for `resourceSubscriptions`. The default
+capabilities declare `listChanged: true` for tools, prompts and resources, and
+`resources.subscribe` once `app.mcpSetResourceSubscribeHandler()` is called; an explicit
+`capabilities` option is used exactly as given.
+
+A stream whose reader falls more than 1 MB behind is closed with `notifications/cancelled`
+and no final response: notifications were lost, so the client should reconnect and
+resynchronize rather than treat it as a graceful end. On stdio the same limit applies once
+stdout stops draining.
+
+Each stream holds a socket and buffers, so streams are bounded:
+`subscriptionMaxStreamsPerPrincipal` per caller (default 10, refused with HTTP `429`),
+`subscriptionMaxStreams` per instance (default 1000), and `subscriptionMaxResourceUris` per
+stream (default 1000, each at most 2048 characters). A stream's id goes into every notification
+it carries, so 2026-07-28 request ids are limited to 256 characters (longer ones are refused
+with `-32600`). A caller is a user at an issuer, whichever
+OAuth client they use; when the deployment cannot identify callers, only the per-instance limit
+applies.
+
+Resource subscriptions go through the same handlers as the legacy `resources/subscribe`: the
+subscribe handler runs for each requested URI with the caller's `authContext`, and a URI whose
+handler throws is left out of the acknowledgement. Throw there for resources the caller may not
+watch; update notifications reveal what changed and when. The unsubscribe handler runs for an
+accepted URI once the last listen stream on that instance holding it ends, however it ends, so a
+handler may start a watcher on subscribe (idempotently) and stop it on unsubscribe. It runs with
+the context of the stream that ended last. Legacy `resources/unsubscribe` calls are not counted:
+they still run the handler for that session. Without a subscribe handler nothing can
+check access, so no URI is accepted, even when `capabilities` declares `resources.subscribe`.
+
+```typescript
+app.mcpSetResourceSubscribeHandler(async ({ uri }, { authContext }) => {
+  if (!canRead(authContext, uri)) throw new Error('Forbidden')
+  watch(uri)
+  return {}
+})
+app.mcpSetResourceUnsubscribeHandler(async ({ uri }) => {
+  unwatch(uri)
+  return {}
+})
+```
+
+With the default capabilities, adding a tool, resource or prompt after the server is ready
+broadcasts the matching `list_changed` notification. Legacy clients are only told
+`listChanged` (and `resources.subscribe`) when `enableSSE` is on, since without SSE they have
+no channel to receive notifications.
+
+With Redis, that broadcast reaches every instance, but each instance has its own registry: a
+tool added at runtime must be added on every instance, or clients told the list changed may
+list it on one that does not have it. Designing this for rolling redeploys is tracked in
+[#237](https://github.com/platformatic/mcp/issues/237).
+
+Request-scoped notifications (`notifications/progress`, `notifications/message`) are never
+delivered here; they belong on the response stream of the request they relate to.
+
+A stream ends when the access token that opened it expires, or after `sseMaxConnectionMs` when
+that comes first, with `notifications/cancelled` and the graceful completion response, so the
+client listens again with fresh credentials and misses nothing. A listen whose `expiresAt` has
+already passed is refused with HTTP `401` instead. Access is checked only when the stream opens:
+a token with no expiry, or one revoked before it expires, keeps its stream open, so deployments
+that revoke tokens should set `sseMaxConnectionMs`. The stream limits above are per instance, so
+behind a balancer with N instances a caller may hold up to N times as many. Callers the deployment cannot
+identify all share `subscriptionMaxStreams` (1000 by default) and have no per-caller limit, so
+one anonymous client can hold every slot; deployments that accept anonymous listeners should
+bound them upstream (per IP, say) or lower the limit.
+
+## Progress and Logging (2026-07-28)
+
+Handlers report progress and log messages through their context:
+
+```typescript
+app.mcpAddTool({ name: 'import', inputSchema: Type.Object({}) }, async (_args, context) => {
+  context.sendProgress(0, 3, 'Reading')
+  context.log('info', { step: 'read' }, 'importer')
+  // ...
+  context.sendProgress(3, 3, 'Done')
+  return { content: [{ type: 'text', text: 'imported' }] }
+})
+```
+
+Both are sent only when the client asked for them, on the response stream of that request:
+
+- `context.sendProgress(progress, total?, message?)` emits `notifications/progress` when the
+  request carries `_meta.progressToken`. `progress` must increase; a value that does not is
+  dropped.
+- `context.log(level, data, logger?)` emits `notifications/message` when the request sets
+  `io.modelcontextprotocol/logLevel`, and only at or above that level. 2026-07-28 clients are
+  therefore always told the server supports `logging`. Legacy clients never are: this server
+  does not implement `logging/setLevel`, and `context.log` writes nothing on the legacy path.
+
+Notifications are held until the outcome is known, or for 200ms after the first one is sent.
+A request that never reports, or that fails before then, answers with plain JSON and its
+proper status. Otherwise the response is a `text/event-stream` carrying the notifications and
+then the result. Once streaming has started the status is committed to `200`, so a later
+error arrives inside the stream. Nothing is sent after the response. Both are no-ops on the
+legacy path and for tasks, whose creating request has already been answered.
+
+A missing client capability must be answered with `400` and `-32021`, which a stream can no
+longer do. So a `tools/call`, `prompts/get` or `resources/read` only starts streaming early
+when the handler cannot need a capability the client lacks: by default, when the client
+declared every capability an input request can need (`elicitation` form and URL,
+`sampling` with `tools` and `context`, and `roots`). Otherwise its notifications wait for the
+outcome. A tool can name what it may ask for, so clients that declared that much still get
+live progress:
+
+```typescript
+app.mcpAddTool({
+  name: 'deploy',
+  inputSchema: Type.Object({}),
+  // Only ever asks with elicitForm(): clients with form elicitation get live progress.
+  inputCapabilities: { elicitation: { form: {} } }
+}, handler)
+```
+
+In practice few clients declare all of these, so **a tool without `inputCapabilities` usually
+delivers its progress together with its result**. Declare `inputCapabilities` on every tool
+whose progress should arrive live. `inputCapabilities: {}` says the tool never asks for input,
+so it always streams early.
+`inputCapabilities` is never listed to clients. A tool that then asks for more than it
+declared, after progress has streamed, gets an internal error instead of `-32021`.
+
+## Result Caching (2026-07-28)
+
+`server/discover`, the four list operations and `resources/read` must carry `ttlMs` and
+`cacheScope`. The default is `{ ttlMs: 0, cacheScope: 'private' }` — immediately stale and
+never shared between callers, which is safe for every server. Opt into caching explicitly:
+
+```typescript
+await app.register(mcpPlugin, {
+  caching: {
+    discover: { ttlMs: 3_600_000, cacheScope: 'public' },
+    toolsList: { ttlMs: 300_000, cacheScope: 'public' },
+    resourcesRead: { ttlMs: 30_000, cacheScope: 'private' }
+  }
+})
+```
+
+> `cacheScope: 'public'` lets shared proxies serve one caller's response to another, **even
+> from an authenticated endpoint**. Only use it for results that genuinely do not vary per
+> user, and never rely on it for access control.
+
+A `resources/read` handler can tighten the configured hint for its own result by returning
+`ttlMs` and `cacheScope`: the shorter `ttlMs` wins, and `cacheScope: 'private'` overrides a
+`public` default. A handler cannot loosen the configured hint. Its `ttlMs` is rounded down
+to whole milliseconds, and a negative one counts as `0`.
+
+```typescript
+app.mcpAddResource({ uriPattern: 'me://profile', name: 'Profile' }, async (uri, context) => ({
+  contents: [{ uri, text: await profileOf(context.authContext) }],
+  cacheScope: 'private',
+  ttlMs: 0
+}))
+```
+
 ## Origin Validation
 
 Browser clients can be protected against DNS rebinding by allow-listing origins. A rejected
@@ -329,10 +813,27 @@ When authorization is enabled, the `/.well-known/*` discovery endpoints answer c
 requests from any origin on their own; that CORS handling is scoped to those routes and does not
 affect the rest of the application.
 
-## Tasks (MCP 2025-11-25, experimental)
+## Tasks
 
 Tasks let a tool call return immediately with a task handle while the work continues in the
-background. The client then polls `tasks/get` and collects the result with `tasks/result`.
+background, and the client polls for the outcome.
+
+The shape differs by era. In `2026-07-28` tasks are the official
+`io.modelcontextprotocol/tasks` **extension**: the client declares it in its per-request
+capabilities, the server advertises it under `capabilities.extensions`, and polling is
+`tasks/get` alone. In `2025-11-25` tasks were part of the core protocol, with a per-call
+`task` field and a blocking `tasks/result`. One `enableTasks: true` turns on both.
+
+| | `2025-11-25` (core) | `2026-07-28` (extension) |
+|---|---|---|
+| Negotiated via | `capabilities.tasks` | `capabilities.extensions['io.modelcontextprotocol/tasks']` |
+| Client opts in | `task` field per call | extension in `clientCapabilities` |
+| Poll | `tasks/get` | `tasks/get` (result and error inlined) |
+| Await result | `tasks/result` (blocks) | — removed, poll instead |
+| Provide input | — | `tasks/update` |
+| Enumerate | `tasks/list` | — removed |
+| Cancel | `tasks/cancel` | `tasks/cancel` |
+| Handle field names | `ttl`, `pollInterval` | `ttlMs`, `pollIntervalMs` |
 
 Enable the feature on the plugin, then opt individual tools in with `execution.taskSupport`:
 
@@ -349,7 +850,38 @@ app.mcpAddTool({
 })
 ```
 
-A client opts in per call by adding a `task` field:
+On `2026-07-28`, a client that declared the extension may get a task handle back from any
+tool that permits one — the server decides, and there is no per-call opt-in:
+
+```jsonc
+// -> tools/call, with "io.modelcontextprotocol/tasks": {} in clientCapabilities.extensions
+// <- CreateTaskResult
+{ "resultType": "task", "taskId": "…", "status": "working", "ttlMs": 60000, "pollIntervalMs": 1000 }
+
+// -> tasks/get { "taskId": "…" }
+// <- the terminal state, with the original result inlined
+{ "resultType": "complete", "status": "completed", "result": { "content": [ ... ] } }
+```
+
+A tool declaring `taskSupport: 'required'` refuses a client that did not declare the
+extension, with `-32021`.
+
+While a task waits in `input_required`, `tasks/get` shows the input requests its handler made,
+which were checked against the capabilities of the request that created the task. Poll with
+the same capabilities you created it with.
+
+A task's handler may ask the client for input up to `taskMaxInputRounds` times (32 by default)
+before the task fails; a synchronous call has no such bound, because each retry is the client's
+choice. A handler that throws `InputRequired` with only `state` and nothing to ask is run again
+after the task's `pollIntervalMs`, as a client would retry it, rather than at once. Such rounds
+do not count toward `taskMaxInputRounds`: a handler may poll something else this way for as
+long as the task's ttl allows.
+
+A tool result with `isError: true` completes a 2026-07-28 task: the extension reserves
+`failed` for JSON-RPC errors, and the error result is inlined like any other. A 2025-11-25
+task with such a result is still reported `failed`, as before.
+
+On `2025-11-25`, the client opts in per call instead:
 
 ```jsonc
 // -> tools/call
@@ -358,11 +890,12 @@ A client opts in per call by adding a `task` field:
 { "task": { "taskId": "…", "status": "working", "ttl": 60000, "pollInterval": 1000 } }
 ```
 
-Supported operations: `tasks/get`, `tasks/result` (blocks until the task is terminal),
+and may then use `tasks/get`, `tasks/result` (blocks until the task is terminal),
 `tasks/list` and `tasks/cancel`, plus optional `notifications/tasks/status` pushes over SSE.
-A blocked `tasks/result` stops waiting when its client disconnects, and when the server
-closes it answers with a JSON-RPC `-32603` "Server shutting down" error, so `app.close()`
-never waits on a task running on another instance.
+A blocked `tasks/result` stops waiting when its client disconnects. When the server closes it
+answers with a JSON-RPC `-32603` "Server shutting down" error, so `app.close()` never waits on a
+task running on another instance; for a task running on this one it waits for the drain (see
+`taskShutdownTimeoutMs`) and answers with the task's outcome.
 
 Retention defaults to 60 seconds when the client does not request a `ttl`. Tasks are meant
 for long-running work, so if your tools can outlive that, raise the bounds — otherwise a task
@@ -389,52 +922,47 @@ result carries an opaque `nextCursor`; pass it back as `params.cursor` to fetch 
 page. An unrecognised cursor is rejected with `-32602` (Invalid params). The Redis store keeps
 a per-owner index, so a listing only reads the caller's own tasks.
 
-Custom `TaskStore` implementations must implement `list(owner, { cursor, limit })`, where
-`owner` is `{ subject, issuer }` and must match a record's `authSubject` and `authIssuer`
-exactly, and return `{ tasks, nextCursor? }`, throwing `InvalidTaskCursorError` for a cursor
-they did not issue.
+Each caller (a user at an issuer, whichever OAuth client they come through) may keep at most
+`taskMaxRetainedPerPrincipal` tasks stored (default 100), for both protocol eras. Finished tasks
+count until their `ttl` expires, so one caller cannot fill the store with results it never
+collects. When a caller is at its quota, its oldest finished task is evicted to make room (one
+created through the same OAuth client first, and only then one another of the user's clients has
+not collected yet); if all
+of them are still running, a 2025-11-25 `tools/call` fails with `-32029` "Task limit reached",
+and a 2026-07-28 call that would run as a task fails with `-32600` "Cannot create a task: Task
+limit reached" (`-32029` lies in the range 2026-07-28 reserves), rather than running a long call
+synchronously. The same errors answer `taskMaxConcurrent` and `taskMaxPerPrincipal`. Callers the deployment cannot identify share a single
+quota, so raise it if you expect many concurrent anonymous tasks. The in-memory store also holds
+at most `taskStoreMaxTasks` tasks in total (default 1000); when full, it evicts the caller's
+oldest finished task, then the oldest finished task of any caller, before refusing. Eviction
+can drop a finished result its client has not read yet. The Redis store enforces the quota
+atomically with a per-user sorted set, so it holds across instances, and prunes expired
+entries from it whenever that caller creates or lists tasks.
 
-Each caller (token issuer and subject) may keep at most `taskMaxRetainedPerPrincipal` tasks stored
-(default 100). Finished tasks count until their `ttl` expires, so one caller cannot fill the
-store with results it never collects. When a caller is at its quota, its oldest finished task
-is evicted to make room; if all of them are still running, the `tools/call` fails with
-`-32029` "Task limit reached". Without authorization every caller shares a single quota, so
-raise it if you expect many concurrent anonymous tasks. The in-memory store also holds at most
-1000 tasks in total; when full, it evicts the caller's oldest finished task, then the oldest
-finished task of any caller, before refusing. The Redis store enforces the quota atomically
-with a per-caller sorted set (`mcp:tasks:owner:<issuer>:<subject>`, each part percent-encoded,
-or `mcp:tasks:anonymous`), so it holds across instances. Custom `TaskStore` implementations
-should throw `TaskLimitError` from `create()` to produce the same response.
-
-The instance running a task holds a lease on it and renews it every third of `taskLeaseMs`
-(default 30 seconds). If that instance dies or shuts down before the task finishes, renewals
-stop. Once the lease lapses, the next `tasks/get` or `tasks/result` (including one already
-waiting) marks the task `failed` with the status message "Task owner lost", so the task no
-longer reads `working` until its ttl runs out. A caller at `taskMaxRetainedPerPrincipal` gets
-the same treatment for their orphaned tasks when they create a new one, so tasks nobody polls
-cannot keep them locked out of their quota. The check is a compare-and-set, so a renewal or
+The instance running a task (of either era) holds a lease on it and renews it every third of
+`taskLeaseMs` (default 15 seconds). If that instance dies or shuts down before the task
+finishes, renewals stop. Once the lease lapses, the next `tasks/get` or `tasks/result`
+(including one already waiting) marks the task `failed`, so it no longer reads `working` until
+its ttl runs out. A caller at `taskMaxRetainedPerPrincipal` gets the same treatment for their
+orphaned tasks when they create a new one. The check is a compare-and-set, so a renewal or
 completion that lands first always wins. With Redis, the lease is set and checked against the
-Redis server clock, so clock skew between instances can never fail a task that is still running,
-nor delay failing one whose owner is gone:
+Redis server clock, so clock skew between instances can never fail a task that is still
+running:
 
 ```typescript
 await app.register(mcpPlugin, {
   enableTasks: true,
   taskMaxRetainedPerPrincipal: 20, // tasks each caller may keep, finished ones included
-  taskLeaseMs: 30_000 // a dead instance's tasks are failed this long after its last renewal
+  taskLeaseMs: 15_000 // a dead instance's tasks are failed this long after its last renewal
 })
 ```
 
-**Security**: when authorization is enabled, tasks are bound to the issuer and `sub` of the
-token that created them (a subject is only unique per issuer, so both must match, as for
-sessions) and a requestor can only reach its own. Another user's task answers
-`tasks/get`, `tasks/result` and `tasks/cancel` exactly like an unknown task id, and never
-appears in `tasks/list`. Tasks created by a version that only recorded the subject have no
-issuer; with authorization enabled they are unreachable and simply expire with their ttl.
-Without authorization no requestor can be identified, so
-tasks are reachable by anyone holding the (random UUID) task id, and `tasks/list` is both
-unadvertised **and refused** — otherwise it would hand every anonymous task's id to any
-caller and defeat that model.
+**Security**: when built-in authorization or `resolveAuthorizationContext` is configured,
+tasks are bound to the resolved principal (user, OAuth client and issuer) and a requestor can
+only reach its own. Without an
+identity resolver no requestor can be identified, so tasks are reachable by anyone holding
+the (random UUID) task id, and `tasks/list` is both unadvertised **and refused** — otherwise
+it would hand every anonymous task's id to any caller and defeat that model.
 
 ## Elicitation Support (MCP 2025-11-25)
 
@@ -758,7 +1286,7 @@ Prompts and resources report failures as JSON-RPC errors instead of successful r
 - `prompts/get` returns `-32603` (Internal error) with the message `Prompt execution failed: <error.message>` when the prompt handler throws.
 - `resources/read` returns `-32602` when the URI fails the resource's `uriSchema`, and `-32603` with `Resource read failed: <error.message>` when the resource handler throws.
 
-Handler errors are logged on the request logger; only the error message is sent to the client, never the stack trace.
+Handler errors are logged; only the error message is sent to the client, never the stack trace. On 2026-07-28 not even the message is: those clients get `Internal server error` for a prompt and `Resource read failed` for a resource, and the details stay in the log.
 
 ### Backward Compatibility
 
@@ -799,8 +1327,7 @@ Set `validateJsonSchemaInputs: {}` to validate plain-JSON-Schema tool inputs wit
 ```typescript
 await app.register(mcpPlugin, {
   validateJsonSchemaInputs: {
-    allErrors: true,
-    useDefaults: false
+    allErrors: true
   }
 })
 ```
@@ -808,7 +1335,7 @@ await app.register(mcpPlugin, {
 Behavior when enabled:
 
 - Invalid arguments return a tool execution error (`isError: true` with an `Invalid tool arguments: ...` message, capped at 5 reported errors), not a protocol error — the same SEP-1303 semantics as TypeBox validation.
-- Validation is non-mutating: no type coercion, no defaults injection, no property removal. Handlers receive the arguments exactly as the client sent them. `format` keywords are annotation-only (JSON Schema 2020-12's own default).
+- Validation is non-mutating: no type coercion, no defaults injection, no property removal, and the `coerceTypes`, `useDefaults` and `removeAdditional` options cannot turn them back on. Handlers receive the arguments exactly as the client sent them. `format` keywords are annotation-only (JSON Schema 2020-12's own default).
 - A plain JSON Schema that AJV cannot compile makes `mcpAddTool` throw, so a misconfigured tool fails at startup instead of running unvalidated.
 - Compiled validators are cached per schema, and the option also applies to stdio transports and task-augmented (`task: {}`) calls.
 
@@ -871,6 +1398,8 @@ const app = Fastify({ logger: true })
 
 await app.register(mcpPlugin, {
   enableSSE: true,
+  // Required with redis: every instance must verify the request state the others seal
+  requestStateSecret: process.env.MCP_REQUEST_STATE_SECRET,
   redis: {
     host: process.env.REDIS_HOST || 'localhost',
     port: parseInt(process.env.REDIS_PORT || '6379'),
@@ -1285,10 +1814,21 @@ The plugin includes a built-in stdio transport utility for MCP communication ove
 
 ### Key Features
 
-- **Complete MCP stdio transport implementation** following the official specification
+- **MCP stdio transport** following the official specification, for both the handshake
+  revisions and 2026-07-28
 - **Fastify integration** using the `.inject()` method for consistency with HTTP routes
+- **Streaming**: `subscriptions/listen` and request-scoped progress or log notifications are
+  written to stdout as they happen
+- **Cancellation**: `notifications/cancelled` aborts the request's `context.signal`, whichever
+  revision the client speaks, and nothing more is written for it
+- **Local trust**: stdio requests are not subject to HTTP bearer authorization, as the spec has
+  the stdio transport take credentials from its environment. Pass the identity they act as with
+  `runStdioServer(app, { authContext: { userId: process.env.USER } })`; without one they are
+  anonymous, and with authorization enabled multi round-trip requests and tasks (which need an
+  identified caller) are refused. `resolveAuthorizationContext` is not called for them, and
+  `isStdioRequest(request)` lets your own authentication hooks skip them
 - **Comprehensive error handling** with proper JSON-RPC error responses
-- **Batch request support** for processing multiple messages at once
+- **Batch request support** for the legacy revisions that allow it
 - **Debug logging** to stderr without interfering with the stdio protocol
 
 ### Quick Start
@@ -1372,6 +1912,23 @@ Starts a Fastify MCP server in stdio mode.
 - `input` - Custom input stream (default: process.stdin)
 - `output` - Custom output stream (default: process.stdout)
 - `error` - Custom error stream (default: process.stderr)
+- `authContext` - Authorization context every request on this stream runs as (stdio has no
+  bearer token, so `resolveAuthorizationContext` is not called)
+- `endpoint` - The MCP endpoint requests go to (default: `/mcp` under the prefix of `app`). Set
+  it when the plugin is registered under a prefix in a child of the instance passed in, for
+  example `endpoint: '/api/mcp'`
+
+stdin is read as plain lines, never in terminal mode, so nothing is echoed to stdout. Messages
+are split on `\n` only (a trailing `\r` is dropped), so U+2028 and U+2029 inside a string are
+safe. A line longer than four times the app's `bodyLimit` (and at least 1 MiB) is dropped as it arrives and answered
+with `Request too large` (id `null`); a shorter one past the limit is refused with its own id.
+While stdout cannot take more (a client that stops reading), no further requests are read; once
+the transport has stopped, output the client never read is dropped so the process can exit.
+When stdout goes away (`EPIPE`) the server stops as it does when stdin closes, and
+`runStdioServer` resolves; so it does when the app is closed by something else, including when
+the plugin is registered in a child of the instance passed in. A response the client sends to a
+server request is passed to `onClientResponse` and never answered. Only a notification named
+`notifications/cancelled` cancels a request; a request by that name is just an unknown method.
 
 #### `createStdioTransport(app, options)`
 
@@ -1392,14 +1949,20 @@ The stdio transport follows the MCP stdio transport specification:
 - Messages are delimited by newlines
 - Messages must NOT contain embedded newlines
 - Server logs can be written to stderr
-- Supports both single messages and batch requests
-- The protocol version negotiated by `initialize` applies to every later message on the stream (a new `initialize` re-negotiates it)
+- 2026-07-28 messages are always sent one per line; a batch containing one is refused with
+  `-32600`. Legacy revisions may still send batches.
+- 2026-07-28 has no header layer on stdio: everything travels in the body's `_meta`
+- The protocol version negotiated by a legacy `initialize` applies to every later legacy message
+  on the stream (a new `initialize` re-negotiates it)
+- Closing stdin shuts the transport down gracefully: requests already read get up to a second
+  to finish and be answered before they are cancelled (a cancelled request is still answered), so `printf '<request>\n' | server`
+  prints its response
 
 ### Error Handling
 
 The stdio transport provides comprehensive error handling:
 
-- JSON parsing errors return appropriate JSON-RPC error responses
+- Unparseable lines are answered with a `-32700` parse error whose `id` is `null`
 - Invalid method calls return "Method not found" errors
 - Tool execution errors are captured and returned in the response
 - Connection errors are logged to stderr
@@ -1458,7 +2021,8 @@ await app.register(mcpPlugin, {
       validateAudience: true
     }
   },
-  // Redis for session persistence (recommended)
+  // Redis for session persistence (recommended), with the shared secret it requires
+  requestStateSecret: process.env.MCP_REQUEST_STATE_SECRET,
   redis: {
     host: process.env.REDIS_HOST || 'localhost',
     port: parseInt(process.env.REDIS_PORT || '6379')
@@ -1527,8 +2091,10 @@ eventSource.onmessage = (event) => {
 By default the plugin adds the bearer-token check as a `preHandler` hook on
 the Fastify instance it is registered on. Because the plugin is not
 encapsulated, that check also covers every route you register yourself on
-that instance. The well-known metadata endpoints and the OAuth flow endpoints
-(`/oauth/authorize`, `/oauth/callback`, `/oauth/register`) are always skipped.
+that instance. The well-known metadata endpoints and the plugin's own OAuth flow
+endpoints (`/oauth/authorize`, `/oauth/callback`, `/oauth/register`, registered when
+`oauth2Client` is configured) are always skipped. Routes of your own under `/oauth/` are
+not: they are protected like any other.
 
 Set `protectedRoutes: 'mcp'` to protect only the MCP endpoints the plugin
 registers (`POST`, `GET` and `DELETE` `/mcp`) and leave your own routes alone:
@@ -1552,11 +2118,13 @@ app.get('/health', async () => ({ status: 'ok' }))
 
 | Value | Behaviour |
 |-------|-----------|
-| `'all'` (default) | Every route of the app requires a token, except the well-known and OAuth endpoints. |
+| `'all'` (default) | Every route of the app requires a token, except the discovery and OAuth endpoints the plugin registers. An application route of your own under `/.well-known/` still requires one. |
 | `'mcp'` | Only the `/mcp` routes require a token. |
 
 If you keep the default and only need to open a few paths, list them in
-`excludedPaths` instead. Each entry is a URL prefix string or a `RegExp`:
+`excludedPaths` instead. Each entry is a path prefix string or a `RegExp`,
+matched against the path the router matched: decoded, and without the query
+string or fragment:
 
 ```typescript
 authorization: {
@@ -1642,6 +2210,10 @@ authorization: {
     
     // Authorization server
     authorizationServer: 'https://auth.example.com',
+
+    // This server: the OAuth callback is https://mcp.example.com/oauth/callback
+    // (or set redirectUri)
+    resourceUri: 'https://mcp.example.com',
     
     // Application configuration
     scopes: ['read', 'write', 'admin'],
@@ -1651,6 +2223,9 @@ authorization: {
   }
 }
 ```
+
+The authorization server's endpoints are discovered from its metadata (RFC 8414 or OpenID
+Connect). Metadata whose `issuer` is not `authorizationServer` is ignored.
 
 ### Session-Based Authorization
 
@@ -1743,7 +2318,7 @@ await app.register(mcpPlugin, {
 The hook receives the tool name and a per-request context (`authContext`, `request`, `sessionId`, `operation`), and may be sync or async. It is consulted at both dispatch points, so list and call can never disagree:
 
 - `tools/list` omits every tool the hook denies for that request, calling the hook with `operation: 'list'`. Per-tool checks run concurrently with a fixed cap (8 at a time), so an async hook backed by a database or HTTP service is not flooded with one lookup per registered tool; the listing keeps registration order.
-- `tools/call` on a denied tool returns the same `-32602` (Invalid params) "Tool 'name' not found" protocol error as an unknown tool, calling the hook with `operation: 'call'`. The hook runs even for unknown names, so callers cannot probe for tools they are not allowed to see by response shape. Response timing is not guaranteed to be indistinguishable — it depends on what the hook itself does per name. Task-augmented calls (`task` field) and `app.mcpCallTool()` also use `operation: 'call'`.
+- `tools/call` on a denied tool returns the same `-32602` (Invalid params) protocol error as an unknown tool ("Unknown tool: name" on 2026-07-28, "Tool 'name' not found" on earlier revisions), calling the hook with `operation: 'call'`. The hook runs even for unknown names, so callers cannot probe for tools they are not allowed to see by response shape. Response timing is not guaranteed to be indistinguishable — it depends on what the hook itself does per name. Task-augmented calls (`task` field) and `app.mcpCallTool()` also use `operation: 'call'`.
 
 Visibility and execution policies may intentionally differ — a tool hidden from `tools/list` can still be callable by a client that already knows its name.
 
@@ -1766,19 +2341,23 @@ await app.register(mcpPlugin, {
 })
 ```
 
-The hook fires exactly once per tool call, after it settles: for JSON-RPC `tools/call`, for `app.mcpCallTool()`, and for a task-augmented call once execution finishes (not when the task is merely accepted). It also fires for access denial, unknown tools, invalid arguments, and task-required outcomes. It does not fire for `tools/list`, initialization/ping, or malformed requests where no tool name was resolved.
+The hook fires exactly once per tool call, after it settles: for JSON-RPC `tools/call`, for `app.mcpCallTool()`, and for a task-augmented call once execution finishes (not when the task is merely accepted). It also fires for access denial, unknown tools, invalid arguments, task-required outcomes, and a handler asking for client input (`reason: 'input-required'`; a multi round-trip retry is a new call and fires again). A task that pauses for client input is still one call: the hook fires once, when the task ends, with its final outcome. When the task ended `failed` or `cancelled` although its last round returned a result or asked for input (cancelled after the handler returned, out of input rounds, or timed out waiting for input), the outcome is `{ ok: false, reason: 'task-ended', status, message }`. It does not fire for `tools/list`, initialization/ping, or malformed requests where no tool name was resolved.
 
 `event.source` is `'json-rpc'`, `'in-process'`, or `'task'`. `event.outcome` is the same `McpCallToolOutcome` returned by `mcpCallTool()`. The hook is awaited before the response is sent, so keep it fast; a throwing or rejecting hook is logged and otherwise ignored — it never changes the tool response.
 
 Synchronous sources (`'json-rpc'` and `'in-process'`) expose the active `request`/`reply`. Task events never do: a task can finish after the original HTTP response has already completed, so `request`/`reply` are absent on `source: 'task'` events. Every event, regardless of source, carries `requestId` for correlation.
 
-Duration semantics also differ by source: `'json-rpc'` and `'in-process'` durations include authorization, validation, sanitization, and execution. Task durations measure only actual execution — validation, sanitization, and the tool call — excluding the time the task spent queued.
+Duration semantics also differ by source: `'json-rpc'` and `'in-process'` durations include authorization, validation, sanitization, and execution. Task durations measure execution — validation, sanitization, and the tool call — excluding the time the task spent queued; for a task that paused for client input, they run from its first round to its last, waits included.
 
 `event.arguments` are the raw, unredacted tool arguments. Redact sensitive values yourself before logging or persisting them.
 
 ## Customizing MCP Route Schemas
 
 Use `transformRouteSchema` to customize Fastify/OpenAPI schema metadata on MCP transport routes without replacing handlers or route definitions.
+
+Avoid adding a `body` schema to the `POST /mcp` route: Fastify answers a validation failure with
+its own plain `400`, not a JSON-RPC error, and a 2026-07-28 client reads a `400` without a
+recognized JSON-RPC error as a server that does not speak its revision.
 
 ```typescript
 import Fastify from 'fastify'
@@ -1834,11 +2413,19 @@ When `oauth2Client` is configured, the plugin registers these legacy server-side
 - `POST /oauth/logout` - Revoke tokens and end session
 - `POST /oauth/register` - Dynamic client registration (if enabled)
 
+The server keeps nothing between `/oauth/authorize` and `/oauth/callback`. The
+pending authorization, PKCE verifier included, travels in an encrypted HttpOnly
+`mcp_oauth_state_<state>` cookie scoped to the callback path, one per
+authorization, so flows started in several tabs complete independently. The
+callback completes only in the browser that started the flow, within 10
+minutes, and clears the cookie. The cookie is sealed with `requestStateSecret`:
+set it when another instance may serve the callback.
+
 ### Well-Known Endpoints
 
 These routes are registered only when `authorization.enabled` is true. They are
-all unauthenticated: the bearer-token check skips every path under
-`/.well-known/`. They allow cross-origin `GET` requests (CORS) so browser-based
+all unauthenticated: the bearer-token check skips these routes, and answers a
+`/.well-known/` URL that matches no route with 404. They allow cross-origin `GET` requests (CORS) so browser-based
 clients can discover them.
 
 - `GET /.well-known/oauth-protected-resource` - OAuth 2.0 Protected Resource Metadata (RFC 9728). Its `resource` field is `resourceUri`.
@@ -2051,6 +2638,7 @@ await app.register(import('@fastify/bearer-auth'), {
 - `capabilities`: MCP capabilities configuration. `completions` is not supported (there is no `completion/complete` handler): it is dropped from the advertised capabilities and a warning is logged at registration
 - `instructions`: Optional server instructions
 - `enableSSE`: Enable Server-Sent Events support on `GET /mcp` (default: false). Sessions and `DELETE /mcp` work either way.
+- `resolveAuthorizationContext`: Maps identities established by upstream Fastify authentication hooks into MCP authorization context (optional)
 - `canAccessTool`: Per-request tool authorization hook consulted by `tools/list` and `tools/call` (optional)
 - `onToolCallComplete`: Transport-neutral hook fired once after every tool call settles, across JSON-RPC, `mcpCallTool()`, and tasks (optional)
 - `toolArgumentLimits`: Limits applied to tool arguments before the handler runs (optional): `maxStringLength` (default 10000), `maxObjectProperties` (default 100, arrays not counted), `maxArrayLength` (default unlimited), `maxDepth` (default 10). `Infinity` disables a limit
@@ -2062,22 +2650,72 @@ await app.register(import('@fastify/bearer-auth'), {
   - `requiredScopes`: Scopes a token must carry (optional). Tokens missing any of them get a 403 `insufficient_scope` challenge. When set, the scopes are also advertised as `scopes_supported` in the protected resource metadata (every `/.well-known/oauth-protected-resource` route) and as `scope="..."` in the `WWW-Authenticate` header of every 401 challenge
   - `scopeImplies`: `(granted, required) => boolean` deciding whether a granted scope satisfies a required one (default: exact match; see `colonScopeHierarchy`)
   - `tokenValidation`: JWT token validation configuration
-    - `jwksUri`: JWKS endpoint URL for JWT signature verification
+    - `jwksUri`: JWKS endpoint URL for JWT signature verification. A string is the key set of the
+      first of `authorizationServers`: a token naming another issuer is not checked against it.
+      With several authorization servers, map each issuer to its key set:
+      `{ 'https://a.example.com': 'https://a.example.com/jwks.json', 'https://b.example.com': 'https://b.example.com/jwks.json' }`
+      (two issuers may share one URL). Keys published with `use: "enc"` are ignored. A key
+      set is fetched again every 10 minutes; for 10 more minutes the keys in hand keep
+      answering while the new set is fetched in the background. After that a token waits
+      for the fetch, and is refused while the key set cannot be fetched
+    - `introspectionEndpoint`: Token introspection endpoint (alternative to JWT). Each call
+      times out after 5 seconds, and a token is active only when the response says
+      `"active": true`
     - `validateAudience`: Enable audience validation
-    - `introspectionEndpoint`: Token introspection endpoint (alternative to JWT)
   - `oauth2Client`: OAuth 2.1 client configuration
     - `clientId`: OAuth client identifier
     - `clientSecret`: OAuth client secret
     - `authorizationServer`: Authorization server URI.
     - `resourceUri`: Resource URI.
+    - `redirectUri`: This server's OAuth callback, sent as `redirect_uri` and advertised in
+      client registration (default: the `/oauth/callback` route, under the plugin's route
+      prefix, on the origin of `resourceUri`). It comes from configuration only, never from
+      the request; with neither option set, `/oauth/authorize` answers 500
     - `scopes`: Requested OAuth scopes
     - `dynamicRegistration`: Enable dynamic client registration (default: false)
+- `requestStateSecret`: Secret (at least 32 bytes) that seals multi round-trip
+  `requestState` and the pending-authorization cookie of the OAuth routes. Set it when
+  `redis` is configured, since any instance may serve a retry or a callback
+  (the plugin warns at startup otherwise). An array rotates secrets: the first seals, any
+  verifies. Rotate in three deploys so no retry fails mid-rollout: `[old, new]` (every
+  instance accepts the new one), then `[new, old]` (instances seal with it), then `[new]`
+  once `requestStateTtlMs` has passed
+- `requestStateTtlMs`: How long sealed state stays valid (default 5 minutes). Must be a positive integer; anything else throws at startup
+- `requestStateMaxAnswerBytes`: How many bytes of JSON of earlier answers sealed state carries
+  into later rounds (default 65536); asking again past it fails with `-32602`, and `0` carries none
+- `caching`: Freshness hints per cacheable operation (default `{ ttlMs: 0, cacheScope: 'private' }`)
+- `enableTasks`: Enable tasks (the 2025-11-25 core tasks and the 2026-07-28 extension)
+- `taskDefaultTtlMs` / `taskMaxTtlMs`: Task retention (defaults 60000 / 3600000)
+- `taskMaxConcurrent`: Most tasks one instance runs at once, for both protocol eras (default 1000).
+  A task counts until its handler settles, even when that is past its ttl
+- `taskMaxPerPrincipal`: Most tasks one caller (a user at an issuer) runs on an instance
+  (default 100). Not applied to callers the deployment cannot identify
+- `taskStoreMaxTasks`: Capacity of the in-memory task store, finished tasks included until their
+  ttl (default 1000). A full store evicts the oldest finished task, and refuses new tasks only when
+  every stored task is still running
+- `taskMaxRetainedPerPrincipal`: Most tasks one caller keeps stored, finished ones included
+  (default 100). At the cap the caller's oldest finished task is evicted
+- `taskLeaseMs`: Worker lease; a task whose worker stops renewing it is reported failed
+  (default 15000)
+- `taskMaxInputRounds`: How many times a 2026-07-28 task's handler may ask the client for input
+  before the task fails (default 32). Rounds that only carry state do not count
+- `taskShutdownTimeoutMs`: How long `close()` waits for running tasks before failing them
+  (default 5000; keep it below Fastify's `pluginTimeout`). Tasks parked in `input_required`
+  are failed at once, since no answer can reach them during a shutdown, and
+  `subscriptions/listen` streams are ended gracefully only after the drain
+- `subscriptionMaxStreams` / `subscriptionMaxStreamsPerPrincipal` /
+  `subscriptionMaxResourceUris`: Bounds on `subscriptions/listen` (defaults 1000 / 10 / 1000)
 - `redis`: Redis configuration for horizontal scaling (optional)
   - `host`: Redis server hostname
   - `port`: Redis server port
   - `db`: Redis database number
   - `password`: Redis authentication password
-  - Any other ioredis [`RedisOptions`](https://github.com/redis/ioredis/blob/main/lib/redis/RedisOptions.ts) (`tls`, `retryStrategy`, `sentinels`, ...); the object is passed to the ioredis constructor as-is
+  - `channelPrefix`: First level of every pub/sub topic (default: `db<db>`, after ioredis
+    `keyPrefix` when set). Redis pub/sub ignores the database number, so this is what keeps
+    two deployments on one Redis server from hearing each other's notifications. Every
+    instance of one deployment needs the same prefix; an instance running an earlier
+    version of this plugin publishes without one, so upgrade all instances together
+  - Any other ioredis [`RedisOptions`](https://github.com/redis/ioredis/blob/main/lib/redis/RedisOptions.ts) (`tls`, `retryStrategy`, `sentinels`, ...); everything but `channelPrefix` is passed to the ioredis constructor as-is
 
 ### Decorators
 
@@ -2123,10 +2761,16 @@ switch (outcome.reason) {
   case 'task-required':
     reply.code(409)
     return { error: 'Tool must be invoked through task-augmented tools/call' }
+  case 'input-required':
+    reply.code(409)
+    return { error: 'Tool needs client input', inputRequests: outcome.inputRequests }
+  case 'task-ended': // only reported to onToolCallComplete, for tasks
+    reply.code(500)
+    return { error: outcome.message }
 }
 ```
 
-The `canAccessTool` hook still runs before validation and before the handler, and receives the same `request` object passed to `mcpCallTool()`. Unlike the JSON-RPC `tools/call` path — which always answers a denied tool exactly like an unknown one, so a remote client cannot probe for tools it is not allowed to see — `mcpCallTool()` is a trusted in-process call and reports the precise reason: `{ ok: false, reason: 'not-found' }` when the tool is not registered, `{ ok: false, reason: 'access-denied' }` when it is registered but `canAccessTool` denied it (existence takes precedence, so an unknown name is always `not-found` even if the hook would also have denied it). Pass the route's real `reply` so tool handlers can use the full Fastify reply API. Pass `authContext` when the in-process caller has one so access hooks and handlers see the same authorization context they would receive over HTTP. If the tool handler throws, the outcome is `{ ok: true, result }` with `result.isError: true`, matching the JSON-RPC `tools/call` path. Every argument rejection that happens before the handler runs — TypeBox validation, AJV validation, or argument sanitization — is reported as `{ ok: false, reason: 'invalid-arguments', detail }`; the handler is never invoked for those.
+The `canAccessTool` hook still runs before validation and before the handler, and receives the same `request` object passed to `mcpCallTool()`. Unlike the JSON-RPC `tools/call` path — which always answers a denied tool exactly like an unknown one, so a remote client cannot probe for tools it is not allowed to see — `mcpCallTool()` is a trusted in-process call and reports the precise reason: `{ ok: false, reason: 'not-found' }` when the tool is not registered, `{ ok: false, reason: 'access-denied' }` when it is registered but `canAccessTool` denied it (existence takes precedence, so an unknown name is always `not-found` even if the hook would also have denied it). Pass the route's real `reply` so tool handlers can use the full Fastify reply API. Pass `authContext` when the in-process caller has one so access hooks and handlers see the same authorization context they would receive over HTTP. If the tool handler throws, the outcome is `{ ok: true, result }` with `result.isError: true`, matching the JSON-RPC `tools/call` path. The exception is `InputRequired`: there is no client to answer it in-process, so the outcome is `{ ok: false, reason: 'input-required', inputRequests }`. Every argument rejection that happens before the handler runs — TypeBox validation, AJV validation, or argument sanitization — is reported as `{ ok: false, reason: 'invalid-arguments', detail }`; the handler is never invoked for those.
 
 #### Type-Safe Resource Registration
 
@@ -2250,7 +2894,18 @@ All handlers receive a consistent context object containing:
   - `body`: Request body (when applicable)
 - `context.reply`: Fastify reply object for setting response headers
 - `context.sessionId`: Session identifier (when using SSE)
-- `context.authContext`: Authorization context (when OAuth is enabled)
+- `context.authContext`: Authorization context, from built-in OAuth, `resolveAuthorizationContext`,
+  or the stdio transport's `authContext` option
+- `context.signal`: `AbortSignal` that aborts when the request is cancelled: a 2026-07-28 client
+  disconnecting before the response, `notifications/cancelled` on stdio, or `tasks/cancel` for a
+  handler running as a task (in either era). A 2026-07-28 request is also aborted when the server
+  shuts down, so a long-running handler cannot hold `app.close()` open. Pass it to `fetch` or
+  check it between steps to stop work early. A legacy HTTP disconnect does not abort it, since it
+  is not a cancellation there.
+- `context.protocolVersion`: the protocol revision the request is served under.
+- `context.clientCapabilities`: what a 2026-07-28 client declared on this request, so a handler
+  can choose URL-mode over form elicitation, or skip asking a client that cannot answer. Absent
+  on the legacy path.
 
 #### Backward Compatibility
 
@@ -2280,7 +2935,7 @@ app.mcpAddTool({
 
 Resource and prompt handlers also receive the same context object as tool handlers, enabling access to HTTP context and authorization information:
 
-When `uriPattern` contains `{name}` placeholders (an RFC 6570 level-1 template), `resources/read` for a concrete URI such as `context://data/42` is routed to it, and the values are available as `context.uriParams` (`{ id: '42' }`). Each placeholder matches a single non-empty segment that does not contain `/`; an exact `uri` registration always takes precedence over a template.
+When `uriPattern` contains `{name}` placeholders (an RFC 6570 level-1 template), `resources/read` for a concrete URI such as `context://data/42` is routed to it, and the values are available as `context.uriParams` (`{ id: '42' }`). Each placeholder matches a single non-empty segment of the URI as sent, and its value is percent-decoded, so `context://files/..%2Fsecret` yields `{ name: '../secret' }`: a decoded value can contain `/` or `..`, and a handler that maps it onto a path must validate it. An exact `uri` registration always takes precedence over a template.
 
 ```typescript
 // Resource handler with context
@@ -2339,6 +2994,11 @@ interface HandlerContext {
   request: FastifyRequest         // HTTP request object
   reply: FastifyReply            // HTTP reply object
   authContext?: AuthorizationContext  // OAuth authorization data
+  protocolVersion?: string        // Revision this request is served under
+  clientCapabilities?: ClientCapabilities // Declared per request (2026-07-28)
+  signal: AbortSignal             // Aborts when the request is cancelled
+  sendProgress: (progress: number, total?: number, message?: string) => void
+  log: (level: LoggingLevel, data: unknown, logger?: string) => void
 }
 
 // Normalized handler signatures
@@ -2358,7 +3018,9 @@ type PromptHandler = (name: string, args: any, context: HandlerContext) => Promi
 The plugin exposes the following endpoints using a dual-endpoint architecture:
 
 - `POST /mcp`: Handles all JSON-RPC 2.0 MCP protocol messages
-  - Always returns `Content-Type: application/json; charset=utf-8`
+  - Returns `Content-Type: application/json; charset=utf-8`, except for 2026-07-28 requests
+    answered as a stream: `subscriptions/listen`, and requests that report progress or logs
+    and accept `text/event-stream`
   - Processes initialize, tool calls, resource reads, prompt gets, etc.
   - Creates and manages session IDs when SSE is enabled
   - Authorization-aware when OAuth is enabled
@@ -2396,14 +3058,28 @@ The plugin does not register a `/health` route; add your own if you need one.
 
 ## Supported MCP Methods
 
-- `initialize`: Server initialization
-- `ping`: Health check
+Served on both eras:
+
 - `tools/list`: List available tools
 - `tools/call`: Execute a tool (calls registered handler or returns error)
 - `resources/list`: List available resources
+- `resources/templates/list`: List resource templates
 - `resources/read`: Read a resource (calls registered handler or returns error)
 - `prompts/list`: List available prompts
 - `prompts/get`: Get a prompt (calls registered handler or returns error)
+
+`2026-07-28` only:
+
+- `server/discover`: Supported versions, capabilities and identity in one request
+- `subscriptions/listen`: Long-lived notification stream
+- `tasks/get`, `tasks/update`, `tasks/cancel`: Tasks extension
+
+`2025-11-25` and earlier only:
+
+- `initialize`: Server initialization
+- `ping`: Health check
+- `resources/subscribe`, `resources/unsubscribe`: Per-resource subscriptions
+- `tasks/get`, `tasks/result`, `tasks/list`, `tasks/cancel`: Core tasks
 
 ## Security Best Practices
 
@@ -2434,13 +3110,13 @@ When using the elicitation feature (server-to-client information requests):
 
 #### Tool Parameters
 
-The plugin automatically sanitizes tool parameters to prevent common attacks:
+The plugin automatically checks tool parameters to prevent common attacks:
 
 - **String length limits:** Maximum 10,000 characters per string
 - **Object depth limits:** Maximum 10 levels of nesting
 - **Property count limits:** Maximum 100 properties per object (array items are not counted)
 - **Array length limits:** Unlimited by default
-- **Control character removal:** Strips null bytes and control characters
+- **Control character rejection:** Arguments whose keys or string values contain null bytes or other control characters (tabs and newlines excepted) are refused, never rewritten, so the handler sees exactly what the client sent
 - **Circular reference detection:** Prevents infinite loops
 
 The limits are configurable with the `toolArgumentLimits` option. Pass `Infinity` to disable one;
@@ -2538,6 +3214,7 @@ When using Redis for horizontal scaling:
 ```typescript
 await app.register(mcpPlugin, {
   enableSSE: true,
+  requestStateSecret: process.env.MCP_REQUEST_STATE_SECRET, // at least 32 bytes
   redis: {
     host: 'your-redis-host',
     port: 6379,
@@ -2555,7 +3232,7 @@ await app.register(mcpPlugin, {
 
 - **Always use authentication:** Set `requirepass` in Redis config
 - **Enable TLS encryption:** Especially for remote Redis instances
-- **Use dedicated Redis database:** Isolate MCP data with `db` parameter
+- **Use dedicated Redis database:** Isolate MCP data with `db` parameter; pub/sub topics are kept apart by `channelPrefix`, which defaults to one per `db`
 - **Implement network security:** Use VPCs, security groups, firewalls
 - **Regular updates:** Keep Redis version up-to-date
 - **Monitor access:** Log and monitor Redis access patterns
@@ -2565,7 +3242,7 @@ await app.register(mcpPlugin, {
 #### Session Management
 
 - **Session IDs are cryptographically secure:** Generated using Node.js crypto
-- **Sessions are bound to their owner:** With authorization enabled, a session remembers the issuer and `sub` of the token that created it; a subject is only unique per issuer, so both must match. Requests (POST, GET, DELETE) presenting that `Mcp-Session-Id` with a token from a different issuer or for a different subject get `404 Session not found`, the same answer as for an unknown session, so a leaked session ID cannot be used by another user. The issuer is the verified JWT `iss` (a trailing slash is ignored). Introspection responses may omit `iss` (RFC 7662); the issuer is then taken from configuration as `introspection:<introspectionEndpoint>`, the endpoint that vouched for the token, so such sessions never match a JWT or an introspection response that names an issuer
+- **Sessions are bound to their owner:** With authorization enabled, a session remembers the issuer, `sub` and OAuth client (`client_id` or `azp`) of the token that created it; a subject is only unique per issuer, so both must match, and another app acting for the same user is a different owner, as for tasks. Requests (POST, GET, DELETE) presenting that `Mcp-Session-Id` with a token from a different issuer, for a different subject or from a different client get `404 Session not found`, the same answer as for an unknown session, so a leaked session ID cannot be used by another user. The issuer is the verified JWT `iss` (a trailing slash is ignored). Introspection responses may omit `iss` (RFC 7662); the issuer is then taken from configuration as `introspection:<introspectionEndpoint>`, the endpoint that vouched for the token, so such sessions never match a JWT or an introspection response that names an issuer
 - **Automatic cleanup:** Sessions expire after 1 hour by default
 - **Message history limits:** Prevents unbounded memory growth
 - **Cross-instance isolation:** Sessions are properly isolated between instances
@@ -2701,6 +3378,148 @@ Set up alerts for:
 Remember: Security is a layered approach. No single measure provides complete protection.
 
 ## Migration from Earlier Versions
+
+### Breaking changes in 3.0.0
+
+The 2026-07-28 support ships as a major release. Legacy clients need no changes; these are
+the changes to the plugin's own API and defaults:
+
+- **`LATEST_PROTOCOL_VERSION` is `2026-07-28`**, and `SUPPORTED_PROTOCOL_VERSIONS` includes it.
+  Use `LATEST_LEGACY_PROTOCOL_VERSION` for the newest handshake revision (see below).
+- **`HandlerContext` gained required members**: `signal`, `sendProgress` and `log`. Code that
+  builds a context by hand (for example to unit-test a handler) must provide them.
+- **`TaskStore` gained methods**: `updateInputResponses`, `acknowledgeInputResponses`,
+  `renewLease` and `expireStaleLease`, and `list` takes `{ cursor, limit, era }` and returns
+  `{ tasks, nextCursor? }`, throwing `InvalidTaskCursorError` for a cursor it did not issue.
+  `create` throws `TaskLimitError` at a caller's retention cap. The plugin builds its own store
+  (there is no option to supply one); code that implements the exported `TaskStore` interface
+  for its own use must follow these.
+- **Redis task records moved** to the `mcp:task:v3:` keyspace, so instances of different
+  versions never misread each other's tasks. During a rolling deploy, tasks created by an
+  instance of the previous version are invisible to upgraded instances (and the reverse): a
+  client polling such a task through an upgraded instance gets "Task not found". Drain tasks
+  before upgrading, or accept that tasks in flight may have to be restarted.
+- **Legacy sessions are bound to the OAuth client too** (`SessionMetadata.ownerClient`), so a
+  session opened through one app is `404` to another app the same user authorized. JWTs whose
+  `sub` is not a non-empty string are refused, as introspection already did.
+- **Tasks are bound to user, OAuth client and issuer**, not the user alone, in both eras.
+  `TaskRecord.authSubject` now holds that principal as a JSON string rather than a bare user
+  id, so code that reads task records or calls `list(subject)` on a `MemoryTaskStore` or
+  `RedisTaskStore` directly must pass it through unchanged. The retention cap counts
+  `TaskRecord.quotaKey` (the user at their issuer), so a user's OAuth clients share it.
+- **Task limits apply to both eras**: 2025-11-25 tasks count against `taskMaxConcurrent` and
+  `taskMaxPerPrincipal` (answering `-32029` past them), are aborted at their ttl and are
+  drained on shutdown.
+- **Task retention is capped per caller** (`taskMaxRetainedPerPrincipal`, default 100) in both
+  stores and both eras; at the cap, and when the in-memory store is full, the oldest finished
+  task is evicted, so a finished result its client has not read yet can be lost.
+- **`requestStateMaxAnswerBytes` fails rather than truncates**: a retry whose carried answers
+  exceed it is answered `-32602`; handlers choose what is carried with `InputRequired`'s `carry`.
+- **`HandlerContext.authContext.authorizationServer` is the normalized issuer** the token
+  validator vouched for (no trailing slash; `introspection:<endpoint>` for an introspected
+  token without `iss`), as sessions already used.
+- **`requestStateSecret` must be at least 32 bytes**; with `redis` and no secret the plugin
+  warns at startup, as multi round-trip retries would fail across instances.
+- **Default capabilities declare `listChanged: true`** for tools, prompts and resources, and
+  registering one after ready broadcasts `list_changed`. Legacy clients only see `listChanged`
+  when `enableSSE` is on.
+- **A tool registered without `inputSchema`** is listed with `{ "type": "object" }`.
+- **`outputSchema` is enforced** (2025-06-18 and later): a result without conforming
+  `structuredContent` becomes a tool error, and an `outputSchema` declaring a dialect other
+  than JSON Schema 2020-12 is refused at registration.
+- **Invalid `caching` values throw at startup** instead of being clamped.
+- **An argument sanitization failure** is reported by `mcpCallTool()` as
+  `{ ok: false, reason: 'invalid-arguments' }`.
+- **`McpCallToolOutcome` has an `input-required` variant**: a tool that throws `InputRequired`
+  under `mcpCallTool()` now returns `{ ok: false, reason: 'input-required', inputRequests }`
+  instead of rejecting, and `onToolCallComplete` fires with it. A `task-ended` variant reports
+  to `onToolCallComplete` a 2026-07-28 task that ended differently from its last round.
+  Exhaustive `switch` statements over `outcome.reason` need the new cases.
+- **Tool arguments are never rewritten.** Keys or string values containing control characters
+  (other than tab, newline and carriage return) are refused as invalid arguments instead of
+  being stripped, and `validateJsonSchemaInputs` no longer coerces types, injects defaults or
+  removes properties (the `coerceTypes`, `useDefaults` and `removeAdditional` AJV options are
+  ignored).
+- **stdio requests skip HTTP authorization.** stdio has no bearer token: the client is whoever
+  started the process. With authorization enabled, stdio requests used to be refused with `401`;
+  now they run as the identity passed to `runStdioServer(app, { authContext })`, or anonymously
+  without one (then multi round-trip requests and tasks are refused, since they need an
+  identified caller). `resolveAuthorizationContext` is not called for them; use the exported
+  `isStdioRequest(request)` to let them through your own authentication hooks.
+- **`subscriptions/listen` calls the resource subscribe handlers**: `mcpSetResourceSubscribeHandler`
+  runs for each requested URI (a throw drops the URI), and the unsubscribe handler when the last
+  stream on the instance holding that URI ends. Without a subscribe handler no resource URI is accepted, as `resources/subscribe` answers
+  `-32601` then.
+- **Legacy clients without `enableSSE` no longer see `resources.subscribe`**, since updates could
+  never reach them.
+- **`GET /mcp` answers `405` with `Allow: POST, DELETE`** when `enableSSE` is off; a modern
+  caller's `GET` or `DELETE` gets `405` with `Allow: POST`.
+- **Body-parser errors on `/mcp` are JSON-RPC errors**: malformed JSON is `-32700`, a body over
+  the size limit or with the wrong content type is `-32600`, with the same HTTP status as before.
+- **Legacy task responses only carry the spec's `Task` fields.**
+- **Era detection**: a request whose `_meta` carries `io.modelcontextprotocol/protocolVersion`,
+  or whose `MCP-Protocol-Version` header names 2026-07-28, takes the modern path. With
+  authorization enabled, a POST with a bad version header now gets `401` before `400`.
+
+### Upgrading to MCP 2026-07-28
+
+Clients that speak `2025-11-25` or earlier need no changes, and adopting the new revision is
+opt-in per client. Deployments may need a configuration change: a `redis` deployment should
+set `requestStateSecret` (it warns at startup otherwise), and the other items under
+[Breaking changes](#breaking-changes-in-300) apply to the legacy path too.
+
+**What is new**
+
+- Requests carry `_meta` with `io.modelcontextprotocol/protocolVersion` and
+  `io.modelcontextprotocol/clientCapabilities`, plus `MCP-Protocol-Version`, `Mcp-Method`
+  and (where applicable) `Mcp-Name` headers that must agree with the body
+- `server/discover`, `subscriptions/listen`, multi round-trip requests, cacheable results
+- Tasks moved from the core protocol to the `io.modelcontextprotocol/tasks` extension
+
+**What changes for server authors**
+
+1. **Server-initiated requests are gone.** If you called `app.mcpElicit()` /
+   `app.mcpElicitUrl()` to prompt a user mid-call, that only reaches legacy clients. For
+   modern clients, throw `InputRequired` from the handler instead and read
+   `context.inputResponses` on the retry — see
+   [Multi Round-Trip Requests](#multi-round-trip-requests-2026-07-28).
+2. **Set `requestStateSecret`** if more than one instance can serve a retry. Without it each
+   process seals with its own random key and a retry landing elsewhere is refused. The
+   secret must be at least 32 bytes; a shorter or empty one is rejected at startup. To rotate
+   it without failing retries mid-rollout, deploy `[old, new]` everywhere first, then
+   `[new, old]`, then `[new]` once `requestStateTtlMs` has passed. Deploying `[new, old]`
+   straight away would seal state that instances still on `[old]` refuse.
+3. **Decide your caching hints.** The default of `ttlMs: 0` is safe but means clients never
+   cache. See [Result Caching](#result-caching-2026-07-28).
+4. **Sessions do not exist for modern clients.** `context.sessionId` is `undefined` on that
+   path, and `app.mcpSendToSession()` cannot reach them. Anything that must span requests
+   needs an explicit handle passed as a tool argument.
+5. **`enableSSE` no longer gates broadcasts.** `app.mcpBroadcastNotification()` now always
+   publishes, because `subscriptions/listen` is core to the modern protocol; legacy SSE
+   delivery is still gated by the flag.
+
+**One gotcha for existing code**
+
+`LATEST_PROTOCOL_VERSION` now means `2026-07-28`, not `2025-11-25`. If you send it as the
+`MCP-Protocol-Version` header, that header alone commits the request to the modern path —
+and a body without `_meta` is then answered with `-32602`. Code that wants the newest
+*handshake* revision should use `LATEST_LEGACY_PROTOCOL_VERSION`:
+
+```diff
+-import { LATEST_PROTOCOL_VERSION } from '@platformatic/mcp'
+-headers: { 'mcp-protocol-version': LATEST_PROTOCOL_VERSION }
++import { LATEST_LEGACY_PROTOCOL_VERSION } from '@platformatic/mcp'
++headers: { 'mcp-protocol-version': LATEST_LEGACY_PROTOCOL_VERSION }
+```
+
+The header is deliberately era-determining rather than the body alone. The transport mirrors
+body fields into headers so gateways can route on them without parsing JSON; if the era were
+decided by the body, a caller could send modern headers with a body that omits `_meta` and
+slip past every header/body check onto the unvalidated legacy path — exactly the split-brain
+the spec's "Server Validation" section exists to prevent.
+
+**Deprecated upstream** (still functional, removal no earlier than twelve months): Roots,
+Sampling, Logging, the HTTP+SSE transport, and OAuth Dynamic Client Registration.
 
 ### Upgrading to MCP 2025-06-18
 

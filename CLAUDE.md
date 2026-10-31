@@ -4,11 +4,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-This is a production-ready Fastify adapter for the Model Context Protocol (MCP). The project implements a Fastify plugin that enables MCP communication through the JSON-RPC 2.0 specification with full horizontal scaling capabilities. The codebase includes MCP protocol specifications in the `spec/` directory that define the messaging format, lifecycle management, and various protocol features.
+This is a production-ready Fastify adapter for the Model Context Protocol (MCP). The project implements a Fastify plugin that enables MCP communication through the JSON-RPC 2.0 specification with full horizontal scaling capabilities. The codebase includes MCP protocol specifications in the `spec/` directory (currently the **2026-07-28** revision) that define the messaging format, versioning, and various protocol features.
+
+The plugin is **dual-era**: it serves the stateless `2026-07-28` revision and the earlier handshake-based revisions (`2025-11-25` through `2024-11-05`) on the same endpoint. A request is treated as modern when `params._meta` carries `io.modelcontextprotocol/protocolVersion`; everything else takes the legacy path.
 
 ## Key Features
 
-- **Complete MCP Protocol Support**: Implements the full Model Context Protocol specification
+- **Complete MCP Protocol Support**: Implements the full Model Context Protocol specification (2026-07-28, plus the legacy handshake revisions)
+- **Stateless Core**: Per-request protocol version and capabilities, `server/discover`, no sessions on the modern path
+- **Multi Round-Trip Requests**: Handlers throw `InputRequired`; state travels through the client under HMAC
+- **Subscriptions**: `subscriptions/listen` long-lived notification streams with per-type opt-in
 - **Server-Sent Events (SSE)**: Real-time streaming communication with session management
 - **Horizontal Scaling**: Redis-backed session management and message broadcasting
 - **Session Persistence**: Message history and reconnection support with Last-Event-ID
@@ -49,10 +54,33 @@ The main entry point is `src/index.ts` which exports a Fastify plugin built with
 - Heartbeat mechanism for connection health monitoring
 - Support for both GET and POST endpoints
 
+### Protocol Eras
+
+**Modern (2026-07-28)** — `src/modern/`:
+- `request-meta.ts` parses and validates the per-request `_meta`; `looksModern()` is the era switch
+- `headers.ts` reconciles `Mcp-Method` / `Mcp-Name` / `Mcp-Param-*` against the body, including the `=?base64?…?=` sentinel
+- `handlers.ts` dispatches modern requests, wraps results in the `resultType` envelope and adds caching hints
+- `input-required.ts` is the handler-facing MRTR API (`InputRequired`, `elicitForm`, …)
+- `request-state.ts` seals `requestState` with HMAC and binds it to principal, expiry and request digest
+- `subscriptions.ts` owns `subscriptions/listen` streams
+- `task-inputs.ts` delivers `tasks/update` responses to a running task
+
+**Legacy (2025-11-25 and earlier)** — `src/handlers.ts`, `src/stores/*session*`, SSE in `src/routes/mcp.ts`.
+
+Business logic is shared: the modern dispatcher calls the same `handleToolsList`, `executeToolCall`, `handleResourcesRead` and `handlePromptsGet` and only changes the envelope.
+
 ### File Structure
 
 ```
 src/
+├── modern/                        # 2026-07-28 protocol
+│   ├── request-meta.ts            # Per-request _meta parsing, era detection
+│   ├── headers.ts                 # Header/body reconciliation
+│   ├── handlers.ts                # Modern dispatch, caching, tasks extension
+│   ├── input-required.ts          # Multi round-trip request API
+│   ├── request-state.ts           # Sealed requestState
+│   ├── subscriptions.ts           # subscriptions/listen streams
+│   └── task-inputs.ts             # tasks/update delivery
 ├── brokers/
 │   ├── message-broker.ts          # Interface definition
 │   ├── memory-message-broker.ts   # MQEmitter implementation
@@ -67,7 +95,9 @@ src/
 ├── handlers.ts                    # MCP protocol handlers
 ├── routes.ts                      # SSE connection handling
 ├── index.ts                       # Plugin entry point with backend selection
-├── schema.ts                      # MCP protocol types
+├── schema.ts                      # MCP protocol types (legacy canonical + shared)
+├── schema-2026.ts                 # Types introduced or reshaped by 2026-07-28
+├── protocol-version.ts            # Revision comparison helpers, era detection
 └── types.ts                       # Plugin types
 ```
 
@@ -94,7 +124,10 @@ The project uses ESM modules (`"type": "module"`) and includes comprehensive MCP
 - `serverInfo`: Server identification (name, version)
 - `capabilities`: MCP capabilities configuration
 - `instructions`: Optional server instructions
-- `enableSSE`: Enable Server-Sent Events support (default: false)
+- `enableSSE`: Enable Server-Sent Events support for legacy clients (default: false). Does not gate `subscriptions/listen`, which is core to 2026-07-28.
+- `caching`: Freshness hints (`ttlMs`, `cacheScope`) per cacheable operation. Defaults to `{ ttlMs: 0, cacheScope: 'private' }`.
+- `requestStateSecret`: Shared secret sealing MRTR `requestState`. Required when more than one instance can serve a retry.
+- `requestStateTtlMs`: How long sealed state stays valid (default 5 minutes).
 - `redis`: Redis configuration for horizontal scaling (optional)
   - `host`: Redis server hostname
   - `port`: Redis server port
@@ -114,7 +147,8 @@ Uses a base TypeScript configuration (`tsconfig.base.json`) extended by the main
 ## Testing
 
 The project includes comprehensive test coverage:
-- **369 tests total** covering all functionality including OAuth 2.1 authorization and tasks
+- **430+ tests total** covering all functionality including OAuth 2.1 authorization, tasks, and both protocol eras
+- **2026-07-28 tests**: `test/spec-2026-07-28.test.ts` (end-to-end) and `test/modern-units.test.ts` (header encoding, request-state sealing, subscription filters)
 - **Memory backend tests**: Session management, message broadcasting, SSE handling
 - **Redis backend tests**: Session persistence, cross-instance messaging, failover
 - **Integration tests**: Full plugin lifecycle, multi-instance deployment

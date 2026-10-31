@@ -10,7 +10,7 @@ import type {
   ListResourceTemplatesResult,
   ReadResourceResult
 } from '../src/schema.ts'
-import { JSONRPC_VERSION, LATEST_PROTOCOL_VERSION } from '../src/schema.ts'
+import { JSONRPC_VERSION, LATEST_LEGACY_PROTOCOL_VERSION } from '../src/schema.ts'
 
 describe('Resource Templates', () => {
   test('resources/list excludes template URIs', async (t: TestContext) => {
@@ -328,7 +328,7 @@ describe('Resource Templates', () => {
       const response = await app.inject({
         method: 'POST',
         url: '/mcp',
-        headers: { 'mcp-protocol-version': LATEST_PROTOCOL_VERSION },
+        headers: { 'mcp-protocol-version': LATEST_LEGACY_PROTOCOL_VERSION },
         payload: { jsonrpc: JSONRPC_VERSION, id: 1, method } satisfies JSONRPCRequest
       })
       return (response.json() as JSONRPCResultResponse).result

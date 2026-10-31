@@ -2,14 +2,14 @@ import { test, describe } from 'node:test'
 import type { TestContext } from 'node:test'
 import Fastify from 'fastify'
 import mcpPlugin from '../src/index.ts'
-import { JSONRPC_VERSION, LATEST_PROTOCOL_VERSION } from '../src/schema.ts'
+import { JSONRPC_VERSION, LATEST_LEGACY_PROTOCOL_VERSION } from '../src/schema.ts'
 
 const initializeRequest = {
   jsonrpc: JSONRPC_VERSION,
   id: 1,
   method: 'initialize',
   params: {
-    protocolVersion: LATEST_PROTOCOL_VERSION,
+    protocolVersion: LATEST_LEGACY_PROTOCOL_VERSION,
     capabilities: {},
     clientInfo: { name: 'test-client', version: '1.0.0' }
   }
@@ -64,7 +64,7 @@ describe('Streamable HTTP sessions without SSE', () => {
       url: '/mcp',
       headers: {
         'mcp-session-id': sessionId,
-        'mcp-protocol-version': LATEST_PROTOCOL_VERSION
+        'mcp-protocol-version': LATEST_LEGACY_PROTOCOL_VERSION
       },
       payload: whoamiCall
     })

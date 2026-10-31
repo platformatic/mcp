@@ -6,17 +6,19 @@ import { setTimeout as sleep } from 'node:timers/promises'
 import Fastify from 'fastify'
 import { Type } from '@sinclair/typebox'
 import mcpPlugin from '../src/index.ts'
-import { JSONRPC_VERSION, LATEST_PROTOCOL_VERSION, INTERNAL_ERROR } from '../src/schema.ts'
+import { JSONRPC_VERSION, LATEST_LEGACY_PROTOCOL_VERSION, INTERNAL_ERROR } from '../src/schema.ts'
 import type { CreateTaskResult, CallToolResult } from '../src/schema.ts'
 import { MemoryTaskStore } from '../src/stores/memory-task-store.ts'
 import { TaskWaiters } from '../src/stores/task-store.ts'
 import { testWithRedis } from './redis-test-utils.ts'
 
+const SECRET = 'tasks-result-lifecycle-test-secret-0123456789'
+
 async function call (app: any, method: string, params: unknown, id = 1) {
   const response = await app.inject({
     method: 'POST',
     url: '/mcp',
-    headers: { 'mcp-protocol-version': LATEST_PROTOCOL_VERSION },
+    headers: { 'mcp-protocol-version': LATEST_LEGACY_PROTOCOL_VERSION },
     payload: { jsonrpc: JSONRPC_VERSION, id, method, params }
   })
   return response.json()
@@ -33,7 +35,7 @@ function post (port: number, method: string, params: unknown) {
     headers: {
       'content-type': 'application/json',
       'content-length': Buffer.byteLength(payload),
-      'mcp-protocol-version': LATEST_PROTOCOL_VERSION
+      'mcp-protocol-version': LATEST_LEGACY_PROTOCOL_VERSION
     }
   })
   const body = new Promise<any>((resolve, reject) => {
@@ -124,7 +126,7 @@ describe('legacy tasks/result lifecycle', () => {
     // A runs the tasks
     const a = Fastify({ logger: false })
     t.after(() => a.close())
-    await a.register(mcpPlugin, { enableTasks: true, redis: redisOpts })
+    await a.register(mcpPlugin, { enableTasks: true, redis: redisOpts, requestStateSecret: SECRET })
     a.mcpAddTool({
       name: 'quick',
       description: 'Finishes shortly',
@@ -139,7 +141,7 @@ describe('legacy tasks/result lifecycle', () => {
     // B only serves tasks/result
     const b = Fastify({ logger: false })
     t.after(() => b.close())
-    await b.register(mcpPlugin, { enableTasks: true, redis: redisOpts })
+    await b.register(mcpPlugin, { enableTasks: true, redis: redisOpts, requestStateSecret: SECRET })
     await b.ready()
 
     const results = await Promise.all(Array.from({ length: 5 }, async () => {
@@ -172,14 +174,14 @@ describe('legacy tasks/result lifecycle', () => {
       open()
       await a.close()
     })
-    await a.register(mcpPlugin, { enableTasks: true, redis: redisOpts })
+    await a.register(mcpPlugin, { enableTasks: true, redis: redisOpts, requestStateSecret: SECRET })
     addGatedTool(a, opened)
     await a.ready()
 
     const b = Fastify({ logger: false })
     let bClosed = false
     t.after(() => bClosed ? undefined : b.close())
-    await b.register(mcpPlugin, { enableTasks: true, redis: redisOpts })
+    await b.register(mcpPlugin, { enableTasks: true, redis: redisOpts, requestStateSecret: SECRET })
     await b.listen({ port: 0, host: '127.0.0.1' })
     const { port } = b.server.address() as AddressInfo
 
