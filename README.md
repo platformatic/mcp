@@ -2123,10 +2123,17 @@ switch (outcome.reason) {
   case 'task-required':
     reply.code(409)
     return { error: 'Tool must be invoked through task-augmented tools/call' }
+  case 'invalid-result':
+    reply.code(500)
+    return { error: 'Tool returned an invalid result' }
 }
 ```
 
-The `canAccessTool` hook still runs before validation and before the handler, and receives the same `request` object passed to `mcpCallTool()`. Unlike the JSON-RPC `tools/call` path — which always answers a denied tool exactly like an unknown one, so a remote client cannot probe for tools it is not allowed to see — `mcpCallTool()` is a trusted in-process call and reports the precise reason: `{ ok: false, reason: 'not-found' }` when the tool is not registered, `{ ok: false, reason: 'access-denied' }` when it is registered but `canAccessTool` denied it (existence takes precedence, so an unknown name is always `not-found` even if the hook would also have denied it). Pass the route's real `reply` so tool handlers can use the full Fastify reply API. Pass `authContext` when the in-process caller has one so access hooks and handlers see the same authorization context they would receive over HTTP. If the tool handler throws, the outcome is `{ ok: true, result }` with `result.isError: true`, matching the JSON-RPC `tools/call` path. Every argument rejection that happens before the handler runs — TypeBox validation, AJV validation, or argument sanitization — is reported as `{ ok: false, reason: 'invalid-arguments', detail }`; the handler is never invoked for those.
+The `canAccessTool` hook still runs before validation and before the handler, and receives the same `request` object passed to `mcpCallTool()`. Unlike the JSON-RPC `tools/call` path — which always answers a denied tool exactly like an unknown one, so a remote client cannot probe for tools it is not allowed to see — `mcpCallTool()` is a trusted in-process call and reports the precise reason: `{ ok: false, reason: 'not-found' }` when the tool is not registered, `{ ok: false, reason: 'access-denied' }` when it is registered but `canAccessTool` denied it (existence takes precedence, so an unknown name is always `not-found` even if the hook would also have denied it). Pass the route's real `reply` so tool handlers can use the full Fastify reply API. Pass `authContext` when the in-process caller has one so access hooks and handlers see the same authorization context they would receive over HTTP. If the tool handler throws, the outcome is `{ ok: true, result }` with `result.isError: true`, matching the JSON-RPC `tools/call` path. Every argument rejection that happens before the handler runs — TypeBox validation, AJV validation, or argument sanitization — is reported as `{ ok: false, reason: 'invalid-arguments', detail }`; the handler is never invoked for those. If the handler returns something that is not a `CallToolResult` (no `content` array), the outcome is `{ ok: false, reason: 'invalid-result' }` and the problem is logged.
+
+#### Malformed Handler Results
+
+Handler results are checked before they are sent: a tool result must have a `content` array, a resource result a `contents` array, and a prompt result a `messages` array. When one is missing (for example the handler returned `undefined` or `{}`), the server logs an error and answers with a JSON-RPC `-32603` "Internal error" instead of a result that looks successful. The error carries no further detail. A task-augmented tool call with a malformed result ends in the `failed` status, and `tasks/result` returns the same error.
 
 #### Type-Safe Resource Registration
 
