@@ -1,3 +1,4 @@
+import type { ResourceSubscriptionHolders } from './resource-subscription-holders.ts'
 import { randomUUID } from 'node:crypto'
 import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify'
 import createFastifyError from 'fastify-error'
@@ -79,6 +80,8 @@ export type HandlerDependencies = {
   shutdownSignal?: AbortSignal
   taskLeases?: TaskLeases
   jsonSchemaValidator?: JsonSchemaValidator
+  /** Sessions holding resource subscriptions made through this instance */
+  resourceHolders?: ResourceSubscriptionHolders
   sessionId?: string
   /** The revision this client negotiated; responses are shaped to match it */
   protocolVersion?: string
@@ -1475,6 +1478,8 @@ async function handleResourcesSubscribe (
     // the sessions that asked for this URI
     if (sessionId && dependencies.sessionStore) {
       await dependencies.sessionStore.addResourceSubscription(sessionId, params.uri)
+      // Recorded after the store, so the sweep never sees a hold the store lacks
+      dependencies.resourceHolders?.add(sessionId, params.uri)
     }
     return createResponse(request.id, result)
   } catch (error: any) {
@@ -1506,6 +1511,9 @@ async function handleResourcesUnsubscribe (
       authContext: dependencies.authContext
     })
     if (sessionId && dependencies.sessionStore) {
+      // The handler just ran, so this hold must not be released a second time
+      // by the sweep once the store no longer lists it
+      dependencies.resourceHolders?.release(sessionId, [params.uri])
       await dependencies.sessionStore.removeResourceSubscription(sessionId, params.uri)
     }
     return createResponse(request.id, result)

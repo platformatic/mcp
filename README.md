@@ -987,6 +987,11 @@ app.mcpSendToSession('session-xyz', {
 })
 ```
 
+**How session messages are delivered:**
+- `mcpSendToSession` (and everything built on it: elicitation, task status updates) first records the message in the session's history, then publishes it on `mcp/session/<id>/message`. It returns `false` if the session is gone or the message could not be recorded.
+- An instance subscribes to that topic only while it holds one of the session's GET streams, wherever the session was created. A message sent while no stream is open is not lost: the client gets it on its next GET with `Last-Event-ID`.
+- `DELETE /mcp` ends the session's streams on every instance. Streams and subscriptions held for a session that expired, or was deleted elsewhere, are released by a periodic sweep that runs with both backends.
+
 ### Implementation Design Decisions
 
 This plugin implements certain behaviors that differ from the strict MCP specification to provide enhanced scalability and resilience in production environments:
@@ -2327,6 +2332,11 @@ app.mcpAddPrompt({
 
 - `app.mcpBroadcastNotification(notification)`: Broadcast a notification to all connected SSE clients (works across Redis instances). `notifications/resources/updated` only reaches sessions subscribed to its `params.uri`
 - `app.mcpSendToSession(sessionId, message)`: Send a message/request to a specific SSE session (works across Redis instances)
+
+### Resource Subscription Handlers
+
+- `app.mcpSetResourceSubscribeHandler(handler)`: called for every `resources/subscribe`; its return value is the response result.
+- `app.mcpSetResourceUnsubscribeHandler(handler)`: called for every `resources/unsubscribe`. It is also called when a session ends without unsubscribing (DELETE, or idle expiry), for each URI it held, but only on the instance that ran the subscribe handler and only once no other session on that instance still holds the URI. In that case there is no request to answer, so `context.request` and `context.reply` are undefined (`ResourceUnsubscribeContext`). Expiry, and sessions deleted or unsubscribed through another instance, are picked up by a periodic sweep (at most every `min(sessionTtlMs, 60s)`).
 
 ## Handler API Reference
 
