@@ -140,6 +140,27 @@ describe('a client on 2025-03-26 keeps that revision\'s behavior', () => {
     t.assert.strictEqual(body.result.content[0].text, '5')
     t.assert.strictEqual(body.result.task, undefined)
   })
+
+  test('a tool with taskSupport required runs normally, as tasks were never declared', async (t: TestContext) => {
+    const app = Fastify({ logger: false })
+    t.after(() => app.close())
+    await app.register(mcpPlugin, { enableTasks: true })
+    app.mcpAddTool({
+      name: 'task-only',
+      description: 'Must be invoked as a task on 2025-11-25',
+      inputSchema: Type.Object({}),
+      execution: { taskSupport: 'required' }
+    } as any, async () => ({ content: [{ type: 'text', text: 'done' }] }))
+    await app.ready()
+
+    const body = (await call(app, 'tools/call', { name: 'task-only', arguments: {} }, OLD)).json()
+    t.assert.strictEqual(body.error, undefined)
+    t.assert.strictEqual(body.result.content[0].text, 'done')
+
+    // The 2025-11-25 client, to which tasks are declared, still gets the rule
+    const modern = (await call(app, 'tools/call', { name: 'task-only', arguments: {} }, NEW)).json()
+    t.assert.strictEqual(modern.error.code, METHOD_NOT_FOUND)
+  })
 })
 
 describe('the session version is authoritative', () => {
