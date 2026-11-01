@@ -137,7 +137,13 @@ export type AuthorizationConfig =
     scopeImplies?: ScopeImplies
     tokenValidation: {
       introspectionEndpoint?: string
-      jwksUri?: string
+      /**
+       * Where signing keys are published. A string is the key set of the
+       * first entry of `authorizationServers`: a token naming another issuer
+       * is never checked against it. With several authorization servers,
+       * map each issuer to its own key set.
+       */
+      jwksUri?: string | Record<string, string>
       validateAudience?: boolean
       /**
        * How to authenticate to the introspection endpoint.

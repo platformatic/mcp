@@ -1,7 +1,9 @@
-import buildGetJwks from 'get-jwks'
 import { createVerifier } from 'fast-jwt'
 import type { FastifyInstance } from 'fastify'
+import { JwksCache } from './jwks.ts'
 import type { AuthorizationConfig, TokenValidationResult, TokenIntrospectionResponse } from '../types/auth-types.ts'
+
+const INTROSPECTION_TIMEOUT_MS = 5_000
 
 /**
  * Issuers we accept, derived from the configured authorization servers.
@@ -30,8 +32,29 @@ export function normalizeIssuer (issuer: string): string {
   return issuer.replace(/\/+$/, '')
 }
 
+/**
+ * The key set of each issuer, keyed by its canonical form. A single `jwksUri`
+ * belongs to the first authorization server; a map names the issuer of each.
+ */
+function keySetsByIssuer (authorizationServers: string[], jwksUri: string | Record<string, string> | undefined): Map<string, JwksCache> {
+  const keySets = new Map<string, JwksCache>()
+  if (typeof jwksUri === 'string') {
+    if (authorizationServers.length > 0) keySets.set(normalizeIssuer(authorizationServers[0]), new JwksCache(jwksUri))
+  } else if (jwksUri) {
+    const caches = new Map<string, JwksCache>()
+    for (const [issuer, uri] of Object.entries(jwksUri)) {
+      let cache = caches.get(uri)
+      if (!cache) {
+        cache = new JwksCache(uri)
+        caches.set(uri, cache)
+      }
+      keySets.set(normalizeIssuer(issuer), cache)
+    }
+  }
+  return keySets
+}
+
 export class TokenValidator {
-  private getJwks?: any
   private jwtVerifier?: any
   private config: AuthorizationConfig
   private fastify: FastifyInstance
@@ -48,26 +71,18 @@ export class TokenValidator {
 
     this.allowedIssuers = buildAllowedIssuers(config.authorizationServers)
 
-    if (config.tokenValidation.jwksUri) {
-      // Extract domain from JWKS URI
-      const jwksUrl = new URL(config.tokenValidation.jwksUri)
-      const domain = `${jwksUrl.protocol}//${jwksUrl.host}`
-
-      this.getJwks = buildGetJwks({
-        max: 50,
-        ttl: 600000, // 10 minutes
-        jwksPath: jwksUrl.pathname
-      })
-
+    const keySets = keySetsByIssuer(config.authorizationServers, config.tokenValidation.jwksUri)
+    if (keySets.size > 0) {
       this.jwtVerifier = createVerifier({
-        key: async (obj: { header?: { kid?: string; alg?: string } } = {}) => {
+        // A key proves who signed the token only when it comes from the key
+        // set of the issuer the token names: one authorization server's key
+        // must not vouch for a subject at another.
+        key: async (obj: { header?: { kid?: string; alg?: string }, payload?: { iss?: unknown } } = {}) => {
           const header = obj.header || {}
-          const publicKey = await this.getJwks!.getPublicKey({
-            kid: header.kid,
-            alg: header.alg,
-            domain,
-          })
-          return publicKey
+          const iss = obj.payload?.iss
+          const jwks = typeof iss === 'string' ? keySets.get(normalizeIssuer(iss)) : undefined
+          if (!jwks) throw new Error('No signing keys for this issuer')
+          return await jwks.getPublicKey(header.kid, header.alg)
         },
 
         algorithms: ['RS256', 'ES256'],
@@ -91,6 +106,12 @@ export class TokenValidator {
       if (this.jwtVerifier) {
         try {
           const payload = await this.jwtVerifier(token)
+
+          // Sessions, tasks and sealed state are bound to the subject, so it
+          // must be a usable identifier, as introspection already requires.
+          if (typeof payload.sub !== 'string' || payload.sub === '') {
+            return { valid: false, error: 'Invalid subject claim' }
+          }
 
           // Validate audience if required
           if (this.config.tokenValidation.validateAudience) {
@@ -180,7 +201,10 @@ export class TokenValidator {
         body: new URLSearchParams({
           token,
           token_type_hint: 'access_token'
-        })
+        }),
+        // Any bearer string reaches here, so a stalled endpoint must not hold
+        // each request that carries one.
+        signal: AbortSignal.timeout(INTROSPECTION_TIMEOUT_MS)
       })
 
       if (!response.ok) {
@@ -192,7 +216,8 @@ export class TokenValidator {
 
       const result = await response.json() as TokenIntrospectionResponse
 
-      if (!result.active) {
+      // RFC 7662 §2.2: `active` is a boolean; anything but true is inactive.
+      if (result?.active !== true) {
         return {
           valid: false,
           error: 'Token is not active'
@@ -259,10 +284,7 @@ export class TokenValidator {
   }
 
   close (): void {
-    // Cleanup if needed
-    if (this.getJwks) {
-      // get-jwks doesn't expose a close method, but the cache will be garbage collected
-    }
+    // Nothing to release: the key cache holds no timers or connections.
   }
 }
 

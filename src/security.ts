@@ -95,12 +95,14 @@ export function validateObjectDepth (
 }
 
 /**
- * Sanitize tool parameters from untrusted sources.
+ * Check tool parameters from untrusted sources and return them unchanged.
  *
  * The structure (depth, property counts, array lengths, cycles) is validated
  * once up front; every string reached afterwards, including object keys and
- * strings nested inside arrays at any depth, is length-checked and stripped of
- * control characters.
+ * strings nested inside arrays at any depth, is length-checked. Arguments are
+ * refused rather than rewritten: stripping characters would let two keys
+ * collapse into one, and would hand the handler a value different from the
+ * one a gateway saw mirrored in the `Mcp-Param-*` headers.
  */
 export function sanitizeToolParams (params: Record<string, any>, limits: ToolArgumentLimits = {}): Record<string, any> {
   const maxStringLength = limits.maxStringLength ?? MAX_STRING_LENGTH
@@ -113,24 +115,23 @@ export function sanitizeToolParams (params: Record<string, any>, limits: ToolArg
     limits.maxArrayLength ?? Infinity
   )
 
-  function sanitizeValue (value: any): any {
+  function checkStrings (value: unknown): void {
     if (typeof value === 'string') {
-      return sanitizeString(value, maxStringLength)
-    }
-    if (Array.isArray(value)) {
-      return value.map(sanitizeValue)
-    }
-    if (typeof value === 'object' && value !== null) {
-      const sanitized: Record<string, any> = {}
-      for (const [key, item] of Object.entries(value)) {
-        sanitized[sanitizeString(key, maxStringLength)] = sanitizeValue(item)
+      if (sanitizeString(value, maxStringLength) !== value) {
+        throw new Error('Tool arguments must not contain control characters')
       }
-      return sanitized
+    } else if (Array.isArray(value)) {
+      for (const item of value) checkStrings(item)
+    } else if (typeof value === 'object' && value !== null) {
+      for (const [key, item] of Object.entries(value)) {
+        checkStrings(key)
+        checkStrings(item)
+      }
     }
-    return value
   }
 
-  return sanitizeValue(params)
+  checkStrings(params)
+  return params
 }
 
 /**

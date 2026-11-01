@@ -12,6 +12,7 @@ describe('Redis Integration Tests', () => {
 
     await app.register(mcpPlugin, {
       enableSSE: true,
+      requestStateSecret: 'test-request-state-secret-32-bytes!!',
       redis: {
         host: redis.options.host!,
         port: redis.options.port!,
@@ -33,6 +34,7 @@ describe('Redis Integration Tests', () => {
 
     await app.register(mcpPlugin, {
       enableSSE: true,
+      requestStateSecret: 'test-request-state-secret-32-bytes!!',
       redis: {
         host: redis.options.host!,
         port: redis.options.port!,
@@ -97,6 +99,7 @@ describe('Redis Integration Tests', () => {
 
     await app.register(mcpPlugin, {
       enableSSE: true,
+      requestStateSecret: 'test-request-state-secret-32-bytes!!',
       redis: {
         host: redis.options.host!,
         port: redis.options.port!,
@@ -163,6 +166,7 @@ describe('Redis Integration Tests', () => {
 
     await app1.register(mcpPlugin, {
       enableSSE: true,
+      requestStateSecret: 'test-request-state-secret-32-bytes!!',
       redis: {
         host: redis.options.host!,
         port: redis.options.port!,
@@ -172,6 +176,7 @@ describe('Redis Integration Tests', () => {
 
     await app2.register(mcpPlugin, {
       enableSSE: true,
+      requestStateSecret: 'test-request-state-secret-32-bytes!!',
       redis: {
         host: redis.options.host!,
         port: redis.options.port!,
@@ -245,6 +250,7 @@ describe('Redis Integration Tests', () => {
 
     await app.register(mcpPlugin, {
       enableSSE: true,
+      requestStateSecret: 'test-request-state-secret-32-bytes!!',
       redis: {
         host: redis.options.host!,
         port: redis.options.port!,
@@ -360,11 +366,13 @@ describe('Redis Integration Tests', () => {
 
     await app1.register(mcpPlugin, {
       enableSSE: true,
+      requestStateSecret: 'test-request-state-secret-32-bytes!!',
       redis: redisConfig
     })
 
     await app2.register(mcpPlugin, {
       enableSSE: true,
+      requestStateSecret: 'test-request-state-secret-32-bytes!!',
       redis: redisConfig
     })
 

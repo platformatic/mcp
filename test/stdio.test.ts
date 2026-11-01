@@ -4,6 +4,8 @@ import fastify from 'fastify'
 import mcpPlugin from '../src/index.ts'
 import { PassThrough } from 'node:stream'
 import { createInterface } from 'node:readline'
+import { LATEST_PROTOCOL_VERSION } from '../src/schema.ts'
+import { META_PROTOCOL_VERSION, META_CLIENT_INFO, META_CLIENT_CAPABILITIES } from '../src/schema-2026.ts'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { createStdioTransport, runStdioServer } from '../src/stdio.ts'
 import { MemoryMessageBroker } from '../src/brokers/memory-message-broker.ts'
@@ -153,6 +155,28 @@ test('stdio transport - re-initialize switches the negotiated version', async (t
   const tool = list.result.tools[0]
   assert.strictEqual(tool.icons, undefined)
   assert.strictEqual(tool.inputSchema.$schema, undefined)
+})
+
+test('stdio transport - a 2026-07-28 message after a legacy initialize keeps its own version', async (t) => {
+  const { send, stop } = await setupStdio()
+  t.after(stop)
+
+  await send(initialize(1, '2025-11-25'))
+  const list = await send({
+    jsonrpc: '2.0',
+    id: 2,
+    method: 'tools/list',
+    params: {
+      _meta: {
+        [META_PROTOCOL_VERSION]: LATEST_PROTOCOL_VERSION,
+        [META_CLIENT_INFO]: { name: 'c', version: '1' },
+        [META_CLIENT_CAPABILITIES]: {}
+      }
+    }
+  })
+  assert.strictEqual(list.error, undefined)
+  assert.strictEqual(list.result.resultType, 'complete')
+  assert.strictEqual(list.result.tools[0].name, 'iconic')
 })
 
 test('stdio transport - rejects a numeric id that is not a safe integer', async (t) => {

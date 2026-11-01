@@ -16,20 +16,21 @@ export type JsonSchemaValidator = ReturnType<typeof createJsonSchemaValidator>
  * so registering the plugin twice never shares compilation state.
  */
 export function createJsonSchemaValidator (customOptions: Options = {}) {
-  // Deliberately non-mutating: tool arguments must reach handlers exactly as the
-  // client sent them, so no coercion, no defaults injection, no property removal.
   // `strict: false` tolerates MCP-style schemas carrying extra annotation keywords;
   // `validateFormats: false` keeps `format` annotation-only, which is also JSON
   // Schema 2020-12's own default behavior.
   const ajv = new Ajv2020({
-    coerceTypes: 'array',
-    useDefaults: true,
-    removeAdditional: true,
     addUsedSchema: false,
     allErrors: false,
     strict: false,
     validateFormats: false,
-    ...customOptions
+    ...customOptions,
+    // Deliberately non-mutating, whatever the caller passes: tool arguments must
+    // reach handlers exactly as the client sent them (and as the `Mcp-Param-*`
+    // headers mirrored them), so no coercion, no defaults, no property removal.
+    coerceTypes: false,
+    useDefaults: false,
+    removeAdditional: false
   })
 
   // Compiled validator cache, mirroring the TypeBox cache in validator.ts

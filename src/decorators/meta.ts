@@ -1,3 +1,5 @@
+import { invalidCapabilityMember } from '../modern/request-meta.ts'
+import { collectHeaderParams } from '../modern/headers.ts'
 import type { FastifyPluginAsync } from 'fastify'
 import fp from 'fastify-plugin'
 import type {
@@ -10,9 +12,11 @@ import type {
   ResourceSubscribeHandler,
   ResourceUnsubscribeHandler
 } from '../types.ts'
-import { callRegisteredTool } from '../handlers.ts'
+import { callRegisteredTool, getOutputValidator } from '../handlers.ts'
 import { schemaToArguments, validateToolSchema, isTypeBoxSchema } from '../validation/index.ts'
 import type { JsonSchemaValidator } from '../validation/json-schema-validator.ts'
+import type { ServerCapabilities } from '../schema.ts'
+import { JSONRPC_VERSION } from '../schema.ts'
 
 interface MCPDecoratorsOptions {
   tools: Map<string, MCPTool>
@@ -21,10 +25,32 @@ interface MCPDecoratorsOptions {
   resourceHandlers: ResourceHandlers
   opts: MCPPluginOptions
   jsonSchemaValidator?: JsonSchemaValidator
+  capabilities: ServerCapabilities
 }
 
+const TOOL_NAME = /^[A-Za-z0-9_.-]{1,128}$/
+
+const SUPPORTED_OUTPUT_DIALECTS = new Set([
+  'https://json-schema.org/draft/2020-12/schema',
+  'https://json-schema.org/draft/2020-12/schema#'
+])
+
 const mcpDecoratorsPlugin: FastifyPluginAsync<MCPDecoratorsOptions> = async (app, options) => {
-  const { tools, resources, prompts, resourceHandlers, opts, jsonSchemaValidator } = options
+  const { tools, resources, prompts, resourceHandlers, opts, jsonSchemaValidator, capabilities } = options
+
+  // Registrations before the server is ready are its initial lists; only later
+  // ones change a list a client may already hold.
+  let ready = false
+  app.addHook('onReady', async () => { ready = true })
+
+  /** Tell clients a list changed, when the server declares it does so. */
+  function announceListChange (list: 'tools' | 'resources' | 'prompts'): void {
+    if (!ready || !(capabilities[list] as { listChanged?: boolean } | undefined)?.listChanged) return
+    app.mcpBroadcastNotification({
+      jsonrpc: JSONRPC_VERSION,
+      method: `notifications/${list}/list_changed`
+    }).catch((error: unknown) => app.log.warn({ err: error, list }, 'Could not announce list change'))
+  }
 
   // Enhanced tool decorator with TypeBox schema support
   app.decorate('mcpAddTool', (
@@ -35,12 +61,25 @@ const mcpDecoratorsPlugin: FastifyPluginAsync<MCPDecoratorsOptions> = async (app
     if (!name) {
       throw new Error('Tool definition must have a name')
     }
+    // The spec recommends 1-128 characters from [A-Za-z0-9_.-]; other names
+    // may not work with every client, so flag them without refusing.
+    if (!TOOL_NAME.test(name)) {
+      app.log.warn({ tool: name }, 'Tool name should be 1-128 characters of A-Z, a-z, 0-9, _, - and .')
+    }
 
     // Validate schema if provided
     if (definition.inputSchema) {
       const schemaErrors = validateToolSchema(definition.inputSchema)
       if (schemaErrors.length > 0) {
         throw new Error(`Invalid tool schema for '${name}': ${schemaErrors.join(', ')}`)
+      }
+
+      // An `x-mcp-header` annotation the transport cannot mirror makes the
+      // definition invalid, and 2026-07-28 clients would never see the tool:
+      // say so now rather than hide it.
+      const headers = collectHeaderParams(definition.inputSchema)
+      if (!headers.ok) {
+        throw new Error(`Invalid tool schema for '${name}': ${headers.message}`)
       }
 
       // When AJV validation is on, an uncompilable plain JSON Schema must fail
@@ -51,6 +90,36 @@ const mcpDecoratorsPlugin: FastifyPluginAsync<MCPDecoratorsOptions> = async (app
         } catch (error) {
           throw new Error(`Invalid tool schema for '${name}': ${error instanceof Error ? error.message : String(error)}`)
         }
+      }
+    }
+
+    // Structured results are validated with JSON Schema 2020-12, the dialect
+    // MCP specifies. A schema declaring another dialect could never validate,
+    // so say so now rather than fail every call with a misleading mismatch.
+    const outputDialect = (definition.outputSchema as { $schema?: unknown } | undefined)?.$schema
+    if (outputDialect !== undefined && !SUPPORTED_OUTPUT_DIALECTS.has(String(outputDialect))) {
+      throw new Error(`Invalid output schema for '${name}': dialect '${outputDialect}' is not supported; use JSON Schema 2020-12`)
+    }
+    // Compile now: a schema that cannot be compiled (an unknown type, an
+    // unresolvable `$ref`) would otherwise fail every call, blaming the result.
+    if (definition.outputSchema !== undefined && !isTypeBoxSchema(definition.outputSchema)) {
+      try {
+        getOutputValidator().compileAndCache(definition.outputSchema)
+      } catch (error) {
+        throw new Error(`Invalid output schema for '${name}': ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+
+    const inputCapabilities = definition.inputCapabilities
+    if (inputCapabilities !== undefined) {
+      if (typeof inputCapabilities !== 'object' || inputCapabilities === null || Array.isArray(inputCapabilities)) {
+        throw new Error(`Invalid inputCapabilities for '${name}': expected client capabilities`)
+      }
+      // Held to the same shape as a client's declaration, which it is
+      // compared against on every call.
+      const member = invalidCapabilityMember(inputCapabilities as Record<string, unknown>)
+      if (member !== undefined) {
+        throw new Error(`Invalid inputCapabilities for '${name}': '${member}' must be an object`)
       }
     }
 
@@ -65,6 +134,7 @@ const mcpDecoratorsPlugin: FastifyPluginAsync<MCPDecoratorsOptions> = async (app
       },
       handler
     })
+    announceListChange('tools')
   })
 
   app.decorate('mcpCallTool', (name: string, args: Record<string, unknown>, context: McpCallToolContext) => {
@@ -104,6 +174,7 @@ const mcpDecoratorsPlugin: FastifyPluginAsync<MCPDecoratorsOptions> = async (app
     }
 
     resources.set(uriPattern, { definition: resourceDefinition, handler })
+    announceListChange('resources')
   })
 
   // Enhanced prompt decorator with argument schema support
@@ -132,11 +203,16 @@ const mcpDecoratorsPlugin: FastifyPluginAsync<MCPDecoratorsOptions> = async (app
       },
       handler
     })
+    announceListChange('prompts')
   })
 
   // Resource subscription handler setters
   app.decorate('mcpSetResourceSubscribeHandler', (handler: ResourceSubscribeHandler) => {
     resourceHandlers.subscribeHandler = handler
+    // Default capabilities only: an explicit configuration is used as given.
+    if (opts.capabilities === undefined && capabilities.resources) {
+      capabilities.resources.subscribe = true
+    }
   })
 
   app.decorate('mcpSetResourceUnsubscribeHandler', (handler: ResourceUnsubscribeHandler) => {

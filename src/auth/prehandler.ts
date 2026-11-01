@@ -1,7 +1,42 @@
 import type { FastifyRequest, FastifyReply, preHandlerHookHandler } from 'fastify'
 import type { AuthorizationConfig, ScopeImplies } from '../types/auth-types.ts'
 import { TokenValidator } from './token-validator.ts'
+import { isStdioRequest } from '../stdio-trust.ts'
 import { getResourceMetadataUrl } from './resource-metadata.ts'
+
+/** Route config key marking the plugin's own pre-authorization OAuth routes. */
+export const SKIP_BEARER_AUTH = 'mcpSkipBearerAuth'
+
+const ABSOLUTE_FORM = /^https?:\/\/.*?\//
+
+/**
+ * The path the router matched for this request, worked out the way
+ * find-my-way does it: absolute-form targets lose their origin, the path
+ * ends at the first `?` or `#` (or `;` with `useSemicolonDelimiter`), and it
+ * is percent-decoded. Exclusions must see the same path the router routed,
+ * or a suffix the router ignores could select an excluded path. Returns
+ * undefined when the path cannot be decoded, so nothing is excluded.
+ */
+function routedPath (request: FastifyRequest): string | undefined {
+  const config = request.server.initialConfig as { useSemicolonDelimiter?: boolean, routerOptions?: { useSemicolonDelimiter?: boolean } }
+  const semicolon = config.routerOptions?.useSemicolonDelimiter ?? config.useSemicolonDelimiter ?? false
+  let path = request.url
+  if (path.charCodeAt(0) !== 47) {
+    path = path.replace(ABSOLUTE_FORM, '/')
+  }
+  for (let i = 0; i < path.length; i++) {
+    const char = path.charCodeAt(i)
+    if (char === 63 || char === 35 || (char === 59 && semicolon)) {
+      path = path.slice(0, i)
+      break
+    }
+  }
+  try {
+    return decodeURI(path)
+  } catch {
+    return undefined
+  }
+}
 
 export const BEARER_SCHEME = /^bearer +(.*)$/i
 
@@ -15,21 +50,36 @@ export function createAuthPreHandler (
       return
     }
 
-    // Skip authorization for well-known endpoints
-    if (request.url.startsWith('/.well-known/') || request.url.startsWith('/mcp/.well-known')) {
+    // stdio is a local transport: the spec has it take credentials from the
+    // environment, not from HTTP bearer tokens, and only the in-process stdio
+    // transport can present this token.
+    if (isStdioRequest(request)) {
       return
     }
 
-    // Skip authorization for OAuth flow endpoints (authorize initiates, callback receives code, register is pre-auth)
-    if (request.url.startsWith('/oauth/authorize') || request.url.startsWith('/oauth/callback') || request.url.startsWith('/oauth/register')) {
+    // Skip authorization for the discovery and OAuth flow endpoints this
+    // plugin registers (metadata, authorize, callback, register). They are
+    // marked on the route, so an application route whose URL merely starts
+    // the same way stays protected.
+    if ((request.routeOptions.config as unknown as Record<string, unknown> | undefined)?.[SKIP_BEARER_AUTH] === true) {
       return
     }
 
-    // Skip authorization for custom excluded paths
-    if (config.excludedPaths?.some(path =>
-      typeof path === 'string' ? request.url.startsWith(path) : path.test(request.url)
-    )) {
-      return
+    const pathname = routedPath(request)
+    if (pathname !== undefined) {
+      // A well-known URL that matches no route answers 404, not 401, so
+      // clients probing discovery locations can tell "not here" apart.
+      if (request.is404 && pathname.startsWith('/.well-known/')) {
+        return
+      }
+
+      // Skip authorization for custom excluded paths. They match the routed
+      // path only: the query string and fragment are the caller's to choose.
+      if (config.excludedPaths?.some(path =>
+        typeof path === 'string' ? pathname.startsWith(path) : path.test(pathname)
+      )) {
+        return
+      }
     }
 
     // Extract Bearer token from Authorization header

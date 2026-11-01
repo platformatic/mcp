@@ -1,0 +1,275 @@
+/**
+ * Per-request metadata handling for the 2026-07-28 revision.
+ *
+ * There is no handshake any more: every request states which protocol version
+ * it speaks and which capabilities the client has, in `_meta`. Nothing may be
+ * inferred from an earlier request on the same connection, so this parsing runs
+ * for each message independently.
+ */
+
+import type { Implementation, LoggingLevel, RequestId } from '../schema.ts'
+import { JSONRPC_VERSION } from '../schema.ts'
+import type { ClientCapabilities, RequestMetaObject } from '../schema-2026.ts'
+import {
+  META_CLIENT_CAPABILITIES,
+  META_CLIENT_INFO,
+  META_LOG_LEVEL,
+  META_PROTOCOL_VERSION,
+  TASKS_EXTENSION
+} from '../schema-2026.ts'
+
+/**
+ * The id is echoed in every response, and a listen stream's id in every
+ * notification it carries: an id of the client's choosing, unbounded, would
+ * make each broadcast cost what the client wants it to.
+ */
+export const MAX_REQUEST_ID_LENGTH = 256
+
+/**
+ * What is wrong with a modern POST body at the JSON-RPC level, or `undefined`
+ * when it is a well-formed request or notification.
+ *
+ * The transport carries exactly one message per POST, and a request id must be
+ * a string or an integer: never null. A number outside the safe integer range
+ * has already lost precision in JSON.parse, so answering it would echo a
+ * different id.
+ */
+export function invalidModernMessage (body: unknown): string | undefined {
+  if (Array.isArray(body)) return 'Batch requests are not supported'
+  if (!body || typeof body !== 'object') return 'Invalid request: expected a JSON-RPC object'
+
+  const message = body as { jsonrpc?: unknown, method?: unknown, id?: unknown }
+  if (message.jsonrpc !== JSONRPC_VERSION) return 'Invalid request: "jsonrpc" must be "2.0"'
+  if (typeof message.method !== 'string') return 'Invalid request: "method" must be a string'
+  if ('id' in message && typeof message.id !== 'string' && !Number.isSafeInteger(message.id)) {
+    return 'Invalid request: "id" must be a string or a safe integer'
+  }
+  if (typeof message.id === 'string' && message.id.length > MAX_REQUEST_ID_LENGTH) {
+    return `Invalid request: "id" must be at most ${MAX_REQUEST_ID_LENGTH} characters`
+  }
+  return undefined
+}
+
+/**
+ * The id to answer an invalid message with: its own id when usable, otherwise
+ * the explicit null JSON-RPC requires when the id cannot be determined.
+ */
+export function requestIdOf (body: unknown): RequestId | null {
+  const id = (body && typeof body === 'object' && !Array.isArray(body))
+    ? (body as { id?: unknown }).id
+    : undefined
+  if (typeof id === 'string') return id.length <= MAX_REQUEST_ID_LENGTH ? id : null
+  return Number.isSafeInteger(id) ? id as RequestId : null
+}
+
+/** The protocol version a request names in `_meta`, if it names one. */
+export function requestedProtocolVersion (params: unknown): string | undefined {
+  const meta = (params as { _meta?: unknown } | undefined)?._meta
+  if (!meta || typeof meta !== 'object' || Array.isArray(meta)) return undefined
+  const version = (meta as Record<string, unknown>)[META_PROTOCOL_VERSION]
+  return typeof version === 'string' && version.length > 0 ? version : undefined
+}
+
+/** Everything the modern dispatch needs to know about who is calling. */
+export interface RequestContext {
+  protocolVersion: string
+  clientInfo?: Implementation
+  clientCapabilities: ClientCapabilities
+  /** Absent means the client did not opt into `notifications/message`. */
+  logLevel?: LoggingLevel
+  progressToken?: string | number
+}
+
+export type RequestContextResult =
+  | { ok: true, context: RequestContext }
+  | { ok: false, message: string }
+
+export const LOG_LEVELS: readonly string[] = [
+  'debug', 'info', 'notice', 'warning', 'error', 'critical', 'alert', 'emergency'
+]
+
+/**
+ * Read `_meta` off a request's params.
+ *
+ * A missing or malformed required field is a client error, reported by the
+ * caller as `-32602` (and HTTP 400) per the spec. We deliberately do not fill
+ * in defaults: guessing a protocol version would defeat the point of carrying
+ * one on every request.
+ */
+export function parseRequestContext (params: unknown): RequestContextResult {
+  const meta = (params as { _meta?: unknown } | undefined)?._meta
+
+  if (meta === undefined || meta === null || typeof meta !== 'object' || Array.isArray(meta)) {
+    return { ok: false, message: 'Missing required "_meta" on request params' }
+  }
+
+  const record = meta as RequestMetaObject
+
+  const protocolVersion = record[META_PROTOCOL_VERSION]
+  if (typeof protocolVersion !== 'string' || protocolVersion.length === 0) {
+    return { ok: false, message: `Missing required "_meta.${META_PROTOCOL_VERSION}"` }
+  }
+
+  const rawCapabilities = record[META_CLIENT_CAPABILITIES]
+  if (rawCapabilities === undefined || rawCapabilities === null ||
+      typeof rawCapabilities !== 'object' || Array.isArray(rawCapabilities)) {
+    return { ok: false, message: `Missing required "_meta.${META_CLIENT_CAPABILITIES}"` }
+  }
+  const invalidCapability = invalidCapabilityMember(rawCapabilities as Record<string, unknown>)
+  if (invalidCapability !== undefined) {
+    return { ok: false, message: `Invalid "_meta.${META_CLIENT_CAPABILITIES}.${invalidCapability}": expected an object` }
+  }
+
+  const rawClientInfo = record[META_CLIENT_INFO]
+  let clientInfo: Implementation | undefined
+  if (rawClientInfo !== undefined) {
+    if (typeof rawClientInfo !== 'object' || rawClientInfo === null || Array.isArray(rawClientInfo)) {
+      return { ok: false, message: `Invalid "_meta.${META_CLIENT_INFO}": expected an object` }
+    }
+    clientInfo = rawClientInfo as Implementation
+  }
+
+  const rawLogLevel = record[META_LOG_LEVEL]
+  let logLevel: LoggingLevel | undefined
+  if (rawLogLevel !== undefined) {
+    if (typeof rawLogLevel !== 'string' || !LOG_LEVELS.includes(rawLogLevel)) {
+      return { ok: false, message: `Invalid "_meta.${META_LOG_LEVEL}": unknown log level` }
+    }
+    logLevel = rawLogLevel as LoggingLevel
+  }
+
+  const rawProgressToken = (record as { progressToken?: unknown }).progressToken
+  let progressToken: string | number | undefined
+  if (rawProgressToken !== undefined) {
+    // Progress tokens MUST be a string or an integer.
+    if (typeof rawProgressToken !== 'string' && !Number.isSafeInteger(rawProgressToken)) {
+      return { ok: false, message: 'Invalid "_meta.progressToken": expected a string or integer' }
+    }
+    progressToken = rawProgressToken as string | number
+  }
+
+  return {
+    ok: true,
+    context: {
+      protocolVersion,
+      clientInfo,
+      clientCapabilities: rawCapabilities as ClientCapabilities,
+      logLevel,
+      progressToken
+    }
+  }
+}
+
+/** Capabilities the server reads members of, and the members it reads. */
+const OBJECT_CAPABILITIES: Record<string, string[]> = {
+  elicitation: ['form', 'url'],
+  sampling: ['tools', 'context'],
+  roots: [],
+  experimental: [],
+  extensions: []
+}
+
+/** Capabilities whose every member is a settings object. */
+const MAP_CAPABILITIES = new Set(['experimental', 'extensions'])
+
+function isObject (value: unknown): boolean {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/**
+ * The path of the first declared capability the server reads that is not an
+ * object (`{ "elicitation": null }`, say), so it is refused up front rather
+ * than failing wherever it is first used.
+ */
+export function invalidCapabilityMember (capabilities: Record<string, unknown>): string | undefined {
+  for (const [name, members] of Object.entries(OBJECT_CAPABILITIES)) {
+    const declared = capabilities[name]
+    if (declared === undefined) continue
+    if (!isObject(declared)) return name
+    // Maps of identifiers to settings objects: a non-object value is not a
+    // declaration (`{ "io.modelcontextprotocol/tasks": null }` opts into nothing).
+    if (MAP_CAPABILITIES.has(name)) {
+      for (const [member, value] of Object.entries(declared as Record<string, unknown>)) {
+        if (!isObject(value)) return `${name}.${member}`
+      }
+    }
+    for (const member of members) {
+      const value = (declared as Record<string, unknown>)[member]
+      if (value !== undefined && !isObject(value)) return `${name}.${member}`
+    }
+  }
+  return undefined
+}
+
+/**
+ * Does this request body claim a modern protocol version?
+ *
+ * Used only as one half of {@link isModernRequest} — on its own it is not a
+ * safe era test, because omitting the key is exactly how a caller would try to
+ * dodge modern validation.
+ */
+export function bodyClaimsModern (body: unknown): boolean {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return false
+  const meta = (body as { params?: { _meta?: unknown } }).params?._meta
+  if (!meta || typeof meta !== 'object') return false
+  return META_PROTOCOL_VERSION in (meta as Record<string, unknown>)
+}
+
+/**
+ * Decide which era a request belongs to.
+ *
+ * The `MCP-Protocol-Version` header alone is enough to commit to the modern
+ * path, and it has to be: the transport mirrors body fields into headers so
+ * that gateways can route on them, and a gateway is entitled to trust those
+ * headers once the version header says the server validates them. If era
+ * detection keyed off the body alone, a caller could send modern headers with
+ * a body that omits `_meta` and slip past every header/body check into the
+ * legacy path — defeating exactly the split-brain attack that
+ * "Server Validation" exists to prevent.
+ *
+ * So: a modern version header, or a body claiming one, means modern. A request
+ * that does neither is legacy, and so is an `initialize` without modern
+ * `_meta`, which the versioning rules say selects legacy semantics. A modern header with a body that lacks `_meta`
+ * now correctly earns `-32602` rather than silently being served.
+ */
+export function isModernRequest (
+  headers: Record<string, string | string[] | undefined>,
+  body: unknown,
+  modernVersions: readonly string[]
+): boolean {
+  const claimsModern = bodyClaimsModern(body)
+  // An `initialize` selects legacy semantics: a legacy client that echoes the
+  // library's newest version in the header still gets its handshake.
+  if (!claimsModern && (body as { method?: unknown } | null)?.method === 'initialize' && !Array.isArray(body)) return false
+
+  const header = headers['mcp-protocol-version']
+  const version = Array.isArray(header) ? header[0] : header
+  if (version !== undefined && modernVersions.includes(version)) return true
+
+  return claimsModern
+}
+
+/** Did the client declare support for elicitation in this request? */
+export function supportsElicitation (capabilities: ClientCapabilities): boolean {
+  return capabilities.elicitation !== undefined
+}
+
+/** Did the client declare support for URL-mode elicitation? */
+export function supportsUrlElicitation (capabilities: ClientCapabilities): boolean {
+  return capabilities.elicitation?.url !== undefined
+}
+
+/** Did the client declare sampling (deprecated, but still negotiable)? */
+export function supportsSampling (capabilities: ClientCapabilities): boolean {
+  return capabilities.sampling !== undefined
+}
+
+/** Did the client declare roots (deprecated, but still negotiable)? */
+export function supportsRoots (capabilities: ClientCapabilities): boolean {
+  return capabilities.roots !== undefined
+}
+
+/** Did the client opt into the official tasks extension on this request? */
+export function supportsTasksExtension (capabilities: ClientCapabilities): boolean {
+  return capabilities.extensions?.[TASKS_EXTENSION] !== undefined
+}

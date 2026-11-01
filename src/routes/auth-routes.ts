@@ -1,17 +1,19 @@
 import type { FastifyInstance, FastifyPluginAsync } from 'fastify'
 import fp from 'fastify-plugin'
 import { Type } from '@sinclair/typebox'
-import type { PKCEChallenge } from '../auth/oauth-client.ts'
-import { BEARER_SCHEME } from '../auth/prehandler.ts'
-import type { SessionStore } from '../stores/session-store.ts'
+import { BEARER_SCHEME, SKIP_BEARER_AUTH } from '../auth/prehandler.ts'
+import { AUTHORIZATION_STATE_TTL_MS, AuthorizationStateSealer } from '../auth/authorization-state.ts'
+import type { AuthSession } from '../auth/authorization-state.ts'
 import type { DCRHooks, DCRRequest, DCRResponse } from '../types/auth-types.ts'
 
-export interface AuthSession {
-  state: string
-  pkce: PKCEChallenge
-  resourceUri?: string
-  callbackUrl?: string // The redirect_uri used in authorization request (required for OIDC token exchange)
-}
+export type { AuthSession } from '../auth/authorization-state.ts'
+
+/**
+ * Prefix of the cookie carrying a pending authorization to its callback.
+ * Each authorization gets its own, named after its state, so flows started
+ * in two tabs do not overwrite each other.
+ */
+export const AUTHORIZATION_STATE_COOKIE = 'mcp_oauth_state_'
 
 export interface AuthorizationCallbackQuery {
   code?: string
@@ -25,7 +27,12 @@ export interface TokenRefreshBody {
 }
 
 export interface AuthRoutesOptions {
-  sessionStore: SessionStore
+  /**
+   * Secret sealing pending authorizations into their cookie (default: a
+   * per-process random one). Every instance that can serve the callback
+   * needs the same one; a list rotates it, sealing with the first.
+   */
+  stateSecret?: string | Buffer | ReadonlyArray<string | Buffer>
   /** DCR hooks for custom request/response processing */
   dcrHooks?: DCRHooks
 }
@@ -100,11 +107,36 @@ const LogoutResponse = Type.Object({
   logout_status: Type.String()
 })
 
+function stateCookie (callbackUrl: string | undefined, state: string, value: string, ttlMs: number): string {
+  const url = callbackUrl ? new URL(callbackUrl) : undefined
+  const attributes = [
+    `${AUTHORIZATION_STATE_COOKIE}${state}=${value}`,
+    `Path=${url?.pathname ?? '/'}`,
+    `Max-Age=${Math.floor(ttlMs / 1000)}`,
+    'HttpOnly',
+    // Lax still sends it on the authorization server's top-level redirect back
+    'SameSite=Lax'
+  ]
+  if (url?.protocol === 'https:') attributes.push('Secure')
+  return attributes.join('; ')
+}
+
+function readCookie (header: string | undefined, name: string): string | undefined {
+  if (!header) return undefined
+  for (const part of header.split(';')) {
+    const separator = part.indexOf('=')
+    if (separator === -1 || part.slice(0, separator).trim() !== name) continue
+    return part.slice(separator + 1).trim()
+  }
+  return undefined
+}
+
 const authRoutesPlugin: FastifyPluginAsync<AuthRoutesOptions> = async (fastify: FastifyInstance, opts) => {
-  const { sessionStore } = opts
+  const sealer = new AuthorizationStateSealer(opts.stateSecret)
 
   // Initiate OAuth authorization flow
   fastify.get('/oauth/authorize', {
+    config: { [SKIP_BEARER_AUTH]: true },
     schema: {
       querystring: AuthorizeQuerystring
     }
@@ -121,8 +153,16 @@ const authRoutesPlugin: FastifyPluginAsync<AuthRoutesOptions> = async (fastify: 
         })
       }
 
-      // Build the callback URL for this server (required for OIDC compliance)
-      const callbackUrl = `${request.protocol}://${request.host}/oauth/callback`
+      // The callback comes from configuration, the same one the client
+      // metadata advertises: a Host header is the caller's to choose.
+      const callbackUrl = fastify.oauthClient.redirectUri
+      if (!callbackUrl) {
+        fastify.log.error('OAuth authorization needs oauth2Client.resourceUri or oauth2Client.redirectUri to build its callback URL')
+        return reply.status(500).send({
+          error: 'server_error',
+          error_description: 'The OAuth callback URL is not configured'
+        })
+      }
 
       // Create authorization request with PKCE and redirect_uri
       const authRequest = await fastify.oauthClient.createAuthorizationRequest({
@@ -130,26 +170,18 @@ const authRoutesPlugin: FastifyPluginAsync<AuthRoutesOptions> = async (fastify: 
         redirect_uri: callbackUrl
       })
 
-      // Store session data in session store
       const sessionData: AuthSession = {
         state: authRequest.state,
         pkce: authRequest.pkce,
         resourceUri: resource,
         callbackUrl // Store for token exchange (must match)
       }
-
-      // Create session metadata with auth session data
-      const sessionMetadata = {
-        id: authRequest.state,
-        eventId: 0,
-        createdAt: new Date(),
-        lastActivity: new Date(),
-        authSession: sessionData
-      }
-
-      await sessionStore.create(sessionMetadata)
-
-      // Redirect to authorization server
+      // The pending authorization travels in a cookie, so the callback only
+      // completes in the browser that started the flow (RFC 9700 Section
+      // 4.7.1): a callback URL from someone else's login carries a state this
+      // browser holds no cookie for.
+      const sealed = sealer.seal(sessionData, AUTHORIZATION_STATE_TTL_MS)
+      reply.header('Set-Cookie', stateCookie(callbackUrl, authRequest.state, sealed, AUTHORIZATION_STATE_TTL_MS))
       return reply.redirect(authRequest.authorizationUrl)
     } catch (error) {
       fastify.log.error({ error }, 'Failed to initiate OAuth authorization')
@@ -162,6 +194,7 @@ const authRoutesPlugin: FastifyPluginAsync<AuthRoutesOptions> = async (fastify: 
 
   // Handle OAuth callback
   fastify.get('/oauth/callback', {
+    config: { [SKIP_BEARER_AUTH]: true },
     schema: {
       querystring: CallbackQuerystring,
       response: {
@@ -197,19 +230,23 @@ const authRoutesPlugin: FastifyPluginAsync<AuthRoutesOptions> = async (fastify: 
         })
       }
 
-      // Retrieve session data from session store
-      const sessionMetadata = await sessionStore.get(state)
-      if (!sessionMetadata || !sessionMetadata.authSession) {
+      const cookie = readCookie(request.headers.cookie, AUTHORIZATION_STATE_COOKIE + state)
+      if (cookie === undefined) {
+        return reply.status(400).send({
+          error: 'invalid_request',
+          error_description: 'This authorization was not started from this browser'
+        })
+      }
+
+      const sessionData = sealer.open(cookie, state)
+      if (!sessionData) {
         return reply.status(400).send({
           error: 'invalid_request',
           error_description: 'Invalid or expired state parameter'
         })
       }
-
-      const sessionData = sessionMetadata.authSession as AuthSession
-
-      // Clean up session data
-      await sessionStore.delete(state)
+      // The authorization server redeems a code once; the cookie goes too
+      reply.header('Set-Cookie', stateCookie(sessionData.callbackUrl, state, '', 0))
 
       // Exchange authorization code for tokens (include redirect_uri for OIDC compliance)
       const tokens = await fastify.oauthClient.exchangeCodeForToken(
@@ -344,6 +381,7 @@ const authRoutesPlugin: FastifyPluginAsync<AuthRoutesOptions> = async (fastify: 
   // (Using oauth-client.dynamicClientRegistration here would cause an infinite loop
   // if OIDC discovery points back to this server.)
   fastify.post('/oauth/register', {
+    config: { [SKIP_BEARER_AUTH]: true },
     schema: {
       body: DynamicRegistrationRequest,
       response: {
