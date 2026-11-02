@@ -30,20 +30,6 @@ export function normalizeIssuer (issuer: string): string {
   return issuer.replace(/\/+$/, '')
 }
 
-// Canonicalise an audience for comparison: lowercase scheme and host and strip
-// a single trailing slash, so `https://MCP.example.com/` matches
-// `https://mcp.example.com`. Non-URL audiences are compared as-is.
-export function normalizeAudience (value: string): string {
-  let normalized = value
-  try {
-    // URL lowercases scheme and host (and adds `/` to an empty path)
-    normalized = new URL(value).href
-  } catch {
-    // Not a URL, fall back to the raw string
-  }
-  return normalized.endsWith('/') ? normalized.slice(0, -1) : normalized
-}
-
 export class TokenValidator {
   private getJwks?: any
   private jwtVerifier?: any
@@ -106,9 +92,9 @@ export class TokenValidator {
         try {
           const payload = await this.jwtVerifier(token)
 
-          // Validate audience unless explicitly disabled
-          if (this.config.tokenValidation.validateAudience !== false) {
-            if (!this.validateAudience(payload.aud)) {
+          // Validate audience if required
+          if (this.config.tokenValidation.validateAudience) {
+            if (!this.validateAudience(payload)) {
               return {
                 valid: false,
                 error: 'Invalid audience claim'
@@ -150,14 +136,13 @@ export class TokenValidator {
     }
   }
 
-  private validateAudience (aud: unknown): boolean {
-    if (!this.config.enabled || !aud) {
+  private validateAudience (payload: any): boolean {
+    if (!this.config.enabled || !payload.aud) {
       return false
     }
 
-    const expected = normalizeAudience(this.config.resourceUri)
-    const audiences = Array.isArray(aud) ? aud : [aud]
-    return audiences.some((value) => typeof value === 'string' && normalizeAudience(value) === expected)
+    const audiences = Array.isArray(payload.aud) ? payload.aud : [payload.aud]
+    return audiences.includes(this.config.resourceUri)
   }
 
   private async introspectToken (token: string): Promise<TokenValidationResult> {
@@ -232,9 +217,9 @@ export class TokenValidator {
         }
       }
 
-      // Validate audience unless explicitly disabled
-      if (this.config.tokenValidation.validateAudience !== false) {
-        if (!this.validateAudience(result.aud)) {
+      // Validate audience if required
+      if (this.config.tokenValidation.validateAudience) {
+        if (!result.aud || !this.validateIntrospectionAudience(result.aud)) {
           return {
             valid: false,
             error: 'Invalid audience claim'
@@ -263,6 +248,14 @@ export class TokenValidator {
         error: error instanceof Error ? error.message : 'Introspection request failed'
       }
     }
+  }
+
+  private validateIntrospectionAudience (aud: string | string[]): boolean {
+    if (!this.config.enabled) {
+      return false
+    }
+    const audiences = Array.isArray(aud) ? aud : [aud]
+    return audiences.includes(this.config.resourceUri)
   }
 
   close (): void {
