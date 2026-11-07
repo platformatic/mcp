@@ -115,7 +115,7 @@ describe('MemorySessionStore idle expiry', () => {
     for (let i = 0; i < 5; i++) {
       t.mock.timers.tick(600)
       await store.touch('touched')
-      await store.addMessage('messaged', String(i + 1), { jsonrpc: '2.0', method: 'notifications/test' })
+      await store.addMessage('messaged', { jsonrpc: '2.0', method: 'notifications/test' })
     }
     await store.cleanup()
 
@@ -131,7 +131,7 @@ describe('MemorySessionStore idle expiry', () => {
 
     t.mock.timers.tick(1001)
     await store.touch('s1')
-    await store.addMessage('s1', '1', { jsonrpc: '2.0', method: 'notifications/test' })
+    await store.addMessage('s1', { jsonrpc: '2.0', method: 'notifications/test' })
 
     t.assert.strictEqual(await store.get('s1'), null)
     t.assert.deepStrictEqual(await store.getMessagesFrom('s1', '0'), [])

@@ -118,10 +118,16 @@ export class MemorySessionStore implements SessionStore {
     return this.sessions.size
   }
 
-  async addMessage (sessionId: string, eventId: string, message: JSONRPCMessage): Promise<void> {
+  async addMessage (sessionId: string, message: JSONRPCMessage): Promise<string | null> {
     // Do not revive an expired session or keep history for one that is gone
     const session = this.live(sessionId)
-    if (!session) return
+    if (!session) return null
+
+    // Bump the counter on the stored object, not on a copy from get(), and
+    // before any await, so concurrent deliveries never share an id
+    const eventId = (++session.eventId).toString()
+    session.lastEventId = eventId
+    session.lastActivity = new Date()
 
     let history = this.messageHistory.get(sessionId)
     if (!history) {
@@ -136,17 +142,7 @@ export class MemorySessionStore implements SessionStore {
       history.splice(0, history.length - this.maxMessages)
     }
 
-    // Update session metadata.
-    // Persist the numeric counter, not just lastEventId. get() hands callers a
-    // copy, so the `++session.eventId` a caller does on that copy is otherwise
-    // never stored — leaving every SSE event with id "1" and breaking
-    // Last-Event-ID resumption. The Redis backend already persists this.
-    const numericEventId = parseInt(eventId, 10)
-    if (!Number.isNaN(numericEventId)) {
-      session.eventId = numericEventId
-    }
-    session.lastEventId = eventId
-    session.lastActivity = new Date()
+    return eventId
   }
 
   async getMessagesFrom (sessionId: string, fromEventId: string): Promise<Array<{ eventId: string, message: JSONRPCMessage }>> {

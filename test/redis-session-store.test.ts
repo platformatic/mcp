@@ -53,7 +53,7 @@ describe('RedisSessionStore', () => {
       method: 'test',
       id: 1
     }
-    await store.addMessage('test-session-2', '1', message)
+    await store.addMessage('test-session-2', message)
 
     // Verify session exists
     const before = await store.get('test-session-2')
@@ -95,8 +95,8 @@ describe('RedisSessionStore', () => {
       id: 2
     }
 
-    await store.addMessage('test-session-3', '1', message1)
-    await store.addMessage('test-session-3', '2', message2)
+    await store.addMessage('test-session-3', message1)
+    await store.addMessage('test-session-3', message2)
 
     // Check updated session metadata
     const updatedSession = await store.get('test-session-3')
@@ -131,7 +131,7 @@ describe('RedisSessionStore', () => {
     ]
 
     for (let i = 0; i < messages.length; i++) {
-      await store.addMessage('test-session-4', (i + 1).toString(), messages[i])
+      await store.addMessage('test-session-4', messages[i])
     }
 
     // Get messages from event ID 1 (should return events 2 and 3)
@@ -162,7 +162,7 @@ describe('RedisSessionStore', () => {
         method: `test${i}`,
         id: i
       }
-      await store.addMessage('test-session-5', i.toString(), message)
+      await store.addMessage('test-session-5', message)
     }
 
     // Should have exactly 3 messages (exact trimming)
@@ -191,7 +191,7 @@ describe('RedisSessionStore', () => {
       method: 'test',
       id: 1
     }
-    await store.addMessage('test-session-6', '1', message)
+    await store.addMessage('test-session-6', message)
 
     // Delete only the session (not the history) to simulate orphaned history
     await redis.del('session:test-session-6')
@@ -226,10 +226,47 @@ describe('RedisSessionStore', () => {
       method: 'test',
       id: 1
     }
-    await store.addMessage('test-session-7', '1', message)
+    await store.addMessage('test-session-7', message)
 
     const newTtl = await redis.ttl('session:test-session-7')
     assert.ok(newTtl > 3500 && newTtl <= 3600)
+  })
+
+  testWithRedis('concurrent addMessage calls get distinct ascending ids (#317)', async (redis) => {
+    const store = new RedisSessionStore({ redis, maxMessages: 100 })
+
+    await store.create({
+      id: 'concurrent-session',
+      eventId: 0,
+      createdAt: new Date(),
+      lastActivity: new Date()
+    })
+
+    const messages: JSONRPCMessage[] = [1, 2, 3, 4].map(i => ({ jsonrpc: '2.0', method: `test${i}`, id: i }))
+    const ids = await Promise.all(messages.map(m => store.addMessage('concurrent-session', m)))
+
+    assert.deepStrictEqual([...ids].sort(), ['1', '2', '3', '4'])
+
+    const session = await store.get('concurrent-session')
+    assert.strictEqual(session?.eventId, 4)
+    assert.strictEqual(session?.lastEventId, '4')
+
+    // No XADD was rejected, so every message is in the history under its id
+    const history = await store.getMessagesFrom('concurrent-session', '0')
+    assert.deepStrictEqual(history.map(h => h.eventId), ['1', '2', '3', '4'])
+    for (const entry of history) {
+      assert.deepStrictEqual(entry.message, messages[ids.indexOf(entry.eventId)])
+    }
+  })
+
+  testWithRedis('addMessage does not recreate a session that does not exist', async (redis) => {
+    const store = new RedisSessionStore({ redis, maxMessages: 100 })
+
+    const eventId = await store.addMessage('missing-session', { jsonrpc: '2.0', method: 'test', id: 1 })
+
+    assert.strictEqual(eventId, null)
+    assert.strictEqual(await redis.exists('session:missing-session'), 0)
+    assert.strictEqual(await redis.exists('session:missing-session:history'), 0)
   })
 
   testWithRedis('should return empty array for non-existent message history', async (redis) => {
