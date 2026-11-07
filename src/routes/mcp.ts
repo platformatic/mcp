@@ -23,6 +23,12 @@ import { processMessage, checkRequestId } from '../handlers.ts'
 import { isStdioRequest } from '../stdio-marker.ts'
 
 const MAX_TIMER_DELAY_MS = 2 ** 31 - 1
+/**
+ * How much a legacy SSE stream may hold for a client that is not reading.
+ * Past it the stream is closed: events are kept in the session history, so
+ * the client loses nothing and resumes with Last-Event-ID.
+ */
+const MAX_SSE_BUFFERED_BYTES = 1024 * 1024
 
 interface MCPPubSubRoutesOptions {
   enableSSE: boolean
@@ -359,7 +365,9 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     const deadStreams = new Set<FastifyReply>()
     for (const stream of streams) {
       try {
-        stream.raw.write(sseEvent)
+        if (!writeSSE(sessionId, stream, sseEvent)) {
+          deadStreams.add(stream)
+        }
       } catch (error) {
         app.log.error({ err: error }, 'Failed to write SSE event')
         deadStreams.add(stream)
@@ -381,14 +389,50 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     }
   }
 
+  /**
+   * Write a frame to a live stream, closing the stream if the client has
+   * fallen too far behind. Returns false if the stream is gone.
+   */
+  function writeSSE (sessionId: string, stream: FastifyReply, frame: string): boolean {
+    const raw = stream.raw
+    if (raw.destroyed || raw.writableEnded) return false
+    if (raw.write(frame)) return true
+    if (raw.writableLength > MAX_SSE_BUFFERED_BYTES) {
+      app.log.warn({ sessionId, maxBufferedBytes: MAX_SSE_BUFFERED_BYTES }, 'Closing SSE stream whose client is not reading; it may resume with Last-Event-ID')
+      raw.destroy()
+      return false
+    }
+    return true
+  }
+
+  /** Resolves once the stream can take more data, or is gone. */
+  function drained (stream: FastifyReply): Promise<void> {
+    const raw = stream.raw
+    return new Promise((resolve) => {
+      const done = () => {
+        raw.off('drain', done)
+        raw.off('close', done)
+        resolve()
+      }
+      raw.on('drain', done)
+      raw.on('close', done)
+    })
+  }
+
   async function replayMessagesFromEventId (sessionId: string, lastEventId: string, stream: FastifyReply): Promise<void> {
     try {
       const messagesToReplay = await sessionStore.getMessagesFrom(sessionId, lastEventId)
 
+      // A replay can be far larger than the buffer limit, so wait for the
+      // client to take each part rather than queue all of it at once
       for (const entry of messagesToReplay) {
         const sseEvent = `id: ${entry.eventId}\ndata: ${JSON.stringify(entry.message)}\n\n`
+        const raw = stream.raw
+        if (raw.destroyed || raw.writableEnded) break
         try {
-          stream.raw.write(sseEvent)
+          if (!raw.write(sseEvent)) {
+            await drained(stream)
+          }
         } catch (error) {
           app.log.error({ err: error }, 'Failed to replay SSE event')
           break
@@ -657,14 +701,14 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         }
 
         // Send initial heartbeat
-        reply.raw.write(': heartbeat\n\n')
+        writeSSE(session.id, reply, ': heartbeat\n\n')
 
         // Keep connection alive with periodic heartbeats. Each heartbeat also
         // counts as session activity, so an open stream keeps its session from
         // expiring even when no messages flow over it.
         const heartbeatInterval = setInterval(() => {
           try {
-            reply.raw.write(': heartbeat\n\n')
+            if (!writeSSE(session.id, reply, ': heartbeat\n\n')) return
             sessionStore.touch?.(session.id)?.catch((err: unknown) => {
               app.log.warn({ err, sessionId: session.id }, 'Failed to refresh session activity on heartbeat')
             })
