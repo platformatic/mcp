@@ -1,5 +1,5 @@
 import { stdin, stdout, stderr } from 'process'
-import { createInterface } from 'readline'
+import { StringDecoder } from 'string_decoder'
 import type { FastifyInstance } from 'fastify'
 import type {
   JSONRPCMessage,
@@ -42,7 +42,12 @@ export interface StdioTransportOptions {
  */
 export class StdioTransport {
   private app: FastifyInstance
-  private readline: any
+  private input: NodeJS.ReadableStream | null = null
+  private decoder = new StringDecoder('utf8')
+  private pending = ''
+  private ended = false
+  // Processing of the final unterminated line, awaited before app.close()
+  private flushing: Promise<void> | null = null
   private transportOpts: StdioTransportOptions
   // There is no session over stdio, so the transport itself has to remember
   // what `initialize` agreed on and echo it like an HTTP client would.
@@ -71,34 +76,14 @@ export class StdioTransport {
   start (): void {
     this.log('Starting MCP stdio transport...')
 
-    // Create readline interface for line-by-line processing
-    this.readline = createInterface({
-      input: this.transportOpts.input!,
-      output: this.transportOpts.output!,
-      crlfDelay: Infinity
-    })
-
-    // Handle each line as a JSON-RPC message
-    this.readline.on('line', (line: string) => {
-      this.handleIncomingMessage(line.trim())
-    })
-
-    // Handle close/error events
-    this.readline.on('close', () => {
-      this.log('Stdio transport closed')
-      // Trigger graceful shutdown when readline closes
-      this.stop().catch(error => {
-        this.logError('Error during shutdown:', error)
-      })
-    })
-
-    this.readline.on('error', (error: Error) => {
-      this.logError('Readline error:', error)
-      // Trigger graceful shutdown on readline error
-      this.stop().catch(shutdownError => {
-        this.logError('Error during shutdown:', shutdownError)
-      })
-    })
+    // Messages are delimited by \n only. readline would also split on a bare
+    // \r, which JSON allows as whitespace inside a message.
+    const input = this.transportOpts.input!
+    this.input = input
+    input.on('data', this.onData)
+    input.on('end', this.onEnd)
+    input.on('close', this.onClose)
+    input.on('error', this.onError)
 
     // Handle process signals for graceful shutdown. Keep references so stop()
     // can remove them; otherwise every transport leaks two listeners.
@@ -127,7 +112,7 @@ export class StdioTransport {
     this.removeSignalListeners()
 
     // Return the same promise to every caller so that concurrent stop() calls
-    // (readline close, stdin end, signals) all wait for app.close() to finish
+    // (stdin end, signals) all wait for app.close() to finish
     if (!this.closePromise) {
       this.closePromise = this.doStop()
     }
@@ -148,8 +133,18 @@ export class StdioTransport {
   private async doStop (): Promise<void> {
     this.log('Stopping stdio transport...')
 
-    if (this.readline) {
-      this.readline.close()
+    if (this.input) {
+      this.input.removeListener('data', this.onData)
+      this.input.removeListener('end', this.onEnd)
+      this.input.removeListener('close', this.onClose)
+      this.input.removeListener('error', this.onError)
+      this.input.pause()
+      this.input = null
+    }
+
+    // Answer a final unterminated line before closing the app
+    if (this.flushing) {
+      await this.flushing
     }
 
     // Close the Fastify app gracefully
@@ -159,6 +154,55 @@ export class StdioTransport {
     } catch (error) {
       this.logError('Error closing Fastify app:', error)
     }
+  }
+
+  private onData = (chunk: Buffer | string): void => {
+    this.pending += typeof chunk === 'string' ? chunk : this.decoder.write(chunk)
+
+    let start = 0
+    let newline: number
+    while ((newline = this.pending.indexOf('\n', start)) !== -1) {
+      this.handleLine(this.pending.slice(start, newline))
+      start = newline + 1
+    }
+    this.pending = this.pending.slice(start)
+  }
+
+  private onEnd = (): void => {
+    this.ended = true
+    const rest = this.pending + this.decoder.end()
+    this.pending = ''
+    if (rest) {
+      this.flushing = this.handleLine(rest)
+    }
+    this.log('Stdio transport closed')
+    this.stop().catch(error => {
+      this.logError('Error during shutdown:', error)
+    })
+  }
+
+  private onClose = (): void => {
+    // 'end' already handled shutdown; a close without 'end' means the
+    // stream was destroyed, so a partial line is dropped
+    if (this.ended) return
+    this.log('Stdio transport closed')
+    this.stop().catch(error => {
+      this.logError('Error during shutdown:', error)
+    })
+  }
+
+  private onError = (error: Error): void => {
+    this.logError('Input error:', error)
+    this.stop().catch(shutdownError => {
+      this.logError('Error during shutdown:', shutdownError)
+    })
+  }
+
+  private handleLine (line: string): Promise<void> {
+    if (line.endsWith('\r')) {
+      line = line.slice(0, -1)
+    }
+    return this.handleIncomingMessage(line.trim())
   }
 
   /**
