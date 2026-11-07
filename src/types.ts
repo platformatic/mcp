@@ -1,6 +1,6 @@
 import type { FastifyReply, FastifyRequest, FastifySchema, HTTPMethods } from 'fastify'
 import type { Options } from 'ajv'
-import type { RedisOptions } from 'ioredis'
+import type { Redis, RedisOptions } from 'ioredis'
 import type {
   JSONRPCMessage,
   JSONRPCNotification,
@@ -401,10 +401,17 @@ export interface MCPPluginOptions {
    */
   validateJsonSchemaInputs?: Options
   /**
-   * Redis connection options, passed as-is to the ioredis constructor.
-   * Providing this option switches sessions, messaging and tasks to the Redis backends.
+   * Redis connection for the session, messaging and task backends. Providing
+   * this option switches them from memory to Redis. Accepts:
+   * - an ioredis `Redis` client: used as-is and never closed by the plugin,
+   *   so the caller keeps ownership (including its 'error' handling). The
+   *   pub/sub connections are derived from it with `duplicate()` and closed
+   *   by the plugin on shutdown.
+   * - a Redis URL (e.g. `redis://localhost:6379/0`), or
+   * - ioredis `RedisOptions`, passed as-is to the ioredis constructor.
+   * In the last two cases the plugin owns the connection and quits it on close.
    */
-  redis?: RedisOptions
+  redis?: Redis | RedisOptions | string
   authorization?: AuthorizationConfig
   /**
    * Optional OpenTelemetry instrumentation.

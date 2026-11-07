@@ -6,7 +6,7 @@ import {
 } from 'tsd'
 import { Type } from '@sinclair/typebox'
 import type { FastifyInstance, FastifyReply, FastifyRequest, FastifySchema, HTTPMethods } from 'fastify'
-import type { RedisOptions } from 'ioredis'
+import type { Redis, RedisOptions } from 'ioredis'
 import { RedisMessageBroker, MemoryMessageBroker, RedisSessionStore, MemorySessionStore, RateLimiter } from '../dist/index.js'
 import type {
   ToolHandler,
@@ -305,6 +305,11 @@ const ioredisOptions: RedisOptions = { host: 'localhost', enableAutoPipelining: 
 expectAssignable<MCPPluginOptions>({ redis: ioredisOptions })
 expectNotAssignable<MCPPluginOptions>({ redis: { port: '6379' } })
 expectNotAssignable<MCPPluginOptions>({ redis: { maxRetriesPerRequest: 'three' } })
+
+// Redis config also accepts a caller-owned ioredis client or a Redis URL
+expectAssignable<MCPPluginOptions>({ redis: {} as Redis })
+expectAssignable<MCPPluginOptions>({ redis: 'redis://localhost:6379/0' })
+expectNotAssignable<MCPPluginOptions>({ redis: 6379 })
 
 // RateLimiter is exported from the main entry point
 const rateLimiter = new RateLimiter(100, 60000)
