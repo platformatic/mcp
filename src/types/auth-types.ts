@@ -110,6 +110,15 @@ export type AuthorizationConfig =
     enabled: true
     authorizationServers: string[]
     resourceUri: string
+    /**
+     * Absolute URL advertised as `resource_metadata` in `WWW-Authenticate`
+     * challenges. Defaults to the URL the plugin serves the metadata at:
+     * `{origin of resourceUri}{route prefix}/.well-known/oauth-protected-resource{path of resourceUri}`,
+     * which is the RFC 9728 §3.1 location when the plugin has no prefix. Set it
+     * when the metadata is served elsewhere, for example at the origin root by
+     * registering `wellKnownRoutes` there.
+     */
+    resourceMetadataUrl?: string
     /** Paths to exclude from authorization (e.g., health checks). Supports string prefix or RegExp. */
     excludedPaths?: (string | RegExp)[]
     /**
