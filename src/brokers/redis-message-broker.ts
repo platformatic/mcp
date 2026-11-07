@@ -24,7 +24,6 @@ function suppressUnhandledQuitRejection (conn?: RedisConnLike): void {
 
 interface RedisMQEmitter extends ReturnType<typeof MQEmitterRedis> {
   state?: { on (event: 'error', listener: (err: Error) => void): unknown }
-  removeAllListeners? (topic: string, done?: (err?: Error) => void): void
   subConn?: RedisConnLike
   pubConn?: RedisConnLike
   _close?: (cb: () => void) => void
@@ -44,6 +43,7 @@ export class RedisMessageBroker implements MessageBroker {
   private readonly closeTimeoutMs: number
   private readonly onCloseTimeout?: (closeTimeoutMs: number) => void
   private closePromise: Promise<void> | null = null
+  private readonly listeners = new Map<string, Set<(packet: any, cb: () => void) => void>>()
 
   /**
    * @param redis Redis connection duplicated (all ioredis options: host, port, auth, db, tls, …) for the MQEmitter pub/sub connections.
@@ -88,20 +88,37 @@ export class RedisMessageBroker implements MessageBroker {
   }
 
   async subscribe (topic: string, handler: (message: JSONRPCMessage) => void): Promise<void> {
-    return new Promise((resolve) => {
-      this.emitter.on(topic, (packet, cb) => {
+    const listener = (packet: any, cb: () => void) => {
+      try {
         handler(packet.message)
+      } finally {
         cb()
-      })
-      resolve()
+      }
+    }
+    let listeners = this.listeners.get(topic)
+    if (!listeners) {
+      listeners = new Set()
+      this.listeners.set(topic, listeners)
+    }
+    listeners.add(listener)
+
+    // Resolve once Redis has acknowledged the SUBSCRIBE, so a message published
+    // right after this returns is not missed
+    return new Promise((resolve) => {
+      this.emitter.on(topic, listener, () => resolve())
     })
   }
 
   async unsubscribe (topic: string): Promise<void> {
-    return new Promise((resolve) => {
-      this.emitter.removeAllListeners?.(topic)
-      resolve()
-    })
+    const listeners = this.listeners.get(topic)
+    if (!listeners) return
+    this.listeners.delete(topic)
+
+    // removeListener, unlike removeAllListeners, also sends UNSUBSCRIBE once a
+    // channel has no listener left; otherwise the Redis subscription leaks
+    await Promise.all([...listeners].map(listener => new Promise<void>((resolve) => {
+      this.emitter.removeListener(topic, listener, () => resolve())
+    })))
   }
 
   async close (): Promise<void> {
