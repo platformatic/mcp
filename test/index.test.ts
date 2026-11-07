@@ -61,6 +61,7 @@ describe('MCP Fastify Plugin', () => {
       const response = await app.inject({
         method: 'POST',
         url: '/mcp',
+        headers: { 'mcp-protocol-version': '2025-06-18' },
         payload: [
           { jsonrpc: JSONRPC_VERSION, id: 1, method: 'ping', params: {} },
           { jsonrpc: JSONRPC_VERSION, id: 2, method: 'ping', params: {} }
