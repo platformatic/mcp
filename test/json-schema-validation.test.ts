@@ -7,6 +7,7 @@ import mcpPlugin from '../src/index.ts'
 import { JSONRPC_VERSION, LATEST_PROTOCOL_VERSION } from '../src/schema.ts'
 import type { CallToolResult } from '../src/schema.ts'
 import type { MCPPluginOptions } from '../src/types.ts'
+import { createJsonSchemaValidator } from '../src/validation/json-schema-validator.ts'
 
 const SEARCH_JSON_SCHEMA = {
   type: 'object',
@@ -41,13 +42,40 @@ async function callTool (app: FastifyInstance, name: string, args: unknown, extr
   return response.json()
 }
 
+describe('createJsonSchemaValidator', () => {
+  test('is non-mutating: no coercion, no defaults, no property removal', () => {
+    const validator = createJsonSchemaValidator({ allErrors: true })
+    const schema = {
+      type: 'object',
+      properties: {
+        n: { type: 'number' },
+        tags: { type: 'array', items: { type: 'string' } },
+        mode: { type: 'string', default: 'fast' }
+      },
+      additionalProperties: false
+    }
+    const args = { n: '42', tags: 'one', extra: 'dropped?' }
+
+    const error = validator.validate(schema, args)
+
+    assert.ok(error !== null)
+    assert.ok(error.includes('/n must be number'))
+    assert.ok(error.includes('/tags must be array'))
+    assert.ok(error.includes('must NOT have additional properties'))
+    assert.deepStrictEqual(args, { n: '42', tags: 'one', extra: 'dropped?' })
+  })
+
+  test('valid data is not augmented with defaults', () => {
+    const validator = createJsonSchemaValidator()
+    const args = { query: 'test' }
+    assert.strictEqual(validator.validate(SEARCH_JSON_SCHEMA, args), null)
+    assert.deepStrictEqual(args, { query: 'test' })
+  })
+})
+
 describe('JSON Schema Validation (validateJsonSchemaInputs)', () => {
-  test('custom AJV options are applied', async (t) => {
-    const app = await buildApp(t, {
-      validateJsonSchemaInputs: {
-        useDefaults: false
-      }
-    })
+  test('arguments reach the handler exactly as sent', async (t) => {
+    const app = await buildApp(t, { validateJsonSchemaInputs: {} })
 
     let receivedParams: unknown
     app.mcpAddTool({
@@ -64,6 +92,34 @@ describe('JSON Schema Validation (validateJsonSchemaInputs)', () => {
     assert.strictEqual(body.result.isError, undefined)
     // The `limit` default from the schema must NOT be injected
     assert.deepStrictEqual(receivedParams, { query: 'test' })
+
+    const invalid = await callTool(app, 'search', { query: 'test', limit: '5' })
+    assert.strictEqual(invalid.result.isError, true)
+    assert.ok(invalid.result.content[0].text.includes('/limit must be number'))
+  })
+
+  test('custom AJV options are applied', async (t) => {
+    const app = await buildApp(t, {
+      validateJsonSchemaInputs: {
+        useDefaults: true
+      }
+    })
+
+    let receivedParams: unknown
+    app.mcpAddTool({
+      name: 'search',
+      description: 'Search',
+      inputSchema: SEARCH_JSON_SCHEMA
+    }, async (params: unknown) => {
+      receivedParams = params
+      return { content: [{ type: 'text' as const, text: 'ok' }] }
+    })
+    await app.ready()
+
+    const body = await callTool(app, 'search', { query: 'test' })
+    assert.strictEqual(body.result.isError, undefined)
+    // Explicitly opting in to `useDefaults` injects the `limit` default
+    assert.deepStrictEqual(receivedParams, { query: 'test', limit: 10 })
   })
 
   test('invalid arguments return an isError result before the handler runs', async (t) => {
