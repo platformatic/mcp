@@ -2,12 +2,14 @@ import type { Redis } from 'ioredis'
 import type { TaskStatus } from '../schema.ts'
 import type { TaskStore, TaskRecord, TaskOutcome, TaskListOptions, TaskListPage, TaskCursorPosition, TaskOwner } from './task-store.ts'
 import {
+  DEFAULT_TASK_MAX_ANONYMOUS,
   DEFAULT_TASK_MAX_PER_PRINCIPAL,
   TaskLimitError,
   TASK_OWNER_LOST,
   canTransition,
   decodeTaskCursor,
   encodeTaskCursor,
+  isAnonymousOwner,
   isTaskOwner,
   isTerminal,
   ownerLostOutcome,
@@ -19,7 +21,8 @@ const TASK_KEY_PREFIX = 'mcp:task:'
 const OWNER_INDEX_PREFIX = 'mcp:tasks:owner:'
 const ANONYMOUS_INDEX_KEY = 'mcp:tasks:anonymous'
 
-// Store a task while enforcing its owner's retention cap, atomically so that
+// Store a task while enforcing its owner's retention cap (the anonymous cap for
+// the anonymous index), atomically so that
 // concurrent creates on different instances cannot overshoot it.
 //
 // KEYS: task key, owner index
@@ -117,12 +120,15 @@ export class RedisTaskStore implements TaskStore {
   private redis: Redis
   private readonly defaultTtlMs: number
   private readonly maxTasksPerPrincipal: number
+  private readonly maxAnonymousTasks: number
 
-  constructor (options: { redis: Redis, defaultTtlMs?: number, maxTasksPerPrincipal?: number }) {
+  constructor (options: { redis: Redis, defaultTtlMs?: number, maxTasksPerPrincipal?: number, maxAnonymousTasks?: number }) {
     this.redis = options.redis
     this.defaultTtlMs = options.defaultTtlMs ?? 3600_000
     this.maxTasksPerPrincipal = options.maxTasksPerPrincipal ?? DEFAULT_TASK_MAX_PER_PRINCIPAL
+    this.maxAnonymousTasks = options.maxAnonymousTasks ?? DEFAULT_TASK_MAX_ANONYMOUS
     validateTaskLimit('maxTasksPerPrincipal', this.maxTasksPerPrincipal)
+    validateTaskLimit('maxAnonymousTasks', this.maxAnonymousTasks)
   }
 
   private key (taskId: string): string {
@@ -132,7 +138,9 @@ export class RedisTaskStore implements TaskStore {
   /**
    * Per-owner index of task ids scored by creation time, so `list` only ever
    * touches the caller's own tasks and `create` can enforce the retention cap.
-   * Ownerless tasks get a separate key that cannot collide with any owner's.
+   * Ownerless tasks get a separate key that cannot collide with any owner's;
+   * it holds every anonymous task across the fleet, which is why it is capped
+   * by maxAnonymousTasks rather than the per-principal quota.
    * Issuer and subject may both contain ':', so each is percent-encoded to keep
    * the pair unambiguous.
    */
@@ -152,23 +160,27 @@ export class RedisTaskStore implements TaskStore {
     // to the default and silently expiring it.
     // The owner index lets `list` enumerate one owner's tasks without a keyspace
     // scan. Task keys expire independently, so stale ids are pruned here and on read.
+    // Anonymous callers cannot be told apart, so the per-principal cap would be
+    // one allowance shared by all of them (#320); bound them as a whole instead.
+    const owner = taskOwner(task)
+    const cap = isAnonymousOwner(owner) ? this.maxAnonymousTasks : this.maxTasksPerPrincipal
     const stored = await this.redis.eval(
       CREATE_SCRIPT,
       2,
       this.key(task.taskId),
-      this.indexKey(taskOwner(task)),
+      this.indexKey(owner),
       JSON.stringify(task),
       task.ttl === null ? -1 : this.expirySeconds(task),
       new Date(task.createdAt).getTime(),
       task.taskId,
-      this.maxTasksPerPrincipal,
+      cap,
       TASK_KEY_PREFIX,
       TASK_OWNER_LOST,
       JSON.stringify(ownerLostOutcome()),
       new Date().toISOString()
     )
     if (stored !== 1) {
-      throw new TaskLimitError(this.maxTasksPerPrincipal)
+      throw new TaskLimitError(cap)
     }
   }
 
