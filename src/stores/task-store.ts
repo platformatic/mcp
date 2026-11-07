@@ -287,8 +287,20 @@ export class TaskWaiters {
 
   wait (taskId: string, signal?: AbortSignal): Promise<TaskRecord> {
     return new Promise((resolve, reject) => {
+      // An abort listener added now would never fire, and only a local
+      // notify() could then remove the entry: register nothing at all.
+      if (signal?.aborted) {
+        reject(new Error('aborted'))
+        return
+      }
+
+      const onAbort = () => {
+        this.remove(taskId, resolveAndCleanup)
+        reject(new Error('aborted'))
+      }
       const resolveAndCleanup = (task: TaskRecord) => {
         this.remove(taskId, resolveAndCleanup)
+        signal?.removeEventListener('abort', onAbort)
         resolve(task)
       }
 
@@ -299,10 +311,7 @@ export class TaskWaiters {
       }
       set.add(resolveAndCleanup)
 
-      signal?.addEventListener('abort', () => {
-        this.remove(taskId, resolveAndCleanup)
-        reject(new Error('aborted'))
-      }, { once: true })
+      signal?.addEventListener('abort', onAbort, { once: true })
     })
   }
 
