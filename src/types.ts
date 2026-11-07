@@ -223,6 +223,17 @@ export type MCPRouteId =
   | 'mcp.post'
   | 'mcp.get'
   | 'mcp.delete'
+  | 'wellKnown.protectedResourceMetadata'
+  | 'wellKnown.resourceHealth'
+  | 'wellKnown.preflight'
+  | 'oauth.authorize'
+  | 'oauth.callback'
+  | 'oauth.refresh'
+  | 'oauth.validate'
+  | 'oauth.status'
+  | 'oauth.register'
+  | 'oauth.logout'
+  | 'oauth.clientIdMetadataDocument'
 
 export interface MCPRouteSchemaContext {
   routeId: MCPRouteId
@@ -390,8 +401,10 @@ export interface MCPPluginOptions {
     context: MCPClientResponseContext
   ) => void | Promise<void>
   /**
-   * Customize Fastify/OpenAPI schema metadata for MCP transport routes.
-   * This callback runs once per registered route during startup.
+   * Customize Fastify/OpenAPI schema metadata for every route this plugin
+   * registers: the MCP transport routes and, when authorization is enabled,
+   * the `/.well-known/*` and `/oauth/*` routes. Runs once per registered
+   * route during startup.
    */
   transformRouteSchema?: MCPRouteSchemaTransformer
   /**
