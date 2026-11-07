@@ -304,6 +304,25 @@ export interface MCPPluginOptions {
    */
   sessionTtlMs?: number
   /**
+   * Most non-expired sessions one principal may keep active (default
+   * Infinity, no limit). A session's principal is the (issuer, subject) pair
+   * that created it; when authorization is off (or a caller cannot be
+   * identified) every session shares one anonymous bucket. At the cap a new
+   * session cannot be created and the request fails with a stable
+   * `SESSION_LIMIT_REACHED` error; existing sessions keep working and expire
+   * on their own. Uses a per-principal index so it can be enforced atomically
+   * across instances with the Redis store.
+   */
+  maxSessionsPerPrincipal?: number
+  /**
+   * Most distinct resource URIs one session may subscribe to via
+   * `resources/subscribe` (default Infinity, no limit). Subscribing to an
+   * already-subscribed URI stays idempotent; only at the cap does a new URI
+   * fail with a stable `SUBSCRIPTION_LIMIT_REACHED` error. Enforced atomically
+   * on the Redis store so concurrent subscribes cannot overshoot it.
+   */
+  maxResourceSubscriptionsPerSession?: number
+  /**
    * Enable task-augmented execution (2025-11-25, experimental). Tools opt in
    * individually via `execution.taskSupport`.
    */
