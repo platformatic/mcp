@@ -9,7 +9,7 @@ import type {
   ReadResourceResult,
   GetPromptResult
 } from '../src/schema.ts'
-import { JSONRPC_VERSION } from '../src/schema.ts'
+import { JSONRPC_VERSION, LATEST_PROTOCOL_VERSION } from '../src/schema.ts'
 
 describe('Tool Context Access', () => {
   describe('Request Object Access', () => {
@@ -320,12 +320,30 @@ describe('Tool Context Access', () => {
         }
       }
 
+      // An unknown session id is answered 404, so open a real session first
+      const init = await app.inject({
+        method: 'POST',
+        url: '/mcp',
+        payload: {
+          jsonrpc: JSONRPC_VERSION,
+          id: 0,
+          method: 'initialize',
+          params: {
+            protocolVersion: LATEST_PROTOCOL_VERSION,
+            capabilities: {},
+            clientInfo: { name: 'test-client', version: '1.0.0' }
+          }
+        }
+      })
+      const sessionId = init.headers['mcp-session-id'] as string
+      t.assert.ok(sessionId)
+
       const response = await app.inject({
         method: 'POST',
         url: '/mcp',
         payload: request,
         headers: {
-          'mcp-session-id': 'test-session-123'
+          'mcp-session-id': sessionId
         }
       })
 
@@ -333,7 +351,7 @@ describe('Tool Context Access', () => {
       const body = response.json() as JSONRPCResultResponse
       const result = body.result as CallToolResult
       const textContent = result.content[0] as { type: 'text', text: string }
-      t.assert.ok(textContent.text.includes('test-session-123'), 'SessionId should still be accessible')
+      t.assert.ok(textContent.text.includes(sessionId), 'SessionId should still be accessible')
     })
   })
 

@@ -24,6 +24,9 @@ import { isStdioRequest } from '../stdio-marker.ts'
 
 const MAX_TIMER_DELAY_MS = 2 ** 31 - 1
 
+// Implementation-defined server error, the same code the official SDKs use
+const SESSION_NOT_FOUND = -32001
+
 interface MCPPubSubRoutesOptions {
   enableSSE: boolean
   opts: MCPPluginOptions
@@ -213,25 +216,47 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
       (request.method === 'GET' ? (request.query as any)?.['mcp-session-id'] : undefined)
   }
 
+  function sendSessionNotFound (request: FastifyRequest, reply: FastifyReply) {
+    const body = request.method === 'POST'
+      ? { jsonrpc: JSONRPC_VERSION, id: null, error: { code: SESSION_NOT_FOUND, message: 'Session not found' } }
+      : { error: 'Session not found' }
+    return reply.code(404).type('application/json').send(body)
+  }
+
   /**
-   * A session created under an access token belongs to that token's issuer and
-   * subject: two authorization servers may assign the same `sub` to different
-   * users, so the subject alone does not identify the owner. Anyone else presenting its ID gets the same 404 as for an unknown session:
-   * the Streamable HTTP transport defines 404 as "this session does not exist
-   * for you", and a 403 would confirm to an attacker that the ID is live.
-   * Runs ahead of anything else that reads the session.
+   * The Streamable HTTP transport requires 404 for a session ID the server does
+   * not know (never issued, terminated or expired), so the client learns it has
+   * to start over with `initialize` instead of silently getting a new session.
+   *
+   * A session created under an access token also belongs to that token's issuer
+   * and subject: two authorization servers may assign the same `sub` to different
+   * users, so the subject alone does not identify the owner. Anyone else
+   * presenting its ID is treated exactly as for an unknown session, since a
+   * different answer would confirm to an attacker that the ID is live.
+   *
+   * `initialize` with an unknown ID is let through and gets a fresh session:
+   * it is how a client recovers, and a client that kept its stale ID around
+   * should not be stuck. Runs ahead of anything else that reads the session.
    */
-  async function enforceSessionOwner (request: FastifyRequest, reply: FastifyReply): Promise<void> {
+  async function enforceSession (request: FastifyRequest, reply: FastifyReply): Promise<void> {
     const sessionId = getRequestSessionId(request)
     if (!sessionId) return
 
     const session = await sessionStore.get(sessionId)
-    if (session?.ownerSub === undefined) return
-
-    if (session.ownerSub !== request.tokenPayload?.sub || session.ownerIss !== request.tokenIssuer) {
+    if (session) {
+      if (session.ownerSub === undefined) return
+      if (session.ownerSub === request.tokenPayload?.sub && session.ownerIss === request.tokenIssuer) return
       request.log.warn({ sessionId }, 'Rejected MCP request for a session owned by a different user')
-      return reply.code(404).type('application/json').send({ error: 'Session not found' })
+    } else {
+      request.log.info({ sessionId }, 'Rejected MCP request for an unknown or expired session')
     }
+
+    if (request.method === 'POST' && isInitializeRequest(request.body)) {
+      ;(request as any).mcpIgnoreSessionId = true
+      return
+    }
+
+    return sendSessionNotFound(request, reply)
   }
 
   // Scoped to the /mcp routes only: this plugin is not encapsulated, so an
@@ -241,8 +266,8 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
   // as it would if it were registered as a global preHandler hook, so the
   // session owner check sees the verified token.
   const mcpPreHandler: preHandlerHookHandler[] = authPreHandler
-    ? [authPreHandler, enforceSessionOwner, reconcileProtocolVersion]
-    : [enforceSessionOwner, reconcileProtocolVersion]
+    ? [authPreHandler, enforceSession, reconcileProtocolVersion]
+    : [enforceSession, reconcileProtocolVersion]
 
   // Heartbeats refresh session activity, so they must come more often than the
   // idle TTL or a live stream's session could expire between two of them
@@ -435,8 +460,16 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
           return reply.code(400).type('application/json').send(idError)
         }
 
-        let sessionId = request.headers['mcp-session-id'] as string | undefined
+        // enforceSession already answered 404 for an unknown ID, except on
+        // `initialize`, which starts over on a fresh session
+        let sessionId = (request as any).mcpIgnoreSessionId
+          ? undefined
+          : request.headers['mcp-session-id'] as string | undefined
         const existingSession = sessionId ? await sessionStore.get(sessionId) : null
+        if (sessionId && !existingSession) {
+          // Expired or deleted since enforceSession looked it up
+          return sendSessionNotFound(request, reply)
+        }
 
         // Sessions belong to Streamable HTTP, not to SSE. Without SSE we only open
         // one on initialize: other requests keep working statelessly as before,
@@ -542,6 +575,17 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
         request.log.info({ sessionId }, 'Handling SSE request')
 
+        // enforceSession already answered 404 for an unknown ID; this covers a
+        // session that expired or was deleted since then
+        let existingSession: SessionMetadata | null = null
+        if (sessionId) {
+          existingSession = await sessionStore.get(sessionId)
+          if (!existingSession) {
+            return sendSessionNotFound(request, reply)
+          }
+          await sessionStore.touch?.(existingSession.id)
+        }
+
         // We are opting out of Fastify proper
         reply.hijack()
 
@@ -551,18 +595,8 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         raw.setHeader('Content-type', 'text/event-stream')
         raw.setHeader('Cache-Control', 'no-cache')
 
-        let session: SessionMetadata
-        if (sessionId) {
-          const existingSession = await sessionStore.get(sessionId)
-          if (existingSession) {
-            session = existingSession
-            await sessionStore.touch?.(session.id)
-          } else {
-            session = await createSession(request)
-            raw.setHeader('Mcp-Session-Id', session.id)
-          }
-        } else {
-          session = await createSession(request)
+        const session = existingSession ?? await createSession(request)
+        if (!existingSession) {
           raw.setHeader('Mcp-Session-Id', session.id)
         }
 
