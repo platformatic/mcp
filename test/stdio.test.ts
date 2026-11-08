@@ -112,7 +112,12 @@ async function setupStdio () {
     return sendRaw(JSON.stringify(message))
   }
 
-  return { send, sendRaw, stop: () => transport.stop() }
+  async function next (): Promise<any> {
+    const { value } = await lines.next()
+    return JSON.parse(value as string)
+  }
+
+  return { send, sendRaw, next, input, stop: () => transport.stop() }
 }
 
 function initialize (id: number, protocolVersion: string) {
@@ -367,4 +372,70 @@ test('stdio transport - a signal removes both signal listeners', async () => {
   assert.strictEqual(process.listenerCount('SIGTERM'), sigtermBaseline)
 
   await transport.stop()
+})
+
+test('stdio transport - a bare \\r inside a message does not split it', async (t) => {
+  const { sendRaw, stop } = await setupStdio()
+  t.after(stop)
+
+  // RFC 8259 allows \r as whitespace between tokens; only \n delimits messages
+  const response = await sendRaw('{"jsonrpc":"2.0","id":"CR",\r"method":"ping","params":{}}')
+  assert.strictEqual(response.id, 'CR')
+  assert.deepStrictEqual(response.result, {})
+})
+
+test('stdio transport - accepts CRLF-terminated messages', async (t) => {
+  const { input, next, stop } = await setupStdio()
+  t.after(stop)
+
+  input.write('{"jsonrpc":"2.0","id":1,"method":"ping"}\r\n{"jsonrpc":"2.0","id":2,"method":"ping"}\r\n')
+  const first = await next()
+  const second = await next()
+  assert.deepStrictEqual([first.id, second.id].sort(), [1, 2])
+})
+
+test('stdio transport - reassembles a message split across chunks', async (t) => {
+  const { input, next, stop } = await setupStdio()
+  t.after(stop)
+
+  // Split inside the JSON and inside a multi-byte UTF-8 character
+  const bytes = Buffer.from('{"jsonrpc":"2.0","id":"café","method":"ping"}\n')
+  const cut = bytes.indexOf(0xc3) + 1
+  input.write(bytes.subarray(0, 10))
+  input.write(bytes.subarray(10, cut))
+  await sleep(10)
+  input.write(bytes.subarray(cut))
+
+  const response = await next()
+  assert.strictEqual(response.id, 'café')
+  assert.deepStrictEqual(response.result, {})
+})
+
+test('stdio transport - processes a final line without a trailing newline', async (t) => {
+  const { input, next, stop } = await setupStdio()
+  t.after(stop)
+
+  input.end('{"jsonrpc":"2.0","id":"last","method":"ping"}')
+  const response = await next()
+  assert.strictEqual(response.id, 'last')
+  assert.deepStrictEqual(response.result, {})
+})
+
+test('runStdioServer - answers a final unterminated line before shutting down', async () => {
+  const app = fastify({ logger: false })
+  await app.register(mcpPlugin, {
+    serverInfo: { name: 'test-server', version: '1.0.0' }
+  })
+  await app.ready()
+
+  const input = new PassThrough()
+  const output = new PassThrough()
+  const running = runStdioServer(app, { input, output, error: new PassThrough() })
+  input.end('{"jsonrpc":"2.0","id":"eof","method":"ping"}')
+  await running
+
+  const written = output.read()?.toString() ?? ''
+  const response = JSON.parse(written.trim())
+  assert.strictEqual(response.id, 'eof')
+  assert.deepStrictEqual(response.result, {})
 })
