@@ -255,6 +255,7 @@ async function mapWithConcurrency<T, R> (items: T[], limit: number, fn: (item: T
 
 async function handleToolsList (request: JSONRPCRequest, dependencies: HandlerDependencies): Promise<JSONRPCResponse> {
   const { tools, protocolVersion } = dependencies
+  const tasksDeclared = tasksDeclaredTo(dependencies)
   // Per-tool checks run concurrently (bounded); order stays registration order
   const registeredTools = Array.from(tools.values())
   const accessResults = await mapWithConcurrency(
@@ -273,6 +274,15 @@ async function handleToolsList (request: JSONRPCRequest, dependencies: HandlerDe
       }
       if (serialized.outputSchema) {
         serialized.outputSchema = withSchemaDialect(serialized.outputSchema, protocolVersion)
+      }
+      if (!tasksDeclared && serialized.execution?.taskSupport !== undefined) {
+        // taskSupport only means something on top of the tasks capability
+        const { taskSupport, ...execution } = serialized.execution
+        if (Object.keys(execution).length > 0) {
+          serialized.execution = execution
+        } else {
+          delete serialized.execution
+        }
       }
       return serialized
     }),
@@ -426,9 +436,11 @@ async function handleToolsCall (
   const params = paramsValidation.data
   const toolName = params.name
 
-  // A client on an older revision cannot have meant `task`, because we never
-  // declared the capability to it. The spec says to ignore it in that case.
-  const taskParams = supportsTasks(dependencies.protocolVersion)
+  // Without the tasks capability declared to this client (tasks disabled, or
+  // an older revision), the spec says to process the call normally, ignoring
+  // any task metadata, and a tool's `taskSupport` does not apply either.
+  const tasksDeclared = tasksDeclaredTo(dependencies)
+  const taskParams = tasksDeclared
     ? (request.params as { task?: { ttl?: unknown } | null } | undefined)?.task
     : undefined
   const ttl = taskParams?.ttl ?? undefined
@@ -457,7 +469,9 @@ async function handleToolsCall (
 
   // Decide up front whether this call runs as a task, so the rest of the
   // handler can stay unaware of it.
-  const augmentation = resolveTaskAugmentation(resolved.tool, taskParams !== undefined)
+  const augmentation = tasksDeclared
+    ? resolveTaskAugmentation(resolved.tool, taskParams !== undefined)
+    : { mode: 'direct' as const }
   if ('error' in augmentation) {
     await emitToolCallComplete('json-rpc', toolName, params.arguments || {}, { ok: false, reason: 'task-required' }, startedAt, dependencies)
     return createError(request.id, METHOD_NOT_FOUND, augmentation.error)
@@ -1006,6 +1020,14 @@ function assertTaskAccess (task: TaskRecord | null, dependencies: HandlerDepende
 
 function relatedTaskMeta (taskId: string): Record<string, unknown> {
   return { [RELATED_TASK_META_KEY]: { taskId } }
+}
+
+/**
+ * Whether `tasks.requests.tools.call` was declared to this client: tasks are
+ * enabled (there is a store) and the negotiated revision has them.
+ */
+function tasksDeclaredTo (dependencies: HandlerDependencies): boolean {
+  return dependencies.taskStore !== undefined && supportsTasks(dependencies.protocolVersion)
 }
 
 /**

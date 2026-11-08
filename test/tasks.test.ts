@@ -797,3 +797,73 @@ describe('tasks over the wire', () => {
     t.assert.strictEqual(init.result.capabilities.tasks, undefined)
   })
 })
+
+describe('task metadata with tasks disabled', () => {
+  async function buildDisabledApp (t: TestContext) {
+    const app = Fastify({ logger: false })
+    t.after(() => app.close())
+    await app.register(mcpPlugin)
+
+    app.mcpAddTool({
+      name: 'optional-task',
+      description: 'Optional task support',
+      inputSchema: Type.Object({ a: Type.Number(), b: Type.Number() }),
+      execution: { taskSupport: 'optional' }
+    } as any, async (params: any): Promise<CallToolResult> => ({
+      content: [{ type: 'text', text: String(params.a + params.b) }]
+    }))
+
+    app.mcpAddTool({
+      name: 'task-only',
+      description: 'Must be invoked as a task',
+      inputSchema: Type.Object({}),
+      execution: { taskSupport: 'required' }
+    } as any, async (): Promise<CallToolResult> => ({ content: [{ type: 'text', text: 'done' }] }))
+
+    app.mcpAddTool({
+      name: 'plain',
+      description: 'No task support',
+      inputSchema: Type.Object({})
+    } as any, async (): Promise<CallToolResult> => ({ content: [{ type: 'text', text: 'plain' }] }))
+
+    await app.ready()
+    return app
+  }
+
+  test('a tools/call carrying task is processed normally', async (t: TestContext) => {
+    const app = await buildDisabledApp(t)
+
+    const body = await call(app, 'tools/call', { name: 'optional-task', arguments: { a: 2, b: 3 }, task: { ttl: 5000 } })
+    t.assert.strictEqual(body.error, undefined)
+    t.assert.strictEqual(body.result.content[0].text, '5')
+    t.assert.strictEqual(body.result.task, undefined)
+  })
+
+  test('task metadata is ignored even on a tool that forbids tasks, or with a bad ttl', async (t: TestContext) => {
+    const app = await buildDisabledApp(t)
+
+    const forbidden = await call(app, 'tools/call', { name: 'plain', arguments: {}, task: {} })
+    t.assert.strictEqual(forbidden.result.content[0].text, 'plain')
+
+    const badTtl = await call(app, 'tools/call', { name: 'plain', arguments: {}, task: { ttl: 'forever' } })
+    t.assert.strictEqual(badTtl.result.content[0].text, 'plain')
+  })
+
+  test('a tool with taskSupport required can be called directly', async (t: TestContext) => {
+    const app = await buildDisabledApp(t)
+
+    const body = await call(app, 'tools/call', { name: 'task-only', arguments: {} })
+    t.assert.strictEqual(body.error, undefined)
+    t.assert.strictEqual(body.result.content[0].text, 'done')
+  })
+
+  test('tools/list does not advertise execution.taskSupport', async (t: TestContext) => {
+    const app = await buildDisabledApp(t)
+
+    const body = await call(app, 'tools/list', {})
+    t.assert.strictEqual(body.result.tools.length, 3)
+    for (const tool of body.result.tools) {
+      t.assert.strictEqual(tool.execution?.taskSupport, undefined, `${tool.name} must not advertise taskSupport`)
+    }
+  })
+})
