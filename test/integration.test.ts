@@ -166,7 +166,7 @@ describe('MCP Integration Tests', () => {
         t.assert.strictEqual(divContent.text, 'Result: 5')
       }
 
-      // Test tool execution with error
+      // Arguments that violate the tool's JSON Schema are rejected before the handler runs
       const errorResult = await client.request({
         method: 'tools/call',
         params: {
@@ -179,7 +179,8 @@ describe('MCP Integration Tests', () => {
       const errorContent = errorResult.content[0]
       t.assert.strictEqual(errorContent.type, 'text')
       if (errorContent.type === 'text') {
-        t.assert.ok(errorContent.text.includes('Invalid operation'))
+        t.assert.ok(errorContent.text.startsWith('Invalid tool arguments:'))
+        t.assert.ok(errorContent.text.includes('/operation must be equal to one of the allowed values'))
       }
 
       // Test resources listing

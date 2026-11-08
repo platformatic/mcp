@@ -458,7 +458,7 @@ expectNotAssignable<MCPPluginOptions>({ canAccessTool: true })
 
 // ─── Plugin options ─────────────────────────────────────────────────
 
-// validateJsonSchemaInputs is an optional object
+// validateJsonSchemaInputs is an optional object of AJV options, or false to opt out
 expectAssignable<MCPPluginOptions>({ validateJsonSchemaInputs: {} })
 
 expectAssignable<MCPPluginOptions>({
@@ -474,7 +474,7 @@ expectNotAssignable<MCPPluginOptions>({
   validateJsonSchemaInputs: true
 })
 
-expectNotAssignable<MCPPluginOptions>({
+expectAssignable<MCPPluginOptions>({
   validateJsonSchemaInputs: false
 })
 
