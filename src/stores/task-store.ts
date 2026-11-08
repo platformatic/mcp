@@ -64,6 +64,14 @@ export function isTaskOwner (task: TaskRecord, owner: TaskOwner): boolean {
   return task.authSubject === owner.subject && task.authIssuer === owner.issuer
 }
 
+/**
+ * Whether an owner identifies no one: neither subject nor issuer is known, as
+ * for every task created without authorization.
+ */
+export function isAnonymousOwner (owner: TaskOwner): boolean {
+  return owner.subject === undefined && owner.issuer === undefined
+}
+
 export interface TaskListOptions {
   /** Opaque cursor from a previous page's `nextCursor` */
   cursor?: string
@@ -137,6 +145,14 @@ export function taskPageLimit (limit: number | undefined): number {
 export const DEFAULT_TASK_MAX_PER_PRINCIPAL = 100
 
 /**
+ * Tasks all anonymous callers together may keep stored, finished ones included,
+ * by default. Anonymous callers cannot be told apart, so a per-principal quota
+ * would be one allowance shared by all of them, letting any of them evict or
+ * lock out everyone else's tasks (#320). They are bounded as a whole instead.
+ */
+export const DEFAULT_TASK_MAX_ANONYMOUS = 1000
+
+/**
  * JSON-RPC error code returned when a task cannot be created because the
  * caller (or the store) is at capacity and holds no finished task to evict.
  * Implementation-defined, in the -32000..-32099 server error range.
@@ -165,9 +181,11 @@ export function validateTaskLimit (name: string, value: unknown): void {
 
 export interface TaskStore {
   /**
-   * Store a new task. Every principal (and the anonymous caller) has a cap on
-   * the tasks it keeps stored, finished ones included; at the cap, its oldest
-   * finished task is evicted to make room.
+   * Store a new task. Every principal has a cap on the tasks it keeps stored,
+   * finished ones included; at the cap, its oldest finished task is evicted to
+   * make room. Anonymous tasks (no subject and no issuer) are not subject to the
+   * per-principal cap, which would be one allowance shared by every anonymous
+   * caller; they are bounded together by a larger, store-wide anonymous cap.
    * @throws TaskLimitError if at capacity with no finished task to evict
    */
   create(task: TaskRecord): Promise<void>

@@ -398,13 +398,17 @@ Each caller (token issuer and subject) may keep at most `taskMaxRetainedPerPrinc
 (default 100). Finished tasks count until their `ttl` expires, so one caller cannot fill the
 store with results it never collects. When a caller is at its quota, its oldest finished task
 is evicted to make room; if all of them are still running, the `tools/call` fails with
-`-32029` "Task limit reached". Without authorization every caller shares a single quota, so
-raise it if you expect many concurrent anonymous tasks. The in-memory store also holds at most
-1000 tasks in total; when full, it evicts the caller's oldest finished task, then the oldest
-finished task of any caller, before refusing. The Redis store enforces the quota atomically
-with a per-caller sorted set (`mcp:tasks:owner:<issuer>:<subject>`, each part percent-encoded,
-or `mcp:tasks:anonymous`), so it holds across instances. Custom `TaskStore` implementations
-should throw `TaskLimitError` from `create()` to produce the same response.
+`-32029` "Task limit reached". Anonymous callers (no authorization, so no identity) cannot be
+told apart, so a per-caller quota would be one allowance any of them could exhaust, evicting or
+locking out everyone else's tasks. `taskMaxRetainedPerPrincipal` therefore does not apply to
+them: all anonymous tasks together are bounded by `taskMaxRetainedAnonymous` (default 1000)
+instead, with the same eviction rules, so raise it if you expect more concurrent anonymous
+tasks. The in-memory store also holds at most 1000 tasks in total; when full, it evicts the
+caller's oldest finished task, then the oldest finished task of any caller, before refusing.
+The Redis store enforces both quotas atomically with a sorted set per caller
+(`mcp:tasks:owner:<issuer>:<subject>`, each part percent-encoded) and one for all anonymous
+tasks (`mcp:tasks:anonymous`), so they hold across instances. Custom `TaskStore`
+implementations should throw `TaskLimitError` from `create()` to produce the same response.
 
 The instance running a task holds a lease on it and renews it every third of `taskLeaseMs`
 (default 30 seconds). If that instance dies or shuts down before the task finishes, renewals
@@ -421,6 +425,7 @@ nor delay failing one whose owner is gone:
 await app.register(mcpPlugin, {
   enableTasks: true,
   taskMaxRetainedPerPrincipal: 20, // tasks each caller may keep, finished ones included
+  taskMaxRetainedAnonymous: 500, // tasks all anonymous callers may keep together
   taskLeaseMs: 30_000 // a dead instance's tasks are failed this long after its last renewal
 })
 ```
