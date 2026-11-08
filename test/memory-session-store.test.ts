@@ -7,16 +7,10 @@ function newSession (id: string): SessionMetadata {
   return { id, eventId: 0, createdAt: new Date(), lastActivity: new Date() }
 }
 
-/**
- * Reproduce what routes/mcp.ts sendSSEToStreams does for each event: read the
- * session (a copy), bump the counter on the copy, then persist via addMessage.
- * Before the fix the counter was never stored, so every event got id "1".
- */
+// What routes/mcp.ts does for each SSE event: the store assigns the event id
 async function emit (store: MemorySessionStore, sessionId: string, i: number): Promise<string> {
-  const session = await store.get(sessionId)
-  const eventId = (++session!.eventId).toString()
-  await store.addMessage(sessionId, eventId, { jsonrpc: '2.0', method: 'notifications/test', params: { i } })
-  return eventId
+  const eventId = await store.addMessage(sessionId, { jsonrpc: '2.0', method: 'notifications/test', params: { i } })
+  return eventId!
 }
 
 describe('MemorySessionStore event id counter', () => {
@@ -52,5 +46,23 @@ describe('MemorySessionStore event id counter', () => {
 
     t.assert.strictEqual((await store.get('s1'))!.eventId, 0)
     t.assert.strictEqual(await emit(store, 's1', 1), '1')
+  })
+
+  test('concurrent addMessage calls get distinct ascending ids (#317)', async (t: TestContext) => {
+    const store = new MemorySessionStore(100)
+    await store.create(newSession('s1'))
+
+    const ids = await Promise.all([1, 2, 3, 4].map(i => emit(store, 's1', i)))
+
+    t.assert.deepStrictEqual(ids, ['1', '2', '3', '4'])
+    t.assert.strictEqual((await store.get('s1'))!.eventId, 4)
+    t.assert.deepStrictEqual((await store.getMessagesFrom('s1', '1')).map(r => r.eventId), ['2', '3', '4'])
+  })
+
+  test('addMessage returns null for a session that does not exist', async (t: TestContext) => {
+    const store = new MemorySessionStore(100)
+
+    t.assert.strictEqual(await store.addMessage('missing', { jsonrpc: '2.0', method: 'notifications/test' }), null)
+    t.assert.strictEqual(await store.get('missing'), null)
   })
 })
