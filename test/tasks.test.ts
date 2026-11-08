@@ -725,6 +725,59 @@ describe('tasks over the wire', () => {
     }
   })
 
+  test('tasks/list reports a task whose lease lapsed as failed, not working', async (t: TestContext) => {
+    const restoreMock = setupMockAgent({
+      'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse()
+    })
+    t.after(() => restoreMock())
+
+    const taskLeaseMs = 50
+    let release!: () => void
+    const hang = new Promise<void>(resolve => { release = resolve })
+    t.after(() => release())
+
+    const app = Fastify({ logger: false })
+    t.after(() => app.close())
+    await app.register(mcpPlugin, { enableTasks: true, authorization: createTestAuthConfig(), taskLeaseMs })
+    app.mcpAddTool({
+      name: 'hang',
+      description: 'Runs until released',
+      inputSchema: Type.Object({}),
+      execution: { taskSupport: 'optional' }
+    } as any, async (): Promise<CallToolResult> => {
+      await hang
+      return { content: [{ type: 'text', text: 'late' }] }
+    })
+    await app.ready()
+
+    const token = createTestJWT({ sub: 'user-a' })
+    const authedCall = async (method: string, params: unknown) => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/mcp',
+        headers: { authorization: `Bearer ${token}`, 'mcp-protocol-version': LATEST_PROTOCOL_VERSION },
+        payload: { jsonrpc: JSONRPC_VERSION, id: 1, method, params }
+      })
+      return res.json()
+    }
+
+    const created = await authedCall('tools/call', { name: 'hang', arguments: {}, task: { ttl: 60_000 } })
+    const taskId = (created.result as CreateTaskResult).task.taskId
+
+    // Simulate the owning instance crashing: its renewals stop landing
+    t.mock.method(MemoryTaskStore.prototype, 'renewLease', async () => true)
+    await new Promise(resolve => setTimeout(resolve, taskLeaseMs * 4))
+
+    const list = (await authedCall('tasks/list', {})).result as ListTasksResult
+    t.assert.deepStrictEqual(list.tasks.map(x => [x.taskId, x.status]), [[taskId, 'failed']])
+    t.assert.strictEqual(list.tasks[0].statusMessage, TASK_OWNER_LOST)
+    t.assert.strictEqual('leaseExpiresAt' in list.tasks[0], false)
+
+    // The task itself was failed, not just reported as such
+    const got = (await authedCall('tasks/get', { taskId })).result
+    t.assert.strictEqual(got.status, 'failed')
+  })
+
   test('a token without sub is rejected before it can create subject-less tasks', async (t: TestContext) => {
     const restoreMock = setupMockAgent({
       'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse()
