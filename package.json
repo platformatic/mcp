@@ -38,6 +38,7 @@
   "devDependencies": {
     "@fastify/cors": "^11.1.0",
     "@fastify/pre-commit": "^2.2.0",
+    "@fastify/swagger": "^9.9.2",
     "@modelcontextprotocol/inspector": "^0.22.0",
     "@modelcontextprotocol/sdk": "^1.13.3",
     "@opentelemetry/api": "^1.9.0",
@@ -54,9 +55,9 @@
     "undici": "^7.11.0"
   },
   "dependencies": {
-    "ajv": "^8.17.1",
     "@fastify/jwt": "^10.0.0",
     "@fastify/type-provider-typebox": "^6.0.0",
+    "ajv": "^8.17.1",
     "fast-jwt": "^6.0.2",
     "fastify-error": "^1.0.0",
     "fastify-plugin": "^6.0.0",

@@ -1,10 +1,12 @@
-import type { FastifyInstance, FastifyPluginAsync } from 'fastify'
+import type { FastifyInstance, FastifyPluginAsync, FastifySchema, HTTPMethods } from 'fastify'
 import fp from 'fastify-plugin'
 import { Type } from '@sinclair/typebox'
 import type { PKCEChallenge } from '../auth/oauth-client.ts'
 import { BEARER_SCHEME } from '../auth/prehandler.ts'
 import type { SessionStore } from '../stores/session-store.ts'
 import type { DCRHooks, DCRRequest, DCRResponse } from '../types/auth-types.ts'
+import type { MCPRouteId, MCPRouteSchemaTransformer } from '../types.ts'
+import { routeSchemaOptions } from './route-schema.ts'
 
 export interface AuthSession {
   state: string
@@ -28,6 +30,7 @@ export interface AuthRoutesOptions {
   sessionStore: SessionStore
   /** DCR hooks for custom request/response processing */
   dcrHooks?: DCRHooks
+  transformRouteSchema?: MCPRouteSchemaTransformer
 }
 
 // TypeBox schemas for validation
@@ -103,12 +106,14 @@ const LogoutResponse = Type.Object({
 const authRoutesPlugin: FastifyPluginAsync<AuthRoutesOptions> = async (fastify: FastifyInstance, opts) => {
   const { sessionStore } = opts
 
+  function routeOptions (routeId: MCPRouteId, method: HTTPMethods, url: string, schema: FastifySchema) {
+    return routeSchemaOptions(fastify, routeId, method, url, schema, opts.transformRouteSchema)
+  }
+
   // Initiate OAuth authorization flow
-  fastify.get('/oauth/authorize', {
-    schema: {
-      querystring: AuthorizeQuerystring
-    }
-  }, async (request, reply) => {
+  fastify.get('/oauth/authorize', routeOptions('oauth.authorize', 'GET', '/oauth/authorize', {
+    querystring: AuthorizeQuerystring
+  }), async (request, reply) => {
     try {
       const { resource, redirect_uri: redirectUri } = request.query as { resource?: string; redirect_uri?: string }
 
@@ -161,16 +166,14 @@ const authRoutesPlugin: FastifyPluginAsync<AuthRoutesOptions> = async (fastify: 
   })
 
   // Handle OAuth callback
-  fastify.get('/oauth/callback', {
-    schema: {
-      querystring: CallbackQuerystring,
-      response: {
-        200: TokenResponse,
-        400: ErrorResponse,
-        500: ErrorResponse
-      }
+  fastify.get('/oauth/callback', routeOptions('oauth.callback', 'GET', '/oauth/callback', {
+    querystring: CallbackQuerystring,
+    response: {
+      200: TokenResponse,
+      400: ErrorResponse,
+      500: ErrorResponse
     }
-  }, async (request, reply) => {
+  }), async (request, reply) => {
     reply.header('Cache-Control', 'no-store')
     reply.header('Pragma', 'no-cache')
 
@@ -240,15 +243,13 @@ const authRoutesPlugin: FastifyPluginAsync<AuthRoutesOptions> = async (fastify: 
   })
 
   // Token refresh endpoint
-  fastify.post('/oauth/refresh', {
-    schema: {
-      body: TokenRefreshBodySchema,
-      response: {
-        200: TokenResponse,
-        400: ErrorResponse
-      }
+  fastify.post('/oauth/refresh', routeOptions('oauth.refresh', 'POST', '/oauth/refresh', {
+    body: TokenRefreshBodySchema,
+    response: {
+      200: TokenResponse,
+      400: ErrorResponse
     }
-  }, async (request, reply) => {
+  }), async (request, reply) => {
     reply.header('Cache-Control', 'no-store')
     reply.header('Pragma', 'no-cache')
 
@@ -275,16 +276,14 @@ const authRoutesPlugin: FastifyPluginAsync<AuthRoutesOptions> = async (fastify: 
   })
 
   // Token validation endpoint
-  fastify.post('/oauth/validate', {
-    schema: {
-      body: TokenValidateBody,
-      response: {
-        200: TokenValidationResponse,
-        400: ErrorResponse,
-        500: ErrorResponse
-      }
+  fastify.post('/oauth/validate', routeOptions('oauth.validate', 'POST', '/oauth/validate', {
+    body: TokenValidateBody,
+    response: {
+      200: TokenValidationResponse,
+      400: ErrorResponse,
+      500: ErrorResponse
     }
-  }, async (request, reply) => {
+  }), async (request, reply) => {
     try {
       const { token } = request.body as { token: string }
 
@@ -303,13 +302,11 @@ const authRoutesPlugin: FastifyPluginAsync<AuthRoutesOptions> = async (fastify: 
   })
 
   // Get authorization status
-  fastify.get('/oauth/status', {
-    schema: {
-      response: {
-        200: AuthStatusResponse
-      }
+  fastify.get('/oauth/status', routeOptions('oauth.status', 'GET', '/oauth/status', {
+    response: {
+      200: AuthStatusResponse
     }
-  }, async (request, reply) => {
+  }), async (request, reply) => {
     try {
       const authHeader = request.headers.authorization
       const match = authHeader && BEARER_SCHEME.exec(authHeader)
@@ -343,17 +340,15 @@ const authRoutesPlugin: FastifyPluginAsync<AuthRoutesOptions> = async (fastify: 
   // Clients should use the authorization server's DCR endpoint directly.
   // (Using oauth-client.dynamicClientRegistration here would cause an infinite loop
   // if OIDC discovery points back to this server.)
-  fastify.post('/oauth/register', {
-    schema: {
-      body: DynamicRegistrationRequest,
-      response: {
-        200: DynamicRegistrationResponse,
-        400: ErrorResponse,
-        501: ErrorResponse,
-        502: ErrorResponse
-      }
+  fastify.post('/oauth/register', routeOptions('oauth.register', 'POST', '/oauth/register', {
+    body: DynamicRegistrationRequest,
+    response: {
+      200: DynamicRegistrationResponse,
+      400: ErrorResponse,
+      501: ErrorResponse,
+      502: ErrorResponse
     }
-  }, async (request, reply) => {
+  }), async (request, reply) => {
     const { dcrHooks } = opts
 
     // DCR proxy requires hooks configuration
@@ -435,15 +430,13 @@ const authRoutesPlugin: FastifyPluginAsync<AuthRoutesOptions> = async (fastify: 
   })
 
   // Logout endpoint (revokes tokens)
-  fastify.post('/oauth/logout', {
-    schema: {
-      response: {
-        200: LogoutResponse,
-        400: ErrorResponse,
-        500: ErrorResponse
-      }
+  fastify.post('/oauth/logout', routeOptions('oauth.logout', 'POST', '/oauth/logout', {
+    response: {
+      200: LogoutResponse,
+      400: ErrorResponse,
+      500: ErrorResponse
     }
-  }, async (request, reply) => {
+  }), async (request, reply) => {
     try {
       const authHeader = request.headers.authorization
       const match = authHeader && BEARER_SCHEME.exec(authHeader)
