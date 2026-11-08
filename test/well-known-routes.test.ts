@@ -432,8 +432,9 @@ describe('Well-known Routes', () => {
       t.assert.strictEqual(response.headers['content-type'], 'application/json; charset=utf-8')
       t.assert.strictEqual(response.headers['cache-control'], undefined)
 
+      // The resource identifier is resourceUri, the one audience the server accepts
       const body = response.json()
-      t.assert.strictEqual(body.resource, 'https://mcp.example.com/mcp')
+      t.assert.strictEqual(body.resource, 'https://mcp.example.com')
       t.assert.deepStrictEqual(body.authorization_servers, [
         'https://auth.example.com'
       ])
