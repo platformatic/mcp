@@ -1145,6 +1145,9 @@ async function awaitTaskTerminal (
 ): Promise<TaskRecord | null> {
   const { taskStore, taskWaiters } = dependencies
   if (!taskStore) return initial
+  // The client may be gone before we start (handleTasksResult aborts up front
+  // when the response is already destroyed): don't wait on its behalf at all.
+  signal.throwIfAborted()
 
   // A single waiter for the whole call. Resolves to a terminal task when this
   // instance completes it, or to null when aborted — caught here so that losing
