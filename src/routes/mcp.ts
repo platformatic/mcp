@@ -14,13 +14,16 @@ import type {
   MCPRouteSchemaTransformer
 } from '../types.ts'
 import type { SessionStore, SessionMetadata } from '../stores/session-store.ts'
-import { DEFAULT_SESSION_TTL_MS } from '../stores/memory-session-store.ts'
+import { DEFAULT_SESSION_TTL_MS, MemorySessionStore } from '../stores/memory-session-store.ts'
 import type { TaskStore, TaskWaiters, TaskLeases } from '../stores/task-store.ts'
 import type { MessageBroker } from '../brokers/message-broker.ts'
 import type { AuthorizationContext } from '../types/auth-types.ts'
 import type { JsonSchemaValidator } from '../validation/json-schema-validator.ts'
 import { processMessage, checkRequestId } from '../handlers.ts'
 import { isStdioRequest } from '../stdio-marker.ts'
+import { appendToHistory, publishSessionTerminated, SessionTopicSubscriptions } from '../session-topic.ts'
+import type { SessionTopicPayload } from '../session-topic.ts'
+import { ResourceSubscriptionHolders } from '../resource-subscription-holders.ts'
 
 const MAX_TIMER_DELAY_MS = 2 ** 31 - 1
 
@@ -42,6 +45,23 @@ interface MCPPubSubRoutesOptions {
   taskLeases?: TaskLeases
   jsonSchemaValidator?: JsonSchemaValidator
   authPreHandler?: preHandlerHookHandler
+  /** Filled in by this plugin; the parent calls `close` before closing the broker */
+  sessionLifecycle: SessionLifecycle
+}
+
+export interface SessionLifecycle {
+  close?: () => Promise<void>
+}
+
+/**
+ * Per GET stream. While a Last-Event-ID replay is running, live events are
+ * queued so they cannot overtake the replay; events already replayed are not
+ * written a second time when they also arrive live.
+ */
+interface StreamState {
+  replaying: boolean
+  queued: Array<{ eventId: string, frame: string }>
+  replayed: Set<string>
 }
 
 function resolveRouteUrl (prefix: string | undefined, url: string): string {
@@ -122,7 +142,7 @@ function buildMcpPostErrorHandler (app: FastifyInstance) {
 }
 
 const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async (app, options) => {
-  const { enableSSE, opts, capabilities, serverInfo, tools, resources, prompts, resourceHandlers, sessionStore, messageBroker, localStreams, taskStore, taskWaiters, shutdownSignal, taskLeases, jsonSchemaValidator, authPreHandler } = options
+  const { enableSSE, opts, capabilities, serverInfo, tools, resources, prompts, resourceHandlers, sessionStore, messageBroker, localStreams, taskStore, taskWaiters, shutdownSignal, taskLeases, jsonSchemaValidator, authPreHandler, sessionLifecycle } = options
   const mcpUrl = resolveRouteUrl(app.prefix, '/mcp')
 
   const allowedOrigins = opts.allowedOrigins
@@ -297,38 +317,9 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
 
     await sessionStore.create(session)
 
-    // Without SSE there is no stream to deliver to, so skip the subscription
-    if (!enableSSE) {
-      return session
-    }
-
-    localStreams.set(sessionId, new Set())
-
-    // Subscribe to messages for this session
-    await messageBroker.subscribe(`mcp/session/${sessionId}/message`, async (message: JSONRPCMessage) => {
-      // Brokers do not await this handler, so any rejection must be caught
-      // here or it becomes an unhandled rejection that crashes the process
-      try {
-        const streams = localStreams.get(sessionId)
-        if (streams && streams.size > 0) {
-          app.log.debug({ sessionId, message }, 'Received message for session via broker, sending to streams')
-          await sendSSEToStreams(sessionId, message, streams)
-        } else {
-          app.log.debug({ sessionId }, 'Received message for session via broker, storing in history without active streams')
-          // Store message in history even without active streams for session persistence
-          const session = await sessionStore.get(sessionId)
-          if (session) {
-            const eventId = (++session.eventId).toString()
-            session.lastEventId = eventId
-            session.lastActivity = new Date()
-            await sessionStore.addMessage(sessionId, eventId, message)
-          }
-        }
-      } catch (error) {
-        app.log.error({ err: error, sessionId }, 'Failed to deliver message to session')
-      }
-    })
-
+    // No broker subscription here: an instance subscribes to the session's
+    // topic only while it holds one of its streams (see attachStream), and
+    // messages sent meanwhile are kept in history by the sender
     return session
   }
 
@@ -343,50 +334,133 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
     return streams ? streams.size > 0 : false
   }
 
-  async function sendSSEToStreams (sessionId: string, message: JSONRPCMessage, streams: Set<FastifyReply>): Promise<void> {
-    const session = await sessionStore.get(sessionId)
-    if (!session) return
+  const streamStates = new WeakMap<FastifyReply, StreamState>()
+  const resourceHolders = new ResourceSubscriptionHolders()
 
-    const eventId = (++session.eventId).toString()
-    const sseEvent = `id: ${eventId}\ndata: ${JSON.stringify(message)}\n\n`
-    session.lastEventId = eventId
-    session.lastActivity = new Date()
-
-    // Store message in history
-    await sessionStore.addMessage(sessionId, eventId, message)
-
-    // Send to all connected streams in this session
-    const deadStreams = new Set<FastifyReply>()
-    for (const stream of streams) {
+  /**
+   * A session stopped holding some URIs without asking (DELETE, expiry, or an
+   * unsubscribe handled by another instance): run the unsubscribe handler for
+   * each URI no other session on this instance still holds.
+   */
+  async function releaseResourceSubscriptions (sessionId: string, uris?: string[], authContext?: AuthorizationContext): Promise<void> {
+    const released = resourceHolders.release(sessionId, uris)
+    const handler = resourceHandlers.unsubscribeHandler
+    if (!handler) return
+    for (const uri of released) {
       try {
-        stream.raw.write(sseEvent)
+        await handler({ uri }, { sessionId, authContext })
       } catch (error) {
-        app.log.error({ err: error }, 'Failed to write SSE event')
-        deadStreams.add(stream)
+        app.log.error({ err: error, sessionId, uri }, 'Resource unsubscribe handler failed while releasing a session subscription')
       }
-    }
-
-    // Clean up dead streams
-    for (const deadStream of deadStreams) {
-      streams.delete(deadStream)
-    }
-
-    // Clean up session if no streams left
-    if (streams.size === 0) {
-      app.log.info({
-        sessionId
-      }, 'Session has no active streams, cleaning up')
-      localStreams.delete(sessionId)
-      await messageBroker.unsubscribe(`mcp/session/${sessionId}/message`)
     }
   }
 
+  // This instance is subscribed to a session's topic exactly while it holds one
+  // of the session's streams; the subscription is what lets a stream on any
+  // instance receive what is sent to the session from any other.
+  const sessionTopics = new SessionTopicSubscriptions(
+    messageBroker,
+    (sessionId) => (localStreams.get(sessionId)?.size ?? 0) > 0,
+    (sessionId, payload) => {
+      // Brokers do not await this handler, so any rejection must be caught
+      // here or it becomes an unhandled rejection that crashes the process
+      onSessionTopicMessage(sessionId, payload).catch((error) => {
+        app.log.error({ err: error, sessionId }, 'Failed to deliver message to session')
+      })
+    }
+  )
+
+  async function onSessionTopicMessage (sessionId: string, payload: SessionTopicPayload): Promise<void> {
+    if (payload.kind === 'terminated') {
+      endLocalStreams(sessionId)
+      await releaseResourceSubscriptions(sessionId)
+      return
+    }
+
+    const streams = localStreams.get(sessionId)
+    if (!streams || streams.size === 0) return
+
+    if (payload.kind === 'event') {
+      app.log.debug({ sessionId, eventId: payload.eventId }, 'Received message for session via broker, sending to streams')
+      writeEventToStreams(sessionId, payload.eventId, payload.message, streams)
+    } else {
+      // Published to the topic directly instead of through mcpSendToSession,
+      // so it still needs to be recorded
+      await sendSSEToStreams(sessionId, payload.message, streams)
+    }
+  }
+
+  async function attachStream (sessionId: string, reply: FastifyReply): Promise<void> {
+    let streams = localStreams.get(sessionId)
+    if (!streams) {
+      streams = new Set()
+      localStreams.set(sessionId, streams)
+    }
+    streams.add(reply)
+    await sessionTopics.sync(sessionId)
+  }
+
+  function detachStream (sessionId: string, reply: FastifyReply): void {
+    const streams = localStreams.get(sessionId)
+    if (!streams || !streams.delete(reply)) return
+    if (streams.size === 0) {
+      localStreams.delete(sessionId)
+    }
+    sessionTopics.sync(sessionId).catch((error) => {
+      app.log.error({ err: error, sessionId }, 'Failed to unsubscribe session from message broker')
+    })
+  }
+
+  /** End this instance's streams for a session that was terminated or is gone */
+  function endLocalStreams (sessionId: string): void {
+    const streams = localStreams.get(sessionId)
+    if (!streams) return
+    for (const stream of [...streams]) {
+      try {
+        stream.raw.end()
+      } catch {
+        // stream may already be closed
+      }
+      detachStream(sessionId, stream)
+    }
+  }
+
+  function writeEvent (sessionId: string, stream: FastifyReply, eventId: string, frame: string): void {
+    const state = streamStates.get(stream)
+    if (state?.replayed.has(eventId)) return
+    if (state?.replaying) {
+      state.queued.push({ eventId, frame })
+      return
+    }
+    try {
+      stream.raw.write(frame)
+    } catch (error) {
+      app.log.error({ err: error }, 'Failed to write SSE event')
+      detachStream(sessionId, stream)
+    }
+  }
+
+  function writeEventToStreams (sessionId: string, eventId: string, message: JSONRPCMessage, streams: Set<FastifyReply>): void {
+    const frame = `id: ${eventId}\ndata: ${JSON.stringify(message)}\n\n`
+    for (const stream of [...streams]) {
+      writeEvent(sessionId, stream, eventId, frame)
+    }
+  }
+
+  async function sendSSEToStreams (sessionId: string, message: JSONRPCMessage, streams: Set<FastifyReply>): Promise<void> {
+    const eventId = await appendToHistory(sessionStore, sessionId, message)
+    if (eventId === null) return
+    writeEventToStreams(sessionId, eventId, message, streams)
+  }
+
   async function replayMessagesFromEventId (sessionId: string, lastEventId: string, stream: FastifyReply): Promise<void> {
+    const state = streamStates.get(stream)
     try {
       const messagesToReplay = await sessionStore.getMessagesFrom(sessionId, lastEventId)
 
       for (const entry of messagesToReplay) {
         const sseEvent = `id: ${entry.eventId}\ndata: ${JSON.stringify(entry.message)}\n\n`
+        state?.replayed.add(entry.eventId)
         try {
           stream.raw.write(sseEvent)
         } catch (error) {
@@ -400,6 +474,14 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
       }
     } catch (error) {
       app.log.warn({ err: error, lastEventId }, 'Failed to replay messages from event ID')
+    } finally {
+      // Deliver what arrived live during the replay, minus what it already sent
+      if (state) {
+        state.replaying = false
+        for (const { eventId, frame } of state.queued.splice(0)) {
+          writeEvent(sessionId, stream, eventId, frame)
+        }
+      }
     }
   }
 
@@ -484,6 +566,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
           shutdownSignal,
           taskLeases,
           jsonSchemaValidator,
+          resourceHolders,
           sessionId,
           protocolVersion: (request as any).mcpProtocolVersion ?? DEFAULT_NEGOTIATED_PROTOCOL_VERSION
         })
@@ -566,49 +649,33 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
           raw.setHeader('Mcp-Session-Id', session.id)
         }
 
-        raw.writeHead(200)
+        const lastEventId = request.headers['last-event-id'] as string | undefined
+        streamStates.set(reply, { replaying: Boolean(lastEventId), queued: [], replayed: new Set() })
 
-        let streams = localStreams.get(session.id)
-        if (!streams) {
-          streams = new Set()
-          localStreams.set(session.id, streams)
-        }
-        streams.add(reply)
+        // Registered before anything else is awaited, so a client that goes
+        // away during setup is still detached
+        reply.raw.on('close', () => {
+          detachStream(session.id, reply)
+          app.log.info({ sessionId: session.id }, 'SSE connection closed')
+        })
+
+        // Subscribe before reading history for the replay, so nothing sent in
+        // between can be missed; anything seen by both is written once
+        await attachStream(session.id, reply)
+
+        raw.writeHead(200)
 
         app.log.info({
           sessionId: session.id,
-          totalStreams: streams.size,
+          totalStreams: localStreams.get(session.id)?.size ?? 0,
           method: 'GET'
         }, 'Added new stream to session')
 
         // Handle resumability with Last-Event-ID
-        const lastEventId = request.headers['last-event-id'] as string
         if (lastEventId) {
           app.log.info(`Resuming SSE stream from event ID: ${lastEventId}`)
           await replayMessagesFromEventId(session.id, lastEventId, reply)
         }
-
-        // Handle connection close
-        reply.raw.on('close', () => {
-          const streams = localStreams.get(session.id)
-          if (streams) {
-            streams.delete(reply)
-            app.log.info({
-              sessionId: session.id,
-              remainingStreams: streams.size
-            }, 'SSE connection closed')
-
-            if (streams.size === 0) {
-              app.log.info({
-                sessionId: session.id
-              }, 'Last SSE stream closed, cleaning up session')
-              localStreams.delete(session.id)
-              messageBroker.unsubscribe(`mcp/session/${session.id}/message`).catch((error) => {
-                app.log.error({ err: error, sessionId: session.id }, 'Failed to unsubscribe session from message broker')
-              })
-            }
-          }
-        })
 
         // SEP-1699: servers may end an SSE stream whenever they like, turning the
         // stream into a polling channel. The client reconnects with Last-Event-ID
@@ -670,10 +737,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
             })
           } catch (error) {
             clearInterval(heartbeatInterval)
-            const streams = localStreams.get(session.id)
-            if (streams) {
-              streams.delete(reply)
-            }
+            detachStream(session.id, reply)
           }
         }, heartbeatIntervalMs)
         heartbeatInterval.unref()
@@ -715,24 +779,19 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         return
       }
 
-      // Force-close any active SSE streams for this session
-      const streams = localStreams.get(sessionId)
-      if (streams) {
-        for (const stream of streams) {
-          try {
-            stream.raw.end()
-          } catch {
-            // stream may already be closed
-          }
-        }
-        localStreams.delete(sessionId)
-      }
-
-      // Unsubscribe from message broker
-      await messageBroker.unsubscribe(`mcp/session/${sessionId}/message`)
-
-      // Delete session from store
+      // Delete first, so a stream reconnecting elsewhere no longer finds it
       await sessionStore.delete(sessionId)
+
+      // End this instance's streams, and tell the others to end theirs
+      endLocalStreams(sessionId)
+      await releaseResourceSubscriptions(sessionId, undefined, session.authorization)
+      if (enableSSE) {
+        try {
+          await publishSessionTerminated(messageBroker, sessionId)
+        } catch (error) {
+          app.log.error({ err: error, sessionId }, 'Failed to notify other instances of session termination')
+        }
+      }
 
       app.log.info({ sessionId }, 'Session terminated via DELETE')
       reply.code(204).send()
@@ -767,6 +826,70 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         })
       }
     })
+  }
+
+  // Sessions also end without a DELETE reaching this instance: they expire, are
+  // deleted through another instance, or (Redis) their key is evicted. Sweep
+  // periodically, whatever the store, so what this instance holds for such a
+  // session is released. The memory store has no TTL mechanism of its own, so
+  // the sweep is also what frees its expired sessions.
+  const sweepIntervalMs = Math.min(opts.sessionTtlMs ?? DEFAULT_SESSION_TTL_MS, 60_000)
+  let sweeping = false
+  async function sweepSessions (): Promise<void> {
+    if (sessionStore instanceof MemorySessionStore) {
+      await sessionStore.cleanup()
+    }
+    for (const sessionId of [...localStreams.keys()]) {
+      if (!(await sessionStore.get(sessionId))) {
+        app.log.info({ sessionId }, 'Session is gone, closing its SSE streams')
+        endLocalStreams(sessionId)
+      }
+    }
+
+    // Resource subscriptions this instance ran the subscribe handler for, whose
+    // session ended or which were unsubscribed through another instance. The
+    // snapshot is taken before reading the store: a subscribe is recorded in the
+    // store before it is recorded here, so it cannot look stale.
+    for (const [sessionId, uris] of resourceHolders.entries()) {
+      const session = await sessionStore.get(sessionId)
+      if (!session) {
+        await releaseResourceSubscriptions(sessionId, uris)
+        continue
+      }
+      const stored = new Set(session.resourceSubscriptions ?? [])
+      const stale = uris.filter(uri => !stored.has(uri))
+      if (stale.length > 0) {
+        await releaseResourceSubscriptions(sessionId, stale, session.authorization)
+      }
+    }
+  }
+  const sweepTimer = setInterval(() => {
+    if (sweeping) return
+    sweeping = true
+    sweepSessions().catch((err: unknown) => {
+      app.log.error({ err }, 'Failed to clean up expired sessions')
+    }).finally(() => {
+      sweeping = false
+    })
+  }, sweepIntervalMs)
+  // Never keep the process alive just to sweep sessions
+  sweepTimer.unref()
+
+  sessionLifecycle.close = async () => {
+    clearInterval(sweepTimer)
+    for (const [sessionId, streams] of localStreams) {
+      for (const stream of streams) {
+        try {
+          if (stream.raw && !stream.raw.destroyed) {
+            stream.raw.destroy()
+          }
+        } catch (error) {
+          app.log.debug({ error, sessionId }, 'Error destroying SSE stream')
+        }
+      }
+    }
+    localStreams.clear()
+    await sessionTopics.close()
   }
 }
 

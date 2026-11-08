@@ -14,6 +14,7 @@ import { randomUUID } from 'node:crypto'
 import { supportsUrlElicitation } from '../protocol-version.ts'
 import type { SessionStore } from '../stores/session-store.ts'
 import type { MessageBroker } from '../brokers/message-broker.ts'
+import { sendToSession } from '../session-topic.ts'
 
 /**
  * Whether the client declared support for an elicitation mode. Elicitation is a
@@ -58,17 +59,11 @@ const mcpPubSubDecoratorsPlugin: FastifyPluginAsync<MCPPubSubDecoratorsOptions> 
       return false
     }
 
-    // Check if session exists in store
-    const session = await sessionStore.get(sessionId)
-    if (!session) {
-      return false
-    }
-
-    // Always publish to messageBroker to support cross-instance messaging in Redis deployments
-    // This ensures the message reaches the correct instance where the SSE connection exists
+    // Recorded in the session's history first, so it is replayed on reconnect
+    // even when no stream is open right now, then published so whichever
+    // instance holds the session's stream delivers it
     try {
-      await messageBroker.publish(`mcp/session/${sessionId}/message`, message)
-      return true
+      return await sendToSession(sessionStore, messageBroker, sessionId, message)
     } catch (error) {
       app.log.error({ err: error }, 'Failed to send message to session')
       return false
