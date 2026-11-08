@@ -37,6 +37,7 @@ import type { RequestId } from './schema.ts'
 
 import type { MCPTool, MCPResource, MCPPrompt, MCPPluginOptions, ResourceHandlers, McpCallToolOutcome, ToolAccessOperation, MCPToolCallCompleteEvent, TracerLike } from './types.ts'
 import type { SessionStore } from './stores/session-store.ts'
+import { SubscriptionLimitError, SUBSCRIPTION_LIMIT_REACHED } from './stores/session-store.ts'
 import type { TaskStore, TaskRecord, TaskOwner, TaskWaiters, TaskLeases } from './stores/task-store.ts'
 import { InvalidTaskCursorError, TaskLimitError, TASK_LIMIT_REACHED, TASK_OWNER_LOST, decodeTaskCursor, isTaskOwner, isTerminal, ownerLostOutcome, toWireTask } from './stores/task-store.ts'
 import type { AuthorizationContext } from './types/auth-types.ts'
@@ -1474,7 +1475,14 @@ async function handleResourcesSubscribe (
     // Remember the subscription so resources/updated broadcasts only reach
     // the sessions that asked for this URI
     if (sessionId && dependencies.sessionStore) {
-      await dependencies.sessionStore.addResourceSubscription(sessionId, params.uri)
+      try {
+        await dependencies.sessionStore.addResourceSubscription(sessionId, params.uri)
+      } catch (error: any) {
+        if (error instanceof SubscriptionLimitError) {
+          return createError(request.id, SUBSCRIPTION_LIMIT_REACHED, `Resource subscription limit reached (${error.limit})`)
+        }
+        throw error
+      }
     }
     return createResponse(request.id, result)
   } catch (error: any) {
