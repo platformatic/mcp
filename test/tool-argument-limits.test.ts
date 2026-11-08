@@ -177,6 +177,40 @@ describe('tool argument limits', () => {
     )
   })
 
+  // Issue #342: a NaN limit made every comparison false and removed the limit
+  for (const field of ['maxStringLength', 'maxObjectProperties', 'maxArrayLength', 'maxDepth'] as const) {
+    for (const value of [NaN, 0, -1, 1.5, -Infinity, '10', null]) {
+      test(`refuses toolArgumentLimits.${field} = ${typeof value === 'string' ? `'${value}'` : String(value)} at registration`, async (t: TestContext) => {
+        const app = Fastify({ logger: false })
+        t.after(() => app.close())
+        app.register(mcpPlugin, { toolArgumentLimits: { [field]: value as number } })
+        await t.assert.rejects(async () => { await app.ready() }, {
+          name: 'TypeError',
+          message: `toolArgumentLimits.${field} must be a positive integer or Infinity`
+        })
+      })
+    }
+
+    test(`accepts toolArgumentLimits.${field} = Infinity`, async (t: TestContext) => {
+      const app = Fastify({ logger: false })
+      t.after(() => app.close())
+      app.register(mcpPlugin, { toolArgumentLimits: { [field]: Infinity } })
+      await app.ready()
+    })
+  }
+
+  test('refuses a toolArgumentLimits that is not an object', async (t: TestContext) => {
+    for (const value of [null, 5, 'x', []]) {
+      const app = Fastify({ logger: false })
+      t.after(() => app.close())
+      app.register(mcpPlugin, { toolArgumentLimits: value as any })
+      await t.assert.rejects(async () => { await app.ready() }, {
+        name: 'TypeError',
+        message: 'toolArgumentLimits must be an object'
+      })
+    }
+  })
+
   test('sanitizeToolParams recurses into nested arrays', (t: TestContext) => {
     t.assert.deepStrictEqual(
       sanitizeToolParams({ xs: [[['a\x00b'], [{ s: 'c\x7Fd' }]], [1, null, true]] }),
