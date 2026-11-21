@@ -108,10 +108,14 @@ async function wellKnownRoutes (app: FastifyInstance, authConfig: AuthorizationC
     serveProtectedResourceMetadata(metadataPath, authConfig.resourceUri)
   }
 
-  // Legacy MCP-specific metadata route, kept for backwards compatibility
+  // Legacy MCP-specific metadata route, kept for backwards compatibility.
+  // Clients probing by path insertion for an endpoint at /mcp land here, so it
+  // must advertise resourceUri: that is the server's canonical URI and the only
+  // audience token validation accepts. Advertising `${resourceUri}/mcp` sent
+  // clients after tokens the server then rejected (#341).
   const legacyMcpPath = `${PROTECTED_RESOURCE_METADATA_PATH}/mcp`
   if (metadataPath !== legacyMcpPath) {
-    serveProtectedResourceMetadata(legacyMcpPath, `${authConfig.resourceUri.replace(/\/+$/, '')}/mcp`)
+    serveProtectedResourceMetadata(legacyMcpPath, authConfig.resourceUri)
   }
 
   // Health check endpoint that can be used to verify the resource server is operational
