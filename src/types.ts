@@ -320,12 +320,23 @@ export interface MCPPluginOptions {
    */
   taskMaxTtlMs?: number
   /**
-   * Most tasks one principal (token subject) may keep stored, finished ones
-   * included (default 100). At the cap, the caller's oldest finished task is
-   * evicted; if all of them are still running, the call fails with
-   * "Task limit reached". Without authorization every caller shares one quota.
+   * Most tasks one principal (token issuer and subject) may keep stored,
+   * finished ones included (default 100). At the cap, the caller's oldest
+   * finished task is evicted; if all of them are still running, the call fails
+   * with "Task limit reached". Does not apply to anonymous callers, see
+   * `taskMaxRetainedAnonymous`.
    */
   taskMaxRetainedPerPrincipal?: number
+  /**
+   * Most tasks all anonymous callers (no identity, e.g. without authorization)
+   * may keep stored together, finished ones included (default 1000). Anonymous
+   * callers cannot be told apart, so they are not given a per-principal quota,
+   * which would be one allowance any of them could exhaust for all the others.
+   * At the cap, the oldest finished anonymous task is evicted; if all of them
+   * are still running, the call fails with "Task limit reached". With Redis the
+   * cap is enforced across all instances.
+   */
+  taskMaxRetainedAnonymous?: number
   /**
    * Lease on a running task, in milliseconds (default 30000). The instance
    * executing a task renews it every third of this period; if the instance dies
