@@ -172,6 +172,32 @@ test('stdio transport - rejects a numeric id that is not a safe integer', async 
   assert.strictEqual(infinite.error.code, -32600)
 })
 
+test('stdio transport - rejects request ids that are not a string or an integer (#318)', async (t) => {
+  const { send, sendRaw, stop } = await setupStdio()
+  t.after(stop)
+
+  for (const id of [null, true, false, { a: 1 }, [1], 1.5]) {
+    const response = await send({ jsonrpc: '2.0', id, method: 'ping' })
+    assert.strictEqual(response.id, null, `id ${JSON.stringify(id)}`)
+    assert.strictEqual(response.error.code, -32600)
+    assert.strictEqual(response.result, undefined)
+  }
+
+  // A notification (no id at all) gets no reply, so the next line on the
+  // output answers the ping that follows it
+  const notification = JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })
+  const ping = JSON.stringify({ jsonrpc: '2.0', id: 'after', method: 'ping' })
+  const response = await sendRaw(notification + '\n' + ping)
+  assert.strictEqual(response.id, 'after')
+  assert.deepStrictEqual(response.result, {})
+
+  for (const id of [0, 7, 'abc']) {
+    const ok = await send({ jsonrpc: '2.0', id, method: 'ping' })
+    assert.strictEqual(ok.id, id)
+    assert.deepStrictEqual(ok.result, {})
+  }
+})
+
 test('runStdioServer - resolves only after app.close() completes on input EOF', async () => {
   const app = fastify({ logger: false })
 

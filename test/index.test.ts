@@ -114,6 +114,80 @@ describe('MCP Fastify Plugin', () => {
       t.assert.strictEqual(body.error.code, -32600)
     })
 
+    test('rejects request ids that are not a string or an integer (#318)', async (t: TestContext) => {
+      const app = Fastify()
+      t.after(() => app.close())
+      await app.register(mcpPlugin)
+      await app.ready()
+
+      // basic.md: requests MUST include a string or integer ID, and the ID
+      // MUST NOT be null. Such ids must not be processed and echoed back.
+      for (const id of [null, true, false, { a: 1 }, [1], 1.5]) {
+        const response = await app.inject({
+          method: 'POST',
+          url: '/mcp',
+          payload: { jsonrpc: JSONRPC_VERSION, id, method: 'ping' }
+        })
+
+        t.assert.strictEqual(response.statusCode, 400, `id ${JSON.stringify(id)}`)
+        const body = response.json()
+        t.assert.strictEqual(body.jsonrpc, JSONRPC_VERSION)
+        t.assert.strictEqual(body.id, null)
+        t.assert.strictEqual(body.error.code, INVALID_REQUEST)
+        t.assert.strictEqual(body.result, undefined)
+      }
+    })
+
+    test('still handles a message without an id as a notification', async (t: TestContext) => {
+      const app = Fastify()
+      t.after(() => app.close())
+      await app.register(mcpPlugin)
+      await app.ready()
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/mcp',
+        payload: { jsonrpc: JSONRPC_VERSION, method: 'notifications/initialized' }
+      })
+
+      t.assert.strictEqual(response.statusCode, 202)
+    })
+
+    test('still accepts a client error response with a null id', async (t: TestContext) => {
+      const app = Fastify()
+      t.after(() => app.close())
+      await app.register(mcpPlugin)
+      await app.ready()
+
+      // JSON-RPC 2.0 §5: an error response carries a null id when the request
+      // id could not be determined
+      const response = await app.inject({
+        method: 'POST',
+        url: '/mcp',
+        payload: { jsonrpc: JSONRPC_VERSION, id: null, error: { code: -32700, message: 'Parse error' } }
+      })
+
+      t.assert.strictEqual(response.statusCode, 202)
+    })
+
+    test('accepts string and integer request ids', async (t: TestContext) => {
+      const app = Fastify()
+      t.after(() => app.close())
+      await app.register(mcpPlugin)
+      await app.ready()
+
+      for (const id of [0, 1, -1, 'abc', '']) {
+        const response = await app.inject({
+          method: 'POST',
+          url: '/mcp',
+          payload: { jsonrpc: JSONRPC_VERSION, id, method: 'ping' }
+        })
+
+        t.assert.strictEqual(response.statusCode, 200)
+        t.assert.strictEqual(response.json().id, id)
+      }
+    })
+
     test('accepts the largest safe integer id and large string ids', async (t: TestContext) => {
       const app = Fastify()
       t.after(() => app.close())
