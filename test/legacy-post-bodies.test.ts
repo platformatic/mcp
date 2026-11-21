@@ -14,7 +14,18 @@ const invalidBodies: Array<{ name: string, contentType: string, payload: string 
   { name: 'a string', contentType: 'application/json', payload: '"x"' },
   { name: 'a boolean', contentType: 'application/json', payload: 'true' },
   { name: 'a text/plain body', contentType: 'text/plain', payload: 'hello' },
-  { name: 'an object that is not a JSON-RPC message', contentType: 'application/json', payload: '{"jsonrpc":"2.0","id":1}' }
+  { name: 'an object that is not a JSON-RPC message', contentType: 'application/json', payload: '{"jsonrpc":"2.0","id":1}' },
+  // Issue #344: JSON-RPC 2.0 requires "jsonrpc": "2.0" and a string method
+  { name: 'a request with jsonrpc "1.0"', contentType: 'application/json', payload: '{"jsonrpc":"1.0","id":1,"method":"tools/list"}' },
+  { name: 'a request without jsonrpc', contentType: 'application/json', payload: '{"id":1,"method":"tools/list"}' },
+  { name: 'an initialize without jsonrpc', contentType: 'application/json', payload: '{"id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"c","version":"1"}}}' },
+  { name: 'a request with a numeric jsonrpc', contentType: 'application/json', payload: '{"jsonrpc":2.0,"id":1,"method":"ping"}' },
+  { name: 'a request with a numeric method', contentType: 'application/json', payload: '{"jsonrpc":"2.0","id":1,"method":5}' },
+  { name: 'a request with a null method', contentType: 'application/json', payload: '{"jsonrpc":"2.0","id":1,"method":null}' },
+  { name: 'a notification with a numeric method', contentType: 'application/json', payload: '{"jsonrpc":"2.0","method":5}' },
+  { name: 'a notification without jsonrpc', contentType: 'application/json', payload: '{"method":"notifications/initialized"}' },
+  { name: 'a client response without jsonrpc', contentType: 'application/json', payload: '{"id":1,"result":{}}' },
+  { name: 'a client error response with jsonrpc "1.0"', contentType: 'application/json', payload: '{"jsonrpc":"1.0","id":1,"error":{"code":-1,"message":"x"}}' }
 ]
 
 describe('Legacy POST /mcp bodies', () => {

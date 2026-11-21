@@ -129,6 +129,23 @@ export function checkRequestId (message: unknown): JSONRPCError | null {
 }
 
 /**
+ * JSON-RPC 2.0 requires every message to carry `"jsonrpc": "2.0"`, and a
+ * request or notification to carry a string `method`. Anything else is an
+ * Invalid Request. Batches are left to `processMessage`, which refuses them.
+ * Returns the error to send, or null if the message is acceptable.
+ */
+export function checkJSONRPCVersion (message: unknown): JSONRPCError | null {
+  if (message === null || typeof message !== 'object' || Array.isArray(message)) return null
+  if ((message as { jsonrpc?: unknown }).jsonrpc !== JSONRPC_VERSION) {
+    return createError(null, INVALID_REQUEST, 'Invalid Request: jsonrpc must be "2.0"')
+  }
+  if ('method' in message && typeof (message as { method?: unknown }).method !== 'string') {
+    return createError(null, INVALID_REQUEST, 'Invalid Request: method must be a string')
+  }
+  return null
+}
+
+/**
  * Pick the protocol revision to use for this session.
  *
  * The spec requires that we echo back the client's requested version when we
@@ -1694,6 +1711,8 @@ export async function processMessage (
     // otherwise surface as an opaque HTTP 500.
     return createError(null, INVALID_REQUEST, 'Batch requests are not supported')
   }
+  const versionError = checkJSONRPCVersion(message)
+  if (versionError) return versionError
   if ('id' in message && 'method' in message) {
     return await handleRequest(message as JSONRPCRequest, sessionId, dependencies)
   } else if ('method' in message) {

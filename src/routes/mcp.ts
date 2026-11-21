@@ -19,7 +19,7 @@ import type { TaskStore, TaskWaiters, TaskLeases } from '../stores/task-store.ts
 import type { MessageBroker } from '../brokers/message-broker.ts'
 import type { AuthorizationContext } from '../types/auth-types.ts'
 import type { JsonSchemaValidator } from '../validation/json-schema-validator.ts'
-import { processMessage, checkRequestId } from '../handlers.ts'
+import { processMessage, checkRequestId, checkJSONRPCVersion } from '../handlers.ts'
 import { isStdioRequest } from '../stdio-marker.ts'
 
 const MAX_TIMER_DELAY_MS = 2 ** 31 - 1
@@ -433,6 +433,12 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         const idError = checkRequestId(message)
         if (idError) {
           return reply.code(400).type('application/json').send(idError)
+        }
+        // processMessage refuses these too, but answer 400 here, before a
+        // session is created for them
+        const versionError = checkJSONRPCVersion(message)
+        if (versionError) {
+          return reply.code(400).type('application/json').send(versionError)
         }
 
         let sessionId = request.headers['mcp-session-id'] as string | undefined
