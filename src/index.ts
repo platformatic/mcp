@@ -102,6 +102,14 @@ const mcpPlugin = fp(async function (app: FastifyInstance, opts: MCPPluginOption
     // Checked before any Redis connection is opened, so a bad value cannot leak one
     validateTaskLimit('taskMaxRetainedPerPrincipal', opts.taskMaxRetainedPerPrincipal)
   }
+  // A zero lease lapses at once and a NaN or negative ttl expires every task, so
+  // reject them (and strings read from env variables) here rather than at runtime
+  for (const name of ['taskLeaseMs', 'taskDefaultTtlMs', 'taskMaxTtlMs'] as const) {
+    const value: unknown = opts[name]
+    if (value !== undefined && !(Number.isSafeInteger(value) && (value as number) > 0)) {
+      throw new TypeError(`${name} must be a positive integer number of milliseconds, got ${String(value)}`)
+    }
+  }
   const tools = new Map<string, MCPTool>()
   const resources = new Map<string, MCPResource>()
   const prompts = new Map<string, MCPPrompt>()
