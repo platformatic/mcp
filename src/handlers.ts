@@ -42,6 +42,7 @@ import { InvalidTaskCursorError, TaskLimitError, TASK_LIMIT_REACHED, TASK_OWNER_
 import type { AuthorizationContext } from './types/auth-types.ts'
 import {
   supportsTasks,
+  supportsBatching,
   supportsSchemaDialect,
   trimDefinitionToRevision,
   capabilitiesForRevision
@@ -1683,16 +1684,74 @@ async function handleClientResponse (response: JSONRPCResponse, dependencies: Ha
   }
 }
 
-export async function processMessage (
-  message: JSONRPCMessage,
+/** What a POST body or stdio line can be answered with: one response, a batch of them, or nothing */
+export type ProcessMessageResult = JSONRPCResponse | JSONRPCError | Array<JSONRPCResponse | JSONRPCError> | null
+
+/**
+ * A JSON-RPC 2.0 batch, for clients that negotiated a revision that has them
+ * (2025-03-26 and earlier; 2025-06-18 removed batching).
+ *
+ * Every entry is answered on its own: an invalid entry gets its own error, a
+ * notification or a client response contributes nothing, and a batch that
+ * yields nothing at all is answered with nothing. Entries run concurrently, as
+ * JSON-RPC allows, so one long-running request does not hold up the others.
+ */
+async function processBatch (
+  batch: unknown[],
+  sessionId: string | undefined,
+  dependencies: HandlerDependencies
+): Promise<ProcessMessageResult> {
+  const { protocolVersion } = dependencies
+  if (!supportsBatching(protocolVersion)) {
+    return createError(null, INVALID_REQUEST, `Batch requests are not supported in protocol version ${protocolVersion}`)
+  }
+  if (batch.length === 0) {
+    return createError(null, INVALID_REQUEST, 'Invalid Request: empty batch')
+  }
+
+  const responses = await Promise.all(batch.map(entry => processBatchEntry(entry, sessionId, dependencies)))
+  const answered = responses.filter((response): response is JSONRPCResponse | JSONRPCError => response !== null)
+  return answered.length > 0 ? answered : null
+}
+
+async function processBatchEntry (
+  entry: unknown,
   sessionId: string | undefined,
   dependencies: HandlerDependencies
 ): Promise<JSONRPCResponse | JSONRPCError | null> {
+  if (typeof entry !== 'object' || entry === null || Array.isArray(entry) ||
+    !('method' in entry || 'result' in entry || 'error' in entry)) {
+    return createError(null, INVALID_REQUEST, 'Invalid Request')
+  }
+
+  const idError = checkRequestId(entry)
+  if (idError) return idError
+
+  const id = 'id' in entry ? (entry.id as string | number | null) : null
+  if ((entry as { method?: unknown }).method === 'initialize') {
+    // 2025-03-26 lifecycle: the initialization request MUST NOT be part of a batch
+    return createError(id ?? null, INVALID_REQUEST, 'Invalid Request: initialize must not be part of a JSON-RPC batch')
+  }
+
+  try {
+    return await processMessage(entry as JSONRPCMessage, sessionId, dependencies) as JSONRPCResponse | JSONRPCError | null
+  } catch (error) {
+    dependencies.app.log.error({ err: error }, 'Error processing JSON-RPC batch entry')
+    return 'method' in entry && id !== null && id !== undefined
+      ? createError(id, INTERNAL_ERROR, 'Internal server error')
+      : null
+  }
+}
+
+export async function processMessage (
+  message: JSONRPCMessage | unknown[],
+  sessionId: string | undefined,
+  dependencies: HandlerDependencies
+): Promise<ProcessMessageResult> {
   if (Array.isArray(message)) {
-    // JSON-RPC batching was removed in the 2025-06-18 revision. Refuse it with a
-    // proper protocol error rather than throwing, which the transport would
-    // otherwise surface as an opaque HTTP 500.
-    return createError(null, INVALID_REQUEST, 'Batch requests are not supported')
+    // Refused with a protocol error, not a throw, for revisions without
+    // batching: the transport would otherwise surface it as an opaque HTTP 500.
+    return await processBatch(message, sessionId, dependencies)
   }
   if ('id' in message && 'method' in message) {
     return await handleRequest(message as JSONRPCRequest, sessionId, dependencies)

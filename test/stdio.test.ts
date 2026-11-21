@@ -136,9 +136,10 @@ test('stdio transport - later requests use the version negotiated in initialize'
   assert.deepStrictEqual(tool.icons, [{ src: 'https://example.com/icon.png', mimeType: 'image/png' }])
   assert.strictEqual(tool.inputSchema.$schema, 'https://json-schema.org/draft/2020-12/schema')
 
-  // Batched requests carry the negotiated version too
+  // Batched requests are judged by the negotiated version too: 2025-11-25 has no batching
   const batch = await send([{ jsonrpc: '2.0', id: 3, method: 'tools/list' }])
-  assert.strictEqual(batch[0].result.tools[0].inputSchema.$schema, 'https://json-schema.org/draft/2020-12/schema')
+  assert.strictEqual(batch.error.code, -32600)
+  assert.strictEqual(batch.id, null)
 })
 
 test('stdio transport - re-initialize switches the negotiated version', async (t) => {

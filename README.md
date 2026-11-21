@@ -224,6 +224,18 @@ never sees a field or method that revision does not define:
 | `$schema` on tool schemas | omitted | JSON Schema 2020-12 |
 | URL mode elicitation | refused | available |
 
+**JSON-RPC batching follows the negotiated revision too**, on both HTTP and stdio. Batches
+were spelled out in `2025-03-26` and removed in `2025-06-18`:
+
+| | `2024-11-05`, `2025-03-26` | `2025-06-18`, `2025-11-25` |
+|---|---|---|
+| Array body | array of responses (notifications and client responses add no entry) | refused: one `-32600` error with `id: null` |
+| Only notifications / responses | HTTP `202`, no body (stdio writes nothing) | refused |
+| Empty array | one `-32600` error | refused |
+| `initialize` inside a batch | that entry gets `-32600` (it MUST NOT be batched) | refused |
+
+Entries in an accepted batch run concurrently, and an invalid entry only fails itself.
+
 The negotiated revision is stored on the session and is **authoritative**:
 a request whose `MCP-Protocol-Version` header contradicts what the session agreed is rejected
 with `400`, so a client cannot opt into newer behaviour after negotiating an older revision.
@@ -1288,7 +1300,7 @@ The plugin includes a built-in stdio transport utility for MCP communication ove
 - **Complete MCP stdio transport implementation** following the official specification
 - **Fastify integration** using the `.inject()` method for consistency with HTTP routes
 - **Comprehensive error handling** with proper JSON-RPC error responses
-- **Batch request support** for processing multiple messages at once
+- **Batch request support** for clients that negotiated `2025-03-26` or earlier (see [Protocol Version Negotiation](#protocol-version-negotiation))
 - **Debug logging** to stderr without interfering with the stdio protocol
 
 ### Quick Start
@@ -1392,7 +1404,7 @@ The stdio transport follows the MCP stdio transport specification:
 - Messages are delimited by newlines
 - Messages must NOT contain embedded newlines
 - Server logs can be written to stderr
-- Supports both single messages and batch requests
+- Supports single messages, and batch requests when the negotiated revision is `2025-03-26` or earlier
 - The protocol version negotiated by `initialize` applies to every later message on the stream (a new `initialize` re-negotiates it)
 
 ### Error Handling
