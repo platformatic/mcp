@@ -2,6 +2,7 @@ import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify'
 import fp from 'fastify-plugin'
 import type { AuthorizationConfig, ProtectedResourceMetadata } from '../types/auth-types.ts'
 import { getResourceMetadataPath, PROTECTED_RESOURCE_METADATA_PATH } from '../auth/resource-metadata.ts'
+import { kPublicRoute } from '../auth/prehandler.ts'
 
 interface WellKnownRoutesOptions {
   authConfig?: AuthorizationConfig
@@ -35,6 +36,10 @@ const wellKnownRoutesPlugin = fp(async function (fastify: FastifyInstance, opts:
   name: 'well-known-routes'
 })
 
+// Discovery must work before the client has a token, so the bearer-token check
+// skips these routes, matched by route rather than URL so a prefix is fine
+const publicRoute = { [kPublicRoute]: true }
+
 async function wellKnownRoutes (app: FastifyInstance, authConfig: AuthorizationConfig & { enabled: true }) {
   // Discovery endpoints are public, so allow cross-origin requests from any origin
   app.addHook('onRequest', async (request, reply) => {
@@ -54,11 +59,12 @@ async function wellKnownRoutes (app: FastifyInstance, authConfig: AuthorizationC
   })
 
   // Lets the router accept preflight requests; they are answered in the hook above
-  app.options('/.well-known/*', async (_request, reply) => {
+  app.options('/.well-known/*', { config: publicRoute }, async (_request, reply) => {
     return reply.callNotFound()
   })
 
   const protectedResourceSchema = {
+    config: publicRoute,
     schema: {
       response: {
         200: {
@@ -116,6 +122,7 @@ async function wellKnownRoutes (app: FastifyInstance, authConfig: AuthorizationC
 
   // Health check endpoint that can be used to verify the resource server is operational
   app.get('/.well-known/mcp-resource-health', {
+    config: publicRoute,
     schema: {
       response: {
         200: {
