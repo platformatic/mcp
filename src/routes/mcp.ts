@@ -316,13 +316,7 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
         } else {
           app.log.debug({ sessionId }, 'Received message for session via broker, storing in history without active streams')
           // Store message in history even without active streams for session persistence
-          const session = await sessionStore.get(sessionId)
-          if (session) {
-            const eventId = (++session.eventId).toString()
-            session.lastEventId = eventId
-            session.lastActivity = new Date()
-            await sessionStore.addMessage(sessionId, eventId, message)
-          }
+          await sessionStore.addMessage(sessionId, message)
         }
       } catch (error) {
         app.log.error({ err: error, sessionId }, 'Failed to deliver message to session')
@@ -344,16 +338,12 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
   }
 
   async function sendSSEToStreams (sessionId: string, message: JSONRPCMessage, streams: Set<FastifyReply>): Promise<void> {
-    const session = await sessionStore.get(sessionId)
-    if (!session) return
+    // The store allocates the event id atomically while recording the message
+    // in history, so overlapping deliveries never reuse an id
+    const eventId = await sessionStore.addMessage(sessionId, message)
+    if (eventId === null) return
 
-    const eventId = (++session.eventId).toString()
     const sseEvent = `id: ${eventId}\ndata: ${JSON.stringify(message)}\n\n`
-    session.lastEventId = eventId
-    session.lastActivity = new Date()
-
-    // Store message in history
-    await sessionStore.addMessage(sessionId, eventId, message)
 
     // Send to all connected streams in this session
     const deadStreams = new Set<FastifyReply>()
