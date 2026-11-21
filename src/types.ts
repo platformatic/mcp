@@ -247,6 +247,8 @@ export type McpCallToolOutcome =
   | { ok: false, reason: 'access-denied' }
   | { ok: false, reason: 'invalid-arguments', detail: string }
   | { ok: false, reason: 'task-required' }
+  /** The handler returned something that is not a `CallToolResult` (no `content` array); details are logged */
+  | { ok: false, reason: 'invalid-result' }
 
 interface MCPToolCallCompleteEventBase {
   toolName: string
