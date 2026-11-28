@@ -581,18 +581,12 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
           method: 'GET'
         }, 'Added new stream to session')
 
-        // Handle resumability with Last-Event-ID
-        const lastEventId = request.headers['last-event-id'] as string
-        if (lastEventId) {
-          app.log.info(`Resuming SSE stream from event ID: ${lastEventId}`)
-          await replayMessagesFromEventId(session.id, lastEventId, reply)
-        }
-
-        // Handle connection close
-        reply.raw.on('close', () => {
+        // Handle connection close. Registered before anything else is awaited:
+        // a stream whose client left in the meantime would otherwise stay in
+        // the session forever, and every later GET would get 409.
+        const removeStream = () => {
           const streams = localStreams.get(session.id)
-          if (streams) {
-            streams.delete(reply)
+          if (streams?.delete(reply)) {
             app.log.info({
               sessionId: session.id,
               remainingStreams: streams.size
@@ -608,7 +602,25 @@ const mcpPubSubRoutesPlugin: FastifyPluginAsync<MCPPubSubRoutesOptions> = async 
               })
             }
           }
-        })
+        }
+        raw.on('close', removeStream)
+
+        // The client may already have left while the session was looked up,
+        // in which case 'close' has fired before the listener was added
+        if (raw.destroyed) {
+          removeStream()
+          return
+        }
+
+        // Handle resumability with Last-Event-ID
+        const lastEventId = request.headers['last-event-id'] as string
+        if (lastEventId) {
+          app.log.info(`Resuming SSE stream from event ID: ${lastEventId}`)
+          await replayMessagesFromEventId(session.id, lastEventId, reply)
+          // Gone during the replay: the stream was removed on 'close', and
+          // timers set up below would never be cleared
+          if (raw.destroyed) return
+        }
 
         // SEP-1699: servers may end an SSE stream whenever they like, turning the
         // stream into a polling channel. The client reconnects with Last-Event-ID
