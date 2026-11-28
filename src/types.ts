@@ -344,7 +344,8 @@ export interface MCPPluginOptions {
    * `maxStringLength` 10000, `maxObjectProperties` 100, `maxDepth` 10,
    * `maxArrayLength` unlimited. Arrays are not counted as object properties.
    * Pass `Infinity` to disable a limit; Fastify's `bodyLimit` still caps the
-   * total request size.
+   * total request size. Any other value must be a positive integer, or
+   * registration throws.
    */
   toolArgumentLimits?: ToolArgumentLimits
   /**
