@@ -247,8 +247,22 @@ enabled:
   `Allow: POST, DELETE`.
 
 With SSE disabled, requests that do not carry an `Mcp-Session-Id` keep working statelessly and
-no session is created for them. With SSE enabled, every request without a known session id gets
+no session is created for them. With SSE enabled, every request without an `Mcp-Session-Id` gets
 a new session, as before.
+
+A request that carries an `Mcp-Session-Id` the server does not know (never issued, terminated
+with `DELETE`, or expired) is answered `404` on `POST`, `GET` and `DELETE`, and no new session is
+created for it. On `POST` the body is a JSON-RPC error:
+
+```json
+{ "jsonrpc": "2.0", "id": null, "error": { "code": -32001, "message": "Session not found" } }
+```
+
+As the Streamable HTTP transport requires, the client should then start over with an
+`initialize` request without the header. An `initialize` that still carries the stale id is
+accepted too and gets a fresh session. A session bound to another user's access token is
+treated exactly like an unknown one. With the memory backend, sessions live in a single
+process, so deployments running several instances need sticky sessions or the `redis` option.
 
 Sessions expire after `sessionTtlMs` milliseconds without activity (default `3600000`, one
 hour), so clients that disconnect without sending `DELETE` do not leave sessions behind. Every
