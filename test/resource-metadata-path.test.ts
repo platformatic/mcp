@@ -6,7 +6,7 @@ import { getResourceMetadataUrl } from '../src/auth/resource-metadata.ts'
 import { createSessionAuthPreHandler } from '../src/auth/session-auth-prehandler.ts'
 import { TokenValidator } from '../src/auth/token-validator.ts'
 import { MemorySessionStore } from '../src/stores/memory-session-store.ts'
-import { createTestAuthConfig } from './auth-test-utils.ts'
+import { createTestAuthConfig, createTestJWT, generateMockJWKSResponse, setupMockAgent } from './auth-test-utils.ts'
 
 // RFC 9728 §3.1: the metadata URL is the origin, then
 // /.well-known/oauth-protected-resource, then the resource path.
@@ -130,4 +130,41 @@ describe('Protected resource metadata URL (RFC 9728 §3.1)', () => {
     t.assert.ok((response.headers['www-authenticate'] as string).includes(
       'resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource/mcp"'))
   })
+})
+
+// Issue #341: every metadata document must advertise a resource whose tokens
+// the server then accepts, whichever well-known URL the client discovered.
+describe('Advertised resource is accepted as token audience', () => {
+  for (const url of [
+    '/.well-known/oauth-protected-resource',
+    '/.well-known/oauth-protected-resource/mcp'
+  ]) {
+    test(`token for the resource advertised at ${url} is accepted`, async (t: TestContext) => {
+      const restoreMock = setupMockAgent({
+        'https://auth.example.com/.well-known/jwks.json': generateMockJWKSResponse()
+      })
+      t.after(restoreMock)
+
+      const app = Fastify({ logger: false })
+      t.after(() => app.close())
+
+      await app.register(mcpPlugin, {
+        serverInfo: { name: 'test-server', version: '1.0.0' },
+        authorization: createTestAuthConfig({ resourceUri: 'https://mcp.example.com' })
+      })
+      await app.ready()
+
+      const metadata = await app.inject({ method: 'GET', url })
+      t.assert.strictEqual(metadata.statusCode, 200)
+      const { resource } = metadata.json()
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/mcp',
+        headers: { authorization: `Bearer ${createTestJWT({ aud: resource })}` },
+        payload: { jsonrpc: '2.0', id: 1, method: 'ping' }
+      })
+      t.assert.strictEqual(response.statusCode, 200, response.body)
+    })
+  }
 })
