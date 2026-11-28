@@ -1,10 +1,13 @@
 import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify'
 import fp from 'fastify-plugin'
 import type { AuthorizationConfig, ProtectedResourceMetadata } from '../types/auth-types.ts'
+import type { MCPRouteSchemaTransformer } from '../types.ts'
+import { routeSchemaOptions } from './route-schema.ts'
 import { getResourceMetadataPath, PROTECTED_RESOURCE_METADATA_PATH } from '../auth/resource-metadata.ts'
 
 interface WellKnownRoutesOptions {
   authConfig?: AuthorizationConfig
+  transformRouteSchema?: MCPRouteSchemaTransformer
 }
 
 const CORS_ALLOWED_METHODS = 'GET, HEAD, OPTIONS'
@@ -30,12 +33,16 @@ const wellKnownRoutesPlugin = fp(async function (fastify: FastifyInstance, opts:
   // @fastify/cors is not used here: it decorates the request and adds a
   // global OPTIONS * route, both of which clash with an app-level
   // @fastify/cors registration.
-  await fastify.register(async (app) => wellKnownRoutes(app, authConfig))
+  await fastify.register(async (app) => wellKnownRoutes(app, authConfig, opts.transformRouteSchema))
 }, {
   name: 'well-known-routes'
 })
 
-async function wellKnownRoutes (app: FastifyInstance, authConfig: AuthorizationConfig & { enabled: true }) {
+async function wellKnownRoutes (
+  app: FastifyInstance,
+  authConfig: AuthorizationConfig & { enabled: true },
+  transformRouteSchema?: MCPRouteSchemaTransformer
+) {
   // Discovery endpoints are public, so allow cross-origin requests from any origin
   app.addHook('onRequest', async (request, reply) => {
     const origin = request.headers.origin
@@ -54,34 +61,33 @@ async function wellKnownRoutes (app: FastifyInstance, authConfig: AuthorizationC
   })
 
   // Lets the router accept preflight requests; they are answered in the hook above
-  app.options('/.well-known/*', async (_request, reply) => {
+  app.options('/.well-known/*', routeSchemaOptions(app, 'wellKnown.preflight', 'OPTIONS', '/.well-known/*', undefined, transformRouteSchema), async (_request, reply) => {
     return reply.callNotFound()
   })
 
   const protectedResourceSchema = {
-    schema: {
-      response: {
-        200: {
-          type: 'object',
-          properties: {
-            resource: { type: 'string' },
-            authorization_servers: {
-              type: 'array',
-              items: { type: 'string' }
-            },
-            scopes_supported: {
-              type: 'array',
-              items: { type: 'string' }
-            }
+    response: {
+      200: {
+        type: 'object',
+        properties: {
+          resource: { type: 'string' },
+          authorization_servers: {
+            type: 'array',
+            items: { type: 'string' }
           },
-          required: ['resource', 'authorization_servers']
-        }
+          scopes_supported: {
+            type: 'array',
+            items: { type: 'string' }
+          }
+        },
+        required: ['resource', 'authorization_servers']
       }
     }
   }
 
   function serveProtectedResourceMetadata (path: string, resource: string) {
-    app.get(path, protectedResourceSchema, async (_request: FastifyRequest, reply: FastifyReply) => {
+    const options = routeSchemaOptions(app, 'wellKnown.protectedResourceMetadata', 'GET', path, protectedResourceSchema, transformRouteSchema)
+    app.get(path, options, async (_request: FastifyRequest, reply: FastifyReply) => {
       const metadata: ProtectedResourceMetadata = {
         resource,
         authorization_servers: authConfig.authorizationServers
@@ -115,21 +121,21 @@ async function wellKnownRoutes (app: FastifyInstance, authConfig: AuthorizationC
   }
 
   // Health check endpoint that can be used to verify the resource server is operational
-  app.get('/.well-known/mcp-resource-health', {
-    schema: {
-      response: {
-        200: {
-          type: 'object',
-          properties: {
-            status: { type: 'string' },
-            resource: { type: 'string' },
-            timestamp: { type: 'string' }
-          },
-          required: ['status', 'resource', 'timestamp']
-        }
+  const healthPath = '/.well-known/mcp-resource-health'
+  const healthSchema = {
+    response: {
+      200: {
+        type: 'object',
+        properties: {
+          status: { type: 'string' },
+          resource: { type: 'string' },
+          timestamp: { type: 'string' }
+        },
+        required: ['status', 'resource', 'timestamp']
       }
     }
-  }, async (_request: FastifyRequest, reply: FastifyReply) => {
+  }
+  app.get(healthPath, routeSchemaOptions(app, 'wellKnown.resourceHealth', 'GET', healthPath, healthSchema, transformRouteSchema), async (_request: FastifyRequest, reply: FastifyReply) => {
     reply.header('Content-Type', 'application/json')
 
     return {
