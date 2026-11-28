@@ -50,7 +50,13 @@ export interface SessionStore {
   cleanup(): Promise<void>
 
   // Message history operations
-  addMessage(sessionId: string, eventId: string, message: JSONRPCMessage): Promise<void>
+  /**
+   * Append a message to the session history under the next SSE event id and
+   * return that id, or null when the session is gone. Allocating the id and
+   * storing the message is one atomic step, so concurrent deliveries to the
+   * same session always get distinct, ascending ids.
+   */
+  addMessage(sessionId: string, message: JSONRPCMessage): Promise<string | null>
   getMessagesFrom(sessionId: string, fromEventId: string): Promise<Array<{ eventId: string, message: JSONRPCMessage }>>
 
   // Token-to-session mapping operations
