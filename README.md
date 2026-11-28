@@ -887,6 +887,33 @@ await app.register(mcpPlugin, {
 })
 ```
 
+The `redis` option accepts three forms:
+
+| Form | Example | Who owns the connection |
+| --- | --- | --- |
+| `RedisOptions` object | `{ host: 'localhost', port: 6379 }` | The plugin: it creates the client, logs its errors, and quits it on `app.close()` |
+| Redis URL string | `'redis://:secret@redis.example.com:6379/0'` | The plugin, as above |
+| ioredis `Redis` client | `new Redis(...)` | You: the plugin uses it but never quits it and adds no `error` listener to it |
+
+Pass your own client when you want to control connecting, reconnecting and error handling yourself, or share one connection with the rest of your application:
+
+```typescript
+import { Redis } from 'ioredis'
+
+const redis = new Redis(process.env.REDIS_URL)
+redis.on('error', (err) => app.log.error({ err }, 'Redis error'))
+
+await app.register(mcpPlugin, { enableSSE: true, redis })
+
+// ...later, on shutdown: close the plugin first, then your client
+await app.close()
+await redis.quit()
+```
+
+If you would rather close it from an `onClose` hook, add that hook before registering the plugin: Fastify runs `onClose` hooks in reverse order, so it then runs after the plugin's own cleanup.
+
+The message broker needs dedicated pub/sub connections, which the plugin derives from your client with `redis.duplicate()`. Those duplicates belong to the plugin and are closed on `app.close()`; your client stays open.
+
 ### Message Broker Exports
 
 `MemoryMessageBroker`, `RedisMessageBroker`, and the `MessageBroker` interface are exported from the package's public entry point, so you can use them directly without deep-importing into `dist/brokers/...`:
