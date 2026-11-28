@@ -389,6 +389,68 @@ describe('task store', () => {
       /Task limit reached/
     )
   })
+
+  test('MemoryTaskStore does not share one per-principal quota across anonymous callers', async (t: TestContext) => {
+    // #320: without an identity every caller would otherwise be one owner, so
+    // any of them could evict or lock out everyone else's tasks
+    const store = new MemoryTaskStore({ maxTasks: 10, maxTasksPerPrincipal: 2 })
+    await store.create(record({ taskId: 'a', ttl: 3600_000 }))
+    await store.updateStatus('a', 'completed')
+
+    // Other anonymous callers create more tasks than the per-principal cap
+    for (const id of ['b', 'c', 'd']) {
+      await store.create(record({ taskId: id }))
+    }
+
+    // A's finished task was not evicted before A collected it
+    t.assert.strictEqual((await store.get('a'))?.status, 'completed')
+    for (const id of ['b', 'c', 'd']) {
+      t.assert.ok(await store.get(id))
+    }
+  })
+
+  test('MemoryTaskStore bounds anonymous tasks by the anonymous cap', async (t: TestContext) => {
+    const store = new MemoryTaskStore({ maxTasks: 10, maxTasksPerPrincipal: 1, maxAnonymousTasks: 3 })
+    await store.create(record({ taskId: 'a' }))
+    await store.create(record({ taskId: 'b' }))
+    await store.create(record({ taskId: 'c' }))
+
+    // All still running: nothing to evict
+    await t.assert.rejects(
+      () => store.create(record({ taskId: 'd' })),
+      (err: any) => err instanceof TaskLimitError && err.limit === 3
+    )
+
+    // Once one finishes, the oldest finished anonymous task makes room
+    await store.updateStatus('b', 'completed')
+    await store.create(record({ taskId: 'd' }))
+    t.assert.strictEqual(await store.get('b'), null)
+    t.assert.ok(await store.get('a'))
+    t.assert.ok(await store.get('d'))
+
+    // Identified callers keep their own per-principal quota
+    await store.create(record({ taskId: 'x', authSubject: 'user-1', authIssuer: ISS }))
+    await t.assert.rejects(
+      () => store.create(record({ taskId: 'y', authSubject: 'user-1', authIssuer: ISS })),
+      (err: any) => err instanceof TaskLimitError && err.limit === 1
+    )
+  })
+
+  test('MemoryTaskStore bounds anonymous tasks by the store-wide cap', async (t: TestContext) => {
+    const store = new MemoryTaskStore({ maxTasks: 3, maxTasksPerPrincipal: 1 })
+    await store.create(record({ taskId: 'a' }))
+    await store.create(record({ taskId: 'b' }))
+    await store.create(record({ taskId: 'c' }))
+
+    await t.assert.rejects(
+      () => store.create(record({ taskId: 'd' })),
+      (err: any) => err instanceof TaskLimitError && err.limit === 3
+    )
+  })
+
+  test('MemoryTaskStore validates maxAnonymousTasks', (t: TestContext) => {
+    t.assert.throws(() => new MemoryTaskStore({ maxAnonymousTasks: 0 }), /maxAnonymousTasks must be a positive integer/)
+  })
 })
 
 describe('task augmentation rules', () => {
@@ -756,7 +818,7 @@ describe('tasks over the wire', () => {
   })
 
   test('a caller over its task quota gets "Task limit reached", not an internal error', async (t: TestContext) => {
-    const app = await buildApp(t, { taskMaxRetainedPerPrincipal: 1 })
+    const app = await buildApp(t, { taskMaxRetainedAnonymous: 1 })
     app.mcpAddTool({
       name: 'hang',
       description: 'Never finishes',
@@ -773,7 +835,7 @@ describe('tasks over the wire', () => {
   })
 
   test('a finished task is evicted so the same caller can start another', async (t: TestContext) => {
-    const app = await buildApp(t, { taskMaxRetainedPerPrincipal: 1 })
+    const app = await buildApp(t, { taskMaxRetainedAnonymous: 1 })
 
     const first = await call(app, 'tools/call', { name: 'slow-add', arguments: { a: 1, b: 2 }, task: { ttl: 3600_000 } })
     await waitForTerminal(app, first.result.task.taskId)
@@ -782,6 +844,36 @@ describe('tasks over the wire', () => {
     t.assert.ok(second.result.task.taskId)
     const gone = await call(app, 'tasks/get', { taskId: first.result.task.taskId })
     t.assert.strictEqual(gone.error.code, INVALID_PARAMS)
+  })
+
+  test('anonymous callers do not share the per-principal quota (#320)', async (t: TestContext) => {
+    const app = await buildApp(t, { taskMaxRetainedPerPrincipal: 2 })
+
+    // Client A's task completes
+    const a = await call(app, 'tools/call', { name: 'slow-add', arguments: { a: 1, b: 2 }, task: { ttl: 3600_000 } })
+    t.assert.strictEqual((await waitForTerminal(app, a.result.task.taskId)).status, 'completed')
+
+    // Other anonymous callers create more tasks than the per-principal cap
+    for (let i = 0; i < 3; i++) {
+      const other = await call(app, 'tools/call', { name: 'slow-add', arguments: { a: i, b: i }, task: { ttl: 3600_000 } }, i + 2)
+      t.assert.ok(other.result.task.taskId)
+    }
+
+    // A can still collect its result
+    const got = await call(app, 'tasks/get', { taskId: a.result.task.taskId })
+    t.assert.strictEqual(got.result.status, 'completed')
+  })
+
+  test('rejects an invalid taskMaxRetainedAnonymous', async (t: TestContext) => {
+    const app = Fastify({ logger: false })
+    t.after(() => app.close())
+    await t.assert.rejects(
+      async () => {
+        await app.register(mcpPlugin, { enableTasks: true, taskMaxRetainedAnonymous: 0 })
+        await app.ready()
+      },
+      /taskMaxRetainedAnonymous must be a positive integer/
+    )
   })
 
   test('task methods are unavailable when tasks are disabled', async (t: TestContext) => {
