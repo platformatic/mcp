@@ -5,14 +5,12 @@ import type {
   JSONRPCMessage,
   JSONRPCResponse,
   JSONRPCError,
-  JSONRPCRequest,
-  JSONRPCNotification
+  RequestId
 } from './schema.ts'
 import { checkRequestId } from './handlers.ts'
 import { STDIO_TRANSPORT_HEADER, STDIO_TOKEN_HEADER, STDIO_TOKEN } from './stdio-marker.ts'
 
-// Local batch types for JSON-RPC 2.0 compatibility
-type JSONRPCBatchRequest = (JSONRPCRequest | JSONRPCNotification)[]
+// Local batch type for JSON-RPC 2.0 compatibility
 type JSONRPCBatchResponse = (JSONRPCResponse | JSONRPCError)[]
 
 /**
@@ -171,9 +169,16 @@ export class StdioTransport {
       const message: JSONRPCMessage = JSON.parse(line)
       this.log('Received message:', message)
 
-      // Handle batch requests
+      // Whether a batch is allowed depends on the negotiated revision
+      // (2025-06-18 removed batching), so hand it to the HTTP handler whole and
+      // let it decide, exactly as it does for the HTTP transport. The raw line
+      // is forwarded, not the parsed array: re-serializing would turn an id
+      // like 1e400 into null before the handler could refuse it.
       if (Array.isArray(message)) {
-        await this.handleBatchMessage(message as JSONRPCBatchRequest)
+        const response = await this.inject(line, false, null)
+        if (response) {
+          this.sendMessage(response)
+        }
         return
       }
 
@@ -208,25 +213,6 @@ export class StdioTransport {
   }
 
   /**
-   * Handle batch JSON-RPC messages
-   */
-  private async handleBatchMessage (batch: JSONRPCBatchRequest): Promise<void> {
-    const responses: JSONRPCBatchResponse = []
-
-    for (const message of batch) {
-      const response = await this.processMessage(message)
-      if (response) {
-        responses.push(response)
-      }
-    }
-
-    // Only send response if we have any responses
-    if (responses.length > 0) {
-      this.sendMessage(responses)
-    }
-  }
-
-  /**
    * Process a single JSON-RPC message using Fastify's inject method
    */
   private async processMessage (message: JSONRPCMessage): Promise<JSONRPCResponse | JSONRPCError | null> {
@@ -237,6 +223,17 @@ export class StdioTransport {
     const idError = checkRequestId(message)
     if (idError) return idError
 
+    return await this.inject(message, isInitialize, ('id' in message) ? message.id ?? 0 : 0) as JSONRPCResponse | JSONRPCError | null
+  }
+
+  /**
+   * Hand a message, or a raw batch line, to the /mcp route via Fastify's inject
+   */
+  private async inject (
+    payload: JSONRPCMessage | string,
+    isInitialize: boolean,
+    errorId: RequestId | null
+  ): Promise<JSONRPCResponse | JSONRPCError | JSONRPCBatchResponse | null> {
     try {
       const headers: Record<string, string> = {
         'content-type': 'application/json',
@@ -254,7 +251,7 @@ export class StdioTransport {
         method: 'POST',
         url: '/mcp',
         headers,
-        payload: message
+        payload
       })
 
       // Parse the response
@@ -279,7 +276,7 @@ export class StdioTransport {
       // Return a generic error response
       const errorResponse: JSONRPCError = {
         jsonrpc: '2.0',
-        id: ('id' in message) ? message.id : 0,
+        id: errorId as RequestId,
         error: {
           code: -32603, // Internal error
           message: 'Internal server error',
