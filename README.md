@@ -284,20 +284,40 @@ error on your other routes, still goes to your own (or Fastify's default) error 
 
 ## Origin Validation
 
-Browser clients can be protected against DNS rebinding by allow-listing origins. A rejected
-origin is answered with `403`:
+The `Origin` header is validated on every `/mcp` request (`POST`, `GET` and `DELETE`) to
+protect browser clients against DNS rebinding. A rejected origin is answered with `403`.
+
+By default, when `allowedOrigins` is not set, only these origins are accepted:
+
+- loopback origins: `localhost`, `127.0.0.0/8` and `[::1]`, on any port, over `http` or `https`
+- the server's own host, i.e. an origin whose `host:port` matches the request's `Host` header
+  (the scheme is ignored, so this keeps working behind a TLS-terminating proxy)
+
+Any other origin, including the opaque `null` origin sent by sandboxed iframes and `file:`
+pages, is rejected. To serve browser clients on other origins, list them explicitly:
 
 ```typescript
 await app.register(mcpPlugin, {
-  allowedOrigins: ['https://app.example.com'] // omit to disable, '*' or true to allow any
+  allowedOrigins: ['https://app.example.com'] // exact matches only
 })
 ```
+
+To turn validation off entirely, opt out with `allowedOrigins: true` (or `'*'`). The plugin
+logs a warning at startup when you do.
 
 Requests without an `Origin` header are always accepted — the header is set by browsers, so
 its absence means the request did not come from one.
 
 `allowedOrigins` must be `true`, `'*'` or an array of strings; any other value (including a
 single origin string) makes registration throw. Wrap a single origin in an array.
+
+> The same-host default stops cross-origin pages from calling your server, but a DNS
+> rebinding attack makes the `Origin` and `Host` agree. If your server is reachable under
+> names you do not control, configure an explicit `allowedOrigins` list.
+
+> **Breaking change:** before this release, omitting `allowedOrigins` disabled validation.
+> If browser clients on other origins call your server, add them to `allowedOrigins`, or set
+> `allowedOrigins: true` to restore the old behaviour.
 
 ## CORS
 
