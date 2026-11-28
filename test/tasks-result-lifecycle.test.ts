@@ -9,6 +9,7 @@ import mcpPlugin from '../src/index.ts'
 import { JSONRPC_VERSION, LATEST_PROTOCOL_VERSION, INTERNAL_ERROR } from '../src/schema.ts'
 import type { CreateTaskResult, CallToolResult } from '../src/schema.ts'
 import { MemoryTaskStore } from '../src/stores/memory-task-store.ts'
+import { RedisTaskStore } from '../src/stores/redis-task-store.ts'
 import { TaskWaiters } from '../src/stores/task-store.ts'
 import { testWithRedis } from './redis-test-utils.ts'
 
@@ -201,5 +202,94 @@ describe('legacy tasks/result lifecycle', () => {
     t.assert.strictEqual(response.id, 1)
     t.assert.strictEqual(response.error.code, INTERNAL_ERROR)
     t.assert.match(response.error.message, /shutting down/i)
+  })
+})
+
+describe('TaskWaiters with an already-aborted signal', () => {
+  test('rejects at once and registers nothing', async (t: TestContext) => {
+    const waiters = new TaskWaiters()
+    const controller = new AbortController()
+    controller.abort()
+
+    await t.assert.rejects(waiters.wait('task-1', controller.signal), /aborted/)
+    t.assert.strictEqual((waiters as any).waiters.size, 0)
+  })
+
+  test('a waiter registered before the abort is removed by it', async (t: TestContext) => {
+    const waiters = new TaskWaiters()
+    const controller = new AbortController()
+
+    const pending = waiters.wait('task-1', controller.signal)
+    t.assert.strictEqual((waiters as any).waiters.size, 1)
+    controller.abort()
+
+    await t.assert.rejects(pending, /aborted/)
+    t.assert.strictEqual((waiters as any).waiters.size, 0)
+  })
+})
+
+/**
+ * Send tasks/result, but tear the connection down on the server side right
+ * after the handler has read the task, i.e. before it starts waiting. This is
+ * the window in which handleTasksResult finds the response already destroyed.
+ */
+async function resultFromDisconnectedClient (t: TestContext, opts: Record<string, unknown>, Store: any) {
+  const { opened, open } = gate()
+  t.after(open)
+
+  const instances = new Set<TaskWaiters>()
+  const originalWait = TaskWaiters.prototype.wait
+  TaskWaiters.prototype.wait = function (taskId: string, signal?: AbortSignal) {
+    instances.add(this)
+    return originalWait.call(this, taskId, signal)
+  }
+  t.after(() => { TaskWaiters.prototype.wait = originalWait })
+
+  const app = Fastify({ logger: false })
+  t.after(() => app.close())
+  await app.register(mcpPlugin, { enableTasks: true, ...opts })
+  addGatedTool(app, opened)
+  await app.listen({ port: 0, host: '127.0.0.1' })
+  const { port } = app.server.address() as AddressInfo
+
+  const sockets = new Set<import('node:net').Socket>()
+  app.server.on('connection', (socket) => sockets.add(socket))
+
+  const created = await call(app, 'tools/call', { name: 'gated', arguments: {}, task: {} })
+  const taskId = (created.result as CreateTaskResult).task.taskId
+
+  let disconnected = false
+  const originalGet = Store.prototype.get
+  Store.prototype.get = async function (id: string) {
+    const task = await originalGet.call(this, id)
+    if (id === taskId && !disconnected) {
+      disconnected = true
+      for (const socket of sockets) socket.destroy()
+    }
+    return task
+  }
+  t.after(() => { Store.prototype.get = originalGet })
+
+  const { body } = post(port, 'tasks/result', { taskId })
+  await body.catch(() => {})
+  await sleep(100)
+
+  t.assert.strictEqual(disconnected, true)
+  let pending = 0
+  for (const waiters of instances) {
+    pending += (waiters as any).waiters.size
+  }
+  // The task is still running here, so only a leak could leave a waiter behind
+  t.assert.strictEqual(pending, 0)
+}
+
+describe('tasks/result from a client that already disconnected', () => {
+  test('leaves no waiter behind (memory)', async (t: TestContext) => {
+    await resultFromDisconnectedClient(t, {}, MemoryTaskStore)
+  })
+
+  testWithRedis('leaves no waiter behind (redis)', async (redis, t: TestContext) => {
+    const redisOpts = { host: redis.options.host!, port: redis.options.port!, db: redis.options.db! }
+    await resultFromDisconnectedClient(t, { redis: redisOpts }, RedisTaskStore)
   })
 })
