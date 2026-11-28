@@ -571,6 +571,9 @@ function toolCallOutcomeToJsonRpc (
     // consistent if they ever converge. Mirrors resolveTaskAugmentation's error.
     case 'task-required':
       return createError(id, METHOD_NOT_FOUND, `Tool '${toolName}' requires task-augmented execution`)
+    // Details stay in the server log; the client only learns that it failed.
+    case 'invalid-result':
+      return createError(id, INTERNAL_ERROR, 'Internal error')
     default: {
       const unhandled: never = outcome
       throw new UnhandledToolCallOutcomeError(JSON.stringify(unhandled))
@@ -623,6 +626,32 @@ async function executeToolCall (
   const outcome = await executeRegisteredTool(tool, toolName, args, callDependencies)
   await emitToolCallComplete(observation.source, toolName, args, outcome, observation.startedAt, callDependencies)
   return toolCallOutcomeToJsonRpc(request.id, toolName, outcome)
+}
+
+/**
+ * A handler result is only forwarded as a successful result when it carries
+ * the array its result type requires; anything else would reach the client as
+ * an apparently successful (and possibly cached) empty result.
+ */
+function hasArrayField (result: unknown, field: string): boolean {
+  return typeof result === 'object' && result !== null && Array.isArray((result as Record<string, unknown>)[field])
+}
+
+function toolResultOutcome (
+  result: unknown,
+  toolName: string,
+  dependencies: ToolCallDependencies
+): McpCallToolOutcome {
+  if (hasArrayField(result, 'content')) {
+    return { ok: true, result: result as CallToolResult }
+  }
+  // app.log rather than request.log: a task may outlive its request
+  dependencies.app.log.error({
+    tool: toolName,
+    sessionId: dependencies.sessionId,
+    requestId: dependencies.request.id
+  }, 'Tool handler returned a result without a content array')
+  return { ok: false, reason: 'invalid-result' }
 }
 
 async function executeRegisteredTool (
@@ -690,7 +719,7 @@ async function executeRegisteredTool (
       // Use validated arguments
       try {
         const result = await tool.handler(argumentsValidation.data, { sessionId, request: dependencies.request, reply: dependencies.reply, authContext: dependencies.authContext })
-        return { ok: true, result }
+        return toolResultOutcome(result, toolName, dependencies)
       } catch (error: any) {
         const result: CallToolResult = {
           content: [{
@@ -713,7 +742,7 @@ async function executeRegisteredTool (
       }
       try {
         const result = await tool.handler(toolArguments, { sessionId, request: dependencies.request, reply: dependencies.reply, authContext: dependencies.authContext })
-        return { ok: true, result }
+        return toolResultOutcome(result, toolName, dependencies)
       } catch (error: any) {
         const result: CallToolResult = {
           content: [{
@@ -734,7 +763,7 @@ async function executeRegisteredTool (
         reply: dependencies.reply,
         authContext: dependencies.authContext
       })
-      return { ok: true, result }
+      return toolResultOutcome(result, toolName, dependencies)
     } catch (error: any) {
       const result: CallToolResult = {
         content: [{
@@ -831,6 +860,10 @@ async function handleResourcesRead (
       authContext: dependencies.authContext,
       uriParams
     })
+    if (!hasArrayField(result, 'contents')) {
+      dependencies.request.log.error({ uri }, 'Resource handler returned a result without a contents array')
+      return createError(request.id, INTERNAL_ERROR, 'Internal error')
+    }
     return createResponse(request.id, result)
   } catch (error: any) {
     dependencies.request.log.error({ err: error, uri }, 'Resource read handler failed')
@@ -904,6 +937,10 @@ async function handlePromptsGet (
       reply: dependencies.reply,
       authContext: dependencies.authContext
     })
+    if (!hasArrayField(result, 'messages')) {
+      dependencies.request.log.error({ prompt: promptName }, 'Prompt handler returned a result without a messages array')
+      return createError(request.id, INTERNAL_ERROR, 'Internal error')
+    }
     return createResponse(request.id, result)
   } catch (error: any) {
     dependencies.request.log.error({ err: error, prompt: promptName }, 'Prompt handler failed')
