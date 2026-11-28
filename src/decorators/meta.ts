@@ -23,6 +23,13 @@ interface MCPDecoratorsOptions {
   jsonSchemaValidator?: JsonSchemaValidator
 }
 
+// Plain JSON Schema inputs are validated with AJV's JSON Schema 2020-12
+// support, the dialect MCP specifies
+const SUPPORTED_INPUT_DIALECTS = new Set([
+  'https://json-schema.org/draft/2020-12/schema',
+  'https://json-schema.org/draft/2020-12/schema#'
+])
+
 const mcpDecoratorsPlugin: FastifyPluginAsync<MCPDecoratorsOptions> = async (app, options) => {
   const { tools, resources, prompts, resourceHandlers, opts, jsonSchemaValidator } = options
 
@@ -43,9 +50,14 @@ const mcpDecoratorsPlugin: FastifyPluginAsync<MCPDecoratorsOptions> = async (app
         throw new Error(`Invalid tool schema for '${name}': ${schemaErrors.join(', ')}`)
       }
 
-      // When AJV validation is on, an uncompilable plain JSON Schema must fail
-      // registration rather than register a tool whose inputs can't be checked
+      // When AJV validation is on, a plain JSON Schema in an unsupported dialect
+      // or one that cannot be compiled must fail registration rather than
+      // register a tool whose inputs can't be checked
       if (jsonSchemaValidator && !isTypeBoxSchema(definition.inputSchema)) {
+        const dialect = definition.inputSchema.$schema
+        if (dialect !== undefined && !SUPPORTED_INPUT_DIALECTS.has(String(dialect))) {
+          throw new Error(`Invalid tool schema for '${name}': dialect '${dialect}' is not supported; use JSON Schema 2020-12 or set validateJsonSchemaInputs: false`)
+        }
         try {
           jsonSchemaValidator.compileAndCache(definition.inputSchema)
         } catch (error) {
