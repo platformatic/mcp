@@ -195,4 +195,82 @@ describe('tool argument limits', () => {
       /depth of 3/
     )
   })
+
+  test('sanitizeToolParams does not let a direct __proto__ key change the result prototype', (t: TestContext) => {
+    const result = sanitizeToolParams(JSON.parse('{"__proto__": {"polluted": true}}'))
+
+    t.assert.strictEqual(Object.getPrototypeOf(result), Object.prototype)
+    t.assert.strictEqual(Object.prototype.hasOwnProperty.call(result, '__proto__'), true)
+    const descriptor = Object.getOwnPropertyDescriptor(result, '__proto__')
+    t.assert.ok(descriptor)
+    t.assert.strictEqual(descriptor.value.polluted, true)
+  })
+
+  test('sanitizeToolParams does not let __proto__ pollute when nested in objects and arrays', (t: TestContext) => {
+    const result = sanitizeToolParams({
+      obj: JSON.parse('{"__proto__": {"a": 1}}'),
+      xs: [JSON.parse('{"__proto__": {"b": 2}}')]
+    })
+
+    t.assert.strictEqual(Object.getPrototypeOf(result.obj), Object.prototype)
+    t.assert.strictEqual(Object.getPrototypeOf(result.xs[0]), Object.prototype)
+    t.assert.deepStrictEqual(Object.keys(result.obj), ['__proto__'])
+    t.assert.deepStrictEqual(Object.keys(result.xs[0]), ['__proto__'])
+    const objDescriptor = Object.getOwnPropertyDescriptor(result.obj, '__proto__')
+    const xsDescriptor = Object.getOwnPropertyDescriptor(result.xs[0], '__proto__')
+    t.assert.ok(objDescriptor)
+    t.assert.ok(xsDescriptor)
+    t.assert.strictEqual(objDescriptor.value.a, 1)
+    t.assert.strictEqual(xsDescriptor.value.b, 2)
+  })
+
+  test('sanitizeToolParams copies constructor and prototype keys as ordinary own properties', (t: TestContext) => {
+    const result = sanitizeToolParams(JSON.parse('{"constructor": 1, "prototype": 2}'))
+
+    t.assert.strictEqual(Object.getPrototypeOf(result), Object.prototype)
+    t.assert.strictEqual(Object.prototype.hasOwnProperty.call(result, 'constructor'), true)
+    t.assert.strictEqual(Object.prototype.hasOwnProperty.call(result, 'prototype'), true)
+    t.assert.strictEqual(result.constructor, 1)
+    t.assert.strictEqual(result.prototype, 2)
+  })
+
+  test('sanitizeToolParams safely copies a key that sanitizes to a special property name', (t: TestContext) => {
+    // '__pro\u0000to__' strips the null character back to '__proto__'
+    const result = sanitizeToolParams({ '__pro\u0000to__': { polluted: true } })
+
+    t.assert.strictEqual(Object.getPrototypeOf(result), Object.prototype)
+    t.assert.strictEqual(Object.prototype.hasOwnProperty.call(result, '__proto__'), true)
+    const entries = Object.entries(result)
+    t.assert.strictEqual(entries.length, 1)
+    t.assert.strictEqual(entries[0][0], '__proto__')
+    t.assert.strictEqual((entries[0][1] as Record<string, unknown>).polluted, true)
+  })
+
+  test('sanitizeToolParams detects when key sanitization maps two keys onto the same output key', (t: TestContext) => {
+    t.assert.throws(
+      () => sanitizeToolParams({ 'a\u0000b': 1, ab: 2 }),
+      /Duplicate key "ab" after key sanitization/
+    )
+  })
+
+  test('sanitizeToolParams detects key collisions nested inside objects and arrays', (t: TestContext) => {
+    t.assert.throws(
+      () => sanitizeToolParams({ o: { 'a\u0000b': 1, ab: 2 } }),
+      /Duplicate key "ab" after key sanitization/
+    )
+    t.assert.throws(
+      () => sanitizeToolParams({ xs: [{ 'a\u0000b': 1, ab: 2 }] }),
+      /Duplicate key "ab" after key sanitization/
+    )
+  })
+
+  test('refuses a tool call whose arguments collide after key sanitization', async (t: TestContext) => {
+    const { app, getInvocations } = await buildApp(t)
+
+    const result = await callTool(app, { 'a\u0000b': 1, ab: 2 })
+
+    t.assert.strictEqual(result.isError, true)
+    t.assert.match((result.content[0] as { text: string }).text, /Duplicate key "ab" after key sanitization/)
+    t.assert.strictEqual(getInvocations(), 0)
+  })
 })
