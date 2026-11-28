@@ -114,18 +114,27 @@ export function createError (id: string | number | null, code: number, message: 
 }
 
 /**
- * Requests MUST carry a string or integer id, and responses MUST echo it. A
- * numeric id outside the safe integer range has already lost precision in
- * JSON.parse, so answering it would echo a different id; refuse it instead.
+ * Requests MUST carry a string or integer id that is not null, and responses
+ * MUST echo it. Any other id (null, boolean, object, array, fractional
+ * number) is refused rather than processed and echoed back. A numeric id
+ * outside the safe integer range has already lost precision in JSON.parse,
+ * so answering it would echo a different id; refuse it too.
+ * A message without an `id` key is a notification and is left alone.
  * Returns the error to send, or null if the id is acceptable.
  */
 export function checkRequestId (message: unknown): JSONRPCError | null {
   if (message === null || typeof message !== 'object' || Array.isArray(message)) return null
+  if (!('id' in message)) return null
   const id = (message as { id?: unknown }).id
-  if (typeof id === 'number' && !Number.isSafeInteger(id)) {
+  if (typeof id === 'number') {
+    if (Number.isSafeInteger(id)) return null
     return createError(null, INVALID_REQUEST, 'Invalid Request: numeric id must be a safe integer')
   }
-  return null
+  if (typeof id === 'string') return null
+  // A response to a server-initiated request may carry a null id when the
+  // client could not determine which request it answers (JSON-RPC 2.0 §5)
+  if (id === null && !('method' in message) && 'error' in message) return null
+  return createError(null, INVALID_REQUEST, 'Invalid Request: id must be a string or an integer')
 }
 
 /**
